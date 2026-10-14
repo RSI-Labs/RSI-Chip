@@ -195,6 +195,14 @@ fn element_effective_resistance(
 }
 
 pub fn dc_operating_point(circuit: &SpiceCircuit) -> Result<DcOperatingPoint, String> {
+    dc_operating_point_cancellable(circuit, &FlowCancellation::new())
+}
+
+/// Solve one DC operating point with cancellation at every Newton iteration.
+pub fn dc_operating_point_cancellable(
+    circuit: &SpiceCircuit,
+    cancellation: &FlowCancellation,
+) -> Result<DcOperatingPoint, String> {
     solve_time(
         circuit,
         0.0,
@@ -202,10 +210,20 @@ pub fn dc_operating_point(circuit: &SpiceCircuit) -> Result<DcOperatingPoint, St
         None,
         IntegrationMethod::BackwardEuler,
         None,
+        cancellation,
     )
 }
 
 pub fn dc_sweep(circuit: &SpiceCircuit, analysis: &Analysis) -> Result<DcSweepResult, String> {
+    dc_sweep_cancellable(circuit, analysis, &FlowCancellation::new())
+}
+
+/// Run a DC sweep with cooperative cancellation at every point and Newton pass.
+pub fn dc_sweep_cancellable(
+    circuit: &SpiceCircuit,
+    analysis: &Analysis,
+    cancellation: &FlowCancellation,
+) -> Result<DcSweepResult, String> {
     let Analysis::DcSweep {
         source,
         start,
@@ -226,6 +244,9 @@ pub fn dc_sweep(circuit: &SpiceCircuit, analysis: &Analysis) -> Result<DcSweepRe
     let count = sweep_point_count(*start, *stop, *step)?;
     let mut points = Vec::with_capacity(count);
     for idx in 0..count {
+        if cancellation.is_cancelled() {
+            return Err("DC sweep cancelled".into());
+        }
         let value = if count == 1 {
             *start
         } else {
@@ -238,6 +259,7 @@ pub fn dc_sweep(circuit: &SpiceCircuit, analysis: &Analysis) -> Result<DcSweepRe
             Some((source, value)),
             IntegrationMethod::BackwardEuler,
             None,
+            cancellation,
         )?;
         points.push(DcSweepPoint {
             source_value: value,
@@ -290,6 +312,7 @@ pub fn transient_cancellable(
             None,
             *method,
             previous.as_ref(),
+            cancellation,
         )?;
         if !op.converged {
             convergence_failures += 1;
@@ -5909,7 +5932,11 @@ fn solve_time(
     source_override: Option<(&str, f64)>,
     method: IntegrationMethod,
     previous: Option<&TransientSample>,
+    cancellation: &FlowCancellation,
 ) -> Result<DcOperatingPoint, String> {
+    if cancellation.is_cancelled() {
+        return Err("DC/transient solve cancelled".into());
+    }
     circuit.validate()?;
     let mut guess = vec![0.0; SystemModel::new(circuit)?.size];
     if let Some(previous) = previous {
@@ -5946,6 +5973,7 @@ fn solve_time(
         method,
         previous,
         &guess,
+        cancellation,
     );
     let (mut solution, mut iterations, mut converged) = if circuit.bjt_models.is_empty() {
         initial_result?
@@ -5987,6 +6015,7 @@ fn solve_time(
                 method,
                 previous,
                 &stage_guess,
+                cancellation,
             )?;
             iterations += stage_iterations;
             converged = stage_converged;
@@ -6027,6 +6056,7 @@ fn solve_time(
                 method,
                 previous,
                 &stage_guess,
+                cancellation,
             )?;
             iterations += stage_iterations;
             converged = stage_converged;
@@ -6052,6 +6082,7 @@ fn newton_for_circuit(
     method: IntegrationMethod,
     previous: Option<&TransientSample>,
     initial: &[f64],
+    cancellation: &FlowCancellation,
 ) -> Result<(Vec<f64>, usize, bool), String> {
     let system = SystemModel::new(circuit)?;
     let mut solution = initial.to_vec();
@@ -6061,6 +6092,9 @@ fn newton_for_circuit(
     let mut converged = false;
     let mut iterations = 0usize;
     for _ in 0..MAX_NEWTON_ITERATIONS {
+        if cancellation.is_cancelled() {
+            return Err("Newton iteration cancelled".into());
+        }
         iterations += 1;
         let (matrix, rhs) = build_real_system(
             circuit,
@@ -6100,7 +6134,7 @@ fn newton_for_circuit(
     Ok((solution, iterations, converged))
 }
 
-fn nonlinear_terminal_currents(
+pub(crate) fn nonlinear_terminal_currents(
     circuit: &SpiceCircuit,
     element: &SpiceElement,
     terminal_voltages: &[f64],
@@ -6168,10 +6202,24 @@ fn nonlinear_terminal_currents(
                 settings.saturation_current_temperature_exponent,
                 circuit.temperature_k,
             );
-            let forward =
-                saturation_current * area * ((v_be / thermal_voltage).clamp(-80.0, 80.0)).exp_m1();
-            let reverse =
-                saturation_current * area * ((v_bc / thermal_voltage).clamp(-80.0, 80.0)).exp_m1();
+            let forward_early_factor = if settings.forward_early_voltage_v > 0.0 {
+                (1.0 - v_bc / settings.forward_early_voltage_v).max(1.0e-3)
+            } else {
+                1.0
+            };
+            let reverse_early_factor = if settings.reverse_early_voltage_v > 0.0 {
+                (1.0 - v_be / settings.reverse_early_voltage_v).max(1.0e-3)
+            } else {
+                1.0
+            };
+            let forward = saturation_current
+                * area
+                * ((v_be / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
+                * forward_early_factor;
+            let reverse = saturation_current
+                * area
+                * ((v_bc / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
+                * reverse_early_factor;
             let transport = forward - reverse;
             let collector_current = transport - reverse / settings.reverse_beta;
             let base_current = forward / settings.forward_beta + reverse / settings.reverse_beta;
@@ -6229,6 +6277,7 @@ fn dynamic_capacitors(
             let vgs = polarity * node_difference(voltages, gate, source);
             let vds = polarity * node_difference(voltages, drain, source);
             let vbs = polarity * node_difference(voltages, bulk, source);
+            let vbd = polarity * node_difference(voltages, bulk, drain);
             let threshold = mos_threshold(
                 settings,
                 vbs,
@@ -6300,6 +6349,36 @@ fn dynamic_capacitors(
                     gate.clone(),
                     bulk.clone(),
                     cgb,
+                ));
+            }
+            let cbs = junction_capacitance(
+                settings.source_junction_sidewall_cap_per_m * width_m * multiplier,
+                settings.junction_potential_v,
+                settings.junction_grading_coefficient,
+                settings.junction_forward_knee,
+                vbs,
+            );
+            if cbs > 0.0 {
+                out.push((
+                    format!("{}:cbs", element.name),
+                    bulk.clone(),
+                    source.clone(),
+                    cbs,
+                ));
+            }
+            let cbd = junction_capacitance(
+                settings.drain_junction_sidewall_cap_per_m * width_m * multiplier,
+                settings.junction_potential_v,
+                settings.junction_grading_coefficient,
+                settings.junction_forward_knee,
+                vbd,
+            );
+            if cbd > 0.0 {
+                out.push((
+                    format!("{}:cbd", element.name),
+                    bulk.clone(),
+                    drain.clone(),
+                    cbd,
                 ));
             }
         }

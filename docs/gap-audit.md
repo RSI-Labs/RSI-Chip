@@ -68,8 +68,11 @@ has now been advanced from “missing” to “partial”:
 * channel-length modulation;
 * `THETA` overdrive mobility degradation;
 * `VSAT` velocity-saturated drain voltage and current limiting;
+* voltage-dependent source/drain-bulk junction sidewall capacitance through
+  `CJSW/CJSWS/CJSWD/PB/MJ/FC`, including forward-knee linear continuation;
 * W/L/M instance scaling;
 * forward/reverse Ebers-Moll NPN/PNP terminal currents;
+* `VAF/VAR` forward/reverse Early output-resistance modulation;
 * AREA instance scaling;
 * nonlinear Jacobian stamping and Newton solution;
 * logarithmic source-step continuation for BJT convergence;
@@ -256,6 +259,9 @@ spanning long-channel, short-channel, narrow-width, body-bias,
 low/high-temperature, and binned geometry.
 `.sens` and `.sobol` expose
 `VTH0/K1/U0/TOX/VSAT/DVT0/DVT1/DVT2/DVT0W/DVT1W/W0/KT1/KT2/KT1L`. The
+dynamic engine now also stamps bias-dependent source/drain junction sidewall
+capacitances from the same cards, scales them by W/M, and round-trips the
+typed fields through the SPICE writer. The
 remaining gap is the full advanced foundry model surface: complete DVT
 equations, vendor parameter interpolation/binning semantics,
 PSP/HiSIM/VBIC/HICUM equations, nonlinear foundry charge, self-heating, and
@@ -404,7 +410,8 @@ remains future work.
 The API now parses and writes typed PDK manifests containing routing-layer
 geometry, process/voltage/temperature corners, optional per-corner delay
 scales, inline per-corner Liberty views with optional SHA-256 integrity checks,
-nominal-versus-golden model
+an optional inline layer/via rule deck with SHA-256 integrity and full typed
+rule validation, nominal-versus-golden model
 correlations with relative-error tolerances, and the required signoff checks.
 `run_pdk_signoff` imports an inline Liberty view when present (or creates a
 scaled built-in library otherwise), reruns the RTL implementation flow for
@@ -412,7 +419,7 @@ every PVT-tagged corner, and reports per-corner model correlation, synthesis
 equivalence, finite STA delay, DRC severity, and nonempty LEF/DEF/SDF physical
 databases. `eda pdk design.v --pdk manifest.pdk` exposes the same report. This
 is a portable MMMC signoff framework, not a foundry-certified PDK: a Liberty
-checksum detects accidental corruption but does not establish vendor identity;
+or rule-deck checksum detects accidental corruption but does not establish vendor identity;
 external provenance/certification, imported compact-model cards, and golden
 certification remain future work.
 
@@ -492,9 +499,104 @@ rejects different-net crossings, enforces exact rational inter-net spacing,
 allows same-net branches to meet, and sums typed route lengths. One hundred
 cases rotate exact diagonal lengths, parallel net spacing, spacing violations,
 polygon blockage rejection, same-net crossing branches, and zero-length
-endpoint rejection. This is a direct route subset rather than a general
-arbitrary-angle maze/rip-up router; the Manhattan Boolean path also remains
-Manhattan-only.
+endpoint rejection. A bounded visibility-graph maze router now complements the
+direct path: it generates clearance candidates around polygon corners, uses
+Dijkstra over legal arbitrary-angle visibility edges, preserves exact squared
+lengths for every polyline segment, honors blockage and different-net spacing,
+and returns multi-bend paths around simple polygon obstacles. A negotiated
+rip-up mode independently routes the initial population, records exact
+conflicting segment pairs as history cost, removes and reroutes nets with
+present-conflict and history penalties, reports typed initial conflicts and
+pass count, and converges crossing nets to conflict-free detours.
+
+The typed geometry API now also performs exact Boolean operations on two simple
+arbitrary-angle polygons. Union, intersection, and left-minus-right difference
+split boundaries at checked integer/rational intersections, classify subsegments
+by exact rational containment, remove duplicate undirected boundary edges,
+assemble closed result loops (including an opposite-oriented interior hole for
+a contained difference), and preserve rational intersection vertices such as
+`13/5` rather than rounding them to integer database units. Total area uses
+signed loop orientation so a hole subtracts from its enclosing polygon while
+disjoint results add. Crate-local tests cover overlap area identities, rational
+vertices, identical inputs, containment with a hole, and disjoint polygons.
+
+Layer rules now carry optional exact density limits in basis points and a
+positive square evaluation window. DRC unions all Manhattan shapes on a layer,
+evaluates a deterministic critical-edge sliding-window set (overall-union center
+and windows aligned with each disjoint-cover edge), clips the cover to every
+window, and computes integer area before comparing minimum/maximum density.
+Overlapping same-layer shapes are counted once rather than double-counted, and
+a local 90% stripe is caught even when the overall union center falls in an
+empty region. The window search is bounded to these critical candidates rather
+than every DBU translation.
+Rules reject densities above 100%, inverted ranges, and nonpositive windows.
+The daemon `layoutDrc` method accepts `minDensityBp`, `maxDensityBp`,
+`densityWindow`, and arbitrary-angle polygon shapes, so remote agents can submit
+the same typed foundry rule-deck fragment used by the Rust API.
+
+Layer rules also carry a typed cross-layer spacing table. For different-net
+shapes on two layers, DRC examines both directional entries, applies the
+stricter requirement, and uses the exact geometry distance engine. Same-net
+cross-layer shapes remain exempt so stacked connecting metal is not reported as
+a spacing violation. The daemon parses a `spacingTo` object in each remote layer
+rule.
+
+Same-layer different-net shapes are additionally checked for positive-area
+overlap using exact Manhattan or arbitrary-angle Boolean intersection. A real
+overlap reports `LAYOUT.SHORT` even when a legacy deck sets `minSpacing` to
+zero; boundary-only touching remains governed by the explicit spacing rule and
+is legal at zero spacing. Same-net overlap remains legal and is unioned for
+density accounting.
+
+The typed layer/via rule deck now has deterministic text import/export. The
+format carries version, all layer width/area/spacing/notch/density fields,
+cross-layer spacing edges, and complete via cut/enclosure/extension/cut-spacing
+fields. Parsing rejects duplicate or forward-referenced layers/vias and unknown
+keywords, comments are allowed, and writing emits the same typed objects in
+sorted order. Daemon method `layoutRuleDeck` validates a remote deck, returns
+typed counts, and emits the normalized representation.
+
+Layout DRC results now support a separate auditable waiver layer. A typed
+waiver names an exact violation code plus optional layer/net/object selectors,
+owner, and reason; duplicate IDs are rejected. Applying waivers never mutates
+the raw DRC computation—the returned object retains active violations, waived
+violations with owner/reason attribution, used waiver IDs, and a text audit
+report. The daemon `layoutDrc` method accepts the same waiver objects and also
+reports pre-waiver error/violation counts.
+
+Those physical waivers are also persistent across daemon requests and async
+jobs. Agents can create bounded named waiver registries, add or remove typed
+rules with an audit actor, list/get/delete registries, and pass
+`waiverRegistryId` to `layoutDrc`. Explicit inline waivers and registry-backed
+waivers are mutually exclusive. Registry responses retain active rules and
+immutable added/removed event snapshots; removing a waiver immediately restores
+the underlying violation to the active DRC result.
+
+Via rules additionally carry an optional exact `minCutSpacing`. DRC checks every
+pair of cuts on a common cut layer using exact rectangle spacing and reports
+`LAYOUT.VIA_CUT_SPACING`; when two rules disagree, the stricter spacing wins.
+Positive-area cut overlap is independently illegal and reports
+`LAYOUT.VIA_CUT_OVERLAP` even when a legacy deck leaves `minCutSpacing` at zero;
+merely touching cuts remain governed by the explicit spacing rule. The daemon
+parses the same `minCutSpacing` field from a remote rule deck and returns both
+typed pair diagnostics.
+
+Layer rules also carry an optional `minNotch`. For rectilinear polygons, DRC
+takes scanlines between every adjacent pair of horizontal edge coordinates,
+forms exact covered intervals from vertical-edge crossings, and reports the
+narrowest gap between disjoint intervals as the notch opening. A 20 DBU notch
+against a 25 DBU rule therefore fails exactly, while a 30 DBU notch passes.
+Arbitrary-angle polygons fail closed with `LAYOUT.NOTCH_GEOMETRY` when a notch
+rule is enabled because that geometry family does not yet have a certified notch
+decomposition. The daemon accepts `minNotch` in remote layer-rule objects.
+
+Via rules also support independent bottom/top X/Y metal extensions beyond the
+cut. DRC combines each directional extension with the legacy uniform enclosure
+requirement and checks that same-net metal contains the resulting axis-expanded
+rectangle. This supports common asymmetric via tables where, for example, bottom
+metal must extend 10 units in X and 5 in Y while top metal extends 5 in X and 10
+in Y. The daemon parses all four fields from remote rule decks and reports the
+same typed `LAYOUT.VIA_ENCLOSURE` diagnosis.
 
 ### Follow-up: interactive schematic event session
 
@@ -1076,6 +1178,14 @@ constrained timing recomputation.
 The regression suite adds 100 generated-clock divide-by cases and 100 clock-group
 relationship cases rotating across all three group kinds.
 
+The parser now also accepts `set_units` with time and capacitance dimensions.
+Subsequent clock periods/edges, uncertainty, latency, transition, IO delay,
+max/min delay, transition limit, input transition, capacitance limit, and load
+values are normalized into the canonical ns/pF representation. Resistance,
+voltage, and current unit metadata is retained in the typed `SdcUnits` record,
+duplicate/unknown dimensions fail closed, and commands before a later
+`set_units` use the unit state active at that line.
+
 The SDC parser also supports design-wide and object-scoped signal-quality
 limits: `set_max_transition`, `set_max_capacitance`, and `set_max_fanout`.
 It additionally accepts typed `set_input_transition` and `set_load` rules.
@@ -1130,15 +1240,336 @@ methods return the complete structured RTL flow plus `cacheHit`/`cacheId`;
 `jobSubmit` executes cached flows through the service-owned dispatcher rather
 than a stateless global path.
 
+### Follow-up: safe sequential ECO replacement
+
+Structural ECO replacement no longer rejects every sequential instance. A
+generic `Dff`/`DffR` can be replaced by a library `DFF`/`DFFR` when the clock,
+data, and reset pin roles and input count match exactly. Mixed
+sequential/combinational replacements and changes such as DFF-to-DFFR remain
+rejected transactionally, preventing an ECO from silently moving a reset or
+clock connection. Unit tests cover positive DFF/DFFR swaps and both negative
+role/class cases; the named integration case also proves the swapped DFF is
+formally equivalent to the original netlist.
+
+### Follow-up: DC solver cancellation reaches Newton iterations
+
+The AMS cancellation surface now includes the two previously synchronous DC
+entry points. `dc_operating_point_cancellable` checks before validation and at
+every Newton iteration; `dc_sweep_cancellable` checks before every sweep point
+and inside each Newton solve. The typed API dispatcher routes `.op` and `.dc`
+through those paths, and daemon `spiceDc` jobs use the same token. Unit tests
+cover direct AMS calls, API dispatch, and RPC cancellation, while transient
+integration now inherits the same per-iteration checks.
+
+### Follow-up: LVS and UPF power-intent RPC surfaces
+
+The persistent daemon adds two signoff-facing methods. `rtlLvs` accepts two
+RTL views (with a shared or per-view top), runs the cancellable implementation
+flow on each, performs labelled graph LVS/ERC, and returns structured cell/net
+matches, shorts, opens, notes, both netlist statistics, and the text report.
+`rtlPowerIntent` compiles RTL, parses UPF, checks domain/supply/switch/
+isolation/retention/level-shifter intent, and returns typed counts, findings,
+an error verdict, and report text. Both methods are available to direct line
+RPC and asynchronous `jobSubmit` workers and honor the shared cancellation
+token before and after each expensive stage.
+
+### Follow-up: formal safety and physical-timing RPC surfaces
+
+Two additional signoff-facing daemon methods close API-first gaps. `rtlSafety`
+runs the cancellable RTL implementation flow, selects a named bad net and bound
+`depth`, invokes bounded reachability plus k-induction, and returns status,
+depth, inductiveness, counterexample/failed-invariant flags, mapped statistics,
+and the proof report. `rtlPhysicalTiming` parses track/iteration/pass and
+interconnect R/C options, runs placement → routing → RC extraction → SDF
+back-annotation → STA, and returns baseline/best delays, iteration and
+wirelength data, RC/DRC counts, the serialized SPEF and SDF, mapped statistics,
+and the full physical-timing report. Both methods are wired into direct RPC
+and cancellable asynchronous jobs.
+
+### Follow-up: RTL antenna repair API and RPC
+
+The unified API now wraps the complete physical antenna loop:
+RTL compile → library synthesis → placement → detailed maze routing →
+physical verification → DIODE insertion → placement extension → rerouting →
+post-repair verification. The typed result retains the baseline DRC evidence,
+per-net old/new antenna ratios and diode counts, final placement/routing,
+mapped statistics, and the human-readable repair report. Cancellation is
+checked around compilation, synthesis, placement, routing, and final assembly.
+Daemon method `rtlAntennaRepair` exposes the same flow with patch-name,
+diode-limit, track-capacity, and congestion-policy options; it returns typed
+baseline DRC, repair records, final physical statistics, and the report, and is
+available to direct RPC and cancellable async jobs.
+
+The antenna threshold itself is now a typed DRC option rather than a hidden
+global constant. `drc_with_options`, `physical_verification_with_options`, and
+`implement_rtl_pnr_with_drc_options` accept a finite positive
+`max_antenna_ratio`; invalid limits fail closed. Daemon `rtlPnr` accepts
+`drcOptions.maxAntennaRatio`, so a foundry-specific ratio can drive the same
+LEF/DEF, placement, routing, and structured physical-verification response
+without changing tool source.
+
+### Follow-up: arbitrary-angle routing RPC
+
+`layoutAnyAngleRoute` exposes the typed exact-geometry two-pin router to
+remote agents. Requests supply one or more net/start/end pairs, optional
+simple-polygon blockages, and an integer minimum-spacing rule. The method
+returns exact rational-squared segment lengths, floating lengths for clients,
+total wirelength, route/blockage counts, and the applied spacing. It rejects
+blockage crossings, net crossings, spacing violations, malformed geometry, and
+empty request lists, and is available through both direct RPC and cancellable
+asynchronous jobs.
+
+### Follow-up: arbitrary-angle maze routing RPC
+
+`layoutAnyAngleMazeRoute` exposes the bounded visibility-graph arbitrary-angle
+router to remote agents. It accepts one or more two-pin requests, simple
+polygon blockages, integer minimum spacing, and a bounded search-node limit.
+The response returns every route point, segment count, exact rational-squared
+segment lengths, per-route and total lengths, blockage count, and the applied
+options. With `ripgup` enabled and a positive `maxPasses`, the RPC invokes
+negotiated arbitrary-angle rip-up/reroute and additionally returns the typed
+initial conflict list and convergence pass count. Direct RPC and cancellable
+asynchronous jobs share the same path.
+
+### Follow-up: arbitrary-angle Boolean RPC
+
+`layoutAnyAngleBoolean` exposes the exact two-polygon geometry engine to remote
+agents. It accepts two simple integer-coordinate polygons and `union`,
+`intersection`, or `difference`, and returns every result loop with exact
+rational vertex numerators/denominators, floating coordinates for convenience,
+per-loop area and signed area, loop count, and total oriented area. Rational
+intersections remain exact rather than being rounded to integer database units;
+for example the RPC preserves a `13/5` coordinate. Invalid operations and
+malformed/self-intersecting polygons fail closed, and the method is available to
+direct RPC and cancellable asynchronous jobs.
+
+### Follow-up: two-view RTL equivalence RPC
+
+`rtlEquivViews` compares two independently supplied RTL/ECO views rather
+than only checking one RTL implementation against its own mapped netlist. It
+runs the cancellable implementation flow for each source/top pair, compares
+the stable unoptimized reference views with sequential LEC, and returns the
+equivalent verdict, binary-string counterexample, proof notes, and per-view
+net/cell statistics. This gives remote agents a direct regression/ECO API for
+before-and-after design versions.
+
+### Follow-up: coverage-plan validation and crate-local coverage tests
+
+Functional coverage parsing now rejects malformed plans at parse time instead
+of deferring structural failures to waveform evaluation. Duplicate covergroup,
+coverpoint, bin, cross, and toggle names are rejected; empty covergroups and
+empty plans are rejected; crosses must reference distinct existing
+coverpoints. Crate-local tests grew from two to eight and now cover posedge
+and negedge sampling, exact bin/cross hit counts, 100% percentage accounting,
+whole/bit/slice selectors, non-contiguous bin ranges, report formatting,
+missing signal/clock fail-closed behavior, and all duplicate/empty-object
+errors.
+
+### Follow-up: expanded crate-local CTS tests
+
+`eda-cts` crate-local tests grew from two to seven. Direct checks now cover a
+nine-sink balanced tree with bounded leaf fanout, preserved sequential count,
+inserted buffers and finite delay/skew metrics; separate clock roots producing
+separate trees; placement-aware CTS with a legal physical view and finite
+physical skew/wire delay; all CTS and timing-driven option bounds; a
+sequential-free netlist rejection; and a placement/netlist cardinality
+mismatch rejection.
+
+### Follow-up: DFT scan option validation and expanded tests
+
+Scan insertion now rejects blank chain names and duplicate scan-control port
+names in addition to existing-name, missing-library, and sequential-input
+errors. Crate-local DFT tests grew from two to five. They now verify a
+three-flop chain's exact order, inserted mux/buffer and net counts, every
+mux's functional/previous-Q connectivity, functional versus shift selection,
+scan-out observation, DFT analysis counts, report output, malformed options,
+and structural audit rejection of empty or non-MUX chains.
+
+### Follow-up: fault-pattern bounds and expanded fault tests
+
+Automatic fault-pattern generation now rejects fewer than two random patterns
+and an exhaustive-input limit above 24 bits, preventing accidental memory
+explosion and shift overflow. Crate-local fault tests grew from two to seven,
+covering exact exhaustive pattern order, exact single-pattern stuck-at
+coverage and detection indices, deterministic reproducible random generation
+beyond the exhaustive limit, invalid options, sequential/no-input/no-output
+fail-closed behavior, missing pattern inputs, invalid STIL names/patterns, and
+malformed or unknown STIL signals.
+
+### Follow-up: SPEF unit conversion and structural validation
+
+SPEF serialization now converts capacitance and resistance values from the
+in-memory unit system into its canonical NS/PF/OHM output units; previously a
+non-default-unit SPEF changed physical quantities on write/read round trip.
+Writer validation rejects nonpositive/non-finite units and non-finite
+parasitics, parser validation rejects negative/non-finite capacitance and
+resistance, invalid total capacitance, duplicate capacitor/resistor IDs, and
+empty parasitic nodes. Quoted escaped design/net/node names and connection
+coordinates now round-trip. Crate-local tests grew from three to nine, adding
+exact non-default-unit conversion, escaped identifiers, parasitic report
+totals/unmatched nets/worst RC, SDF INTERCONNECT export, and malformed
+parser/writer rejection coverage.
+
+### Follow-up: LVS structural validation and expanded tests
+
+Both reference and layout views are now validated before graph comparison:
+empty or duplicate port/net/cell names are rejected, and combinational cycles
+fail closed rather than entering signature refinement. This closes a port-map
+ambiguity where duplicate port names could collapse through a hash map.
+Crate-local LVS tests grew from four to ten, adding exact cell/net mappings
+and report contents; count/name/direction/width port mismatches; pin/connectivity
+mismatch; sequential-boundary matching with a renamed clock; unloaded input
+and undriven output ERC checks; and duplicate-name/combinational-cycle
+rejection.
+
+### Follow-up: UPF domain-consistency checks and expanded tests
+
+UPF parsing now rejects repeated domain elements and supply-port directions
+outside `in`, `out`, and `inout`. Power-intent checking additionally enforces
+domain consistency for a domain's primary supplies, every supply-net/port
+connection, and each switch input/output supply. A supply port connected to
+multiple nets is reported as an error. The human report now starts with an
+explicit PASS/FAIL verdict. Crate-local UPF tests grew from four to seven,
+adding a clean end-to-end intent over a constructed design, cross-domain
+supply/shared-port errors, and top/element/signal check failures while
+retaining switch, mode, and strategy-current coverage.
+
+### Follow-up: RTL MMMC timing RPC
+
+The daemon adds `rtlMmmcTiming`, exposing the existing typed
+multi-scenario timing API to remote agents. It accepts RTL, an optional top,
+and an inline named scenario manifest with SDC constraints and generic
+properties; runs the cancellable implementation flow; analyzes every scenario
+against the mapped netlist; and returns scenario count, worst scenario,
+worst setup/hold slack, per-corner clock/period/delay/slack data, all generic
+properties, mapped statistics, and the full MMMC report. Unconstrained
+infinite slacks serialize as JSON null rather than failing the response.
+The method is available synchronously and through cancellable async jobs.
+
+### Follow-up: timing scenario diff RPC
+
+The daemon adds `timingScenarioDiff` so agents can compare two inline MMMC
+manifests before rerunning analysis. It parses both scenario sets, computes
+added/removed/changed/timing-changed scenarios, and returns per-scenario SDC
+object diffs, generic property additions/removals/changes, recompute
+classification flags, scenario counts, and the text report. This distinguishes
+a power-only property edit from a timing constraint edit and is available
+through both direct RPC and cancellable asynchronous jobs.
+
+### Follow-up: incremental MMMC timing RPC
+
+`rtlIncrementalMmmcTiming` executes a complete remote incremental timing flow:
+parse old and new scenario manifests, run the cancellable RTL implementation
+flow once, analyze the old scenario baseline, and invoke the typed incremental
+MMMC engine. The response reports baseline/final worst scenarios and setup/hold
+slacks, added/removed/changed/timing-changed scenarios, reused scenario names,
+per-update recomputed nets/cells and recompute classification, final per-corner
+summaries, text diff/final reports, and mapped statistics. Property-only edits
+reuse the old STA object while timing constraint edits execute the incremental
+constraint engine.
+
+### Follow-up: RTL signal-quality RPC
+
+`rtlSignalQuality` exposes transition, capacitance, and fanout checks to
+remote agents. It parses design-wide limits, object-scoped transition/
+capacitance/fanout rules, input transitions, pin/port loads, and per-net extra
+capacitance; runs the cancellable RTL implementation flow; and returns check
+counts, worst transition/capacitance slack, typed violations with net/cell IDs
+and names, actual/limit values, mapped statistics, and the text report. The
+method is available synchronously and through cancellable asynchronous jobs.
+
+### Follow-up: timing waiver audit RPC
+
+`timingWaiverAudit` gives remote agents a signoff-review view of immutable
+waiver history. It parses the serialized audit stream, reconstructs the active
+waiver set, and returns typed event and rule snapshots, actor/generation
+metadata, active waiver IDs, hierarchy-scoped event distributions and latest
+generations, plus both human-readable audit reports. Direct RPC and async jobs
+share the same cancellation token.
+
+### Follow-up: MMMC setup/hold/reset path RPC
+
+`rtlMmmcTimingPaths` exposes merged cross-corner path review to remote agents.
+After the cancellable RTL flow and multi-scenario timing analysis, it extracts
+setup/output, hold, and recovery/removal paths and serializes endpoint/scenario
+metadata, slack/required/arrival values, launch and endpoint objects, cell/net
+IDs and stable names, every timing arc with delay, and per-corner slack
+vectors. Separate setup, hold, and reset reports are returned alongside the
+typed path arrays.
+
+### Follow-up: MMMC timing-violation registry RPC
+
+`rtlMmmcTimingViolations` turns the typed cross-corner violation registry into
+an agent-facing signoff review operation. It accepts RTL, an optional top, an
+inline named timing-scenario manifest, serialized waivers, and an audit actor;
+runs the cancellable implementation flow; and returns active and waived
+violations per scenario, active waiver snapshots, actor-attributed audit
+reports, cross-corner endpoint summaries, hierarchy distributions, the full
+registry report, and mapped statistics. Matching waivers move the affected
+paths from active and cross-corner/hierarchy summaries into the per-scenario
+waived map without destroying their audit history.
+
+### Follow-up: incremental MMMC timing-violation RPC
+
+`rtlIncrementalMmmcTimingViolations` persists a baseline violation registry by
+scenario name, applies global waivers and audit actors, replaces the scenario
+set, and returns the full lifecycle transition. The response includes added and
+removed scenario snapshots, per-scenario added/removed/improved/degraded/
+unchanged paths with old and new slacks, cross-corner endpoint lifecycle
+changes, baseline and update reports, the final active/waived registry, and
+mapped statistics. Waivers survive constraint updates while raw violation
+lifecycle remains visible for review.
+
+### Follow-up: persistent timing-waiver registry RPC lifecycle
+
+The stateful daemon now owns bounded, cross-request MMMC violation registries.
+Agents can create a named registry from RTL plus scenarios, list registries,
+fetch the full active/waived state, add or remove global waivers with audit
+actors, replace the scenario set while retaining lifecycle history and waivers,
+and delete a registry. Create reuses the service-owned content-addressed RTL
+flow cache; direct calls and asynchronous jobs share the same registry store.
+Responses include serialized immutable waiver audit history, active waiver IDs,
+scenario names, cross-corner and hierarchy summaries, mapped statistics, and
+typed scenario lifecycle updates.
+
+### Follow-up: multi-scenario post-route power/IR RPC
+
+`rtlPostRoutePowerIr` closes another agent-driven signoff gap. It parses the
+same inline timing-scenario manifest, converts `post_route.*` properties into
+per-scenario power/IR options, runs the cancellable RTL implementation and
+physical timing flow once, applies every power scenario to the selected
+post-route parasitic view, and returns per-scenario voltage, dynamic/static/
+total power, parasitic dynamic power, effective capacitance count and value,
+total current, worst IR drop/row, typed findings, and reports. Worst power and
+drop scenario labels, total error findings, vector count, the physical timing
+report, and mapped statistics are also returned. Explicit input vectors are
+supported; gate-level VCD activity is equally supported through the `vcd`
+parameter and uses waveform timestamps/intervals rather than resynthesizing
+stimulus. Supplying both stimulus forms fails closed. Absent vectors use the
+deterministic zero/all-ones pair.
+
+### Follow-up: multi-scenario UPF power-mode IR/EM RPC
+
+`rtlPostRoutePowerModeIr` analyzes every timing/power scenario crossed with
+every declared UPF power mode on the selected post-route physical view. It
+accepts RTL, the timing-scenario manifest, UPF power intent, physical-timing
+options, optional explicit vectors or gate-level VCD activity, and optional
+multilayer mesh dimensions. The
+response reports the scenario × mode power/current/IR matrix, per-domain power
+and voltage data, worst power/drop/EM scenario and mode labels, finite versus
+unbounded EM lifetime, findings, per-scenario UPF reports, the physical timing
+report, stimulus kind/sample count, and mapped statistics. Direct RPC and
+async jobs share cancellation.
+
 ## Remaining high-priority gaps
 
 | Priority | Gap | Why it matters |
 |---|---|---|
-| P0 | Advanced foundry MOSFET/BJT compact and charge models | A BSIM3 I-V core with simplified short-channel/DIBL/narrow-width/temperature behavior now exists, but full BSIM3/4 DVT/binning, charge, NQS, self-heating/noise and PSP/HiSIM/VBIC/HICUM-class signoff models do not |
+| P0 | Advanced foundry MOSFET/BJT compact and charge models | A BSIM3 I-V core with simplified short-channel/DIBL/narrow-width/temperature behavior, MOS intrinsic/overlap charge, and voltage-dependent source/drain junction sidewall capacitance now exists, but full BSIM3/4 DVT/binning, charge, NQS, self-heating/noise and PSP/HiSIM/VBIC/HICUM-class signoff models do not |
 | P0 | Certified foundry PDK calibration | Typed PDK signoff exists, but external vendor certification and golden compact-model correlation remain required |
 | P1 | Temperature/foundry noise correlation, arbitrary covariance/vendor distributions, autonomous startup/HB | Commercial analog analysis breadth |
-| P1 | Full SystemVerilog/UVM and SDC semantics | Parameterized generate-if/for/case, parameter packages/imports/scoped constants, local/package enum, packed struct, and packed union typedefs, simple local/package functions with non-recursive nested inlining, recursion rejection, scalar, packed struct/union, fixed multidimensional unpacked-array locals, fixed multidimensional unpacked module nets and ports, constant-base/runtime-module-read/runtime-function-read/runtime-blocking-write/runtime-NBA-write-and-synthesis/reversed-packed-module-function-continuous-read-write/scalar-runtime-packed-base-continuous-write/runtime-array-element-constant-packed-base-continuous-write/procedural-runtime-module-array-element-read-write-and-synthesis/runtime-function-array-element-read-write indexed part-selects, if/else assignment merging, exact/wildcard-case assignment merging, bounded canonical for-loop unrolling, constant-repeat unrolling, constant-condition bounded while-loop unrolling, shared-interface signal connectivity with explicit modport direction checks, fixed multidimensional interface/module arrays, and static virtual ports, immediate assertions and clocked assert/assume/cover properties with fixed/bounded-range delays, fixed/range bounded consecutive, goto, and nonconsecutive repetition, bounded fixed-delay two-sequence and/or composition, and disable-iff aborts, signed arithmetic/casts/literals, common variable types/default widths, casez/casex, generated clocks, and clock groups are implemented, but dynamic non-interface aggregates, dynamic/multidimensional virtual interfaces, unbounded temporal repetition, full arbitrary-length sequence composition, classes/UVM, and broader commercial SDC semantics remain |
-| P1 | Advanced polygon/via layout operations and rule-deck breadth | A typed Manhattan polygon/via database with editing, exact Boolean operations, spacing, width/area, cut, enclosure DRC, and fix suggestions exists, and arbitrary-angle polygons are integrated into document storage, hit testing, SVG, movement, exact area checks, same-layer spacing DRC, dedicated API/browser creation, unconstrained vertex editing, and direct two-pin routing; arbitrary-angle Boolean/full maze routing and complete foundry rule decks remain |
+| P1 | Full SystemVerilog/UVM and SDC semantics | Parameterized generate-if/for/case, parameter packages/imports/scoped constants, local/package enum, packed struct, and packed union typedefs, simple local/package functions with non-recursive nested inlining, recursion rejection, scalar, packed struct/union, fixed multidimensional unpacked-array locals, fixed multidimensional unpacked module nets and ports, constant-base/runtime-module-read/runtime-function-read/runtime-blocking-write/runtime-NBA-write-and-synthesis/reversed-packed-module-function-continuous-read-write/scalar-runtime-packed-base-continuous-write/runtime-array-element-constant-packed-base-continuous-write/procedural-runtime-module-array-element-read-write-and-synthesis/runtime-function-array-element-read-write indexed part-selects, if/else assignment merging, exact/wildcard-case assignment merging, bounded canonical for-loop unrolling, constant-repeat unrolling, constant-condition bounded while-loop unrolling, shared-interface signal connectivity with explicit modport direction checks, fixed multidimensional interface/module arrays, and static virtual ports, immediate assertions and clocked assert/assume/cover properties with fixed/bounded-range delays, fixed/range bounded consecutive, goto, and nonconsecutive repetition, bounded fixed-delay two-sequence and/or composition, and disable-iff aborts, signed arithmetic/casts/literals, common variable types/default widths, casez/casex, generated clocks, clock groups, and `set_units` time/capacitance normalization are implemented, but dynamic non-interface aggregates, dynamic/multidimensional virtual interfaces, unbounded temporal repetition, full arbitrary-length sequence composition, classes/UVM, and broader commercial SDC semantics remain |
+| P1 | Advanced polygon/via layout operations and rule-deck breadth | A typed Manhattan polygon/via database with editing, exact Boolean operations, spacing, width/area, cut, enclosure DRC, and fix suggestions exists, and arbitrary-angle polygons are integrated into document storage, hit testing, SVG, movement, exact area checks, same-layer spacing DRC, dedicated API/browser creation, unconstrained vertex editing, exact two-polygon union/intersection/difference, direct two-pin routing, bounded visibility-graph maze routing, and negotiated arbitrary-angle rip-up/congestion refinement; the candidate graph remains bounded and complete foundry rule decks remain |
 | P2 | Native/production-grade GUI shell | Browser hosts drive schematic and layout sessions, including zoom/pan, property grids, rectangle/polygon/via editing, polygon vertices, and DRC; a native shell and broader production workflow integration remain |
 | P2 | Full daemon/RPC method surface | Foundational JSON/TCP RPC and job manager exist with cooperative RTL/PDK/SAT/BMC/equivalence/k-induction/router/AMS-loop cancellation including optimizers, but every toolchain API is not yet remotely callable and cancellation is not yet supported inside every nested solver |
 | P2 | Distributed/cloud simulation backend | Daemon-shared bounded LRU regression caching is implemented; distributed workers, network storage, and scheduling are not bundled |

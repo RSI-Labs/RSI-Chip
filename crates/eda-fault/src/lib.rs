@@ -94,6 +94,12 @@ pub fn grade_automatic(
 /// Generate exhaustive patterns when practical, otherwise a deterministic
 /// zero, all-ones, and pseudo-random sequence.
 pub fn automatic_patterns(nl: &Netlist, options: &PatternOptions) -> Result<Vec<Pattern>, String> {
+    if options.max_random_patterns < 2 {
+        return Err("fault pattern generation requires at least two random patterns".into());
+    }
+    if options.exhaustive_input_limit > 24 {
+        return Err("exhaustive fault-pattern input limit must be at most 24 bits".into());
+    }
     validate(nl)?;
     let inputs: Vec<(String, usize)> = nl
         .ports
@@ -592,6 +598,24 @@ pub fn report(result: &FaultCoverageResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eda_core::netlist::Cell;
+
+    fn and_netlist() -> Netlist {
+        let mut nl = Netlist::new("and");
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u_and".into(),
+            kind: CellKind::And,
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, vec![a]);
+        nl.add_port("b", Dir::In, vec![b]);
+        nl.add_port("y", Dir::Out, vec![y]);
+        nl
+    }
 
     #[test]
     fn exhaustive_and_gate_reaches_full_coverage() {
@@ -648,5 +672,153 @@ mod tests {
         assert_eq!(parsed.vectors[0].outputs["y"], 0);
         assert_eq!(parsed.vectors[1].inputs["b"], 1);
         assert_eq!(parsed.vectors[1].outputs["y"], 1);
+    }
+
+    #[test]
+    fn exhaustive_pattern_generation_enumerates_input_values_in_order() {
+        let patterns = automatic_patterns(&and_netlist(), &PatternOptions::default()).unwrap();
+        assert_eq!(
+            patterns,
+            vec![
+                HashMap::from([("a".to_string(), 0), ("b".to_string(), 0)]),
+                HashMap::from([("a".to_string(), 1), ("b".to_string(), 0)]),
+                HashMap::from([("a".to_string(), 0), ("b".to_string(), 1)]),
+                HashMap::from([("a".to_string(), 1), ("b".to_string(), 1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_pattern_grades_exact_stuck_at_coverage() {
+        let patterns = vec![HashMap::from([("a".to_string(), 1), ("b".to_string(), 1)])];
+        let result = grade_patterns(&and_netlist(), &patterns).unwrap();
+        assert_eq!(result.total_faults, 6);
+        assert_eq!(result.detected_faults, 3);
+        assert_eq!(result.undetected_faults.len(), 3);
+        assert!((result.coverage_percent - 50.0).abs() < 1e-12);
+        assert!(!result.exhaustive);
+        assert_eq!(result.patterns.len(), 1);
+        assert!(report(&result).contains("50.00% coverage"));
+        assert!(result
+            .detections
+            .iter()
+            .filter(|detection| !detection.detecting_patterns.is_empty())
+            .all(|detection| detection.detecting_patterns == vec![0]));
+    }
+
+    #[test]
+    fn deterministic_random_patterns_are_reproducible_beyond_exhaustive_limit() {
+        let mut nl = Netlist::new("wide");
+        let mut bits = Vec::new();
+        for index in 0..17 {
+            bits.push(nl.add_net(format!("a{index}")));
+        }
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u_not".into(),
+            kind: CellKind::Not,
+            inputs: vec![bits[0]],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, bits);
+        nl.add_port("y", Dir::Out, vec![y]);
+        let options = PatternOptions {
+            max_random_patterns: 5,
+            exhaustive_input_limit: 16,
+            random_seed: 0x1234_5678_9abc_def0,
+        };
+        let first = automatic_patterns(&nl, &options).unwrap();
+        let second = automatic_patterns(&nl, &options).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 5);
+        assert_eq!(first[0]["a"], 0);
+        assert_eq!(first[1]["a"], (1u64 << 17) - 1);
+    }
+
+    #[test]
+    fn rejects_invalid_pattern_options_and_netlist_shape() {
+        let options = PatternOptions {
+            max_random_patterns: 1,
+            ..PatternOptions::default()
+        };
+        assert_eq!(
+            automatic_patterns(&and_netlist(), &options).unwrap_err(),
+            "fault pattern generation requires at least two random patterns"
+        );
+        let options = PatternOptions {
+            exhaustive_input_limit: 25,
+            ..PatternOptions::default()
+        };
+        assert_eq!(
+            automatic_patterns(&and_netlist(), &options).unwrap_err(),
+            "exhaustive fault-pattern input limit must be at most 24 bits"
+        );
+
+        let mut sequential = Netlist::new("sequential");
+        let clk = sequential.add_net("clk");
+        let d = sequential.add_net("d");
+        let q = sequential.add_net("q");
+        sequential.add_cell(Cell {
+            name: "u_dff".into(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clk, d],
+            output: q,
+        });
+        sequential.add_port("clk", Dir::In, vec![clk]);
+        sequential.add_port("d", Dir::In, vec![d]);
+        sequential.add_port("q", Dir::Out, vec![q]);
+        assert!(automatic_patterns(&sequential, &PatternOptions::default()).is_err());
+
+        let mut no_inputs = Netlist::new("constant");
+        let y = no_inputs.add_net("y");
+        no_inputs.add_cell(Cell {
+            name: "tie".into(),
+            kind: CellKind::Const(LogicValue::One),
+            inputs: Vec::new(),
+            output: y,
+        });
+        no_inputs.add_port("y", Dir::Out, vec![y]);
+        assert!(automatic_patterns(&no_inputs, &PatternOptions::default()).is_err());
+
+        let mut no_outputs = and_netlist();
+        no_outputs.ports.retain(|port| port.dir != Dir::Out);
+        let patterns = vec![HashMap::from([("a".to_string(), 0), ("b".to_string(), 0)])];
+        assert_eq!(
+            grade_patterns(&no_outputs, &patterns).unwrap_err(),
+            "fault simulation requires at least one primary output"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_pattern_input_and_invalid_stil() {
+        let patterns = vec![HashMap::from([("a".to_string(), 0)])];
+        assert_eq!(
+            grade_patterns(&and_netlist(), &patterns).unwrap_err(),
+            "pattern lacks input 'b'"
+        );
+        assert_eq!(
+            write_stil(&and_netlist(), &[], "valid").unwrap_err(),
+            "STIL export requires at least one pattern"
+        );
+        assert!(write_stil(&and_netlist(), &patterns, "bad-name")
+            .unwrap_err()
+            .contains("identifier"));
+
+        let source = r#"
+STIL 1.0;
+Ann {* Pattern set: bad *}
+SignalGroups {
+  inputs = 'a';
+  outputs = 'y';
+}
+Pattern "vectors" {
+  V {a=0;unknown=0;}
+}
+"#;
+        assert!(parse_stil(source).unwrap_err().contains("not in a group"));
+        let source = source.replace("unknown=0", "unknown");
+        assert!(parse_stil(&source)
+            .unwrap_err()
+            .contains("malformed STIL assignment"));
     }
 }

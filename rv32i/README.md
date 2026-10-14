@@ -49,68 +49,38 @@ Scoreboard 比对 → Env 编排）。
 
 - `rv32i_dft_scan_insertion_and_audit`：对 `rv32i_top` 插入并审计一条
   扫描链（链非空、无未扫描时序单元、扫描前后时序单元计数保持）。
-- MMMC PDK 签核链路已打通：fast/slow 双 corner、模型相关性、
-  timing（关键路径有限且有限值）、DRC（0 error）、LEF/DEF/SDF 物理
-  库全生成；PDK manifest 新增 `layer ... tracks N` 驱动布线容量
-  （本设计 69 行需要 ≥128 tracks/channel）。
-- 全项签核用例暂时门控（等价项）。LEC 已达成的状态：
-  - 本地化 correspondence-point 引擎 + 割点反链选择（DFS 区间嵌套判
-    依赖，单次 DFS O(锥)）；修掉 gate 字面量未移位、状态配对位置 zip
-    两个实现 bug；SAT 卡死从进程退出改为 fail-closed 结构化结果。
-  - 对应点归纳继续补强：触发器按输出网名配对（不受映射后 cell 顺序影
-    响）；局部区域 miter 同样绑定同名无驱动网络；显式 TIE 常量允许安
-    全 many-to-one 割点；最终查询优先选择靠近 sink 的反链 frontier；
-    超尺寸局部区域和局部 SAT 预算耗尽都保守拒绝，不会退化成单体
-    miter 卡死。
-  - 结构同构快速通道升级为递归匹配：交换律输入可递归尝试排列，且一次
-    匹配会回收所有 lockstep 证明的中间对应点；复杂 Liberty 表达式（如
-    带反相输入的 AND）不再被误当作扁平 primitive 结构。局部 CNF 使用
-    精确变量重命名键缓存重复区域，随机仿真种子与候选 tie-break 确定
-    化；SAT 核增加 learnt-clause 数据库缩减，保留原始/二元子句。
-  - 对应点候选队列升级为去重 topological heap：在每个新证明割点上继续
-    提议其直接 fanout；整体结构匹配失败时保留已独立证明的子图，并用唯
-    一、非常量输入签名桥接优化后的 decode 锥；等价 gold 网络可安全
-    many-to-one 映射到同一 mapped 目标。RTL 命名向量会尝试共享多
-    bit 局部 miter，并同样做 full-cone CEGAR 一致性检查；超尺寸向量会
-    退回相邻 4-bit slice 证明；触发器边界
-    只在两侧查询锥都出现时才互切；cut model
-    会补齐并绑定被割掉的 source
-    literals，再恢复所选 frontier 的精确 source 关系后重试。functional
-    refinement 可跨相关 source family 泛化，容量耗尽仍 fail-closed；
-    CEGAR 复用 incremental CDCL context。
-    duplicate merge 会在保留 canonical cell 的同时优先保留稳定 RTL
-    alias 名。最终触发器义务按锥规模从大到小调度，使深锥容量阻塞先于
-    大量易证存储位暴露。当前确定性 RV32I profile 可接受 4107 个
-    verified correspondence points；hardest-first profiling 到达
-    `dut.x31[31]`，抽象查询为 gold 9374 vars / mapped 4564 vars，
-    在 1616 个 source guards 上扩展 106 个 gold cut 与 25 个 mapped
-    cut 后，仍于 16672 vars / 69549 clauses / 1120 conflicts 处
-    fail-closed，且无 counterexample。
-  - 找到并修复 LEC 跨进程不确定的根因：综合 written set 依 HashSet
-    遍历、mapper peephole 依 HashMap 遍历。现在分别按稳定顺序和
-    `BTreeMap` 发射；两个独立 RV32I 进程的 gold/mapped netlist 签名与
-    fail-closed LEC note 完全一致。
-  - 差分仿真证据：gold（未优化）与 mapped（库映射）在混合程序上，
-    全部输出端口 + 全部 RTL 命名内部网络逐周期一致直至停机。
-  - 中等规模全点证明通过（16 词存储 287 查询）；RV32I 2049 触发器
-    全枚举 ~90s，绝大部分点位证明，`dut.pc[3]` 等深 ALU 锥局部
-    miter 超出当前 SAT 核容量 → 等价“未证明”（保守判 false 并附
-    容量说明，不再崩溃）。
-  - 对应点引擎升级为拓扑归纳式：种子（PI/触发器按名）→ 候选（RTL
-    名 + 48 轮仿真签名 1:1）→ 每个候选用「割点限定的局部区域 miter」
-    证明后才进入 accepted 映射（正确处理映射器把多个门合并成一个库
-    单元的结构重构；修复了对称门签名误配 bug）。中等规模全部通过。
-  - 新增结构同构快速通道：把库单元归一为功能类（AND2→And、
-    MUX2→Mux 等），割点限定的两侧区域按锁步 DFS 比类、比输入对应；
-    同构则免 SAT 直接接受。RV32I 全设计 LEC 从 >15 分钟降到 ~2 分
-    50 秒，并给出具体区分点（当前 `dut.x23[0]` 次态；差分仿真无行为
-    分歧，下一步做反例可达性判定以区分真实 bug 与割点伪影）。
-- 由此发现并修复两个真实工具 bug：
-  1) `always @*` case 无 default → 锁存器推断（组合环）；RTL 已在
-     case 前加默认赋值。
-  2) 综合器 If 降低时丢弃 else 分支 written 集 → 仅在 else 赋值的
-     寄存器不出触发器（2049 位状态塌缩到 545 位）；已修复并有
-     `rv32i_synth_else_written_regs_get_flops` 回归。
+- MMMC PDK 物理链路通过：fast/slow 双 corner、模型相关性、
+  timing（slow 关键路径 201.125 ns）、DRC（0 error）、LEF/DEF/SDF
+  物理库全生成；`layer ... tracks N` 驱动布线容量。
+- **完整 `rv32i_pdk_signoff_mmmc_pass` 已取消门控并通过**：模型相关、
+  sequential LEC、双角 timing、DRC、物理数据库全部 PASS。
+- LEC 参考 Kepler Formal 的可扩展路径重写关键执行层：
+  - 与 Kepler LEC 一样共享边界变量、构建去重 Boolean/CNF miter，并默认
+    使用工业级 Kissat CDCL；Kissat 源码按 Kepler 绑定的
+    `8af8e56f174b778aef3aa45af9f739b2a5f492c2` 提交 vendored 到
+    `eda-formal`，由 build script 构建并通过 C API 取出 SAT/UNSAT 与
+    SAT model，CEGAR refinement 不再把求解器容量误报为设计不等价。
+  - 删除从未被求解的全网表死 CNF；`enc_cone_with_cuts` 改为谓词式割点，
+    gate-side accepted 集合在归纳过程中维护，局部候选不再复制数千个
+    cut；dense NetId identity hash 消除候选队列的 SipHash 开销。
+  - 已由结构/局部/向量 CEGAR 证明的内部点不再在最终阶段逐点重放；
+    最终只保留触发器次态与输出 obligations。触发器调度改为一次性
+    计算的拓扑深度，不再为排序重复遍历 2051 个深锥。
+  - 保留自研 incremental CDCL 作为 Kissat 初始化失败时的后备；Kissat
+    为默认后端，保留 phase/model 语义与 fail-closed cancellation。
+- 当前专用 profile 结论：`equivalent=true`、无 counterexample；
+  3128 个直接命名点中证明 362 个，归纳接受 8660 个 correspondence
+  points，最终 2406 个局部 miter queries 全部 UNSAT。专用 profile
+  本机耗时约 3 分 55 秒。
+- 验证入口：
+  - `SUITE_FILTER=rv32i_pdk_signoff_mmmc_pass cargo test -p eda-tests
+    --test suite full_suite_all_green -- --nocapture`：PASS
+    （1 test，758.53s）。
+  - `SUITE_FILTER=rv32i_ cargo test -p eda-tests --test suite
+    full_suite_all_green -- --nocapture`：PASS（1 test，1530.13s）。
+- 由此发现并保留两个真实工具 bug 的回归：组合 case 缺 default 曾推断
+  锁存；synthesis If lowering 曾丢 else written set，导致 2049 位状态
+  塌缩。二者均已修复。
 
 ## 签核工件
 
@@ -124,9 +94,9 @@ Scoreboard 比对 → Env 编排）。
   5. UPF 电源域 IR（TOP 域 18311 单元 / 3.74 mA / 域多层网格
      256 节点 928 线段 43 迭代；空 DEFAULT 域如实为零）；
   6. 时钟树综合（1 棵树、1245 个缓冲）；
-  7. LEC 独立跟踪（容量受限 fail-closed + 完整证据链）。
-  工件随仓库检查；当前可重复入口以 `eda-api` 分段 flow 与回归套件为准。
-- 套件常开用例：`rv32i_pdk_physical_signoff_mmmc_pass`（物理签核双角）。
+  7. sequential LEC：PASS，无 counterexample。
+- 套件常开用例：`rv32i_pdk_physical_signoff_mmmc_pass` 与完整
+  `rv32i_pdk_signoff_mmmc_pass`（含 equivalence gate）。
 
 ## 功耗 / IR / CTS（套件常开）
 
@@ -159,7 +129,6 @@ get/is_zero/plus_two。
 
 ## 后续
 
-- 逐状态位 LEC（大设计顺序等价）
 - 类方法副作用表达式：`y = h.m(...)` 直接赋值现在会完整执行方法体，
   再读取返回 scratch；静态方法与经基类句柄的 virtual override 均覆盖；
   内置 `uvm_tlm_fifo.try_get()` 已改用该语义回归

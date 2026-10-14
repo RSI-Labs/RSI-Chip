@@ -808,7 +808,7 @@ impl TimingViolationRegistry {
         let waiver_id = waiver.id.clone();
         self.waivers.insert(waiver.id.clone(), waiver.clone());
         for store in self.stores.values_mut() {
-            store.add_waiver(waiver.clone())?;
+            store.add_waiver_with_actor(waiver.clone(), changed_by.clone())?;
         }
         self.summaries = aggregate_cross_corner(&self.stores);
         self.record_waiver_audit(
@@ -840,7 +840,7 @@ impl TimingViolationRegistry {
             .find(|entry| entry.waiver_id == id && entry.action == TimingWaiverAuditAction::Added)
             .map(|entry| entry.waiver.clone());
         for store in self.stores.values_mut() {
-            store.remove_waiver(id)?;
+            store.remove_waiver_with_actor(id, changed_by.clone())?;
         }
         let Some(waiver) = waiver else {
             return Err(format!(

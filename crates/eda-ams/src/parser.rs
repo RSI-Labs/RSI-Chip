@@ -1074,6 +1074,11 @@ fn parse_model(circuit: &mut SpiceCircuit, parts: &[String], line_no: usize) -> 
             } else {
                 None
             };
+            let shared_junction_sidewall_cap = model_number(&properties, "cjsw", 0.0, line_no)?;
+            let source_junction_sidewall_cap =
+                model_number(&properties, "cjsws", shared_junction_sidewall_cap, line_no)?;
+            let drain_junction_sidewall_cap =
+                model_number(&properties, "cjswd", shared_junction_sidewall_cap, line_no)?;
             let model = MosfetModel {
                 polarity,
                 kind,
@@ -1134,6 +1139,26 @@ fn parse_model(circuit: &mut SpiceCircuit, parts: &[String], line_no: usize) -> 
                     &properties,
                     "cox",
                     default_oxide_cap,
+                    line_no,
+                )?,
+                source_junction_sidewall_cap_per_m: source_junction_sidewall_cap,
+                drain_junction_sidewall_cap_per_m: drain_junction_sidewall_cap,
+                junction_potential_v: model_number(
+                    &properties,
+                    "pb",
+                    default.junction_potential_v,
+                    line_no,
+                )?,
+                junction_grading_coefficient: model_number(
+                    &properties,
+                    "mj",
+                    default.junction_grading_coefficient,
+                    line_no,
+                )?,
+                junction_forward_knee: model_number(
+                    &properties,
+                    "fc",
+                    default.junction_forward_knee,
                     line_no,
                 )?,
                 saturation_charge_partition: model_number(
@@ -1279,6 +1304,18 @@ fn parse_model(circuit: &mut SpiceCircuit, parts: &[String], line_no: usize) -> 
                 )?,
                 forward_beta: model_number(&properties, "bf", default.forward_beta, line_no)?,
                 reverse_beta: model_number(&properties, "br", default.reverse_beta, line_no)?,
+                forward_early_voltage_v: model_number(
+                    &properties,
+                    "vaf",
+                    default.forward_early_voltage_v,
+                    line_no,
+                )?,
+                reverse_early_voltage_v: model_number(
+                    &properties,
+                    "var",
+                    default.reverse_early_voltage_v,
+                    line_no,
+                )?,
                 base_emitter_zero_bias_cap_f: model_number(
                     &properties,
                     "cje",
@@ -2765,7 +2802,7 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
         };
         let body = match model.kind {
             MosfetModelKind::Level1 => format!(
-                "KP={} VTO={} LAMBDA={} GAMMA={} PHI={} THETA={} VSAT={} CGSO={} CGDO={} CGB={} COX={} XPART={} KF={} AF={} EF={} MEXP={}",
+                "KP={} VTO={} LAMBDA={} GAMMA={} PHI={} THETA={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} MEXP={}",
                 format_number(model.transconductance_a_per_v2),
                 format_number(model.threshold_voltage_v),
                 format_number(model.channel_length_modulation_per_v),
@@ -2777,6 +2814,11 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
                 format_number(model.gate_drain_overlap_cap_per_m),
                 format_number(model.gate_bulk_cap_per_m2),
                 format_number(model.gate_oxide_cap_per_m2),
+                format_number(model.source_junction_sidewall_cap_per_m),
+                format_number(model.drain_junction_sidewall_cap_per_m),
+                format_number(model.junction_potential_v),
+                format_number(model.junction_grading_coefficient),
+                format_number(model.junction_forward_knee),
                 format_number(model.saturation_charge_partition),
                 format_number(model.flicker_coefficient_a2),
                 format_number(model.flicker_current_exponent),
@@ -2784,7 +2826,7 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
                 format_number(model.mobility_temperature_exponent)
             ),
             MosfetModelKind::Bsim3LongChannel => format!(
-                "LEVEL=8 VTH0={} K1={} K2={} DVT0={} DVT1={} DVT2={} DVT0W={} DVT1W={} W0={} KT1={} KT2={} KT1L={} LAMBDA={} PHI={} TOX={} U0={} UA={} UB={} UC={} VSAT={} CGSO={} CGDO={} CGB={} COX={} XPART={} KF={} AF={} EF={} UTE={}",
+                "LEVEL=8 VTH0={} K1={} K2={} DVT0={} DVT1={} DVT2={} DVT0W={} DVT1W={} W0={} KT1={} KT2={} KT1L={} LAMBDA={} PHI={} TOX={} U0={} UA={} UB={} UC={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} UTE={}",
                 format_number(model.threshold_voltage_v),
                 format_number(model.body_effect_v_per_sqrt_v),
                 format_number(model.bsim3_body_bias_threshold_coefficient),
@@ -2809,6 +2851,11 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
                 format_number(model.gate_drain_overlap_cap_per_m),
                 format_number(model.gate_bulk_cap_per_m2),
                 format_number(model.gate_oxide_cap_per_m2),
+                format_number(model.source_junction_sidewall_cap_per_m),
+                format_number(model.drain_junction_sidewall_cap_per_m),
+                format_number(model.junction_potential_v),
+                format_number(model.junction_grading_coefficient),
+                format_number(model.junction_forward_knee),
                 format_number(model.saturation_charge_partition),
                 format_number(model.flicker_coefficient_a2),
                 format_number(model.flicker_current_exponent),
@@ -2831,7 +2878,7 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
     }
     for (name, model) in &circuit.bjt_models {
         out.push_str(&format!(
-            ".model {} {}(IS={} BF={} BR={} CJE={} CJC={} VJE={} VJC={} MJE={} MJC={} FC={} KF={} AF={} EF={} EG={} XTI={} TF={} TR={})\n",
+            ".model {} {}(IS={} BF={} BR={} VAF={} VAR={} CJE={} CJC={} VJE={} VJC={} MJE={} MJC={} FC={} KF={} AF={} EF={} EG={} XTI={} TF={} TR={})\n",
             name,
             match model.polarity {
                 BjtPolarity::Npn => "NPN",
@@ -2840,6 +2887,8 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
             format_number(model.saturation_current_a),
             format_number(model.forward_beta),
             format_number(model.reverse_beta),
+            format_number(model.forward_early_voltage_v),
+            format_number(model.reverse_early_voltage_v),
             format_number(model.base_emitter_zero_bias_cap_f),
             format_number(model.base_collector_zero_bias_cap_f),
             format_number(model.base_emitter_junction_potential_v),

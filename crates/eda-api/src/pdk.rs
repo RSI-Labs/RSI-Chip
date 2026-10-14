@@ -84,6 +84,10 @@ pub struct PdkDefinition {
     pub layers: Vec<PdkLayer>,
     pub corners: Vec<PdkCorner>,
     pub model_correlations: Vec<PdkModelCorrelation>,
+    /// Optional inline foundry layer/via rule deck.
+    pub layout_rule_deck_source: Option<String>,
+    /// Required SHA-256 of the inline layout rule deck.
+    pub layout_rule_deck_sha256: Option<String>,
     pub required_checks: Vec<PdkSignoffCheckKind>,
 }
 
@@ -194,6 +198,32 @@ impl PdkDefinition {
                 ));
             }
         }
+        if let Some(source) = &self.layout_rule_deck_source {
+            if source.trim().is_empty() {
+                return Err("PDK layout rule deck source cannot be empty".into());
+            }
+            if source.lines().any(|line| line.trim() == "END") {
+                return Err("PDK layout rule deck cannot contain a bare END line".into());
+            }
+            crate::read_layout_rule_deck(source)
+                .map_err(|error| format!("invalid PDK layout rule deck: {error}"))?;
+        }
+        if let Some(expected) = &self.layout_rule_deck_sha256 {
+            if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(
+                    "PDK layout rule deck checksum must be 64 hexadecimal characters".into(),
+                );
+            }
+            let Some(source) = &self.layout_rule_deck_source else {
+                return Err("PDK layout rule deck checksum requires a rule deck".into());
+            };
+            let actual = pdk_liberty_sha256(source);
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err(format!(
+                    "PDK layout rule deck checksum mismatch: expected {expected}, got {actual}"
+                ));
+            }
+        }
         if self.required_checks.is_empty() {
             return Err("PDK signoff requires at least one check".into());
         }
@@ -224,8 +254,11 @@ pub fn parse_pdk(source: &str) -> Result<PdkDefinition, String> {
 
     let mut liberties = BTreeMap::<String, String>::new();
     let mut liberty_checksums = BTreeMap::<String, String>::new();
+    let mut layout_rule_deck: Option<String> = None;
+    let mut layout_rule_deck_checksum: Option<String> = None;
     let mut logical_lines = Vec::new();
     let mut liberty_block: Option<(String, usize, Vec<String>)> = None;
+    let mut rule_deck_block: Option<(usize, Vec<String>)> = None;
     for (index, raw) in source.lines().enumerate() {
         let line = raw.trim();
         if let Some((corner, start, body)) = liberty_block.as_mut() {
@@ -238,6 +271,21 @@ pub fn parse_pdk(source: &str) -> Result<PdkDefinition, String> {
                     ));
                 }
                 liberty_block = None;
+            } else {
+                body.push(raw.to_string());
+            }
+            continue;
+        }
+        if let Some((start, body)) = rule_deck_block.as_mut() {
+            if line == "END" {
+                let source = body.join("\n").trim().to_string();
+                if layout_rule_deck.replace(source).is_some() {
+                    return Err(format!(
+                        "line {}: duplicate PDK layout rule deck",
+                        *start + 1
+                    ));
+                }
+                rule_deck_block = None;
             } else {
                 body.push(raw.to_string());
             }
@@ -261,11 +309,33 @@ pub fn parse_pdk(source: &str) -> Result<PdkDefinition, String> {
             }
             continue;
         }
+        if tokens.len() == 2 && tokens[0] == "rule_deck" && tokens[1] == "<<END" {
+            rule_deck_block = Some((index, Vec::new()));
+            continue;
+        }
+        if tokens.len() == 2 && tokens[0] == "rule_deck_sha256" {
+            if layout_rule_deck_checksum
+                .replace(tokens[1].to_ascii_lowercase())
+                .is_some()
+            {
+                return Err(format!(
+                    "line {}: duplicate PDK layout rule deck checksum",
+                    index + 1
+                ));
+            }
+            continue;
+        }
         logical_lines.push((index, raw.to_string()));
     }
     if let Some((corner, start, _)) = liberty_block {
         return Err(format!(
             "line {}: unterminated Liberty view for PDK corner '{corner}'",
+            start + 1
+        ));
+    }
+    if let Some((start, _)) = rule_deck_block {
+        return Err(format!(
+            "line {}: unterminated PDK layout rule deck",
             start + 1
         ));
     }
@@ -365,6 +435,8 @@ pub fn parse_pdk(source: &str) -> Result<PdkDefinition, String> {
         layers,
         corners,
         model_correlations,
+        layout_rule_deck_source: layout_rule_deck,
+        layout_rule_deck_sha256: layout_rule_deck_checksum,
         required_checks,
     };
     definition.validate()?;
@@ -423,6 +495,15 @@ pub fn write_pdk(definition: &PdkDefinition) -> Result<String, String> {
                 checksum.to_ascii_lowercase()
             ));
         }
+    }
+    if let Some(source) = &definition.layout_rule_deck_source {
+        out.push_str(&format!("rule_deck <<END\n{}\nEND\n", source.trim_end()));
+    }
+    if let Some(checksum) = &definition.layout_rule_deck_sha256 {
+        out.push_str(&format!(
+            "rule_deck_sha256 {}\n",
+            checksum.to_ascii_lowercase()
+        ));
     }
     for correlation in &definition.model_correlations {
         out.push_str(&format!(
@@ -599,6 +680,8 @@ pub struct PdkSignoffResult {
     pub critical_path_delay_ns: f64,
     pub drc_errors: usize,
     pub drc_warnings: usize,
+    pub layout_rule_deck_sha256: Option<String>,
+    pub layout_rule_deck_validated: bool,
     pub model_correlations: Vec<PdkModelCorrelationResult>,
     pub checks: Vec<PdkSignoffCheckResult>,
     pub passed: bool,
@@ -911,6 +994,8 @@ pub fn run_pdk_signoff_cancellable(
         critical_path_delay_ns: flow.timing.critical_path_delay,
         drc_errors: total_drc_errors,
         drc_warnings: total_drc_warnings,
+        layout_rule_deck_sha256: pdk.layout_rule_deck_sha256.clone(),
+        layout_rule_deck_validated: pdk.layout_rule_deck_source.is_some(),
         model_correlations: correlations,
         corner_results,
         checks,
@@ -923,6 +1008,13 @@ pub fn report_pdk_signoff(result: &PdkSignoffResult) -> String {
         "PDK signoff: pdk={} version={} design={} netlist={}\n",
         result.pdk_name, result.pdk_version, result.design_name, result.netlist_name
     );
+    out.push_str(&format!(
+        "Layout rule deck: {}\n",
+        result
+            .layout_rule_deck_sha256
+            .as_deref()
+            .unwrap_or("not-supplied")
+    ));
     for correlation in &result.model_correlations {
         out.push_str(&format!(
             "Model correlation {}.{}: nominal={:.9} golden={:.9} error={:.6}% tolerance={:.6}% {}\n",
@@ -994,6 +1086,51 @@ mod tests {
         assert_eq!(definition.required_checks.len(), 5);
         let bad = "pdk bad\nversion 1\nsignoff timing\nsignoff timing\n.end";
         assert!(parse_pdk(bad).is_err());
+    }
+
+    #[test]
+    fn pdk_layout_rule_deck_is_checksummed_and_validated() {
+        let rule_deck = r#"version 1
+layer M1 min_width 10 min_spacing 20 min_area 100 min_notch 25
+layer M2 min_width 10 min_spacing 20 min_area 100
+spacing M1 M2 30
+via VIA1 cut_layer V1 bottom_layer M1 top_layer M2 cut_width 20 cut_height 20 bottom_enclosure 1 top_enclosure 2 bottom_extension_x 10 bottom_extension_y 5 top_extension_x 6 top_extension_y 11 cut_spacing 20
+"#;
+        let checksum = pdk_liberty_sha256(rule_deck.trim());
+        let source = format!(
+            "pdk rule-pdk\nversion 1.0\nrule_deck <<END\n{rule_deck}\nEND\nrule_deck_sha256 {checksum}\nsignoff timing\nsignoff drc\n.end"
+        );
+        let definition = parse_pdk(&source).unwrap();
+        assert_eq!(
+            definition.layout_rule_deck_source.as_deref(),
+            Some(rule_deck.trim())
+        );
+        assert_eq!(
+            definition.layout_rule_deck_sha256.as_deref(),
+            Some(checksum.as_str())
+        );
+        assert_eq!(
+            definition,
+            parse_pdk(&write_pdk(&definition).unwrap()).unwrap()
+        );
+        let rtl = "module top(input a, output y); assign y = ~a; endmodule";
+        let signoff = run_pdk_signoff(rtl, Some("top"), &definition).unwrap();
+        assert!(signoff.layout_rule_deck_validated);
+        assert_eq!(
+            signoff.layout_rule_deck_sha256.as_deref(),
+            Some(checksum.as_str())
+        );
+        assert!(report_pdk_signoff(&signoff).contains(&format!("Layout rule deck: {checksum}")));
+
+        let bad_checksum = "0".repeat(64);
+        let bad = source.replace(&checksum, &bad_checksum);
+        assert!(parse_pdk(&bad)
+            .unwrap_err()
+            .contains("layout rule deck checksum mismatch"));
+        let invalid_deck = source.replace("min_width 10", "min_width broken");
+        assert!(parse_pdk(&invalid_deck)
+            .unwrap_err()
+            .contains("invalid PDK layout rule deck"));
     }
 
     #[test]

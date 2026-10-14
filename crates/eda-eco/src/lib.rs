@@ -81,6 +81,39 @@ pub struct FanoutRepairOptions {
     pub patch_name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SequentialPinRoles {
+    input_count: usize,
+    clock_pin: usize,
+    reset_pin: Option<usize>,
+}
+
+fn sequential_pin_roles(nl: &Netlist, kind: &CellKind) -> Option<SequentialPinRoles> {
+    match kind {
+        CellKind::Dff { .. } => Some(SequentialPinRoles {
+            input_count: 2,
+            clock_pin: 0,
+            reset_pin: None,
+        }),
+        CellKind::DffR { .. } => Some(SequentialPinRoles {
+            input_count: 3,
+            clock_pin: 0,
+            reset_pin: Some(2),
+        }),
+        CellKind::Lib(id) => {
+            let library = nl.library()?;
+            let definition = library.get(*id);
+            let sequential = definition.seq.as_ref()?;
+            Some(SequentialPinRoles {
+                input_count: definition.inputs.len(),
+                clock_pin: sequential.clk_pin,
+                reset_pin: sequential.reset_pin,
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Default for FanoutRepairOptions {
     fn default() -> Self {
         Self {
@@ -416,11 +449,27 @@ pub fn apply_eco(nl: &Netlist, patch: &EcoPatch) -> Result<EcoResult, String> {
                 let hierarchy = cell_hierarchy_path(&out, ci);
                 let old = out.cell(ci);
                 let kind = target_kind(&out, target, old.inputs.len())?;
-                if out.cell_is_sequential(&kind) || out.cell_is_sequential(&old.kind) {
-                    return Err(format!(
-                        "operation {}: sequential replacement is unsupported",
-                        index
-                    ));
+                let old_roles = sequential_pin_roles(&out, &old.kind);
+                let new_roles = sequential_pin_roles(&out, &kind);
+                match (old_roles, new_roles) {
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(format!(
+                            "operation {}: sequential/combinational replacement changes cell class",
+                            index
+                        ));
+                    }
+                    (Some(old_roles), Some(new_roles)) => {
+                        if old_roles.input_count != old.inputs.len()
+                            || old_roles != new_roles
+                            || new_roles.input_count != old.inputs.len()
+                        {
+                            return Err(format!(
+                                "operation {}: sequential replacement requires identical clock/reset pin roles",
+                                index
+                            ));
+                        }
+                    }
+                    (None, None) => {}
                 }
                 let new = Cell {
                     name: old.name.clone(),
@@ -937,5 +986,112 @@ mod tests {
             assert!(fanout <= 2, "buffer fanout {}", fanout);
         }
         assert_eq!(result.operations_applied, 1);
+    }
+
+    #[test]
+    fn replaces_generic_dff_with_pin_compatible_library_dff() {
+        let library = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("sequential_eco");
+        nl.set_library(library.clone());
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u_dff".into(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clk, d],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("q", Dir::Out, vec![q]);
+
+        let patch = parse_eco("eco dff_swap; replace_cell u_dff DFF;").unwrap();
+        let result = apply_eco(&nl, &patch).unwrap();
+        let expected = library.find("DFF").unwrap();
+        assert_eq!(result.netlist.cell(0).kind, CellKind::Lib(expected));
+        assert_eq!(result.netlist.cell(0).inputs, vec![clk, d]);
+        assert_eq!(result.netlist.cell(0).output, q);
+        assert_eq!(result.operations_applied, 1);
+        assert!(result.changes[0].description.contains("replaced"));
+    }
+
+    #[test]
+    fn replaces_generic_dffr_with_pin_compatible_library_dffr() {
+        let library = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("sequential_reset_eco");
+        nl.set_library(library.clone());
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let rst = nl.add_net("rst");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u_dffr".into(),
+            kind: CellKind::DffR {
+                posedge: true,
+                reset_high: true,
+            },
+            inputs: vec![clk, d, rst],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("rst", Dir::In, vec![rst]);
+        nl.add_port("q", Dir::Out, vec![q]);
+
+        let patch = parse_eco("eco dffr_swap; replace_cell u_dffr DFFR;").unwrap();
+        let result = apply_eco(&nl, &patch).unwrap();
+        let expected = library.find("DFFR").unwrap();
+        assert_eq!(result.netlist.cell(0).kind, CellKind::Lib(expected));
+        assert_eq!(result.netlist.cell(0).inputs, vec![clk, d, rst]);
+        assert_eq!(result.operations_applied, 1);
+    }
+
+    #[test]
+    fn sequential_eco_rejects_changed_pin_roles() {
+        let library = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("bad_sequential_eco");
+        nl.set_library(library);
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let rst = nl.add_net("rst");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u_dff".into(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clk, d],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("rst", Dir::In, vec![rst]);
+        nl.add_port("q", Dir::Out, vec![q]);
+
+        let patch = parse_eco("eco bad_swap; replace_cell u_dff DFFR;").unwrap();
+        let error = apply_eco(&nl, &patch).unwrap_err();
+        assert!(error.contains("identical clock/reset pin roles"), "{error}");
+    }
+
+    #[test]
+    fn sequential_eco_rejects_cell_class_changes() {
+        let library = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("class_eco");
+        nl.set_library(library);
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u_dff".into(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clk, d],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("q", Dir::Out, vec![q]);
+
+        let patch = parse_eco("eco class_swap; replace_cell u_dff AND;").unwrap();
+        let error = apply_eco(&nl, &patch).unwrap_err();
+        assert!(error.contains("changes cell class"), "{error}");
     }
 }

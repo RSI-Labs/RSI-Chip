@@ -33,25 +33,17 @@ Overall signoff: PASS
 -- 时钟树综合 --
 树数: 1；插入缓冲: 1245（原 18311 单元）
 
--- LEC（独立跟踪项）--
-状态: 容量受限未证明（fail-closed）
-证据: 差分仿真（真实程序、全 RTL 命名网络）无行为分歧；
-      miter 模型组合求值 0/2051 次态不一致；假 counterexample 根因
-      （同名无驱动网络未绑定）已修复；剩余为深锥 SAT 容量上限。
-      当前引擎已加入按名触发器种子、同名自由变量局部绑定、显式常量
-      many-to-one 割点、近 sink 割点 frontier 与局部 SAT 预算；所有
-      unknown 仍 fail-closed。结构同构路径递归匹配交换律输入并回收中间
-      对应点；重复局部 CNF 精确缓存；SAT learnt-clause 数据库可缩减。
-      综合与映射输出已消除 HashSet/HashMap 遍历随机性；独立进程生成
-      相同 netlist 签名与相同 fail-closed LEC 结论。确定性 topological
-      候选队列加入直接 fanout、失败结构匹配的独立子图回收、唯一输入签
-      名桥接与 many-to-one 对应；RTL 命名向量尝试共享多 bit 局部 miter
-      并做 full-cone CEGAR，超尺寸向量退回相邻 4-bit slice；触发器边界只在两侧查询锥同时出现时互切，
-      cut model 补齐/绑定 source literals，恢复 frontier 精确
-      关系后重试，复用 incremental CDCL context；最终触发器义务按锥规模
-      从大到小调度。当前 profile 可接受 4107 个 correspondence points；
-      hardest-first 代表点为 dut.x31[31]，抽象查询 gold/mapped 为
-      9374/4564 vars，扩展 106/25 个 gold/mapped cuts、绑定 1616 个
-      source guards 后，仍在 16672 vars / 69549 clauses / 1120 conflicts
-      处容量受限且 fail-closed，无 counterexample。
-结论: 物理签核 PASS；LEC 交付门保持独立开启。
+-- LEC（完整 sequential equivalence）--
+状态: PASS（equivalent=true，无 counterexample）
+方法: 参考 Kepler Formal LEC：共享边界变量、缓存 Boolean/CNF miter、
+      默认 Kissat 工业级 CDCL；在本设计上叠加按名触发器种子、结构同构、
+      局部 correspondence-point miter、RTL 向量共享 miter 与 full-cone
+      CEGAR refinement。已证明内部点作为 sound cuts 供最终 obligations
+      使用，不重复重放。
+证据: 3128 个直接命名点中证明 362 个；归纳接受 8660 个
+      correspondence points；最终 2406 个局部 miter queries 全部 UNSAT。
+      深锥包括 store_dword/store_word、rf_wdata、next_pc；CEGAR SAT
+      模型由 Kissat 提取，refinement 后均收敛为 UNSAT。
+复验: SUITE_FILTER=rv32i_pdk_signoff_mmmc_pass ... -> PASS (758.53s)
+      SUITE_FILTER=rv32i_ ... -> PASS (1530.13s)
+结论: 物理签核 PASS；sequential LEC PASS；RV32I 完整签核 PASS。

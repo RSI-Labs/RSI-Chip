@@ -5,9 +5,9 @@
 //! keeping geometry, hit testing, spacing, enclosure, and intersection checks
 //! exact and dependency-free.
 
-use crate::any_angle::AnyAnglePolygon;
+use crate::any_angle::{any_angle_boolean, AnyAngleBooleanOperation, AnyAnglePolygon};
 use crate::DrcSeverity;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type LayoutCoordinate = i64;
 
@@ -82,6 +82,13 @@ impl LayoutRect {
             self.x2 + margin,
             self.y2 + margin,
         )
+    }
+
+    pub fn expanded_by(self, dx: i64, dy: i64) -> Result<Self, String> {
+        if dx < 0 || dy < 0 {
+            return Err("layout expansion margins cannot be negative".into());
+        }
+        Self::new(self.x1 - dx, self.y1 - dy, self.x2 + dx, self.y2 + dy)
     }
 
     pub fn vertices(self) -> [LayoutPoint; 4] {
@@ -212,6 +219,46 @@ impl LayoutPolygon {
             previous = *current;
         }
         inside
+    }
+
+    /// Return the narrowest concave notch opening on a horizontal slice.
+    ///
+    /// The polygon database is simply connected and rectilinear. A scanline
+    /// between each adjacent pair of horizontal edge coordinates yields
+    /// disjoint covered intervals; gaps between those intervals are notch
+    /// openings. Exterior space to the left/right of the outermost intervals is
+    /// intentionally ignored.
+    pub fn minimum_notch_width(&self) -> Option<i64> {
+        let mut ys = self.points.iter().map(|point| point.y).collect::<Vec<_>>();
+        ys.sort_unstable();
+        ys.dedup();
+        let mut minimum = None::<i64>;
+        for pair in ys.windows(2) {
+            let scan_y2 = i128::from(pair[0]) + i128::from(pair[1]);
+            let mut crossings = Vec::new();
+            for (a, b) in self.segments() {
+                if a.x != b.x {
+                    continue;
+                }
+                let a_y2 = i128::from(a.y) * 2;
+                let b_y2 = i128::from(b.y) * 2;
+                if (a_y2 < scan_y2 && b_y2 > scan_y2) || (b_y2 < scan_y2 && a_y2 > scan_y2) {
+                    crossings.push(a.x);
+                }
+            }
+            crossings.sort_unstable();
+            crossings.dedup();
+            if crossings.len() >= 4 {
+                for interval_index in 1..crossings.len() / 2 {
+                    let opening = crossings[interval_index * 2]
+                        .saturating_sub(crossings[2 * interval_index - 1]);
+                    if opening > 0 {
+                        minimum = Some(minimum.map_or(opening, |current| current.min(opening)));
+                    }
+                }
+            }
+        }
+        minimum
     }
 }
 
@@ -393,6 +440,16 @@ pub struct LayoutLayerRule {
     pub min_width: i64,
     pub min_spacing: i64,
     pub min_area: i64,
+    /// Minimum layer density in basis points (0..=10_000).
+    pub min_density_bp: Option<u32>,
+    /// Maximum layer density in basis points (0..=10_000).
+    pub max_density_bp: Option<u32>,
+    /// Side length of the square density evaluation window in DBU.
+    pub density_window: i64,
+    /// Minimum concave notch opening for a rectilinear polygon, in DBU.
+    pub min_notch: i64,
+    /// Minimum spacing from this layer to another layer for different nets.
+    pub spacing_to: BTreeMap<String, i64>,
 }
 
 impl LayoutLayerRule {
@@ -407,9 +464,43 @@ impl LayoutLayerRule {
             min_width,
             min_spacing,
             min_area,
+            min_density_bp: None,
+            max_density_bp: None,
+            density_window: 1_000,
+            min_notch: 0,
+            spacing_to: BTreeMap::new(),
         };
         out.validate()?;
         Ok(out)
+    }
+
+    pub fn with_density(
+        mut self,
+        min_density_bp: Option<u32>,
+        max_density_bp: Option<u32>,
+        density_window: i64,
+    ) -> Result<Self, String> {
+        self.min_density_bp = min_density_bp;
+        self.max_density_bp = max_density_bp;
+        self.density_window = density_window;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_notch(mut self, min_notch: i64) -> Result<Self, String> {
+        self.min_notch = min_notch;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_spacing_to(
+        mut self,
+        other_layer: impl Into<String>,
+        min_spacing: i64,
+    ) -> Result<Self, String> {
+        self.spacing_to.insert(other_layer.into(), min_spacing);
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -418,6 +509,55 @@ impl LayoutLayerRule {
         }
         if self.min_width <= 0 || self.min_spacing < 0 || self.min_area < 0 {
             return Err(format!("invalid layout rule for layer '{}'", self.layer));
+        }
+        if self.min_notch < 0 {
+            return Err(format!(
+                "layout rule for layer '{}' has negative minimum notch",
+                self.layer
+            ));
+        }
+        for (layer, spacing) in &self.spacing_to {
+            if layer.trim().is_empty() {
+                return Err(format!(
+                    "layout rule for layer '{}' has an empty cross-layer spacing name",
+                    self.layer
+                ));
+            }
+            if *spacing < 0 {
+                return Err(format!(
+                    "layout rule for layer '{}' has negative spacing to layer '{}'",
+                    self.layer, layer
+                ));
+            }
+        }
+        if let Some(value) = self.min_density_bp {
+            if value > 10_000 {
+                return Err(format!(
+                    "layer '{}' minimum density cannot exceed 100%",
+                    self.layer
+                ));
+            }
+        }
+        if let Some(value) = self.max_density_bp {
+            if value > 10_000 {
+                return Err(format!(
+                    "layer '{}' maximum density cannot exceed 100%",
+                    self.layer
+                ));
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_density_bp, self.max_density_bp) {
+            if min > max {
+                return Err(format!("layer '{}' density range is inverted", self.layer));
+            }
+        }
+        if (self.min_density_bp.is_some() || self.max_density_bp.is_some())
+            && self.density_window <= 0
+        {
+            return Err(format!(
+                "layer '{}' density window must be positive",
+                self.layer
+            ));
         }
         Ok(())
     }
@@ -433,6 +573,11 @@ pub struct LayoutViaRule {
     pub cut_height: i64,
     pub min_bottom_enclosure: i64,
     pub min_top_enclosure: i64,
+    pub min_cut_spacing: i64,
+    pub min_bottom_extension_x: i64,
+    pub min_bottom_extension_y: i64,
+    pub min_top_extension_x: i64,
+    pub min_top_extension_y: i64,
 }
 
 impl LayoutViaRule {
@@ -456,9 +601,35 @@ impl LayoutViaRule {
             cut_height,
             min_bottom_enclosure,
             min_top_enclosure,
+            min_cut_spacing: 0,
+            min_bottom_extension_x: 0,
+            min_bottom_extension_y: 0,
+            min_top_extension_x: 0,
+            min_top_extension_y: 0,
         };
         out.validate()?;
         Ok(out)
+    }
+
+    pub fn with_cut_spacing(mut self, min_cut_spacing: i64) -> Result<Self, String> {
+        self.min_cut_spacing = min_cut_spacing;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_extensions(
+        mut self,
+        bottom_x: i64,
+        bottom_y: i64,
+        top_x: i64,
+        top_y: i64,
+    ) -> Result<Self, String> {
+        self.min_bottom_extension_x = bottom_x;
+        self.min_bottom_extension_y = bottom_y;
+        self.min_top_extension_x = top_x;
+        self.min_top_extension_y = top_y;
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -473,6 +644,11 @@ impl LayoutViaRule {
             || self.cut_height <= 0
             || self.min_bottom_enclosure < 0
             || self.min_top_enclosure < 0
+            || self.min_cut_spacing < 0
+            || self.min_bottom_extension_x < 0
+            || self.min_bottom_extension_y < 0
+            || self.min_top_extension_x < 0
+            || self.min_top_extension_y < 0
         {
             return Err(format!(
                 "invalid geometry in layout via rule '{}'",
@@ -524,6 +700,145 @@ impl LayoutDrcResult {
             .filter(|violation| violation.severity == DrcSeverity::Error)
             .count()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutDrcWaiver {
+    pub id: String,
+    pub code: String,
+    pub layer: Option<String>,
+    pub net: Option<String>,
+    pub object: Option<String>,
+    pub owner: String,
+    pub reason: String,
+}
+
+impl LayoutDrcWaiver {
+    pub fn new(
+        id: impl Into<String>,
+        code: impl Into<String>,
+        layer: Option<String>,
+        net: Option<String>,
+        object: Option<String>,
+        owner: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<Self, String> {
+        let out = Self {
+            id: id.into(),
+            code: code.into(),
+            layer,
+            net,
+            object,
+            owner: owner.into(),
+            reason: reason.into(),
+        };
+        out.validate()?;
+        Ok(out)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() || self.code.trim().is_empty() {
+            return Err("layout DRC waiver requires id and violation code".into());
+        }
+        if self.owner.trim().is_empty() || self.reason.trim().is_empty() {
+            return Err(format!(
+                "layout DRC waiver '{}' requires owner and reason",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches(&self, violation: &LayoutDrcViolation) -> bool {
+        self.code == violation.code
+            && self
+                .layer
+                .as_ref()
+                .is_none_or(|layer| violation.layer.as_ref().is_some_and(|value| value == layer))
+            && self
+                .net
+                .as_ref()
+                .is_none_or(|net| violation.net.as_ref().is_some_and(|value| value == net))
+            && self.object.as_ref().is_none_or(|object| {
+                violation
+                    .object
+                    .as_ref()
+                    .is_some_and(|value| value == object)
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutDrcWaivedViolation {
+    pub violation: LayoutDrcViolation,
+    pub waiver_id: String,
+    pub owner: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayoutDrcWaiverResult {
+    pub active: LayoutDrcResult,
+    pub waived: Vec<LayoutDrcWaivedViolation>,
+    pub used_waiver_ids: Vec<String>,
+}
+
+/// Apply auditable selectors to a completed layout DRC result.
+///
+/// Waivers never suppress DRC generation itself; they form a separate review
+/// layer so callers retain both active and waived evidence.
+pub fn apply_layout_drc_waivers(
+    result: &LayoutDrcResult,
+    waivers: &[LayoutDrcWaiver],
+) -> Result<LayoutDrcWaiverResult, String> {
+    let mut ids = BTreeSet::new();
+    for waiver in waivers {
+        waiver.validate()?;
+        if !ids.insert(waiver.id.clone()) {
+            return Err(format!("duplicate layout DRC waiver '{}'", waiver.id));
+        }
+    }
+    let mut active = LayoutDrcResult::default();
+    let mut waived = Vec::new();
+    let mut used = BTreeSet::new();
+    for violation in &result.violations {
+        if let Some(waiver) = waivers.iter().find(|waiver| waiver.matches(violation)) {
+            waived.push(LayoutDrcWaivedViolation {
+                violation: violation.clone(),
+                waiver_id: waiver.id.clone(),
+                owner: waiver.owner.clone(),
+                reason: waiver.reason.clone(),
+            });
+            used.insert(waiver.id.clone());
+        } else {
+            active.violations.push(violation.clone());
+        }
+    }
+    Ok(LayoutDrcWaiverResult {
+        active,
+        waived,
+        used_waiver_ids: used.into_iter().collect(),
+    })
+}
+
+pub fn layout_drc_waiver_report(result: &LayoutDrcWaiverResult) -> String {
+    let mut out = format!(
+        "Layout DRC waiver report: {} active, {} waived, {} waiver(s) used\n",
+        result.active.violations.len(),
+        result.waived.len(),
+        result.used_waiver_ids.len()
+    );
+    for waived in &result.waived {
+        out.push_str(&format!(
+            "  waived {} [{}] by '{}' owner='{}' reason='{}'\n",
+            waived.violation.code,
+            waived.violation.object.as_deref().unwrap_or("<unknown>"),
+            waived.waiver_id,
+            waived.owner,
+            waived.reason
+        ));
+    }
+    out
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -757,6 +1072,233 @@ fn scaled_geometry(geometry: &LayoutGeometry, factor: i64) -> Result<LayoutGeome
     }
 }
 
+fn rule_deck_i64(tokens: &[&str], index: usize, line_no: usize) -> Result<i64, String> {
+    tokens
+        .get(index)
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| format!("rule deck line {line_no} requires an i64 argument"))
+}
+
+fn rule_deck_u32(tokens: &[&str], index: usize, line_no: usize) -> Result<u32, String> {
+    tokens
+        .get(index)
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| format!("rule deck line {line_no} requires a u32 argument"))
+}
+
+/// Serialize only a document's layer/via rule deck in deterministic text form.
+pub fn write_layout_rule_deck(document: &LayoutDocument) -> Result<String, String> {
+    for rule in document.layer_rules.values() {
+        rule.validate()?;
+    }
+    for rule in document.via_rules.values() {
+        rule.validate()?;
+    }
+    let mut out = String::from("version 1\n");
+    for rule in document.layer_rules.values() {
+        out.push_str(&format!(
+            "layer {} min_width {} min_spacing {} min_area {}",
+            rule.layer, rule.min_width, rule.min_spacing, rule.min_area
+        ));
+        if let Some(min) = rule.min_density_bp {
+            out.push_str(&format!(" min_density_bp {min}"));
+        }
+        if let Some(max) = rule.max_density_bp {
+            out.push_str(&format!(" max_density_bp {max}"));
+        }
+        if rule.min_density_bp.is_some() || rule.max_density_bp.is_some() {
+            out.push_str(&format!(" density_window {}", rule.density_window));
+        }
+        if rule.min_notch > 0 {
+            out.push_str(&format!(" min_notch {}", rule.min_notch));
+        }
+        out.push('\n');
+    }
+    for rule in document.layer_rules.values() {
+        for (other_layer, spacing) in &rule.spacing_to {
+            out.push_str(&format!(
+                "spacing {} {} {spacing}\n",
+                rule.layer, other_layer
+            ));
+        }
+    }
+    for rule in document.via_rules.values() {
+        out.push_str(&format!(
+            "via {} cut_layer {} bottom_layer {} top_layer {} cut_width {} cut_height {} bottom_enclosure {} top_enclosure {} bottom_extension_x {} bottom_extension_y {} top_extension_x {} top_extension_y {} cut_spacing {}\n",
+            rule.via,
+            rule.cut_layer,
+            rule.bottom_layer,
+            rule.top_layer,
+            rule.cut_width,
+            rule.cut_height,
+            rule.min_bottom_enclosure,
+            rule.min_top_enclosure,
+            rule.min_bottom_extension_x,
+            rule.min_bottom_extension_y,
+            rule.min_top_extension_x,
+            rule.min_top_extension_y,
+            rule.min_cut_spacing
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse a deterministic layer/via rule deck into a fresh layout document.
+pub fn read_layout_rule_deck(source: &str) -> Result<LayoutDocument, String> {
+    let mut document = LayoutDocument::new();
+    let mut seen_layers = BTreeSet::new();
+    let mut seen_vias = BTreeSet::new();
+    let mut seen_spacing = BTreeSet::new();
+    let mut saw_version = false;
+    for (line_index, raw) in source.lines().enumerate() {
+        let line_no = line_index + 1;
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        match tokens.first().copied() {
+            Some("version") => {
+                if saw_version || tokens.len() != 2 || tokens[1] != "1" {
+                    return Err(format!(
+                        "rule deck line {line_no} must contain exactly 'version 1' once"
+                    ));
+                }
+                saw_version = true;
+            }
+            Some("layer") => {
+                if !saw_version {
+                    return Err("rule deck requires an initial 'version 1'".into());
+                }
+                if tokens.len() < 8 || tokens.len() % 2 != 0 {
+                    return Err(format!(
+                        "rule deck line {line_no} has malformed layer syntax"
+                    ));
+                }
+                let layer = tokens[1];
+                if !seen_layers.insert(layer.to_string()) {
+                    return Err(format!(
+                        "rule deck line {line_no} duplicates layer '{layer}'"
+                    ));
+                }
+                let mut rule = LayoutLayerRule::new(
+                    layer,
+                    rule_deck_i64(&tokens, 3, line_no)?,
+                    rule_deck_i64(&tokens, 5, line_no)?,
+                    rule_deck_i64(&tokens, 7, line_no)?,
+                )?;
+                let mut index = 8;
+                while index < tokens.len() {
+                    let keyword = tokens[index];
+                    if index + 1 >= tokens.len() {
+                        return Err(format!(
+                            "rule deck line {line_no} lacks a value for '{keyword}'"
+                        ));
+                    }
+                    rule = match keyword {
+                        "min_density_bp" => {
+                            let value = rule_deck_u32(&tokens, index + 1, line_no)?;
+                            let max = rule.max_density_bp;
+                            let window = rule.density_window;
+                            rule.with_density(Some(value), max, window)?
+                        }
+                        "max_density_bp" => {
+                            let value = rule_deck_u32(&tokens, index + 1, line_no)?;
+                            let min = rule.min_density_bp;
+                            let window = rule.density_window;
+                            rule.with_density(min, Some(value), window)?
+                        }
+                        "density_window" => {
+                            let value = rule_deck_i64(&tokens, index + 1, line_no)?;
+                            let min = rule.min_density_bp;
+                            let max = rule.max_density_bp;
+                            rule.with_density(min, max, value)?
+                        }
+                        "min_notch" => {
+                            rule.with_notch(rule_deck_i64(&tokens, index + 1, line_no)?)?
+                        }
+                        other => {
+                            return Err(format!(
+                                "rule deck line {line_no} has unknown layer keyword '{other}'"
+                            ))
+                        }
+                    };
+                    index += 2;
+                }
+                document.set_layer_rule(rule)?;
+            }
+            Some("spacing") => {
+                if tokens.len() != 4 {
+                    return Err(format!(
+                        "rule deck line {line_no} must be 'spacing LAYER LAYER DBU'"
+                    ));
+                }
+                let (left, right) = (tokens[1], tokens[2]);
+                if !seen_layers.contains(left) || !seen_layers.contains(right) {
+                    return Err(format!(
+                        "rule deck line {line_no} references an undefined layer"
+                    ));
+                }
+                if !seen_spacing.insert((left.to_string(), right.to_string())) {
+                    return Err(format!(
+                        "rule deck line {line_no} duplicates a spacing rule"
+                    ));
+                }
+                let spacing = rule_deck_i64(&tokens, 3, line_no)?;
+                let rule = document
+                    .layer_rules
+                    .get(left)
+                    .cloned()
+                    .ok_or_else(|| format!("rule deck line {line_no} lacks layer '{left}'"))?;
+                document.set_layer_rule(rule.with_spacing_to(right, spacing)?)?;
+            }
+            Some("via") => {
+                if tokens.len() != 26 {
+                    return Err(format!("rule deck line {line_no} has malformed via syntax"));
+                }
+                let via = tokens[1];
+                if !seen_vias.insert(via.to_string()) {
+                    return Err(format!("rule deck line {line_no} duplicates via '{via}'"));
+                }
+                let mut index = 9;
+                let mut values = [0_i64; 9];
+                for value in &mut values {
+                    *value = rule_deck_i64(&tokens, index, line_no)?;
+                    index += 2;
+                }
+                let cut_layer = tokens[3];
+                let bottom_layer = tokens[5];
+                let top_layer = tokens[7];
+                for layer in [bottom_layer, top_layer] {
+                    if !seen_layers.contains(layer) {
+                        return Err(format!(
+                            "rule deck line {line_no} references undefined layer '{layer}'"
+                        ));
+                    }
+                }
+                let rule = LayoutViaRule::new(
+                    via,
+                    cut_layer,
+                    bottom_layer,
+                    top_layer,
+                    values[0],
+                    values[1],
+                    values[2],
+                    values[3],
+                )?
+                .with_extensions(values[4], values[5], values[6], values[7])?
+                .with_cut_spacing(values[8])?;
+                document.set_via_rule(rule)?;
+            }
+            _ => return Err(format!("rule deck line {line_no} has unknown syntax")),
+        }
+    }
+    if !saw_version {
+        return Err("rule deck requires 'version 1'".into());
+    }
+    Ok(document)
+}
+
 fn scale_coordinate(value: i64, factor: i64) -> Result<i64, String> {
     value
         .checked_mul(factor)
@@ -958,8 +1500,204 @@ impl LayoutDocument {
         })
     }
 
+    fn density_violations(&self, layer: &str, rule: &LayoutLayerRule) -> Vec<LayoutDrcViolation> {
+        if rule.min_density_bp.is_none() && rule.max_density_bp.is_none() {
+            return Vec::new();
+        }
+        let geometries = self
+            .shapes
+            .iter()
+            .filter(|shape| shape.layer == layer)
+            .map(|shape| shape.geometry.clone())
+            .collect::<Vec<_>>();
+        if geometries.is_empty() {
+            return Vec::new();
+        }
+        let union = match manhattan_union(&geometries) {
+            Ok(union) => union,
+            Err(error) => {
+                return vec![LayoutDrcViolation {
+                    code: "LAYOUT.DENSITY_GEOMETRY".into(),
+                    severity: DrcSeverity::Error,
+                    message: format!("layer '{}' density geometry is invalid: {}", layer, error),
+                    layer: Some(layer.into()),
+                    net: None,
+                    object: Some(layer.into()),
+                }]
+            }
+        };
+        if union.rectangles.is_empty() {
+            return Vec::new();
+        }
+        let min_x = union
+            .rectangles
+            .iter()
+            .map(|rect| rect.x1)
+            .min()
+            .unwrap_or_default();
+        let max_x = union
+            .rectangles
+            .iter()
+            .map(|rect| rect.x2)
+            .max()
+            .unwrap_or_default();
+        let min_y = union
+            .rectangles
+            .iter()
+            .map(|rect| rect.y1)
+            .min()
+            .unwrap_or_default();
+        let max_y = union
+            .rectangles
+            .iter()
+            .map(|rect| rect.y2)
+            .max()
+            .unwrap_or_default();
+        let center_x = min_x.saturating_add((max_x - min_x) / 2);
+        let center_y = min_y.saturating_add((max_y - min_y) / 2);
+        let mut x_positions = vec![center_x - rule.density_window / 2];
+        let mut y_positions = vec![center_y - rule.density_window / 2];
+        for rect in &union.rectangles {
+            x_positions.extend([
+                rect.x1,
+                rect.x2,
+                rect.x1.checked_sub(rule.density_window).unwrap_or(rect.x1),
+                rect.x2.checked_sub(rule.density_window).unwrap_or(rect.x2),
+            ]);
+            y_positions.extend([
+                rect.y1,
+                rect.y2,
+                rect.y1.checked_sub(rule.density_window).unwrap_or(rect.y1),
+                rect.y2.checked_sub(rule.density_window).unwrap_or(rect.y2),
+            ]);
+        }
+        x_positions.sort_unstable();
+        x_positions.dedup();
+        y_positions.sort_unstable();
+        y_positions.dedup();
+
+        let mut violations = Vec::new();
+        let mut evaluated = BTreeSet::new();
+        for x in x_positions {
+            for y in &y_positions {
+                if !evaluated.insert((x, *y)) {
+                    continue;
+                }
+                let Some(x2) = x.checked_add(rule.density_window) else {
+                    continue;
+                };
+                let Some(y2) = y.checked_add(rule.density_window) else {
+                    continue;
+                };
+                let Ok(window) = LayoutRect::new(x, *y, x2, y2) else {
+                    continue;
+                };
+                if window.x2 <= min_x
+                    || window.x1 >= max_x
+                    || window.y2 <= min_y
+                    || window.y1 >= max_y
+                {
+                    continue;
+                }
+                violations.extend(Self::density_window_violations(
+                    layer,
+                    rule,
+                    &union.rectangles,
+                    window,
+                ));
+            }
+        }
+        if evaluated.is_empty() {
+            return vec![LayoutDrcViolation {
+                code: "LAYOUT.DENSITY_WINDOW".into(),
+                severity: DrcSeverity::Error,
+                message: format!(
+                    "layer '{}' density window {} is invalid",
+                    layer, rule.density_window
+                ),
+                layer: Some(layer.into()),
+                net: None,
+                object: Some(layer.into()),
+            }];
+        }
+        violations
+    }
+
+    fn density_window_violations(
+        layer: &str,
+        rule: &LayoutLayerRule,
+        rectangles: &[LayoutRect],
+        window: LayoutRect,
+    ) -> Vec<LayoutDrcViolation> {
+        let covered = rectangles
+            .iter()
+            .map(|rect| {
+                let x1 = i128::from(rect.x1.max(window.x1));
+                let x2 = i128::from(rect.x2.min(window.x2));
+                let y1 = i128::from(rect.y1.max(window.y1));
+                let y2 = i128::from(rect.y2.min(window.y2));
+                (x2 - x1).max(0) * (y2 - y1).max(0)
+            })
+            .sum::<i128>();
+        let window_area = i128::from(window.width()) * i128::from(window.height());
+        if window_area == 0 {
+            return Vec::new();
+        }
+        let density_bp = (covered * 10_000) / window_area;
+        let density_percent = f64::from(density_bp.clamp(0, 10_000) as u32) / 100.0;
+        let mut violations = Vec::new();
+        if rule
+            .min_density_bp
+            .is_some_and(|required| density_bp < i128::from(required))
+        {
+            violations.push(LayoutDrcViolation {
+                code: "LAYOUT.MIN_DENSITY".into(),
+                severity: DrcSeverity::Error,
+                message: format!(
+                    "layer '{}' density {:.3}% at ({},{}) is below required {:.3}% in {}x{} window",
+                    layer,
+                    density_percent,
+                    window.x1,
+                    window.y1,
+                    f64::from(rule.min_density_bp.unwrap_or(0)) / 100.0,
+                    window.width(),
+                    window.height()
+                ),
+                layer: Some(layer.into()),
+                net: None,
+                object: Some(layer.into()),
+            });
+        }
+        if rule
+            .max_density_bp
+            .is_some_and(|limit| density_bp > i128::from(limit))
+        {
+            violations.push(LayoutDrcViolation {
+                code: "LAYOUT.MAX_DENSITY".into(),
+                severity: DrcSeverity::Error,
+                message: format!(
+                    "layer '{}' density {:.3}% at ({},{}) exceeds limit {:.3}% in {}x{} window",
+                    layer,
+                    density_percent,
+                    window.x1,
+                    window.y1,
+                    f64::from(rule.max_density_bp.unwrap_or(10_000)) / 100.0,
+                    window.width(),
+                    window.height()
+                ),
+                layer: Some(layer.into()),
+                net: None,
+                object: Some(layer.into()),
+            });
+        }
+        violations
+    }
+
     pub fn check_layout_drc(&self) -> LayoutDrcResult {
         let mut violations = Vec::new();
+        for (layer, rule) in &self.layer_rules {
+            violations.extend(self.density_violations(layer, rule));
+        }
         for shape in &self.shapes {
             let Some(rule) = self.layer_rules.get(&shape.layer) else {
                 violations.push(LayoutDrcViolation {
@@ -1040,19 +1778,103 @@ impl LayoutDocument {
                 }
                 Ok(_) => {}
             }
+            if rule.min_notch > 0 {
+                match &shape.geometry {
+                    LayoutGeometry::Rect(_) => {}
+                    LayoutGeometry::Polygon(polygon) => {
+                        if polygon
+                            .minimum_notch_width()
+                            .is_some_and(|notch| notch < rule.min_notch)
+                        {
+                            violations.push(LayoutDrcViolation {
+                                code: "LAYOUT.MIN_NOTCH".into(),
+                                severity: DrcSeverity::Error,
+                                message: format!(
+                                    "shape '{}' notch {} is below layer minimum {}",
+                                    shape.id,
+                                    polygon.minimum_notch_width().unwrap_or_default(),
+                                    rule.min_notch
+                                ),
+                                layer: Some(shape.layer.clone()),
+                                net: Some(shape.net.clone()),
+                                object: Some(shape.id.clone()),
+                            });
+                        }
+                    }
+                    LayoutGeometry::AnyAngle(_) => {
+                        violations.push(LayoutDrcViolation {
+                            code: "LAYOUT.NOTCH_GEOMETRY".into(),
+                            severity: DrcSeverity::Error,
+                            message: format!(
+                                "shape '{}' uses an arbitrary-angle polygon that does not yet support notch DRC",
+                                shape.id
+                            ),
+                            layer: Some(shape.layer.clone()),
+                            net: Some(shape.net.clone()),
+                            object: Some(shape.id.clone()),
+                        });
+                    }
+                }
+            }
         }
 
         for (index, left) in self.shapes.iter().enumerate() {
             for right in self.shapes.iter().skip(index + 1) {
-                if left.layer != right.layer || left.net == right.net {
+                if left.net == right.net {
                     continue;
                 }
-                let Some(rule) = self.layer_rules.get(&left.layer) else {
+                if left.layer == right.layer {
+                    match positive_area_overlap(&left.geometry, &right.geometry) {
+                        Ok(true) => {
+                            violations.push(LayoutDrcViolation {
+                                code: "LAYOUT.SHORT".into(),
+                                severity: DrcSeverity::Error,
+                                message: format!(
+                                    "different-net shapes '{}' and '{}' overlap on layer '{}'",
+                                    left.id, right.id, left.layer
+                                ),
+                                layer: Some(left.layer.clone()),
+                                net: Some(left.net.clone()),
+                                object: Some(format!("{}|{}", left.id, right.id)),
+                            });
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            violations.push(LayoutDrcViolation {
+                                code: "LAYOUT.GEOMETRY".into(),
+                                severity: DrcSeverity::Error,
+                                message: format!(
+                                    "shapes '{}' and '{}' overlap check failed: {}",
+                                    left.id, right.id, error
+                                ),
+                                layer: Some(left.layer.clone()),
+                                net: Some(left.net.clone()),
+                                object: Some(format!("{}|{}", left.id, right.id)),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                let required = if left.layer == right.layer {
+                    self.layer_rules
+                        .get(&left.layer)
+                        .map(|rule| rule.min_spacing)
+                } else {
+                    let left_to_right = self
+                        .layer_rules
+                        .get(&left.layer)
+                        .and_then(|rule| rule.spacing_to.get(&right.layer).copied());
+                    let right_to_left = self
+                        .layer_rules
+                        .get(&right.layer)
+                        .and_then(|rule| rule.spacing_to.get(&left.layer).copied());
+                    [left_to_right, right_to_left].into_iter().flatten().max()
+                };
+                let Some(required) = required else {
                     continue;
                 };
-                let spacing = left
-                    .geometry
-                    .check_spacing_to(&right.geometry, rule.min_spacing);
+                let spacing = left.geometry.check_spacing_to(&right.geometry, required);
                 let violation = match spacing {
                     Ok(result) if !result.compliant => Some(Ok(result.actual_distance_dbu)),
                     Ok(_) => None,
@@ -1070,7 +1892,7 @@ impl LayoutDocument {
                                 .as_ref()
                                 .map(|value| format!("{value:.3}"))
                                 .unwrap_or_else(|error| format!("invalid: {error}")),
-                            rule.min_spacing
+                            required
                         ),
                         layer: Some(left.layer.clone()),
                         net: Some(left.net.clone()),
@@ -1115,11 +1937,23 @@ impl LayoutDocument {
                     object: Some(via.id.clone()),
                 });
             }
-            for (layer, enclosure) in [
-                (&rule.bottom_layer, rule.min_bottom_enclosure),
-                (&rule.top_layer, rule.min_top_enclosure),
+            for (layer, enclosure, extension_x, extension_y) in [
+                (
+                    &rule.bottom_layer,
+                    rule.min_bottom_enclosure,
+                    rule.min_bottom_extension_x,
+                    rule.min_bottom_extension_y,
+                ),
+                (
+                    &rule.top_layer,
+                    rule.min_top_enclosure,
+                    rule.min_top_extension_x,
+                    rule.min_top_extension_y,
+                ),
             ] {
-                let required = via.cut.expanded(enclosure).unwrap_or(via.cut);
+                let dx = enclosure.max(extension_x);
+                let dy = enclosure.max(extension_y);
+                let required = via.cut.expanded_by(dx, dy).unwrap_or(via.cut);
                 let enclosed = self.shapes.iter().any(|shape| {
                     shape.net == via.net
                         && shape.layer == *layer
@@ -1130,12 +1964,76 @@ impl LayoutDocument {
                         code: "LAYOUT.VIA_ENCLOSURE".into(),
                         severity: DrcSeverity::Error,
                         message: format!(
-                            "via '{}' lacks {}-unit enclosure on layer '{}'",
-                            via.id, enclosure, layer
+                            "via '{}' lacks enclosure/extension ({}x{}, {}x{}) on layer '{}'",
+                            via.id, enclosure, extension_x, enclosure, extension_y, layer
                         ),
                         layer: Some(layer.clone()),
                         net: Some(via.net.clone()),
                         object: Some(via.id.clone()),
+                    });
+                }
+            }
+        }
+
+        for (index, left) in self.vias.iter().enumerate() {
+            for right in self.vias.iter().skip(index + 1) {
+                if left.cut_layer != right.cut_layer {
+                    continue;
+                }
+                let cuts_overlap = left.cut.x1 < right.cut.x2
+                    && right.cut.x1 < left.cut.x2
+                    && left.cut.y1 < right.cut.y2
+                    && right.cut.y1 < left.cut.y2;
+                if cuts_overlap {
+                    violations.push(LayoutDrcViolation {
+                        code: "LAYOUT.VIA_CUT_OVERLAP".into(),
+                        severity: DrcSeverity::Error,
+                        message: format!(
+                            "via cuts '{}' and '{}' overlap on layer '{}'",
+                            left.id, right.id, left.cut_layer
+                        ),
+                        layer: Some(left.cut_layer.clone()),
+                        net: Some(left.net.clone()),
+                        object: Some(format!("{}|{}", left.id, right.id)),
+                    });
+                    continue;
+                }
+                let required = [
+                    self.via_rules.get(&left.rule),
+                    self.via_rules.get(&right.rule),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|rule| rule.min_cut_spacing)
+                .max()
+                .unwrap_or(0);
+                if required == 0 {
+                    continue;
+                }
+                let spacing = LayoutGeometry::Rect(left.cut)
+                    .check_spacing_to(&LayoutGeometry::Rect(right.cut), required);
+                let violation = match spacing {
+                    Ok(result) if !result.compliant => Some(Ok(result.actual_distance_dbu)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                };
+                if let Some(distance) = violation {
+                    violations.push(LayoutDrcViolation {
+                        code: "LAYOUT.VIA_CUT_SPACING".into(),
+                        severity: DrcSeverity::Error,
+                        message: format!(
+                            "via cuts '{}' and '{}' distance {} are below minimum {}",
+                            left.id,
+                            right.id,
+                            distance
+                                .as_ref()
+                                .map(|value| format!("{value:.3}"))
+                                .unwrap_or_else(|error| format!("invalid: {error}")),
+                            required
+                        ),
+                        layer: Some(left.cut_layer.clone()),
+                        net: Some(left.net.clone()),
+                        object: Some(format!("{}|{}", left.id, right.id)),
                     });
                 }
             }
@@ -2063,12 +2961,554 @@ fn segments_properly_cross(a: LayoutPoint, b: LayoutPoint, c: LayoutPoint, d: La
     abc.signum() * abd.signum() < 0 && cda.signum() * cdb.signum() < 0
 }
 
+fn positive_area_overlap(left: &LayoutGeometry, right: &LayoutGeometry) -> Result<bool, String> {
+    if !matches!(left, LayoutGeometry::AnyAngle(_)) && !matches!(right, LayoutGeometry::AnyAngle(_))
+    {
+        return manhattan_boolean(left, right, ManhattanBooleanOp::Intersection)
+            .map(|result| result.area > 0);
+    }
+    any_angle_boolean(
+        &left.try_into_any_angle()?,
+        &right.try_into_any_angle()?,
+        AnyAngleBooleanOperation::Intersection,
+    )
+    .map(|result| result.total_area > 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rule() -> LayoutLayerRule {
         LayoutLayerRule::new("M1", 10, 20, 100).unwrap()
+    }
+
+    #[test]
+    fn layout_drc_checks_exact_layer_density_rules() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M1", 10, 20, 100)
+                    .unwrap()
+                    .with_density(Some(2_000), Some(8_000), 100)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "a".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 50, 50).unwrap()),
+            })
+            .unwrap();
+        assert!(document.check_layout_drc().is_clean());
+
+        document.remove_shape("a").unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "sparse".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 10, 10).unwrap()),
+            })
+            .unwrap();
+        assert!(document
+            .check_layout_drc()
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.MIN_DENSITY"));
+
+        document.remove_shape("sparse").unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "dense".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 90, 90).unwrap()),
+            })
+            .unwrap();
+        assert!(document
+            .check_layout_drc()
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.MAX_DENSITY"));
+
+        document.remove_shape("dense").unwrap();
+        for id in ["overlap1", "overlap2"] {
+            document
+                .add_shape(LayoutShape {
+                    id: id.into(),
+                    layer: "M1".into(),
+                    net: "a".into(),
+                    geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 50, 50).unwrap()),
+                })
+                .unwrap();
+        }
+        assert!(document.check_layout_drc().is_clean());
+
+        assert!(LayoutLayerRule::new("M1", 10, 20, 100)
+            .unwrap()
+            .with_density(Some(10_001), None, 100)
+            .is_err());
+        assert!(LayoutLayerRule::new("M1", 10, 20, 100)
+            .unwrap()
+            .with_density(Some(5_000), Some(4_000), 100)
+            .is_err());
+        assert!(LayoutLayerRule::new("M1", 10, 20, 100)
+            .unwrap()
+            .with_density(Some(1), None, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn layout_drc_checks_via_cut_spacing() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_via_rule(
+                LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 0, 0)
+                    .unwrap()
+                    .with_cut_spacing(20)
+                    .unwrap(),
+            )
+            .unwrap();
+        for (id, x1) in [("left", 0), ("near", 30), ("far", 70)] {
+            document
+                .add_via(LayoutVia {
+                    id: id.into(),
+                    rule: "VIA1".into(),
+                    net: "a".into(),
+                    cut_layer: "V1".into(),
+                    bottom_layer: "M1".into(),
+                    top_layer: "M2".into(),
+                    cut: LayoutRect::new(x1, 0, x1 + 20, 20).unwrap(),
+                })
+                .unwrap();
+        }
+        let result = document.check_layout_drc();
+        let violations = result
+            .violations
+            .iter()
+            .filter(|violation| violation.code == "LAYOUT.VIA_CUT_SPACING")
+            .collect::<Vec<_>>();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].object.as_deref(), Some("left|near"));
+        assert!(violations[0].message.contains("below minimum 20"));
+
+        assert!(LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 0, 0)
+            .unwrap()
+            .with_cut_spacing(-1)
+            .is_err());
+    }
+
+    #[test]
+    fn layout_drc_checks_directional_via_extensions() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(LayoutLayerRule::new("M1", 10, 20, 100).unwrap())
+            .unwrap();
+        document
+            .set_layer_rule(LayoutLayerRule::new("M2", 10, 20, 100).unwrap())
+            .unwrap();
+        document
+            .set_via_rule(
+                LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 0, 0)
+                    .unwrap()
+                    .with_extensions(10, 5, 5, 10)
+                    .unwrap(),
+            )
+            .unwrap();
+        let add_rect = |document: &mut LayoutDocument, id: &str, layer: &str, rect: LayoutRect| {
+            document
+                .add_shape(LayoutShape {
+                    id: id.into(),
+                    layer: layer.into(),
+                    net: "a".into(),
+                    geometry: LayoutGeometry::Rect(rect),
+                })
+                .unwrap();
+        };
+        add_rect(
+            &mut document,
+            "bottom",
+            "M1",
+            LayoutRect::new(-10, -5, 30, 25).unwrap(),
+        );
+        add_rect(
+            &mut document,
+            "top",
+            "M2",
+            LayoutRect::new(-5, -10, 25, 30).unwrap(),
+        );
+        document
+            .add_via(LayoutVia {
+                id: "via".into(),
+                rule: "VIA1".into(),
+                net: "a".into(),
+                cut_layer: "V1".into(),
+                bottom_layer: "M1".into(),
+                top_layer: "M2".into(),
+                cut: LayoutRect::new(0, 0, 20, 20).unwrap(),
+            })
+            .unwrap();
+        assert!(document.check_layout_drc().is_clean());
+
+        document.remove_shape("bottom").unwrap();
+        add_rect(
+            &mut document,
+            "bottom_short_x",
+            "M1",
+            LayoutRect::new(-5, -5, 30, 25).unwrap(),
+        );
+        let result = document.check_layout_drc();
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.VIA_ENCLOSURE"
+                && violation.message.contains("extension (0x10, 0x5)")));
+
+        assert!(LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 0, 0)
+            .unwrap()
+            .with_extensions(-1, 0, 0, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn layout_drc_rejects_overlapping_via_cuts() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_via_rule(LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 0, 0).unwrap())
+            .unwrap();
+        for (id, x1) in [("left", 0), ("overlap", 10), ("touching", 30)] {
+            document
+                .add_via(LayoutVia {
+                    id: id.into(),
+                    rule: "VIA1".into(),
+                    net: "a".into(),
+                    cut_layer: "V1".into(),
+                    bottom_layer: "M1".into(),
+                    top_layer: "M2".into(),
+                    cut: LayoutRect::new(x1, 0, x1 + 20, 20).unwrap(),
+                })
+                .unwrap();
+        }
+        let result = document.check_layout_drc();
+        let overlaps = result
+            .violations
+            .iter()
+            .filter(|violation| violation.code == "LAYOUT.VIA_CUT_OVERLAP")
+            .collect::<Vec<_>>();
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].object.as_deref(), Some("left|overlap"));
+        assert!(overlaps[0].message.contains("overlap on layer 'V1'"));
+    }
+
+    #[test]
+    fn layout_density_drc_checks_local_windows() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M1", 10, 20, 100)
+                    .unwrap()
+                    .with_density(None, Some(8_000), 100)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "local".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 90, 100).unwrap()),
+            })
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "far".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(200, 0, 210, 100).unwrap()),
+            })
+            .unwrap();
+        let result = document.check_layout_drc();
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.MAX_DENSITY"
+                && violation.message.contains("at (0,0)")
+                && violation.message.contains("90.000%")));
+    }
+
+    #[test]
+    fn layout_drc_checks_cross_layer_spacing() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M1", 10, 20, 100)
+                    .unwrap()
+                    .with_spacing_to("M2", 30)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M2", 10, 20, 100)
+                    .unwrap()
+                    .with_spacing_to("M1", 40)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "m1".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 50, 10).unwrap()),
+            })
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "m2".into(),
+                layer: "M2".into(),
+                net: "b".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 45, 50, 55).unwrap()),
+            })
+            .unwrap();
+        let result = document.check_layout_drc();
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.SPACING"
+                && violation.message.contains("below layer minimum 40")));
+
+        document.remove_shape("m2").unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "m2_same_net".into(),
+                layer: "M2".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 45, 50, 55).unwrap()),
+            })
+            .unwrap();
+        assert!(document.check_layout_drc().is_clean());
+
+        assert!(LayoutLayerRule::new("M1", 10, 20, 100)
+            .unwrap()
+            .with_spacing_to("M2", -1)
+            .is_err());
+    }
+
+    #[test]
+    fn layout_drc_rejects_different_net_overlap() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(LayoutLayerRule::new("M1", 10, 0, 100).unwrap())
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "left".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(0, 0, 20, 20).unwrap()),
+            })
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "right".into(),
+                layer: "M1".into(),
+                net: "b".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(10, 0, 30, 20).unwrap()),
+            })
+            .unwrap();
+        let result = document.check_layout_drc();
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.SHORT"
+                && violation.object.as_deref() == Some("left|right")));
+
+        document.remove_shape("right").unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "touching".into(),
+                layer: "M1".into(),
+                net: "b".into(),
+                geometry: LayoutGeometry::Rect(LayoutRect::new(20, 0, 40, 20).unwrap()),
+            })
+            .unwrap();
+        assert!(document.check_layout_drc().is_clean());
+    }
+
+    #[test]
+    fn layout_drc_checks_minimum_notch() {
+        let notch_polygon = |opening: i64| {
+            LayoutPolygon::new([
+                LayoutPoint::new(0, 0),
+                LayoutPoint::new(100, 0),
+                LayoutPoint::new(100, 100),
+                LayoutPoint::new(50 + opening / 2, 100),
+                LayoutPoint::new(50 + opening / 2, 40),
+                LayoutPoint::new(50 - opening / 2, 40),
+                LayoutPoint::new(50 - opening / 2, 100),
+                LayoutPoint::new(0, 100),
+            ])
+            .unwrap()
+        };
+        assert_eq!(notch_polygon(20).minimum_notch_width(), Some(20));
+        assert_eq!(notch_polygon(30).minimum_notch_width(), Some(30));
+
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M1", 10, 20, 100)
+                    .unwrap()
+                    .with_notch(25)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "narrow".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Polygon(notch_polygon(20)),
+            })
+            .unwrap();
+        let result = document.check_layout_drc();
+        assert!(result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "LAYOUT.MIN_NOTCH"
+                && violation
+                    .message
+                    .contains("notch 20 is below layer minimum 25")));
+
+        document.remove_shape("narrow").unwrap();
+        document
+            .add_shape(LayoutShape {
+                id: "wide".into(),
+                layer: "M1".into(),
+                net: "a".into(),
+                geometry: LayoutGeometry::Polygon(notch_polygon(30)),
+            })
+            .unwrap();
+        assert!(document.check_layout_drc().is_clean());
+
+        assert!(LayoutLayerRule::new("M1", 10, 20, 100)
+            .unwrap()
+            .with_notch(-1)
+            .is_err());
+    }
+
+    #[test]
+    fn layout_rule_deck_round_trips_all_typed_rules() {
+        let mut document = LayoutDocument::new();
+        document
+            .set_layer_rule(
+                LayoutLayerRule::new("M1", 10, 20, 100)
+                    .unwrap()
+                    .with_density(Some(2_000), Some(8_000), 100)
+                    .unwrap()
+                    .with_notch(25)
+                    .unwrap()
+                    .with_spacing_to("M2", 30)
+                    .unwrap(),
+            )
+            .unwrap();
+        document
+            .set_layer_rule(LayoutLayerRule::new("M2", 10, 20, 100).unwrap())
+            .unwrap();
+        document
+            .set_via_rule(
+                LayoutViaRule::new("VIA1", "V1", "M1", "M2", 20, 20, 1, 2)
+                    .unwrap()
+                    .with_extensions(10, 5, 6, 11)
+                    .unwrap()
+                    .with_cut_spacing(20)
+                    .unwrap(),
+            )
+            .unwrap();
+        let written = write_layout_rule_deck(&document).unwrap();
+        let restored = read_layout_rule_deck(&written).unwrap();
+        assert_eq!(restored.layer_rule("M1"), document.layer_rule("M1"));
+        assert_eq!(restored.layer_rule("M2"), document.layer_rule("M2"));
+        assert_eq!(restored.via_rule("VIA1"), document.via_rule("VIA1"));
+        assert_eq!(write_layout_rule_deck(&restored).unwrap(), written);
+
+        assert!(read_layout_rule_deck("").is_err());
+        assert!(read_layout_rule_deck("version 2\n").is_err());
+        assert!(read_layout_rule_deck("version 1\nlayer M1\n").is_err());
+        assert!(read_layout_rule_deck("version 1\nspacing M1 M2 10\n").is_err());
+        assert!(read_layout_rule_deck("version 1\nvia V1 V1 M1 M2\n").is_err());
+    }
+
+    #[test]
+    fn layout_drc_waivers_use_exact_auditable_selectors() {
+        let violation = |code: &str, object: &str| LayoutDrcViolation {
+            code: code.into(),
+            severity: DrcSeverity::Error,
+            message: format!("{code} {object}"),
+            layer: Some("M1".into()),
+            net: Some("a".into()),
+            object: Some(object.into()),
+        };
+        let result = LayoutDrcResult {
+            violations: vec![
+                violation("LAYOUT.MIN_WIDTH", "narrow"),
+                violation("LAYOUT.MIN_WIDTH", "other"),
+                violation("LAYOUT.SPACING", "narrow|other"),
+            ],
+        };
+        let waiver = LayoutDrcWaiver::new(
+            "w1",
+            "LAYOUT.MIN_WIDTH",
+            Some("M1".into()),
+            Some("a".into()),
+            Some("narrow".into()),
+            "physical-owner",
+            "approved duplicate metal fill",
+        )
+        .unwrap();
+        let waived = apply_layout_drc_waivers(&result, &[waiver]).unwrap();
+        assert_eq!(waived.active.violations.len(), 2);
+        assert_eq!(waived.waived.len(), 1);
+        assert_eq!(waived.waived[0].waiver_id, "w1");
+        assert_eq!(waived.waived[0].owner, "physical-owner");
+        assert_eq!(waived.used_waiver_ids, vec!["w1".to_string()]);
+        let report = layout_drc_waiver_report(&waived);
+        assert!(report.contains("2 active, 1 waived, 1 waiver(s) used"));
+        assert!(report.contains("waived LAYOUT.MIN_WIDTH [narrow] by 'w1'"));
+        assert!(report.contains("owner='physical-owner'"));
+
+        let wrong_object = LayoutDrcWaiver::new(
+            "w2",
+            "LAYOUT.MIN_WIDTH",
+            Some("M1".into()),
+            Some("a".into()),
+            Some("missing".into()),
+            "physical-owner",
+            "does not match",
+        )
+        .unwrap();
+        let unused = apply_layout_drc_waivers(&result, &[wrong_object]).unwrap();
+        assert_eq!(unused.active.violations.len(), 3);
+        assert!(unused.waived.is_empty());
+
+        assert!(
+            LayoutDrcWaiver::new("", "LAYOUT.MIN_WIDTH", None, None, None, "owner", "reason")
+                .is_err()
+        );
+        let first = LayoutDrcWaiver::new(
+            "same",
+            "LAYOUT.MIN_WIDTH",
+            None,
+            None,
+            None,
+            "owner",
+            "reason",
+        )
+        .unwrap();
+        assert!(apply_layout_drc_waivers(&result, &[first.clone(), first]).is_err());
     }
 
     #[test]

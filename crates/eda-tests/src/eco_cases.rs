@@ -1,7 +1,9 @@
 //! Structural ECO parsing, application, and validation cases.
 
 use crate::CaseList;
-use eda_core::netlist::Netlist;
+use eda_core::library::CellLibrary;
+use eda_core::netlist::{Cell, CellKind, Dir, Netlist};
+use std::sync::Arc;
 
 fn synth() -> Netlist {
     let design = eda_hdl::compile(
@@ -350,6 +352,46 @@ tie_input u1_and2 1 0;
             Err(eda_api::eco_report(&result))
         }
     });
+
+    c.add(
+        "api_eco_replaces_sequential_cell_and_proves_equivalence",
+        || {
+            let library = Arc::new(CellLibrary::std());
+            let mut nl = Netlist::new("sequential_eco");
+            nl.set_library(library.clone());
+            let clk = nl.add_net("clk");
+            let d = nl.add_net("d");
+            let q = nl.add_net("q");
+            nl.add_cell(Cell {
+                name: "q_reg".into(),
+                kind: CellKind::Dff { posedge: true },
+                inputs: vec![clk, d],
+                output: q,
+            });
+            nl.add_port("clk", Dir::In, vec![clk]);
+            nl.add_port("d", Dir::In, vec![d]);
+            nl.add_port("q", Dir::Out, vec![q]);
+
+            let patch = eda_api::parse_eco_patch("eco dff_map; replace_cell q_reg DFF;")?;
+            let result = eda_api::apply_eco_patch(&nl, &patch)?;
+            let expected = CellKind::Lib(library.find("DFF").expect("standard DFF"));
+            if result.operations_applied != 1
+                || result.netlist.cell(0).kind != expected
+                || result.netlist.cell(0).inputs != vec![clk, d]
+            {
+                return Err(eda_api::eco_report(&result));
+            }
+            let equivalent = eda_formal::check_equivalent(&nl, &result.netlist)?;
+            if equivalent.equivalent {
+                Ok(())
+            } else {
+                Err(format!(
+                    "sequential ECO replacement changed behavior: {:?}",
+                    equivalent.notes
+                ))
+            }
+        },
+    );
     c.add("api_eco_hierarchy_scoped_patch", || {
         let src = r#"
             module leaf(input a, b, output y); assign y = a & b; endmodule

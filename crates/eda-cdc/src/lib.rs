@@ -532,3 +532,115 @@ pub fn report(result: &CdcResult) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eda_core::netlist::{Cell, Dir};
+
+    fn add_flop(nl: &mut Netlist, name: &str, clock: NetId, data: NetId, output: NetId) {
+        nl.add_cell(Cell {
+            name: name.to_string(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clock, data],
+            output,
+        });
+    }
+
+    fn add_ports(nl: &mut Netlist, names: &[&str]) {
+        for name in names {
+            let net = nl.net_by_name(name).unwrap_or_else(|| nl.add_net(*name));
+            nl.add_port(*name, Dir::In, vec![net]);
+        }
+    }
+
+    #[test]
+    fn single_clock_domain_has_no_crossing() {
+        let mut nl = Netlist::new("single_clock");
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        let r = nl.add_net("r");
+        add_flop(&mut nl, "q_reg", clk, d, q);
+        add_flop(&mut nl, "r_reg", clk, q, r);
+        add_ports(&mut nl, &["clk", "d"]);
+        nl.add_port("q", Dir::Out, vec![q]);
+        nl.add_port("r", Dir::Out, vec![r]);
+
+        let result = analyze(&nl).unwrap();
+        assert_eq!(result.clocks.len(), 1);
+        assert!(result.crossings.is_empty());
+        assert!(result.clean());
+    }
+
+    #[test]
+    fn two_flop_synchronizer_is_recognized() {
+        let mut nl = Netlist::new("synchronizer");
+        let clk_a = nl.add_net("clk_a");
+        let clk_b = nl.add_net("clk_b");
+        let d = nl.add_net("d");
+        let a_q = nl.add_net("a_q");
+        let sync0 = nl.add_net("sync0");
+        let sync1 = nl.add_net("sync1");
+        add_flop(&mut nl, "a_q_reg", clk_a, d, a_q);
+        add_flop(&mut nl, "sync0_reg", clk_b, a_q, sync0);
+        add_flop(&mut nl, "sync1_reg", clk_b, sync0, sync1);
+        add_ports(&mut nl, &["clk_a", "clk_b", "d"]);
+        nl.add_port("a_q", Dir::Out, vec![a_q]);
+        nl.add_port("sync0", Dir::Out, vec![sync0]);
+        nl.add_port("sync1", Dir::Out, vec![sync1]);
+
+        let result = analyze(&nl).unwrap();
+        assert_eq!(result.clocks.len(), 2);
+        assert_eq!(result.crossings.len(), 1);
+        assert!(result.crossings[0].synchronized);
+        assert!(result.clean());
+    }
+
+    #[test]
+    fn unsynchronized_crossing_is_an_error() {
+        let mut nl = Netlist::new("unsynchronized");
+        let clk_a = nl.add_net("clk_a");
+        let clk_b = nl.add_net("clk_b");
+        let d = nl.add_net("d");
+        let a_q = nl.add_net("a_q");
+        let b_q = nl.add_net("b_q");
+        add_flop(&mut nl, "a_q_reg", clk_a, d, a_q);
+        add_flop(&mut nl, "b_q_reg", clk_b, a_q, b_q);
+        add_ports(&mut nl, &["clk_a", "clk_b", "d"]);
+
+        let result = analyze(&nl).unwrap();
+        assert!(result.has_errors());
+        assert!(result
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "unsynchronized-crossing"));
+        assert!(report(&result).contains("unsynchronized-crossing"));
+    }
+
+    #[test]
+    fn clock_inverter_preserves_one_domain() {
+        let mut nl = Netlist::new("clock_inverter");
+        let clk = nl.add_net("clk");
+        let not_clk = nl.add_net("not_clk");
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        let r = nl.add_net("r");
+        nl.add_cell(Cell {
+            name: "clk_inv".into(),
+            kind: CellKind::Not,
+            inputs: vec![clk],
+            output: not_clk,
+        });
+        add_flop(&mut nl, "q_reg", clk, d, q);
+        add_flop(&mut nl, "r_reg", not_clk, q, r);
+        add_ports(&mut nl, &["clk", "d"]);
+        nl.add_port("q", Dir::Out, vec![q]);
+        nl.add_port("r", Dir::Out, vec![r]);
+
+        let result = analyze(&nl).unwrap();
+        assert_eq!(result.clocks.len(), 1);
+        assert!(result.crossings.is_empty());
+        assert!(result.clean());
+    }
+}

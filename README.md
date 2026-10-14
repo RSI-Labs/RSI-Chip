@@ -112,13 +112,14 @@ mixed program, a class-composed Monitor/Scoreboard/Env testbench that
 samples the debug ports and reports pass/fail, RTL scan-chain DFT
 insertion with a full-chain audit, and an MMMC PDK signoff case (model
 correlation, per-corner implementation, timing, DRC, LEF/DEF/SDF
-physical databases) that is gated on sequential-equivalence LEC capacity
-for the full 2051-flop netlist. A staged physical signoff
+physical databases, and full sequential-equivalence LEC) for the complete
+2051-flop netlist. The full `rv32i_pdk_signoff_mmmc_pass` gate is enabled
+and PASSES. A staged physical signoff
 (`rv32i_pdk_physical_signoff_mmmc_pass`) runs in-suite and PASSES —
 model correlation, two-corner timing (worst 201.125 ns), zero DRC
 errors, and LEF/DEF/SDF generation — via a new staged-flow API that
-skips the separately tracked LEC deliverable when the PDK manifest
-does not require it. The generated artifact lives at
+can run physical closure independently when a manifest does not require
+LEC. The generated artifact lives at
 `rv32i/verify/signoff_report.txt` and covers physical signoff,
 power/IR, single- and multi-layer power meshes with EM, UPF
 power-domain IR (with per-domain multilayer meshes), and CTS. Power/IR and CTS stages run in-suite
@@ -143,71 +144,29 @@ fixed two real tool bugs: `always @*` case blocks without defaults
 inferred combinational loops, and synthesis dropped registers that were
 only assigned in an `if` branch's `else` path (2049 state bits collapsed
 to 545). PDK manifests now carry per-layer routing track capacity
-(`tracks N`) that feeds the global router. Sequential equivalence was
-rebuilt as a localized correspondence-point LEC: every flop next-state
-function, output bit, and RTL-named internal point gets its own small
-XOR-miter query over an interval-antichain cut set (one DFS per side),
-replacing the monolithic miter that stalled on 2k-flop designs. Solver
-capacity limits fail closed with a structured note. Correspondence
-points are built by topological induction with a structural-isomorphism
-fast path: library cells normalize to generic function classes (AND2 to
-And, MUX2 to Mux, ...), and lockstep DFS accepts cut-bounded regions
-that are structurally identical modulo already-accepted input
-correspondences without invoking SAT. The matcher now recurses through
-commutative permutations, returns every proved internal pair as a cut,
-and refuses complex Liberty expressions (such as inverted-pin ANDs) that
-are not structurally identical to the primitive class. Everything else
-still requires the local-region miter. Induction is independent of physical cell
-order (flops are seeded by output-net name), same-named driverless locals
-are tied inside local-region proofs as well as final miters, explicit TIE
-cells provide sound many-to-one constant cuts, and final-query cut
-antichains prefer the frontier nearest the sink instead of near-source
-topological candidates. A deduplicating topological candidate queue now adds
-the immediate fanout of every newly proved correspondence, preserves
-independently proved subgraphs when a larger structural match fails, and
-uses unique nonconstant input signatures to bridge optimized decode cones.
-RTL-named vector groups are tried as shared multi-bit local miters with the
-same full-cone CEGAR consistency check. An oversized group falls back to
-adjacent four-bit slices, keeping neighbouring carry/shift bits together while
-avoiding a monolithic RF-wide miter. Matched
-flop boundaries are cut only when both query cones contain the pair, and a
-cut model is checked against full-cone evaluation. A spurious source
-assignment now materializes the otherwise-cut-away source literals, ties their
-corresponding gold/mapped variables, and then restores the selected frontier's
-exact source relations before retrying. Exact functional refinement generalizes beyond one
-assignment; a regression covers six correlated source families, while
-confirmed full-cone differences can be returned directly and refinement
-capacity remains unknown rather than UNSAT. Refined queries use the new public
-`IncrementalSolver`: original and learnt clauses, activities, and saved phases
-persist as CEGAR clauses are added, instead of rebuilding the SAT context.
-Equivalent gold nets may share one proved gate net (sound many-to-one
-correspondence), while duplicate merging preserves a stable RTL alias name on
-the surviving canonical net. Oversized local regions and exhausted local SAT
-budgets reject candidates before a monolithic query can stall. Repeated
-local regions use an exact variable-renaming-proof CNF cache, simulation
-seeds, synthesis written-set traversal, mapper peephole traversal, and
-candidate tie-breaks are deterministic, and the CDCL core reduces
-its learned-clause database while retaining original and binary clauses.
-Final flop obligations are scheduled largest-cone-first so a capacity-limited
-deep state bit is reported before thousands of easier storage bits. The current
-deterministic correspondence-queue profile accepts 4,107 points; hardest-first
-profiling reaches `dut.x31[31]` with a 9,374-variable gold / 4,564-variable
-mapped abstract query, expands a 106-cut gold / 25-cut mapped frontier over
-1,616 source guards, and still fails closed at 16,672 variables, 69,549
-incremental-SAT clauses, and 1,120 conflicts without a counterexample.
-Differential
-simulation of the RV32I gold/mapped netlists shows no divergence on any
-RTL-named net or output through halt, and direct combinational
-evaluation of both netlists under the miter's own distinguishing
-assignment shows zero next-state differences across all 2051 flops —
-the false report was root-caused to same-named driverless internal nets
-(e.g. the hardwired-zero register left undriven after constant folding)
-being treated as independent free variables on the two sides; tying them
-eliminates the artifact, and the remaining gap is solver capacity on a
-few deep cones (reported fail-closed). The structural fast path carries
-a bounded work budget per candidate, and two measured-negative
-acceptance experiments (fixpoint retry, signature-guided commutative
-input pairing) were cleanly reverted.
+(`tracks N`) that feeds the global router. Sequential equivalence is now
+open on the full RV32I gold-versus-mapped design and **passes**. The proof
+follows the scalable parts of Kepler Formal's LEC flow: normalize shared
+boundary variables, construct cached Boolean/CNF miters, solve with the
+industrial Kissat CDCL backend, and only decompose individual outputs when a
+miter is satisfiable. The Rust engine retains its sound correspondence-point
+induction for this reordered, technology-mapped netlist and adds the same
+Kissat revision used by Kepler as a vendored backend.
+
+The former full-netlist pre-encode was dead overhead and has been removed.
+Cone encoding now takes cut predicates, the inductive gate-side cut set is
+maintained incrementally, dense NetId sets avoid SipHash overhead, already
+discharged internal points are not replayed, and topological flop scheduling
+is computed once instead of walking every full cone. SAT contexts keep the
+in-tree incremental CDCL as a fallback but use Kissat first, including model
+extraction for CEGAR refinement.
+
+The full RV32I LEC profile reports `equivalent=true` with no counterexample:
+362/3128 directly named points, 8660 accepted correspondence points in
+total, and 2406 localized final miter queries. The enabled
+`rv32i_pdk_signoff_mmmc_pass` gate passes model correlation, LEC, two-corner
+timing, zero-DRC physical databases, and the complete `rv32i_` regression
+suite passes as well.
 
 The analog contribution includes:
 

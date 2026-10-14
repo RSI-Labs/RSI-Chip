@@ -767,6 +767,19 @@ pub fn timing_driven_report(result: &TimingDrivenCtsResult) -> String {
 mod tests {
     use super::*;
 
+    fn mapped(source: &str) -> Netlist {
+        let design = eda_hdl::compile(source, None).unwrap();
+        eda_synth::synthesize(
+            &design,
+            &eda_synth::SynthOptions {
+                optimize: true,
+                map_lib: true,
+            },
+        )
+        .unwrap()
+        .netlist
+    }
+
     #[test]
     fn rejects_branch_factor() {
         let design = eda_hdl::compile(
@@ -825,5 +838,109 @@ mod tests {
         );
         assert!(result.target_met);
         assert!(timing_driven_report(&result).contains("target MET"));
+    }
+
+    #[test]
+    fn balanced_tree_preserves_sequential_cells_and_bounds_fanout() {
+        let nl = mapped(
+            r#"
+module clocks(input clk, input [8:0] d, output reg [8:0] q);
+  always @(posedge clk) q <= d;
+endmodule
+"#,
+        );
+        let before = nl.stats().seq;
+        let result = synthesize(
+            &nl,
+            &CtsOptions {
+                branch_factor: 2,
+                wire_delay_ns_per_unit: 0.01,
+            },
+        )
+        .unwrap();
+        let tree = result.trees.first().unwrap();
+        assert_eq!(tree.sinks.len(), 9);
+        assert_eq!(tree.branch_factor, 2);
+        assert!(tree.max_fanout <= 2);
+        assert!(tree.levels >= 4);
+        assert!(result.buffers_inserted > 0);
+        assert_eq!(result.netlist.stats().seq, before);
+        assert!(tree.estimated_insertion_delay_ns.is_finite());
+        assert!(tree.estimated_skew_ns.is_finite());
+        assert!(report(&result).contains("CTS report"));
+    }
+
+    #[test]
+    fn separate_clock_roots_get_separate_trees() {
+        let nl = mapped(
+            r#"
+module two_domains(input clk_a, clk_b, a, b, output reg qa, qb);
+  always @(posedge clk_a) qa <= a;
+  always @(posedge clk_b) qb <= b;
+endmodule
+"#,
+        );
+        let result = synthesize(&nl, &CtsOptions::default()).unwrap();
+        assert_eq!(result.trees.len(), 2);
+        assert!(result
+            .trees
+            .iter()
+            .all(|tree| tree.sinks.len() == 1 && tree.domain.starts_with("clk")));
+    }
+
+    #[test]
+    fn placement_aware_cts_reports_legal_physical_view() {
+        let nl =
+            mapped("module m(input clk, d, output reg q); always @(posedge clk) q <= d; endmodule");
+        let placement = eda_pnr::place(&nl).unwrap();
+        let result = synthesize_with_placement(
+            &nl,
+            &placement,
+            &CtsOptions {
+                branch_factor: 4,
+                wire_delay_ns_per_unit: 0.02,
+            },
+        )
+        .unwrap();
+        assert!(result.physical_placement.is_some());
+        assert!(result.trees[0].placement_aware);
+        assert!(result.trees[0].estimated_physical_skew_ns.is_finite());
+        assert!(result.trees[0].estimated_wire_delay_ns.is_finite());
+    }
+
+    #[test]
+    fn rejects_invalid_cts_and_timing_options() {
+        assert!(CtsOptions::new(1, 0.01).is_err());
+        assert!(CtsOptions::new(17, 0.01).is_err());
+        assert!(CtsOptions::new(4, -0.01).is_err());
+        assert!(CtsOptions::new(4, f64::NAN).is_err());
+        assert!(TimingDrivenCtsOptions::new(1, 8, 0.01, 0.1).is_err());
+        assert!(TimingDrivenCtsOptions::new(4, 2, 0.01, 0.1).is_err());
+        assert!(TimingDrivenCtsOptions::new(2, 17, 0.01, 0.1).is_err());
+        assert!(TimingDrivenCtsOptions::new(2, 8, -0.01, 0.1).is_err());
+        assert!(TimingDrivenCtsOptions::new(2, 8, 0.01, -0.1).is_err());
+    }
+
+    #[test]
+    fn rejects_netlist_without_sequential_cells_and_mismatched_placement() {
+        let combinational = mapped("module m(input a, output y); assign y = ~a; endmodule");
+        assert_eq!(
+            synthesize(&combinational, &CtsOptions::default()).unwrap_err(),
+            "CTS requires at least one sequential cell"
+        );
+
+        let one_flop =
+            mapped("module m(input clk, d, output reg q); always @(posedge clk) q <= d; endmodule");
+        let two_flops = mapped(
+            r#"
+module m(input clk, d0, d1, output reg q0, q1);
+  always @(posedge clk) begin q0 <= d0; q1 <= d1; end
+endmodule
+"#,
+        );
+        let small_placement = eda_pnr::place(&one_flop).unwrap();
+        let error = synthesize_with_placement(&two_flops, &small_placement, &CtsOptions::default())
+            .unwrap_err();
+        assert!(error.contains("CTS placement has"), "{error}");
     }
 }

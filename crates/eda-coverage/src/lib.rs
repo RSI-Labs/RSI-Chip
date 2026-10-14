@@ -156,7 +156,72 @@ pub fn parse_coverage(source: &str) -> Result<CoveragePlan, String> {
     if plan.groups.is_empty() && plan.toggles.is_empty() {
         return Err("coverage plan is empty".into());
     }
+    validate_plan(&plan)?;
     Ok(plan)
+}
+
+fn validate_plan(plan: &CoveragePlan) -> Result<(), String> {
+    let mut group_names = std::collections::BTreeSet::new();
+    for group in &plan.groups {
+        if !group_names.insert(group.name.as_str()) {
+            return Err(format!("duplicate covergroup name '{}'", group.name));
+        }
+        if group.points.is_empty() {
+            return Err(format!("covergroup '{}' has no coverpoints", group.name));
+        }
+
+        let mut point_names = std::collections::BTreeSet::new();
+        for point in &group.points {
+            if !point_names.insert(point.name.as_str()) {
+                return Err(format!(
+                    "covergroup '{}' has duplicate coverpoint '{}'",
+                    group.name, point.name
+                ));
+            }
+            let mut bin_names = std::collections::BTreeSet::new();
+            for bin in &point.bins {
+                if !bin_names.insert(bin.name.as_str()) {
+                    return Err(format!(
+                        "coverpoint '{}' has duplicate bin '{}'",
+                        point.name, bin.name
+                    ));
+                }
+            }
+        }
+
+        let mut cross_names = std::collections::BTreeSet::new();
+        for cross in &group.crosses {
+            if !cross_names.insert(cross.name.as_str()) {
+                return Err(format!(
+                    "covergroup '{}' has duplicate cross '{}'",
+                    group.name, cross.name
+                ));
+            }
+            let mut referenced = std::collections::BTreeSet::new();
+            for point_name in &cross.points {
+                if !point_names.contains(point_name.as_str()) {
+                    return Err(format!(
+                        "cross '{}' references unknown coverpoint '{}'",
+                        cross.name, point_name
+                    ));
+                }
+                if !referenced.insert(point_name.as_str()) {
+                    return Err(format!(
+                        "cross '{}' repeats coverpoint '{}'",
+                        cross.name, point_name
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut toggle_names = std::collections::BTreeSet::new();
+    for toggle in &plan.toggles {
+        if !toggle_names.insert(toggle.name.as_str()) {
+            return Err(format!("duplicate toggle name '{}'", toggle.name));
+        }
+    }
+    Ok(())
 }
 
 pub fn check_coverage(vcd: &Vcd, plan: &CoveragePlan) -> Result<CoverageReport, String> {
@@ -784,7 +849,7 @@ b11 #
     }
 
     #[test]
-    fn parses_and_checks_bins_cross_toggle() {
+    fn posedge_plan_checks_bins_cross_toggle_and_percentage() {
         let plan = parse_coverage(
             r#"
 covergroup cg @(posedge clk);
@@ -806,7 +871,157 @@ toggle req;
         assert_eq!(result.bins.len(), 3);
         assert_eq!(result.crosses.len(), 2);
         assert_eq!(result.toggles[0].transitions, 3);
-        assert!(result.percentage > 0.0);
+        assert_eq!(
+            result
+                .bins
+                .iter()
+                .find(|bin| bin.point == "cp_req" && bin.bin == "asserted")
+                .unwrap()
+                .hits,
+            2
+        );
+        assert_eq!(
+            result
+                .bins
+                .iter()
+                .find(|bin| bin.point == "cp_state" && bin.bin == "low")
+                .unwrap()
+                .hits,
+            1
+        );
+        assert_eq!(
+            result
+                .bins
+                .iter()
+                .find(|bin| bin.point == "cp_state" && bin.bin == "high")
+                .unwrap()
+                .hits,
+            1
+        );
+        assert!(result.crosses.iter().all(|cross| cross.hits == 1));
+        assert!((result.percentage - 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn negedge_sampling_uses_only_falling_clock_times() {
+        let plan = parse_coverage(
+            r#"
+covergroup cg @(negedge clk);
+  cp_req: coverpoint req { bins asserted = {1}; }
+  cp_state: coverpoint state[1:0] {
+    bins low = {0,1};
+    bins high = {[2:3]};
+  }
+  x_all: cross cp_req, cp_state;
+endgroup
+"#,
+        )
+        .unwrap();
+        let result = check_coverage(&vcd(), &plan).unwrap();
+        assert_eq!(result.samples, 1);
+        assert_eq!(
+            result
+                .bins
+                .iter()
+                .find(|bin| bin.point == "cp_req")
+                .unwrap()
+                .hits,
+            0
+        );
+        assert_eq!(
+            result
+                .bins
+                .iter()
+                .find(|bin| bin.point == "cp_state" && bin.bin == "low")
+                .unwrap()
+                .hits,
+            1
+        );
+        assert!(result.crosses.iter().all(|cross| cross.hits == 0));
+    }
+
+    #[test]
+    fn parses_whole_bit_and_slice_signal_selectors() {
+        let plan = parse_coverage(
+            r#"
+covergroup selectors @(posedge clk);
+  whole: coverpoint req { bins one = {1}; }
+  bit0: coverpoint state[0] { bins one = {1}; }
+  slice: coverpoint state[1:0] { bins all = {[0:3]}; }
+endgroup
+"#,
+        )
+        .unwrap();
+        let group = &plan.groups[0];
+        assert_eq!(group.points[0].signal, SignalSelect::Whole("req".into()));
+        assert_eq!(
+            group.points[1].signal,
+            SignalSelect::Bit {
+                name: "state".into(),
+                index: 0
+            }
+        );
+        assert_eq!(
+            group.points[2].signal,
+            SignalSelect::Slice {
+                name: "state".into(),
+                msb: 1,
+                lsb: 0
+            }
+        );
+        assert_eq!(group.clock.as_deref(), Some("clk"));
+        assert_eq!(group.edge, Some(Edge::Pos));
+    }
+
+    #[test]
+    fn multi_value_bins_count_each_matching_sample_once() {
+        let plan = parse_coverage(
+            r#"
+covergroup cg @(posedge clk);
+  cp: coverpoint state[1:0] { bins odd = {1, 3}; }
+endgroup
+"#,
+        )
+        .unwrap();
+        let result = check_coverage(&vcd(), &plan).unwrap();
+        assert_eq!(result.bins.len(), 1);
+        assert_eq!(result.bins[0].hits, 2);
+    }
+
+    #[test]
+    fn reports_bin_cross_and_toggle_lines() {
+        let plan = parse_coverage(
+            "covergroup g; cp: coverpoint req { bins one = {1}; } endgroup toggle req;",
+        )
+        .unwrap();
+        let result = check_coverage(&vcd(), &plan).unwrap();
+        let text = report(&result);
+        assert!(text.contains("Coverage report:"), "{text}");
+        assert!(text.contains("BIN g.cp.one"), "{text}");
+        assert!(
+            text.contains("TOGGLE req transitions=3 samples=4"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn missing_signal_and_missing_clock_fail_closed() {
+        let plan =
+            parse_coverage("covergroup g; cp: coverpoint missing { bins x = {0}; } endgroup")
+                .unwrap();
+        assert_eq!(
+            check_coverage(&vcd(), &plan).unwrap_err(),
+            "coverage signal 'missing' not found"
+        );
+
+        let plan = parse_coverage(
+            "covergroup g @(posedge missing_clk); cp: coverpoint req { bins x = {0}; } endgroup",
+        )
+        .unwrap();
+        assert_eq!(
+            check_coverage(&vcd(), &plan).unwrap_err(),
+            "coverage clock 'missing_clk' not found"
+        );
     }
 
     #[test]
@@ -815,9 +1030,40 @@ toggle req;
             parse_coverage("covergroup g; cp: coverpoint a { bins x = {[2:1]}; } endgroup;")
                 .is_err()
         );
-        assert!(parse_coverage(
-            "covergroup g; cp: coverpoint a { bins x = {0}; } x: cross cp, missing; endgroup;"
+        let error = parse_coverage(
+            "covergroup g; cp: coverpoint a { bins x = {0}; } x: cross cp, missing; endgroup;",
         )
-        .is_ok());
+        .unwrap_err();
+        assert!(error.contains("unknown coverpoint 'missing'"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_and_empty_plan_objects() {
+        assert!(parse_coverage("covergroup g; endgroup;")
+            .unwrap_err()
+            .contains("no coverpoints"));
+        assert!(parse_coverage("")
+            .unwrap_err()
+            .contains("coverage plan is empty"));
+        assert!(parse_coverage(
+            "covergroup g; cp: coverpoint a { bins x = {0}; bins x = {1}; } endgroup;"
+        )
+        .unwrap_err()
+        .contains("duplicate bin"));
+        assert!(
+            parse_coverage(
+                "covergroup g; cp: coverpoint a { bins x = {0}; } cp: coverpoint b { bins x = {0}; } endgroup;"
+            )
+            .unwrap_err()
+            .contains("duplicate coverpoint")
+        );
+        assert!(parse_coverage(
+            "covergroup g; cp: coverpoint a { bins x = {0}; } x: cross cp, cp; endgroup;"
+        )
+        .unwrap_err()
+        .contains("repeats coverpoint"));
+        assert!(parse_coverage("toggle req; toggle req;")
+            .unwrap_err()
+            .contains("duplicate toggle"));
     }
 }

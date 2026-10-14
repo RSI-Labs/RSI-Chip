@@ -160,16 +160,16 @@ impl<'a> NetlistEncoder<'a> {
     /// Encode the combinational cone feeding `sink_net`; primary inputs and
     /// flop outputs act as free variables. Returns the sink literal.
     pub fn enc_cone(&mut self, sink: NetId) -> Result<i32, String> {
-        self.enc_cone_with_cuts(sink, &std::collections::HashSet::new())
+        self.enc_cone_with_cuts(sink, |_| false)
     }
 
     /// Encode the combinational cone of `sink`, stopping descent at any net
     /// in `cuts` (those nets become free variables to be tied by the caller).
     /// This is the LEC correspondence-point mechanism: each query stays local.
-    pub fn enc_cone_with_cuts(
+    pub fn enc_cone_with_cuts<F: Fn(&NetId) -> bool>(
         &mut self,
         sink: NetId,
-        cuts: &std::collections::HashSet<NetId>,
+        cuts: F,
     ) -> Result<i32, String> {
         // Iterative depth-first topological encoding. Pushing a parent above
         // its not-yet-visited children made the former work stack regrow on
@@ -213,7 +213,7 @@ impl<'a> NetlistEncoder<'a> {
                                 })
                                 .unwrap_or(false)
                         });
-                        if drivers.is_empty() || sequential_boundary || cuts.contains(&n) {
+                        if drivers.is_empty() || sequential_boundary || cuts(&n) {
                             // Primary inputs and flip-flop Q pins are free
                             // variables. Do not traverse a sequential cell's D
                             // cone: that edge belongs to the next time frame.

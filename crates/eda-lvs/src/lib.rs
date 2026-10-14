@@ -32,6 +32,8 @@ pub struct LvsResult {
 }
 
 pub fn check_lvs(reference: &Netlist, layout: &Netlist) -> Result<LvsResult, String> {
+    validate_lvs_netlist(reference, "reference")?;
+    validate_lvs_netlist(layout, "layout")?;
     let mut notes = Vec::new();
     let mut result = LvsResult {
         matches: true,
@@ -108,6 +110,45 @@ pub fn check_lvs(reference: &Netlist, layout: &Netlist) -> Result<LvsResult, Str
     result.net_matches = map_nets(reference, layout, &reference_sigs.nets, &layout_sigs.nets);
     result.notes = notes;
     Ok(result)
+}
+
+fn validate_lvs_netlist(nl: &Netlist, side: &str) -> Result<(), String> {
+    let mut port_names = BTreeSet::new();
+    for port in &nl.ports {
+        if port.name.trim().is_empty() {
+            return Err(format!("{side} netlist has an empty port name"));
+        }
+        if !port_names.insert(port.name.as_str()) {
+            return Err(format!(
+                "{side} netlist has duplicate port name '{}'",
+                port.name
+            ));
+        }
+    }
+    let mut net_names = BTreeSet::new();
+    for ni in 0..nl.net_count() {
+        let name = nl.net(ni).name.as_str();
+        if name.trim().is_empty() {
+            return Err(format!("{side} netlist has an empty net name"));
+        }
+        if !net_names.insert(name) {
+            return Err(format!("{side} netlist has duplicate net name '{name}'"));
+        }
+    }
+    let mut cell_names = BTreeSet::new();
+    for ci in 0..nl.cell_count() {
+        let name = nl.cell(ci).name.as_str();
+        if name.trim().is_empty() {
+            return Err(format!("{side} netlist has an empty cell name"));
+        }
+        if !cell_names.insert(name) {
+            return Err(format!("{side} netlist has duplicate cell name '{name}'"));
+        }
+    }
+    if nl.topo_cells().is_none() {
+        return Err(format!("{side} netlist contains a combinational cycle"));
+    }
+    Ok(())
 }
 
 /// Human-readable LVS/ERC summary.
@@ -489,6 +530,29 @@ mod tests {
         nl
     }
 
+    fn sequential_netlist_with_clock(name: &str, clock_name: &str) -> Netlist {
+        let lib = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new(name);
+        nl.set_library(lib.clone());
+        let clk = nl.add_net(clock_name);
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u_dff".into(),
+            kind: CellKind::Lib(lib.find("DFF").unwrap()),
+            inputs: vec![clk, d],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("q", Dir::Out, vec![q]);
+        nl
+    }
+
+    fn sequential_netlist(name: &str) -> Netlist {
+        sequential_netlist_with_clock(name, "clk")
+    }
+
     #[test]
     fn renamed_instances_and_internal_nets_match() {
         let reference = and_netlist("ref");
@@ -537,5 +601,158 @@ mod tests {
         assert!(!r.matches);
         assert_eq!(r.open_nets.len(), 2);
         assert!(r.open_nets.iter().all(|open| open.contains("floating")));
+    }
+
+    #[test]
+    fn exact_cell_net_and_report_mappings_are_returned() {
+        let reference = and_netlist("ref");
+        let mut layout = and_netlist("layout");
+        layout.cells_mut()[0].name = "layout_and".into();
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(result.matches, "{:?}", result.notes);
+        assert_eq!(
+            result.cell_matches,
+            vec![LvsCellMatch {
+                reference_cell: "u1".into(),
+                layout_cell: "layout_and".into(),
+                device_type: "LIB:AND2:COMB".into(),
+            }]
+        );
+        assert_eq!(result.net_matches.len(), 3);
+        assert!(result
+            .net_matches
+            .iter()
+            .any(|match_item| match_item.reference_net == "a" && match_item.layout_net == "a"));
+        let text = report(&result);
+        assert!(text.contains("LVS report: MATCH"), "{text}");
+        assert!(text.contains("matched devices : 1"), "{text}");
+    }
+
+    #[test]
+    fn port_count_name_direction_and_width_mismatches_are_reported() {
+        let reference = and_netlist("ref");
+        let mut layout = and_netlist("layout");
+        layout.ports.pop();
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result.notes[0].contains("port count differs"));
+
+        let mut layout = and_netlist("layout");
+        layout.ports[1].name = "changed".into();
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result.notes[0].contains("layout has no port 'b'"));
+
+        let mut layout = and_netlist("layout");
+        layout.ports[0].dir = Dir::Out;
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result.notes[0].contains("direction differs"));
+
+        let mut layout = and_netlist("layout");
+        let extra = layout.add_net("extra_a");
+        layout.ports[0].bits.push(extra);
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result.notes[0].contains("width differs"));
+    }
+
+    #[test]
+    fn connectivity_and_pin_role_changes_are_mismatches() {
+        let reference = and_netlist("ref");
+        let mut layout = and_netlist("layout");
+        let a = layout.net_by_name("a").unwrap();
+        layout.cells_mut()[0].inputs[1] = a;
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result
+            .notes
+            .iter()
+            .any(|note| note.contains("structural connectivity signatures differ")));
+    }
+
+    #[test]
+    fn sequential_boundary_and_renamed_clock_net_match() {
+        let reference = sequential_netlist("ref");
+        let layout = sequential_netlist_with_clock("layout", "layout_clk");
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(result.matches, "{:?}", result.notes);
+        assert_eq!(result.cell_matches.len(), 1);
+        assert_eq!(result.cell_matches[0].device_type, "LIB:DFF:SEQ");
+    }
+
+    #[test]
+    fn unloaded_input_and_undriven_output_ports_are_reported() {
+        let mut reference = and_netlist("open_ports");
+        let a = reference.net_by_name("a").unwrap();
+        let hidden = reference.add_net("hidden_driver");
+        let mut cell = reference.cell(0).clone();
+        cell.inputs[1] = a;
+        cell.output = hidden;
+        reference.replace_cell(0, cell);
+        let layout = reference.clone();
+        let result = check_lvs(&reference, &layout).unwrap();
+        assert!(!result.matches);
+        assert!(result
+            .open_nets
+            .iter()
+            .any(|open| open.contains("b[0] input port is unloaded")));
+        assert!(result
+            .open_nets
+            .iter()
+            .any(|open| open.contains("y[0] output port is undriven")));
+    }
+
+    #[test]
+    fn rejects_duplicate_names_and_combinational_cycles() {
+        let mut duplicate_port = and_netlist("duplicate_port");
+        let a = duplicate_port.net_by_name("a").unwrap();
+        duplicate_port.add_port("a", Dir::In, vec![a]);
+        assert_eq!(
+            check_lvs(&duplicate_port, &duplicate_port).unwrap_err(),
+            "reference netlist has duplicate port name 'a'"
+        );
+
+        let mut duplicate_net = and_netlist("duplicate_net");
+        let y = duplicate_net.net_by_name("y").unwrap();
+        let duplicate_y = duplicate_net.add_net("y");
+        let _ = (y, duplicate_y);
+        assert!(check_lvs(&duplicate_net, &duplicate_net)
+            .unwrap_err()
+            .contains("duplicate net name"));
+
+        let mut duplicate_cell = and_netlist("duplicate_cell");
+        let a = duplicate_cell.net_by_name("a").unwrap();
+        let b = duplicate_cell.net_by_name("b").unwrap();
+        let y = duplicate_cell.net_by_name("y").unwrap();
+        duplicate_cell.add_cell(Cell {
+            name: "u1".into(),
+            kind: CellKind::And,
+            inputs: vec![a, b],
+            output: y,
+        });
+        assert!(check_lvs(&duplicate_cell, &duplicate_cell)
+            .unwrap_err()
+            .contains("duplicate cell name"));
+
+        let mut cyclic = Netlist::new("cyclic");
+        let n1 = cyclic.add_net("n1");
+        let n2 = cyclic.add_net("n2");
+        cyclic.add_cell(Cell {
+            name: "inv1".into(),
+            kind: CellKind::Not,
+            inputs: vec![n1],
+            output: n2,
+        });
+        cyclic.add_cell(Cell {
+            name: "inv2".into(),
+            kind: CellKind::Not,
+            inputs: vec![n2],
+            output: n1,
+        });
+        assert_eq!(
+            check_lvs(&cyclic, &cyclic).unwrap_err(),
+            "reference netlist contains a combinational cycle"
+        );
     }
 }

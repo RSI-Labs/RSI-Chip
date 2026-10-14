@@ -10,6 +10,7 @@ use eda_core::netlist::{CellKind, Netlist};
 use std::collections::HashMap;
 
 pub mod any_angle;
+pub mod any_angle_maze;
 pub mod any_angle_route;
 pub mod layout;
 pub mod layout_browser;
@@ -335,6 +336,30 @@ impl RouteOptions {
 pub enum DrcSeverity {
     Warning,
     Error,
+}
+
+/// Physical verification options.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrcOptions {
+    /// Maximum routed wirelength per physical pin before an antenna warning.
+    pub max_antenna_ratio: f64,
+}
+
+impl Default for DrcOptions {
+    fn default() -> Self {
+        Self {
+            max_antenna_ratio: MAX_ANTENNA_RATIO,
+        }
+    }
+}
+
+impl DrcOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.max_antenna_ratio.is_finite() || self.max_antenna_ratio <= 0.0 {
+            return Err("maximum antenna ratio must be finite and positive".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2226,6 +2251,17 @@ pub fn routing_report(r: &Routing) -> String {
 /// channels, cross-net shorts, and disconnected multi-pin nets. Warnings
 /// cover conservative antenna-ratio violations.
 pub fn drc(nl: &Netlist, p: &Placement, r: &Routing) -> Result<DrcResult, String> {
+    drc_with_options(nl, p, r, &DrcOptions::default())
+}
+
+/// Run placement/routing DRC with an explicit foundry antenna-ratio rule.
+pub fn drc_with_options(
+    nl: &Netlist,
+    p: &Placement,
+    r: &Routing,
+    options: &DrcOptions,
+) -> Result<DrcResult, String> {
+    options.validate()?;
     let mut out = DrcResult::default();
 
     if p.cell_width.len() != nl.cell_count() || p.cell_pos.len() != nl.cell_count() {
@@ -2370,7 +2406,7 @@ pub fn drc(nl: &Netlist, p: &Placement, r: &Routing) -> Result<DrcResult, String
 
         let pin_count = pins.len().max(1);
         let ratio = segments.iter().map(Segment::length).sum::<usize>() as f64 / pin_count as f64;
-        if ratio > MAX_ANTENNA_RATIO {
+        if ratio > options.max_antenna_ratio {
             out.violations.push(DrcViolation {
                 code: "ANT-001".into(),
                 severity: DrcSeverity::Warning,
@@ -2378,7 +2414,7 @@ pub fn drc(nl: &Netlist, p: &Placement, r: &Routing) -> Result<DrcResult, String
                     "net '{}' antenna ratio {:.2} exceeds {:.2}",
                     nl.net(ni).name,
                     ratio,
-                    MAX_ANTENNA_RATIO
+                    options.max_antenna_ratio
                 ),
                 cell: None,
                 net: Some(ni),
@@ -3029,6 +3065,25 @@ mod tests {
         let routing = route(&nl, &placement).unwrap();
         let result = drc(&nl, &placement, &routing).unwrap();
         assert!(!result.has_errors(), "{}", drc_report(&result));
+
+        let strict = DrcOptions {
+            max_antenna_ratio: 0.001,
+        };
+        let strict_result = drc_with_options(&nl, &placement, &routing, &strict).unwrap();
+        assert!(strict_result
+            .violations
+            .iter()
+            .any(|violation| violation.code == "ANT-001"
+                && violation.message.contains("exceeds 0.00")));
+        assert!(drc_with_options(
+            &nl,
+            &placement,
+            &routing,
+            &DrcOptions {
+                max_antenna_ratio: 0.0,
+            }
+        )
+        .is_err());
     }
 
     #[test]

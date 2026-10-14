@@ -40,7 +40,7 @@ pub use constraints::{
     ConstrainedHoldTimingPath, ConstrainedResetTimingPath, ConstrainedTiming,
     ConstrainedTimingPath, DisabledTimingArc, ExcludedTimingCheck, ExcludedTimingPath,
     MinPulsePolarity, MinPulseWidthCheck, NetSlack, PathDelayLimit, PathException, PortDelay,
-    ResetCheckKind, ScopedCellTimingDerate, ScopedPinTimingDerate, TimingClockEdge,
+    ResetCheckKind, ScopedCellTimingDerate, ScopedPinTimingDerate, SdcUnits, TimingClockEdge,
     TimingClockEdgeKind, TimingConstraintDiff, TimingConstraints, TimingDerate, TimingObjectKind,
     TimingObjectPattern, TimingObjectPatternToken, TimingObjectRef, TimingPathClocks, TimingPin,
 };

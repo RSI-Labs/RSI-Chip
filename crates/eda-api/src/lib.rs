@@ -16,12 +16,13 @@ pub use pdk::*;
 
 pub use eda_ams::{
     ac_sweep as sweep_ac, aging_analysis, constrained_pareto_dominates, constraint_violation,
-    dc_operating_point, dc_sweep, derivative_analysis, envelope_follow, global_sensitivity,
-    global_sensitivity_cancellable, monte_carlo, monte_carlo_cancellable, noise_sweep, optimize,
-    optimize_cancellable, pareto_dominates, pareto_optimize, pareto_optimize_cancellable,
-    parse_resistor_layer_models, parse_statistical_model, periodic_steady_state,
-    periodic_steady_state_cancellable, reference_direction_count, report as report_ams_result,
-    run_all as run_all_ams_analyses, run_analysis as run_ams_analysis, sensitivity,
+    dc_operating_point, dc_operating_point_cancellable, dc_sweep, dc_sweep_cancellable,
+    derivative_analysis, envelope_follow, global_sensitivity, global_sensitivity_cancellable,
+    monte_carlo, monte_carlo_cancellable, noise_sweep, optimize, optimize_cancellable,
+    pareto_dominates, pareto_optimize, pareto_optimize_cancellable, parse_resistor_layer_models,
+    parse_statistical_model, periodic_steady_state, periodic_steady_state_cancellable,
+    reference_direction_count, report as report_ams_result, run_all as run_all_ams_analyses,
+    run_analysis as run_ams_analysis, sensitivity,
     threshold_crossings as analog_threshold_crossings, transient, transient_cancellable,
     write_resistor_layer_models, write_statistical_model, write_transient_csv, AgingOptions,
     AgingResult, AmsResult, Analysis, BjtModel, BjtPolarity, ConstraintExpression,
@@ -103,7 +104,15 @@ pub use eda_ir::{
     UpfPowerModeIr, UpfPowerModeIrResult,
 };
 pub use eda_lvs::{check_lvs as check_layout_vs_schematic, report as lvs_report, LvsResult};
-pub use eda_pnr::any_angle::{AnyAnglePolygon, AnyAngleSpacingResult, RationalSquare};
+pub use eda_pnr::any_angle::{
+    any_angle_boolean, AnyAngleBooleanOperation, AnyAngleBooleanResult, AnyAnglePolygon,
+    AnyAngleRationalPoint, AnyAngleRationalPolygon, AnyAngleSpacingResult, RationalSquare,
+};
+pub use eda_pnr::any_angle_maze::{
+    route_any_angle_maze, route_any_angle_maze_cancellable, route_any_angle_maze_ripgup,
+    route_any_angle_maze_ripgup_cancellable, AnyAngleMazeRipupResult, AnyAngleMazeRoute,
+    AnyAngleMazeRouting, AnyAngleMazeRoutingOptions, AnyAngleRouteConflict,
+};
 pub use eda_pnr::any_angle_route::{
     route_any_angle_direct, AnyAngleRoute, AnyAngleRouteRequest, AnyAngleRouting,
     AnyAngleRoutingOptions,
@@ -122,7 +131,7 @@ pub use eda_pnr::{
     Def, DefComponent, DefPlacementBlockage, DefRouteBlockage, DefVia, PlacementBlockage,
     RouteChannelBlockage, RouteOptions, Via, SITES_PER_ROW,
 };
-pub use eda_pnr::{DrcResult, DrcSeverity, Routing};
+pub use eda_pnr::{DrcOptions, DrcResult, DrcSeverity, Routing};
 pub use eda_pnr::{LayoutBrowserServer, LayoutBrowserService};
 pub use eda_power::report as power_report;
 pub use eda_power::{CellPower, InputVector, PowerOptions, PowerReport, SwitchingActivity};
@@ -153,7 +162,7 @@ pub use eda_sta::{
     MinPulseWidthCheck, MultiCornerScenarioSetDiff, MultiCornerScenarioUpdate,
     MultiCornerScenarioUpdateKind, MultiCornerTimingResult, NetSlack, PathDelayLimit,
     PathException, PortDelay, ResetCheckKind, ResetEndpoint, ResetTimingPaths,
-    ScopedCellTimingDerate, ScopedPinTimingDerate, StaResult, TimingArc, TimingArcKind,
+    ScopedCellTimingDerate, ScopedPinTimingDerate, SdcUnits, StaResult, TimingArc, TimingArcKind,
     TimingClockEdge, TimingClockEdgeKind, TimingConstraintDiff, TimingConstraints, TimingDerate,
     TimingLaunch, TimingObjectKind, TimingObjectPattern, TimingObjectPatternToken, TimingObjectRef,
     TimingPath, TimingPathClocks, TimingPathEndpoint, TimingPathKind, TimingPin, TimingScenario,
@@ -202,6 +211,14 @@ pub fn run_ams_analysis_cancellable(
     cancellation: &FlowCancellation,
 ) -> Result<AmsResult, String> {
     match analysis {
+        Analysis::OperatingPoint => Ok(AmsResult::OperatingPoint(
+            eda_ams::dc_operating_point_cancellable(circuit, cancellation)?,
+        )),
+        Analysis::DcSweep { .. } => Ok(AmsResult::DcSweep(eda_ams::dc_sweep_cancellable(
+            circuit,
+            analysis,
+            cancellation,
+        )?)),
         Analysis::Transient { .. } => Ok(AmsResult::Transient(eda_ams::transient_cancellable(
             circuit,
             analysis,
@@ -383,9 +400,31 @@ mod cancellation_tests {
     }
 
     #[test]
-    fn ams_optimizer_dispatch_is_cancellable() {
+    fn ams_directives_dispatch_cancellably() {
         let cancellation = FlowCancellation::new();
         cancellation.cancel();
+        let operating_point =
+            parse_spice("cancelled op\nVin in 0 1.8\nR1 in out 1k\nR2 out 0 1k\n.op\n.end")
+                .unwrap();
+        assert_eq!(
+            run_ams_analysis_cancellable(
+                &operating_point,
+                &operating_point.analyses[0],
+                &cancellation
+            )
+            .unwrap_err(),
+            "DC/transient solve cancelled"
+        );
+
+        let sweep = parse_spice(
+            "cancelled dc sweep\nVin in 0 1.8\nR1 in out 1k\nR2 out 0 1k\n.dc Vin 0 1.8 0.1\n.end",
+        )
+        .unwrap();
+        assert_eq!(
+            run_ams_analysis_cancellable(&sweep, &sweep.analyses[0], &cancellation).unwrap_err(),
+            "DC sweep cancelled"
+        );
+
         let circuit = parse_spice(
             "cancelled optimizer\nVin in 0 1.8\nR1 in out 1k\nR2 out 0 1k\n.optim match V(out) goal=1.2 params=R2.R:100:5000 population=8 iterations=2 seed=17 tol=1e-8\n.end",
         )
@@ -448,6 +487,54 @@ mod cancellation_tests {
         cancellation.cancel();
         let error = implement_rtl_pnr_cancellable(source, Some("top"), &cancellation).unwrap_err();
         assert_eq!(error, "RTL PnR cancelled");
+
+        let strict = DrcOptions {
+            max_antenna_ratio: 0.001,
+        };
+        let strict_result =
+            implement_rtl_pnr_with_drc_options(source, Some("top"), &strict).unwrap();
+        assert!(strict_result.drc.has_warnings());
+        assert!(strict_result
+            .drc
+            .violations
+            .iter()
+            .any(|violation| violation.code == "ANT-001"));
+        assert!(implement_rtl_pnr_with_drc_options(
+            source,
+            Some("top"),
+            &DrcOptions {
+                max_antenna_ratio: f64::NAN,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rtl_antenna_repair_is_structured_and_cancellable() {
+        let source = "module top(input a, b, output y); assign y = a & b; endmodule";
+        let options = AntennaRepairOptions::default();
+        let result = repair_rtl_antennas(source, Some("top"), &options).unwrap();
+        assert!(!result.baseline_drc.has_errors());
+        assert_eq!(result.repair.diodes_inserted, 0);
+        assert!(result.repair.all_antennas_repaired);
+        assert!(result.final_mapped_stats.lib_cells > 0);
+
+        let cancellation = FlowCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            repair_rtl_antennas_cancellable(source, Some("top"), &options, &cancellation)
+                .unwrap_err(),
+            "RTL antenna repair cancelled"
+        );
+        assert!(repair_rtl_antennas(
+            source,
+            Some("top"),
+            &AntennaRepairOptions {
+                patch_name: " ".into(),
+                ..AntennaRepairOptions::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -1506,6 +1593,14 @@ pub fn implement_rtl_pnr(src: &str, top: Option<&str>) -> Result<RtlPnrResult, S
     implement_rtl_pnr_cancellable(src, top, &FlowCancellation::new())
 }
 
+pub fn implement_rtl_pnr_with_drc_options(
+    src: &str,
+    top: Option<&str>,
+    drc_options: &DrcOptions,
+) -> Result<RtlPnrResult, String> {
+    implement_rtl_pnr_with_drc_options_cancellable(src, top, drc_options, &FlowCancellation::new())
+}
+
 /// Standalone RTL PnR with cooperative checks between major stages.
 pub fn implement_rtl_pnr_cancellable(
     src: &str,
@@ -1539,6 +1634,58 @@ pub fn implement_rtl_pnr_cancellable(
         return Err("RTL PnR cancelled".into());
     }
     let drc = eda_pnr::drc(&netlist, &placement, &routing)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let lef = eda_pnr::write_lef(&netlist, &placement)?;
+    let def = eda_pnr::write_def(&netlist, &placement, &routing)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    Ok(RtlPnrResult {
+        mapped_stats: netlist.stats(),
+        placement,
+        routing,
+        drc,
+        lef,
+        def,
+    })
+}
+
+/// Standalone RTL PnR with a foundry-specific physical verification rule.
+pub fn implement_rtl_pnr_with_drc_options_cancellable(
+    src: &str,
+    top: Option<&str>,
+    drc_options: &DrcOptions,
+    cancellation: &FlowCancellation,
+) -> Result<RtlPnrResult, String> {
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let design = compile(src, top)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let netlist =
+        eda_synth::synthesize_with_library(&design, &SynthOptions::default(), &CellLibrary::std())?
+            .netlist;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let placement = eda_pnr::place(&netlist)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let routing = eda_pnr::route_with_options_cancellable(
+        &netlist,
+        &placement,
+        &RouteOptions::default(),
+        cancellation,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err("RTL PnR cancelled".into());
+    }
+    let drc = physical_verification_with_options(&netlist, &placement, &routing, drc_options)?;
     if cancellation.is_cancelled() {
         return Err("RTL PnR cancelled".into());
     }
@@ -5306,6 +5453,16 @@ pub fn physical_verification(
     eda_pnr::drc(nl, placement, routing)
 }
 
+/// Physical verification with a foundry-specific maximum antenna ratio.
+pub fn physical_verification_with_options(
+    nl: &Netlist,
+    placement: &Placement,
+    routing: &Routing,
+    options: &DrcOptions,
+) -> Result<DrcResult, String> {
+    eda_pnr::drc_with_options(nl, placement, routing, options)
+}
+
 /// Options for automatic antenna-ratio repair.
 #[derive(Clone, Debug)]
 pub struct AntennaRepairOptions {
@@ -5355,6 +5512,75 @@ pub struct AntennaRepairResult {
     pub diodes_inserted: usize,
     pub antenna_warnings: usize,
     pub all_antennas_repaired: bool,
+}
+
+/// End-to-end RTL physical-implementation antenna repair result.
+#[derive(Clone, Debug)]
+pub struct RtlAntennaRepairResult {
+    pub baseline_drc: DrcResult,
+    pub repair: AntennaRepairResult,
+    pub final_mapped_stats: NetlistStats,
+}
+
+/// Compile RTL, place/route it, verify antenna ratios, and insert physical DIODEs.
+pub fn repair_rtl_antennas(
+    src: &str,
+    top: Option<&str>,
+    options: &AntennaRepairOptions,
+) -> Result<RtlAntennaRepairResult, String> {
+    repair_rtl_antennas_cancellable(src, top, options, &FlowCancellation::new())
+}
+
+pub fn repair_rtl_antennas_cancellable(
+    src: &str,
+    top: Option<&str>,
+    options: &AntennaRepairOptions,
+    cancellation: &FlowCancellation,
+) -> Result<RtlAntennaRepairResult, String> {
+    options.validate()?;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let design = compile(src, top)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let netlist =
+        eda_synth::synthesize_with_library(&design, &SynthOptions::default(), &CellLibrary::std())?
+            .netlist;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let placement = eda_pnr::place(&netlist)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let routing = eda_pnr::route_maze_with_options_cancellable(
+        &netlist,
+        &placement,
+        &options.route,
+        cancellation,
+    )?;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let baseline_drc = physical_verification(&netlist, &placement, &routing)?;
+    if baseline_drc.has_errors() {
+        return Err(format!(
+            "RTL antenna repair requires an error-free route: {}",
+            eda_pnr::drc_report(&baseline_drc)
+        ));
+    }
+    let repair = repair_antennas(&netlist, &placement, &routing, options)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL antenna repair cancelled".into());
+    }
+    let final_mapped_stats = repair.netlist.stats();
+    Ok(RtlAntennaRepairResult {
+        baseline_drc,
+        repair,
+        final_mapped_stats,
+    })
 }
 
 /// Repair conservative antenna-ratio warnings with physical DIODE loads.

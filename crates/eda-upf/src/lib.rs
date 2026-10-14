@@ -194,9 +194,19 @@ fn apply_command(upf: &mut Upf, command: &str, args: &[Token], line: usize) -> R
         }
         "create_power_domain" => {
             let name = arg_word(args, 0, line)?;
+            let elements = opt_list(args, "-elements");
+            let mut unique_elements = BTreeSet::new();
+            for element in &elements {
+                if !unique_elements.insert(element.as_str()) {
+                    return Err(format!(
+                        "line {}: power domain '{}' repeats element '{}'",
+                        line, name, element
+                    ));
+                }
+            }
             let domain = PowerDomain {
                 name: name.clone(),
-                elements: opt_list(args, "-elements"),
+                elements,
                 ..Default::default()
             };
             if upf.domains.insert(name.clone(), domain).is_some() {
@@ -208,10 +218,19 @@ fn apply_command(upf: &mut Upf, command: &str, args: &[Token], line: usize) -> R
             let name = arg_word(args, 0, line)?;
             let domain = option_word(args, "-domain")
                 .ok_or_else(|| format!("line {}: supply port requires -domain", line))?;
+            let direction = option_word(args, "-direction");
+            if let Some(direction) = &direction {
+                if !matches!(direction.as_str(), "in" | "out" | "inout") {
+                    return Err(format!(
+                        "line {}: supply port direction must be in, out, or inout",
+                        line
+                    ));
+                }
+            }
             let port = SupplyPort {
                 name: name.clone(),
                 domain,
-                direction: option_word(args, "-direction"),
+                direction,
             };
             if upf.supply_ports.insert(name.clone(), port).is_some() {
                 return Err(format!("line {}: duplicate supply port '{}'", line, name));
@@ -666,6 +685,14 @@ pub fn check(design: &Design, upf: &Upf) -> UpfResult {
                         domain.name, net
                     ),
                 ));
+            } else if upf.supply_nets[&net].domain != domain.name {
+                findings.push(error(
+                    "UPF-DOMAIN",
+                    format!(
+                        "domain '{}' primary supply '{}' belongs to domain '{}'",
+                        domain.name, net, upf.supply_nets[&net].domain
+                    ),
+                ));
             }
         }
     }
@@ -699,7 +726,36 @@ pub fn check(design: &Design, upf: &Upf) -> UpfResult {
                         net.name, connected
                     ),
                 ));
+            } else if upf.supply_ports[connected].domain != net.domain {
+                findings.push(error(
+                    "UPF-DOMAIN",
+                    format!(
+                        "supply net '{}' in domain '{}' connects port '{}' in domain '{}'",
+                        net.name, net.domain, connected, upf.supply_ports[connected].domain
+                    ),
+                ));
             }
+        }
+    }
+    let mut nets_by_connected_port: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for net in upf.supply_nets.values() {
+        for connected in &net.connected_ports {
+            nets_by_connected_port
+                .entry(connected.as_str())
+                .or_default()
+                .push(net.name.as_str());
+        }
+    }
+    for (port, nets) in nets_by_connected_port {
+        if nets.len() > 1 {
+            findings.push(error(
+                "UPF-PORT",
+                format!(
+                    "supply port '{}' connects multiple supply nets: {}",
+                    port,
+                    nets.join(",")
+                ),
+            ));
         }
     }
     for switch in upf.switches.values() {
@@ -719,6 +775,14 @@ pub fn check(design: &Design, upf: &Upf) -> UpfResult {
                     format!(
                         "switch '{}' references unknown supply net '{}'",
                         switch.name, net
+                    ),
+                ));
+            } else if upf.supply_nets[net].domain != switch.domain {
+                findings.push(error(
+                    "UPF-DOMAIN",
+                    format!(
+                        "switch '{}' in domain '{}' uses supply '{}' in domain '{}'",
+                        switch.name, switch.domain, net, upf.supply_nets[net].domain
                     ),
                 ));
             }
@@ -1075,7 +1139,8 @@ fn opt_list(args: &[Token], option: &str) -> Vec<String> {
 
 pub fn report(result: &UpfResult) -> String {
     let mut out = format!(
-        "UPF report: {} domain(s), {} supply net(s), {} switch(es), {} power mode(s), {} isolation(s), {} retention(s), {} level shifter(s), {} error(s)\n",
+        "UPF report: {} - {} domain(s), {} supply net(s), {} switch(es), {} power mode(s), {} isolation(s), {} retention(s), {} level shifter(s), {} error(s)\n",
+        if result.has_errors() { "FAIL" } else { "PASS" },
         result.domain_count,
         result.supply_net_count,
         result.switch_count,
@@ -1101,6 +1166,62 @@ pub fn report(result: &UpfResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eda_core::ir::{Dir, NetDecl, PortDecl};
+
+    fn design() -> Design {
+        let net_decls = vec![
+            NetDecl {
+                name: "a".into(),
+                width: 1,
+                is_reg: false,
+                is_signed: false,
+                base: 0,
+            },
+            NetDecl {
+                name: "q".into(),
+                width: 1,
+                is_reg: true,
+                is_signed: false,
+                base: 1,
+            },
+            NetDecl {
+                name: "sleep".into(),
+                width: 1,
+                is_reg: false,
+                is_signed: false,
+                base: 2,
+            },
+        ];
+        Design {
+            name: "m".into(),
+            net_decls,
+            n_nets: 3,
+            ports: vec![
+                PortDecl {
+                    name: "a".into(),
+                    dir: Dir::In,
+                    base: 0,
+                    width: 1,
+                },
+                PortDecl {
+                    name: "q".into(),
+                    dir: Dir::Out,
+                    base: 1,
+                    width: 1,
+                },
+                PortDecl {
+                    name: "sleep".into(),
+                    dir: Dir::In,
+                    base: 2,
+                    width: 1,
+                },
+            ],
+            assigns: Vec::new(),
+            processes: Vec::new(),
+            initials: Vec::new(),
+            hierarchy: Vec::new(),
+        }
+    }
 
     #[test]
     fn parses_power_intent() {
@@ -1120,6 +1241,14 @@ set_domain_supply_net TOP -primary_power_net vdd -primary_ground_net vss
         .unwrap();
         assert_eq!(upf.design_top.as_deref(), Some("m"));
         assert_eq!(upf.supply_nets["vdd"].connected_ports, vec!["vdd"]);
+        assert!(parse_upf("create_power_domain TOP -elements {m m}")
+            .unwrap_err()
+            .contains("repeats element"));
+        assert!(parse_upf(
+            "create_power_domain TOP\ncreate_supply_port p -domain TOP -direction both"
+        )
+        .unwrap_err()
+        .contains("direction must be"));
     }
 
     #[test]
@@ -1268,5 +1397,136 @@ set_power_mode_strategy_current sleep retention ret 5e-9
             "create_power_domain TOP\nset_isolation iso -domain TOP -signal a\ncreate_power_mode m\nset_power_mode_strategy_current m buffer iso 1"
         )
         .is_err());
+    }
+
+    #[test]
+    fn valid_power_intent_checks_cleanly() {
+        let upf = parse_upf(
+            r#"
+upf_version 2.1
+set_design_top m
+create_power_domain TOP -elements {m}
+create_supply_port vdd -domain TOP -direction in
+create_supply_port vss -domain TOP -direction out
+create_supply_net vdd -domain TOP
+create_supply_net vss -domain TOP
+connect_supply_net vdd -ports {vdd}
+connect_supply_net vss -ports {vss}
+set_domain_supply_net TOP -primary_power_net vdd -primary_ground_net vss
+create_power_switch sw -domain TOP -input_supply_port vdd -output_supply_port vdd -control_port {sleep}
+set_power_switch_on_resistance sw 0.025
+create_power_mode active
+set_power_mode_switch active sw on
+set_power_mode_domain_activity active TOP 1.0
+set_active_power_mode active
+set_isolation iso -domain TOP -signal a -isolation_power_net vdd -isolation_ground_net vss
+set_retention ret -domain TOP -signal q -retention_power_net vdd -retention_ground_net vss
+set_level_shifter shift -domain TOP -input vdd -output vss
+"#,
+        )
+        .unwrap();
+        let result = check(&design(), &upf);
+        assert!(!result.has_errors(), "{:?}", result.findings);
+        assert_eq!(result.domain_count, 1);
+        assert_eq!(result.supply_net_count, 2);
+        assert_eq!(result.switch_count, 1);
+        assert_eq!(result.power_mode_count, 1);
+        assert_eq!(result.isolation_count, 1);
+        assert_eq!(result.retention_count, 1);
+        assert_eq!(result.level_shifter_count, 1);
+        let text = report(&result);
+        assert!(text.contains("UPF report: PASS"), "{text}");
+    }
+
+    #[test]
+    fn cross_domain_supplies_and_shared_ports_are_errors() {
+        let upf = parse_upf(
+            r#"
+create_power_domain TOP -elements {m}
+create_power_domain AUX
+create_supply_port auxp -domain AUX
+create_supply_net vdd -domain TOP
+create_supply_net vss -domain TOP
+create_supply_net aux -domain AUX
+connect_supply_net vdd -ports {auxp}
+set_domain_supply_net TOP -primary_power_net aux -primary_ground_net vss
+create_power_switch sw -domain TOP -input_supply_port aux -output_supply_port vss
+create_power_mode m
+set_power_mode_switch m sw on
+"#,
+        )
+        .unwrap();
+        let result = check(&design(), &upf);
+        assert!(result.has_errors());
+        let codes: Vec<&str> = result
+            .findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect();
+        for expected in ["UPF-DOMAIN", "UPF-DOMAIN", "UPF-DOMAIN", "UPF-DOMAIN"] {
+            assert!(codes.contains(&expected), "{:?}", result.findings);
+        }
+        let text = report(&result);
+        assert!(
+            text.contains("primary supply 'aux' belongs to domain 'AUX'"),
+            "{text}"
+        );
+        assert!(
+            text.contains("connects port 'auxp' in domain 'AUX'"),
+            "{text}"
+        );
+        assert!(text.contains("uses supply 'aux' in domain 'AUX'"), "{text}");
+
+        let shared = parse_upf(
+            r#"
+create_power_domain TOP
+create_supply_port p -domain TOP
+create_supply_net vdd -domain TOP
+create_supply_net vss -domain TOP
+connect_supply_net vdd -ports {p}
+connect_supply_net vss -ports {p}
+"#,
+        )
+        .unwrap();
+        let result = check(&design(), &shared);
+        assert!(result
+            .findings
+            .iter()
+            .any(|finding| finding.code == "UPF-PORT"
+                && finding.message.contains("connects multiple supply nets")));
+    }
+
+    #[test]
+    fn check_reports_top_element_signal_and_mode_errors() {
+        let upf = parse_upf(
+            r#"
+set_design_top wrong
+create_power_domain TOP -elements {ghost}
+create_supply_net vdd -domain TOP
+create_supply_net vss -domain TOP
+set_domain_supply_net TOP -primary_power_net vdd -primary_ground_net vss
+create_power_switch sw -domain TOP -input_supply_port vdd -output_supply_port vdd
+create_power_mode only
+set_power_mode_switch only sw on
+set_isolation iso -domain TOP -signal missing -isolation_power_net vdd
+"#,
+        )
+        .unwrap();
+        let result = check(&design(), &upf);
+        let messages = result
+            .findings
+            .iter()
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("does not match design")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("unknown element 'ghost'")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("unknown signal 'missing'")));
+        assert!(result.has_errors());
     }
 }

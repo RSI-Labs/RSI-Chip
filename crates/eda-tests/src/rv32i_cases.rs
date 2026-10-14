@@ -1182,7 +1182,7 @@ signoff physical-database
         Ok(())
     });
 
-    const FULL_SIGNOFF_ENABLED: bool = false;
+    const FULL_SIGNOFF_ENABLED: bool = true;
     if FULL_SIGNOFF_ENABLED {
         c.add("rv32i_pdk_signoff_mmmc_pass", || {
             let manifest = r#"pdk rv32i-signoff-pdk

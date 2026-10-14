@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 eda-api = { path = "../eda-api" }
+eda-core = { path = "../eda-core" }
 eda-pnr = { path = "../eda-pnr" }

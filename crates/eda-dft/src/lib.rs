@@ -57,6 +57,9 @@ impl Default for ScanOptions {
 
 /// Insert one serial scan chain into a mapped sequential netlist.
 pub fn insert_scan_chain(nl: &Netlist, options: &ScanOptions) -> Result<ScanChainResult, String> {
+    if options.chain_name.trim().is_empty() {
+        return Err("scan chain name cannot be empty".into());
+    }
     let lib = nl
         .library()
         .cloned()
@@ -77,6 +80,16 @@ pub fn insert_scan_chain(nl: &Netlist, options: &ScanOptions) -> Result<ScanChai
                 "scan port name '{}' is empty or already used",
                 port_name
             ));
+        }
+    }
+    let mut scan_port_names = std::collections::BTreeSet::new();
+    for port_name in [
+        &options.scan_en_port,
+        &options.scan_in_port,
+        &options.scan_out_port,
+    ] {
+        if !scan_port_names.insert(port_name.as_str()) {
+            return Err(format!("duplicate scan port name '{}'", port_name));
         }
     }
 
@@ -245,7 +258,29 @@ pub fn report(result: &ScanChainResult) -> String {
 mod tests {
     use super::*;
     use eda_core::library::CellLibrary;
+    use eda_core::logic::LogicValue;
     use std::sync::Arc;
+
+    fn sequential_netlist(flops: usize) -> Netlist {
+        let lib = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("sequential");
+        nl.set_library(lib.clone());
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        for index in 0..flops {
+            let q = nl.add_net(format!("q{index}"));
+            nl.add_cell(Cell {
+                name: format!("u_dff{index}"),
+                kind: CellKind::Lib(lib.find("DFF").unwrap()),
+                inputs: vec![clk, d],
+                output: q,
+            });
+            nl.add_port(format!("q{index}"), Dir::Out, vec![q]);
+        }
+        nl
+    }
 
     #[test]
     fn rejects_combinational_netlist() {
@@ -305,5 +340,156 @@ mod tests {
         assert_eq!(custom_view.scan_cells, 1);
         assert_eq!(custom_view.scan_chains, 1);
         assert!(custom_view.unscanned_sequential.is_empty());
+    }
+
+    #[test]
+    fn multi_flop_chain_is_structurally_and_functionally_correct() {
+        let nl = sequential_netlist(3);
+        let before_cells = nl.cell_count();
+        let before_nets = nl.net_count();
+        let result = insert_scan_chain(&nl, &ScanOptions::default()).unwrap();
+
+        assert_eq!(result.chain.len(), 3);
+        assert_eq!(result.netlist.cell_count(), before_cells + 4);
+        assert_eq!(result.netlist.net_count(), before_nets + 6);
+        assert_eq!(result.chain[0].name, "u_dff0");
+        assert_eq!(result.chain[1].name, "u_dff1");
+        assert_eq!(result.chain[2].name, "u_dff2");
+        check_scan_structure(
+            &result.netlist,
+            &result.chain,
+            result.scan_en,
+            result.scan_in,
+            result.scan_out,
+        )
+        .unwrap();
+
+        let mut previous_q = result.scan_in;
+        for link in &result.chain {
+            let mux = result.netlist.cell(link.mux_cell);
+            assert_eq!(
+                mux.inputs,
+                vec![result.scan_en, link.functional_d_net, previous_q]
+            );
+            let flop = result.netlist.cell(link.cell);
+            assert_eq!(flop.inputs[1], link.scan_d_net);
+            assert_eq!(flop.output, link.q_net);
+            previous_q = link.q_net;
+        }
+
+        let first = &result.chain[0];
+        let mut values = std::collections::HashMap::new();
+        values.insert(result.scan_en, LogicValue::Zero);
+        values.insert(first.functional_d_net, LogicValue::One);
+        values.insert(result.scan_in, LogicValue::Zero);
+        assert_eq!(
+            result.netlist.eval_cell(first.mux_cell, &values),
+            LogicValue::One
+        );
+        values.insert(result.scan_en, LogicValue::One);
+        assert_eq!(
+            result.netlist.eval_cell(first.mux_cell, &values),
+            LogicValue::Zero
+        );
+
+        let last_q = result.chain.last().unwrap().q_net;
+        values.insert(result.scan_en, LogicValue::One);
+        values.insert(last_q, LogicValue::One);
+        let scan_out_driver = result
+            .netlist
+            .net(result.scan_out)
+            .drivers
+            .first()
+            .copied()
+            .unwrap();
+        assert_eq!(
+            result.netlist.eval_cell(scan_out_driver, &values),
+            LogicValue::One
+        );
+
+        let analysis = analyze(&result.netlist).unwrap();
+        assert_eq!(analysis.sequential_cells, 3);
+        assert_eq!(analysis.scan_cells, 3);
+        assert_eq!(analysis.scan_chains, 1);
+        assert!(analysis.unscanned_sequential.is_empty());
+        assert!(report(&result).contains("chain length 3"));
+    }
+
+    #[test]
+    fn rejects_invalid_library_options_and_malformed_flop() {
+        let nl = sequential_netlist(1);
+        assert_eq!(
+            insert_scan_chain(
+                &nl,
+                &ScanOptions {
+                    chain_name: " ".into(),
+                    ..ScanOptions::default()
+                }
+            )
+            .unwrap_err(),
+            "scan chain name cannot be empty"
+        );
+        assert_eq!(
+            insert_scan_chain(
+                &nl,
+                &ScanOptions {
+                    scan_in_port: "scan_en".into(),
+                    ..ScanOptions::default()
+                }
+            )
+            .unwrap_err(),
+            "duplicate scan port name 'scan_en'"
+        );
+        assert_eq!(
+            insert_scan_chain(
+                &nl,
+                &ScanOptions {
+                    scan_en_port: "clk".into(),
+                    ..ScanOptions::default()
+                }
+            )
+            .unwrap_err(),
+            "scan port name 'clk' is empty or already used"
+        );
+
+        let mut no_library = nl.clone();
+        no_library.set_library(Arc::new(CellLibrary::new("empty")));
+        assert!(insert_scan_chain(&no_library, &ScanOptions::default()).is_err());
+
+        let mut malformed = sequential_netlist(1);
+        let mut cell = malformed.cell(0).clone();
+        cell.inputs.pop();
+        malformed.replace_cell(0, cell);
+        assert!(insert_scan_chain(&malformed, &ScanOptions::default()).is_err());
+    }
+
+    #[test]
+    fn scan_structure_audit_rejects_empty_and_tampered_chain() {
+        let result = insert_scan_chain(&sequential_netlist(2), &ScanOptions::default()).unwrap();
+        assert_eq!(
+            check_scan_structure(
+                &result.netlist,
+                &[],
+                result.scan_en,
+                result.scan_in,
+                result.scan_out
+            )
+            .unwrap_err(),
+            "scan chain is empty"
+        );
+
+        let mut tampered = result.netlist.clone();
+        let mut mux = tampered.cell(result.chain[0].mux_cell).clone();
+        mux.kind = CellKind::And;
+        tampered.replace_cell(result.chain[0].mux_cell, mux);
+        let error = check_scan_structure(
+            &tampered,
+            &result.chain,
+            result.scan_en,
+            result.scan_in,
+            result.scan_out,
+        )
+        .unwrap_err();
+        assert!(error.contains("is not a MUX2"), "{error}");
     }
 }

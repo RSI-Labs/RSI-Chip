@@ -17,11 +17,11 @@ pub mod parser;
 pub mod types;
 
 pub use analysis::{
-    ac_sweep, aging_analysis, dc_operating_point, dc_sweep, derivative_analysis, envelope_follow,
-    global_sensitivity, global_sensitivity_cancellable, monte_carlo, monte_carlo_cancellable,
-    noise_sweep, optimize, optimize_cancellable, pareto_optimize, pareto_optimize_cancellable,
-    periodic_steady_state, periodic_steady_state_cancellable, sensitivity, transient,
-    transient_cancellable,
+    ac_sweep, aging_analysis, dc_operating_point, dc_operating_point_cancellable, dc_sweep,
+    dc_sweep_cancellable, derivative_analysis, envelope_follow, global_sensitivity,
+    global_sensitivity_cancellable, monte_carlo, monte_carlo_cancellable, noise_sweep, optimize,
+    optimize_cancellable, pareto_optimize, pareto_optimize_cancellable, periodic_steady_state,
+    periodic_steady_state_cancellable, sensitivity, transient, transient_cancellable,
 };
 pub use eda_core::cancellation::FlowCancellation;
 pub use parser::{
@@ -561,6 +561,23 @@ mod tests {
     fn long_running_ams_analyses_honor_cooperative_cancellation() {
         let cancellation = FlowCancellation::new();
         cancellation.cancel();
+        let operating_point =
+            parse_spice("cancelled op\nVin in 0 1.8\nR1 in out 1k\nR2 out 0 2k\n.op\n.end")
+                .unwrap();
+        assert_eq!(
+            dc_operating_point_cancellable(&operating_point, &cancellation).unwrap_err(),
+            "DC/transient solve cancelled"
+        );
+
+        let sweep = parse_spice(
+            "cancelled dc sweep\nVin in 0 1.8\nR1 in out 1k\nR2 out 0 2k\n.dc Vin 0 1.8 0.1\n.end",
+        )
+        .unwrap();
+        assert_eq!(
+            dc_sweep_cancellable(&sweep, &sweep.analyses[0], &cancellation).unwrap_err(),
+            "DC sweep cancelled"
+        );
+
         let transient = parse_spice(
             "cancelled transient\nVin in 0 PULSE(0 1 0 1p 1p 1n 2n)\nR1 in out 1k\nC1 out 0 1n\n.tran 1p 2n\n.end",
         )
@@ -711,7 +728,7 @@ L1 mid out 1n IC=0
 M1 d g s b NM W=1u L=180n M=2
 Q1 c b e sub NPN AREA=1.5
 .model NM NMOS(KP=1m VTO=0.5 LAMBDA=0.01 GAMMA=0.2 PHI=0.7 THETA=0.2 VSAT=0.8)
-.model NPN NPN(IS=1e-14 BF=120 BR=2)
+.model NPN NPN(IS=1e-14 BF=120 BR=2 VAF=80 VAR=6)
 .op
 .end"#;
         let circuit = parse_spice(source).unwrap();
@@ -894,6 +911,78 @@ M2 e g 0 0 NM W=500n L=400n
     }
 
     #[test]
+    fn bjt_early_voltage_modulates_output_current() {
+        let mut circuit = SpiceCircuit::default();
+        circuit.elements.push(SpiceElement {
+            name: "Q1".into(),
+            nodes: vec!["c".into(), "b".into(), "e".into()],
+            kind: SpiceElementKind::BipolarJunctionTransistor {
+                model: "NPN".into(),
+                area: 1.0,
+            },
+        });
+        let mut model = BjtModel {
+            forward_early_voltage_v: 10.0,
+            reverse_early_voltage_v: 5.0,
+            ..BjtModel::default()
+        };
+        circuit.bjt_models.insert("NPN".into(), model.clone());
+        let transistor = &circuit.elements[0];
+
+        let near = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[0.7, 0.7, 0.0, 0.0],
+        )
+        .unwrap()[0];
+        let reverse_biased = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[1.7, 0.7, 0.0, 0.0],
+        )
+        .unwrap()[0];
+        assert!(reverse_biased > near);
+        assert!((reverse_biased / near - 1.1).abs() < 1e-9);
+
+        let reverse_near = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[0.0, 0.7, 0.7, 0.0],
+        )
+        .unwrap()[0];
+        let reverse_early = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[0.0, 0.7, 1.7, 0.0],
+        )
+        .unwrap()[0];
+        assert!(reverse_early.abs() > reverse_near.abs());
+
+        model.forward_early_voltage_v = 0.0;
+        model.reverse_early_voltage_v = 0.0;
+        circuit.bjt_models.insert("NPN".into(), model);
+        let disabled_near = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[0.7, 0.7, 0.0, 0.0],
+        )
+        .unwrap()[0];
+        let disabled_reverse = crate::analysis::nonlinear_terminal_currents(
+            &circuit,
+            transistor,
+            &[1.7, 0.7, 0.0, 0.0],
+        )
+        .unwrap()[0];
+        assert!((disabled_near - disabled_reverse).abs() < 1e-12);
+
+        assert!(
+            parse_spice("bad\nQ1 c b 0 NPN\n.model NPN NPN(IS=1e-14 VAF=-1)\n.op\n.end")
+                .unwrap_err()
+                .contains("BJT VAF")
+        );
+    }
+
+    #[test]
     fn transistor_ac_analysis_linearizes_dc_operating_point() {
         let circuit = parse_spice(
             "common-source\nVdd vdd 0 1.8\nRd vdd d 10k\nVg g 0 DC 1 AC 1\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5)\n.ac lin 2 1 1meg\n.end",
@@ -994,6 +1083,32 @@ M2 e g 0 0 NM W=500n L=400n
         let base = result.node_magnitude("b").unwrap();
         assert!(base[0] > 0.99, "{base:?}");
         assert!(base[1] < 2e-4, "{base:?}");
+    }
+
+    #[test]
+    fn mos_junction_sidewall_capacitance_is_voltage_aware() {
+        let source = "mos junction pole\nVin in 0 DC 0 AC 1\nRd in d 10k\nM1 d 0 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5 CJSW=1m CJSWD=2m PB=0.8 MJ=0.5 FC=0.5)\n.ac lin 2 1 1g\n.end";
+        let circuit = parse_spice(source).unwrap();
+        let model = &circuit.mosfet_models["NM"];
+        assert_eq!(model.source_junction_sidewall_cap_per_m, 1.0e-3);
+        assert_eq!(model.drain_junction_sidewall_cap_per_m, 2.0e-3);
+        assert_eq!(model.junction_potential_v, 0.8);
+        assert_eq!(model.junction_grading_coefficient, 0.5);
+        assert_eq!(model.junction_forward_knee, 0.5);
+        let rewritten = write_spice(&circuit).unwrap();
+        assert_eq!(circuit, parse_spice(&rewritten).unwrap());
+
+        let result = ac_sweep(&circuit, &circuit.analyses[0]).unwrap();
+        let drain = result.node_magnitude("d").unwrap();
+        assert!(drain[0] > 0.99, "{drain:?}");
+        assert!(drain[1] < 2e-4, "{drain:?}");
+
+        let invalid = parse_spice(
+            "invalid\nM1 d 0 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5 CJSW=1m MJ=1.5)\n.op\n.end",
+        );
+        assert!(invalid
+            .unwrap_err()
+            .contains("MOS MJ must be finite and between zero and one"));
     }
 
     #[test]

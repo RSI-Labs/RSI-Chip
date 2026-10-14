@@ -108,7 +108,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "simulation",
         name: "mosfet_bjt_behavioral",
         status: CapabilityStatus::Partial,
-        evidence: "Level-1 MOS; BSIM3 LEVEL=8 core with VTH0/K1/K2/TOX/U0/UA/UB/UC/VSAT, DVT0/DVT1/DVT2 short-channel/DIBL reduction, DVT0W/DVT1W/W0 narrow-width threshold shift, KT1/KT2/KT1L/UTE temperature scaling, and WMIN/WMAX/LMIN/LMAX geometry-bin selection; local/global parameter sensitivity, MOS charge; Ebers-Moll BJT and diode/BJT transit charge",
+        evidence: "Level-1 MOS; BSIM3 LEVEL=8 core with VTH0/K1/K2/TOX/U0/UA/UB/UC/VSAT, DVT0/DVT1/DVT2 short-channel/DIBL reduction, DVT0W/DVT1W/W0 narrow-width threshold shift, KT1/KT2/KT1L/UTE temperature scaling, WMIN/WMAX/LMIN/LMAX geometry-bin selection, and CJSW/CJSWS/CJSWD/PB/MJ/FC voltage-dependent source/drain junction sidewall capacitance; local/global parameter sensitivity, MOS charge; Ebers-Moll BJT with VAF/VAR forward/reverse Early effect and diode/BJT transit charge",
         limitation: "BSIM3 uses simplified geometry and temperature subsets with rectangular W/L bins only; full DVT, full charge, NQS, self-heating, full noise, and PSP/HiSIM/VBIC/HICUM-class models are not implemented",
     },
     Capability {
@@ -157,15 +157,15 @@ const CAPABILITIES: &[Capability] = &[
         domain: "timing",
         name: "sta_constraints_mmmc_waivers",
         status: CapabilityStatus::Implemented,
-        evidence: "eda_sta constrained timing, generated clocks, clock groups, independent min/max clock transitions, design-wide/object-scoped transition/capacitance/fanout plus input-transition/load SDC quality rules, MMMC, violation registry",
+        evidence: "eda_sta constrained timing, generated clocks, clock groups, independent min/max clock transitions, set_units time/capacitance normalization, design-wide/object-scoped transition/capacitance/fanout plus input-transition/load SDC quality rules, MMMC, violation registry",
         limitation: "not a full commercial SDC parser",
     },
     Capability {
         domain: "physical",
         name: "placement_routing_drc_def_lef",
         status: CapabilityStatus::Implemented,
-        evidence: "eda_pnr placement, maze/rip-up routing, LEF/DEF writers, typed rectilinear polygon/via layout editing, exact Manhattan boolean operations, width/area/spacing/enclosure DRC, typed fix suggestions, arbitrary-angle polygon area/bounds/containment/exact-spacing primitives, arbitrary-angle layout-document hit-test/SVG/movement/DRC/editor-tool/vertex-drag integration, and direct arbitrary-angle two-pin routing",
-        limitation: "arbitrary-angle Boolean operations and a general arbitrary-angle maze/rip-up router are absent, and a complete foundry rule deck is missing",
+        evidence: "eda_pnr placement, maze/rip-up routing, physical antenna verification/repair with a foundry-configurable maximum antenna ratio, LEF/DEF writers, typed rectilinear polygon/via layout editing, exact Manhattan boolean operations, width/area/same-and-cross-layer-spacing/different-net-short/enclosure/directional-via-extension/cut-overlap/cut-spacing/notch plus exact min/max layer-density-window DRC, deterministic typed rule-deck text import/export, auditable layout-DRC waivers, persistent daemon layout-DRC waiver registries, typed fix suggestions, arbitrary-angle polygon area/bounds/containment/exact-spacing primitives, exact two-polygon arbitrary-angle union/intersection/difference Boolean results with rational intersection vertices, arbitrary-angle layout-document hit-test/SVG/movement/DRC/editor-tool/vertex-drag integration, direct arbitrary-angle two-pin routing, bounded visibility-graph arbitrary-angle maze routing with exact segment lengths and blockage clearance, and bounded negotiated arbitrary-angle rip-up/congestion refinement",
+        limitation: "arbitrary-angle routing remains bounded to a visibility-graph candidate set, and a complete foundry rule deck is missing",
     },
     Capability {
         domain: "physical",
@@ -206,7 +206,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "integration",
         name: "persistent_agent_daemon",
         status: CapabilityStatus::Partial,
-        evidence: "line-delimited JSON TCP RPC with ping/capabilities/SPICE-DC/all-AMS-analysis/functional-coverage/waveform-assertions/waveform-clock-pulse-comparison/layout-polygon-via-DRC/RTL-equivalence/RTL-standalone-STA/RTL-standalone-PnR/RTL-DFT-scan-insertion/RTL-CTS-clock-tree-synthesis/RTL-structural-ECO/RTL-CDC/RTL-combinational-stuck-at-fault-grading-STIL/RTL-timed-simulation/RTL-power/RTL-power-grid-IR-EM/RTL-temporal-property-BMC/RTL-flow-with-structured-STA-PnR-DRC/cached-RTL-flow/cache-stats/cache-clear/PDK-signoff plus remote jobSubmit/jobStatus/jobCancel/jobWait, typed asynchronous job manager with service-owned flow-cache dispatch, cancellation-before-start, cooperative RTL/PDK stage, SAT/BMC/equivalence/k-induction search, simulator delta scheduling, global/maze/rip-up routing, single-corner physical-timing extraction/STA/antenna/hold/optimization stages, and AMS transient/Monte-Carlo/Sobol/PSS/optimizer/quantized-refine loop cancellation, and concurrent clients",
+        evidence: "line-delimited JSON TCP RPC with ping/capabilities/cooperatively cancellable SPICE-DC/all-AMS-analysis/functional-coverage/waveform-assertions/waveform-clock-pulse-comparison/layout-rule-deck/layout-polygon-via-DRC-with-waivers/persistent-layout-DRC-waiver-registries/any-angle-layout-routing/any-angle-layout-maze-routing/any-angle-layout-Boolean/RTL-equivalence/RTL-two-view-equivalence/RTL-standalone-STA/RTL-signal-quality/RTL-timing-waiver-audit/persistent-timing-waiver-registry-lifecycle/RTL-MMMC-scenario-timing/RTL-MMMC-setup-hold-reset-paths/RTL-MMMC-timing-violations/RTL-MMMC-scenario-diff/RTL-incremental-MMMC-timing/RTL-incremental-MMMC-timing-violations/RTL-standalone-PnR-with-configurable-DRC/RTL-antenna-repair/RTL-DFT-scan-insertion/RTL-CTS-clock-tree-synthesis/RTL-structural-ECO/RTL-CDC/RTL-LVS/RTL-UPF-power-intent/RTL-k-induction-safety/RTL-physical-timing-SPEF-SDF/RTL-combinational-stuck-at-fault-grading-STIL/RTL-timed-simulation/RTL-power/RTL-power-grid-IR-EM/RTL-multi-scenario-post-route-power-IR/VCD-driven-RTL-multi-scenario-post-route-power-IR/RTL-multi-scenario-UPF-power-mode-IR-EM/VCD-driven-RTL-multi-scenario-UPF-power-mode-IR-EM/RTL-temporal-property-BMC/RTL-flow-with-structured-STA-PnR-DRC/cached-RTL-flow/cache-stats/cache-clear/PDK-signoff plus remote jobSubmit/jobStatus/jobCancel/jobWait, typed asynchronous job manager with service-owned flow-cache, timing-waiver-registry, and layout-DRC-waiver-registry dispatch, cancellation-before-start, cooperative RTL/PDK stage, SAT/BMC/equivalence/k-induction search, simulator delta scheduling, global/maze/rip-up routing, single-corner physical-timing extraction/STA/antenna/hold/optimization stages, and DC operating-point/sweep Newton, AMS transient/Monte-Carlo/Sobol/PSS/optimizer/quantized-refine loop cancellation, and concurrent clients",
         limitation: "daemon exposes RTL, AMS, waveform/layout, and PDK signoff flows but not every specialized toolchain API; cancellation is not yet supported inside every nested multi-corner physical-timing stage",
     },
     Capability {
@@ -227,8 +227,8 @@ const CAPABILITIES: &[Capability] = &[
         domain: "signoff",
         name: "foundry_calibrated_pdk_signoff",
         status: CapabilityStatus::Partial,
-        evidence: "typed PDK manifests with layers, PVT-tagged delay-scale corners, checksummed inline per-corner Liberty views, model correlations, and required checks; deterministic per-corner RTL-to-equivalence/timing/DRC/LEF-DEF-SDF MMMC signoff",
-        limitation: "manifest is portable but not certified by an external foundry; Liberty SHA-256 detects accidental corruption but does not establish foundry provenance, and advanced compact-model correlation is not vendor-calibrated",
+        evidence: "typed PDK manifests with layers, PVT-tagged delay-scale corners, checksummed inline per-corner Liberty views, checksummed and pre-validated inline layer/via rule decks, model correlations, and required checks; deterministic per-corner RTL-to-equivalence/timing/DRC/LEF-DEF-SDF MMMC signoff",
+        limitation: "manifest is portable but not certified by an external foundry; Liberty/rule-deck SHA-256 detects accidental corruption but does not establish foundry provenance, and advanced compact-model correlation is not vendor-calibrated",
     },
 ];
 
@@ -283,6 +283,100 @@ mod tests {
         assert_eq!(missing_capabilities().len(), 0);
         let report = capability_report();
         assert!(report.contains("spice_dc_ac_transient") && report.contains("implemented"));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("RTL-MMMC-timing-violations")
+                && capability
+                    .evidence
+                    .contains("RTL-incremental-MMMC-timing-violations")
+                && capability
+                    .evidence
+                    .contains("VCD-driven-RTL-multi-scenario-post-route-power-IR")
+                && capability
+                    .evidence
+                    .contains("VCD-driven-RTL-multi-scenario-UPF-power-mode-IR-EM")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability
+                    .evidence
+                    .contains("persistent-timing-waiver-registry-lifecycle")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("any-angle-layout-routing")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("any-angle-layout-Boolean")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("exact two-polygon arbitrary-angle union/intersection/difference")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains(
+                "physical antenna verification/repair with a foundry-configurable maximum antenna ratio",
+            )));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("checksummed and pre-validated inline layer/via rule decks")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("set_units time/capacitance normalization")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("VAF/VAR forward/reverse Early effect")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("voltage-dependent source/drain junction sidewall capacitance")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("bounded visibility-graph arbitrary-angle maze routing")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("bounded negotiated arbitrary-angle rip-up/congestion refinement")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("exact min/max layer-density-window DRC")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("deterministic typed rule-deck text import/export")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.evidence.contains("auditable layout-DRC waivers")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("persistent daemon layout-DRC waiver registries")));
+        assert!(CAPABILITIES.iter().any(|capability| capability
+            .evidence
+            .contains("different-net-short/enclosure/directional-via-extension")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.evidence.contains("cut-overlap/cut-spacing")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.evidence.contains("directional-via-extension")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability
+                    .evidence
+                    .contains("any-angle-layout-maze-routing")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability
+                    .evidence
+                    .contains("persistent-layout-DRC-waiver-registries")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("RTL-antenna-repair")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("layout-rule-deck")));
         assert!(report.contains("summary: implemented="));
     }
 }

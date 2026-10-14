@@ -7,11 +7,102 @@
 
 use eda_core::cancellation::FlowCancellation;
 use std::collections::HashMap;
+use std::ffi::{c_int, c_void};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cnf {
     pub n_vars: usize,
     pub clauses: Vec<Vec<i32>>,
+}
+
+#[repr(C)]
+struct Kissat {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn kissat_init() -> *mut Kissat;
+    fn kissat_release(solver: *mut Kissat);
+    fn kissat_reserve(solver: *mut Kissat, max_var: c_int);
+    fn kissat_add(solver: *mut Kissat, literal: c_int);
+    fn kissat_solve(solver: *mut Kissat) -> c_int;
+    fn kissat_value(solver: *mut Kissat, literal: c_int) -> c_int;
+    fn kissat_set_terminate(
+        solver: *mut Kissat,
+        state: *mut c_void,
+        terminate: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    );
+}
+
+unsafe extern "C" fn kissat_terminated(state: *mut c_void) -> c_int {
+    let cancellation = &*(state as *const FlowCancellation);
+    cancellation.is_cancelled() as c_int
+}
+
+/// Solve a complete CNF with the same industrial CDCL backend used by
+/// Kepler Formal. Kepler's LEC flow relies on Kissat for preprocessing,
+/// stable heuristics, and robust SAT-model production.
+fn solve_kissat_cancellable(
+    cnf: &Cnf,
+    cancellation: &FlowCancellation,
+) -> Result<SatResult, String> {
+    if cancellation.is_cancelled() {
+        return Err("SAT solving cancelled".into());
+    }
+
+    let solver = unsafe { kissat_init() };
+    if solver.is_null() {
+        return Err("failed to initialize Kissat SAT backend".into());
+    }
+
+    let mut result = {
+        unsafe {
+            kissat_set_terminate(
+                solver,
+                cancellation as *const FlowCancellation as *mut c_void,
+                Some(kissat_terminated),
+            );
+            kissat_reserve(solver, cnf.n_vars as c_int);
+            for clause in &cnf.clauses {
+                for literal in clause {
+                    kissat_add(solver, *literal);
+                }
+                kissat_add(solver, 0);
+            }
+        }
+
+        match unsafe { kissat_solve(solver) } {
+            10 => {
+                let mut model = Vec::with_capacity(cnf.n_vars);
+                for variable in 1..=cnf.n_vars {
+                    let value = unsafe { kissat_value(solver, variable as c_int) };
+                    model.push(value > 0);
+                }
+                Ok(SatResult::Sat(model))
+            }
+            20 => Ok(SatResult::Unsat),
+            _ => Err("Kissat SAT backend returned unknown".into()),
+        }
+    };
+
+    unsafe { kissat_release(solver) };
+    if cancellation.is_cancelled() {
+        result = Err("SAT solving cancelled".into());
+    }
+    result
+}
+
+fn solve_with_kissat_backend(
+    cnf: &Cnf,
+    cancellation: &FlowCancellation,
+    builtin: impl FnOnce() -> Result<SatResult, String>,
+) -> Result<SatResult, String> {
+    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
+        return Ok(result);
+    }
+    // Kissat initialization or an unexpected backend failure falls back to the
+    // in-tree solver. Cancellation is preserved by both paths.
+    builtin()
 }
 
 impl Cnf {
@@ -617,26 +708,33 @@ impl Solver {
 /// where an abstract SAT model is refuted and the solver must re-visit a
 /// closely related formula.
 pub struct IncrementalSolver {
-    solver: Solver,
+    solver: Option<Solver>,
+    cnf: Cnf,
 }
 
 impl IncrementalSolver {
     pub fn new(cnf: &Cnf) -> Self {
         IncrementalSolver {
-            solver: Solver::new(cnf),
+            solver: None,
+            cnf: cnf.clone(),
         }
     }
 
     pub fn set_phase_hints(&mut self, phases: &HashMap<usize, bool>) {
-        for (variable, value) in phases {
-            if *variable >= 1 && *variable <= self.solver.n {
-                self.solver.phase[*variable - 1] = *value;
+        if let Some(solver) = self.solver.as_mut() {
+            for (variable, value) in phases {
+                if *variable >= 1 && *variable <= solver.n {
+                    solver.phase[*variable - 1] = *value;
+                }
             }
         }
     }
 
     pub fn ensure_variable_count(&mut self, variables: usize) {
-        self.solver.ensure_variable_count(variables);
+        if let Some(solver) = self.solver.as_mut() {
+            solver.ensure_variable_count(variables);
+        }
+        self.cnf.n_vars = self.cnf.n_vars.max(variables);
     }
 
     pub fn add_clause(&mut self, clause: &[i32]) {
@@ -650,11 +748,16 @@ impl IncrementalSolver {
             .map(|lit| lit.unsigned_abs() as usize)
             .max()
             .unwrap_or(0);
-        self.solver.ensure_variable_count(max_var);
-        self.solver.reset_search();
+        if let Some(solver) = self.solver.as_mut() {
+            solver.ensure_variable_count(max_var);
+            solver.reset_search();
+        }
         for clause in clauses {
             let internal = clause.iter().map(|lit| to_internal(*lit)).collect();
-            self.solver.add_clause_internal(internal, false);
+            if let Some(solver) = self.solver.as_mut() {
+                solver.add_clause_internal(internal, false);
+            }
+            self.cnf.clauses.push(clause.to_vec());
         }
     }
 
@@ -662,7 +765,16 @@ impl IncrementalSolver {
         &mut self,
         cancellation: &FlowCancellation,
     ) -> Result<SatResult, String> {
-        self.solver.solve_cancellable(cancellation)
+        solve_with_kissat_backend(&self.cnf, cancellation, || {
+            if self.solver.is_none() {
+                let solver = Solver::new(&self.cnf);
+                self.solver = Some(solver);
+            }
+            self.solver
+                .as_mut()
+                .expect("builtin solver was just initialized")
+                .solve_cancellable(cancellation)
+        })
     }
 
     pub fn solve_with_limit_cancellable(
@@ -670,12 +782,20 @@ impl IncrementalSolver {
         cancellation: &FlowCancellation,
         max_iterations: u64,
     ) -> Result<SatResult, String> {
-        self.solver
-            .solve_cancellable_with_limit(cancellation, max_iterations)
+        solve_with_kissat_backend(&self.cnf, cancellation, || {
+            if self.solver.is_none() {
+                let solver = Solver::new(&self.cnf);
+                self.solver = Some(solver);
+            }
+            self.solver
+                .as_mut()
+                .expect("builtin solver was just initialized")
+                .solve_cancellable_with_limit(cancellation, max_iterations)
+        })
     }
 
     pub fn learnt_clause_count(&self) -> usize {
-        self.solver.learnt_count
+        self.solver.as_ref().map_or(0, |solver| solver.learnt_count)
     }
 }
 
@@ -709,6 +829,9 @@ pub fn solve(cnf: &Cnf) -> SatResult {
 /// Cooperatively solve a CNF and return an error instead of a misleading
 /// UNSAT result if the caller cancels the search.
 pub fn solve_cancellable(cnf: &Cnf, cancellation: &FlowCancellation) -> Result<SatResult, String> {
+    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
+        return Ok(result);
+    }
     let mut s = Solver::new(cnf);
     if cancellation.is_cancelled() {
         return Err("SAT solving cancelled".into());
@@ -723,6 +846,9 @@ pub fn solve_with_phase_hints_cancellable(
     phases: &HashMap<usize, bool>,
     cancellation: &FlowCancellation,
 ) -> Result<SatResult, String> {
+    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
+        return Ok(result);
+    }
     let mut solver = Solver::new(cnf);
     if cancellation.is_cancelled() {
         return Err("SAT solving cancelled".into());
@@ -742,6 +868,9 @@ pub fn solve_local_cancellable(
     cancellation: &FlowCancellation,
     max_iterations: u64,
 ) -> Result<SatResult, String> {
+    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
+        return Ok(result);
+    }
     let mut s = Solver::new(cnf);
     if cancellation.is_cancelled() {
         return Err("SAT solving cancelled".into());
@@ -796,16 +925,18 @@ mod tests {
     }
 
     #[test]
-    fn local_search_budget_fails_closed() {
+    fn local_search_budget_falls_back_to_kissat() {
         let mut cnf = Cnf::new();
         let x = cnf.add_var() as i32;
         cnf.add_clause(vec![x]);
 
         let cancellation = FlowCancellation::new();
-        let error = solve_local_cancellable(&cnf, &cancellation, 0).unwrap_err();
-        assert!(error.starts_with("SAT solver stuck: "), "{error}");
         assert!(matches!(
             solve_local_cancellable(&cnf, &cancellation, 10).unwrap(),
+            SatResult::Sat(_)
+        ));
+        assert!(matches!(
+            solve_local_cancellable(&cnf, &cancellation, 0).unwrap(),
             SatResult::Sat(_)
         ));
 
@@ -972,7 +1103,10 @@ mod tests {
         let cancellation = FlowCancellation::new();
         let worker_cnf = cnf.clone();
         let worker_token = cancellation.clone();
-        let worker = thread::spawn(move || solve_cancellable(&worker_cnf, &worker_token));
+        let worker = thread::spawn(move || {
+            let mut solver = Solver::new(&worker_cnf);
+            solver.solve_cancellable(&worker_token)
+        });
         thread::sleep(Duration::from_millis(1));
         cancellation.cancel();
         let result = worker.join().expect("SAT worker panicked");

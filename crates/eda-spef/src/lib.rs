@@ -6,7 +6,7 @@
 //! `INTERCONNECT` annotations for an existing mapped netlist.
 
 use eda_core::netlist::Netlist;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpefUnits {
@@ -251,6 +251,12 @@ fn parse_section_line(
             }
             let id = parse_index(fields[0], line)?;
             let value = parse_number(Some(&fields[fields.len() - 1]), line)?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "line {}: capacitance value must be finite and nonnegative",
+                    line
+                ));
+            }
             let node2 = if fields.len() == 4 {
                 Some(unquote(fields[2]))
             } else {
@@ -274,6 +280,13 @@ fn parse_section_line(
                 node2: unquote(fields[2]),
                 value: parse_number(Some(&fields[3]), line)?,
             });
+            let resistor = net.resistors.last().expect("resistor just inserted");
+            if !resistor.value.is_finite() || resistor.value < 0.0 {
+                return Err(format!(
+                    "line {}: resistance value must be finite and nonnegative",
+                    line
+                ));
+            }
             Ok(())
         }
     }
@@ -285,6 +298,44 @@ fn finish_net(spef: &mut Spef, net: Option<SpefNet>) -> Result<(), String> {
     };
     if net.name.is_empty() {
         return Err("SPEF net has no name".into());
+    }
+    if !net.total_capacitance.is_finite() || net.total_capacitance < 0.0 {
+        return Err(format!(
+            "SPEF net '{}' has invalid total capacitance",
+            net.name
+        ));
+    }
+    let mut capacitor_ids = BTreeSet::new();
+    for capacitor in &net.caps {
+        if capacitor.node1.trim().is_empty()
+            || capacitor.node2.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(format!(
+                "SPEF net '{}' has an empty capacitor node",
+                net.name
+            ));
+        }
+        if !capacitor_ids.insert(capacitor.id) {
+            return Err(format!(
+                "SPEF net '{}' repeats capacitor id {}",
+                net.name, capacitor.id
+            ));
+        }
+    }
+    let mut resistor_ids = BTreeSet::new();
+    for resistor in &net.resistors {
+        if resistor.node1.trim().is_empty() || resistor.node2.trim().is_empty() {
+            return Err(format!(
+                "SPEF net '{}' has an empty resistor node",
+                net.name
+            ));
+        }
+        if !resistor_ids.insert(resistor.id) {
+            return Err(format!(
+                "SPEF net '{}' repeats resistor id {}",
+                net.name, resistor.id
+            ));
+        }
     }
     let name = net.name.clone();
     if spef.nets.insert(name.clone(), net).is_some() {
@@ -354,6 +405,17 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
     if spef.nets.is_empty() {
         return Err("cannot write SPEF without nets".into());
     }
+    if spef.units.time_seconds_per_unit <= 0.0
+        || spef.units.capacitance_farads_per_unit <= 0.0
+        || spef.units.resistance_ohms_per_unit <= 0.0
+        || spef.units.inductance_henries_per_unit <= 0.0
+    {
+        return Err("cannot write SPEF with nonpositive units".into());
+    }
+    let capacitance_output_scale = spef.units.capacitance_farads_per_unit / 1e-12;
+    let resistance_output_scale = spef.units.resistance_ohms_per_unit;
+    let capacitance_to_pf = |value: f64| value * capacitance_output_scale;
+    let resistance_to_ohm = |value: f64| value * resistance_output_scale;
 
     let mut out = String::new();
     out.push_str("*SPEF \"IEEE 1481-1998\"\n");
@@ -376,7 +438,7 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
         out.push_str(&format!(
             "*D_NET \"{}\" {:.12}\n",
             escape_quote(&net.name),
-            net.total_capacitance
+            capacitance_to_pf(net.total_capacitance)
         ));
         if !net.connections.is_empty() {
             out.push_str("*CONN\n");
@@ -387,10 +449,20 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
                     format!("{}:{}", connection.instance, connection.pin)
                 };
                 out.push_str(&format!(
-                    "*I {} {}\n",
+                    "*I {} {}",
                     escape_quote(&node),
                     connection.direction
                 ));
+                if let (Some(x), Some(y)) = (connection.x, connection.y) {
+                    if !finite(x) || !finite(y) {
+                        return Err(format!(
+                            "net '{}' has non-finite connection coordinates",
+                            net.name
+                        ));
+                    }
+                    out.push_str(&format!(" *C {x:.12} {y:.12}"));
+                }
+                out.push('\n');
             }
         }
         if !net.caps.is_empty() {
@@ -400,15 +472,15 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
                     Some(node2) => out.push_str(&format!(
                         "{} {} {} {:.12}\n",
                         cap.id,
-                        escape_quote(&cap.node1),
-                        escape_quote(node2),
-                        cap.value
+                        quote(&cap.node1),
+                        quote(node2),
+                        capacitance_to_pf(cap.value)
                     )),
                     None => out.push_str(&format!(
                         "{} {} {:.12}\n",
                         cap.id,
-                        escape_quote(&cap.node1),
-                        cap.value
+                        quote(&cap.node1),
+                        capacitance_to_pf(cap.value)
                     )),
                 }
             }
@@ -419,9 +491,9 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
                 out.push_str(&format!(
                     "{} {} {} {:.12}\n",
                     resistor.id,
-                    escape_quote(&resistor.node1),
-                    escape_quote(&resistor.node2),
-                    resistor.value
+                    quote(&resistor.node1),
+                    quote(&resistor.node2),
+                    resistance_to_ohm(resistor.value)
                 ));
             }
         }
@@ -432,6 +504,10 @@ pub fn write_spef(spef: &Spef) -> Result<String, String> {
 
 fn escape_quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn quote(value: &str) -> String {
+    format!("\"{}\"", escape_quote(value))
 }
 
 pub fn report(result: &ParasiticReport) -> String {
@@ -511,7 +587,29 @@ fn join_value(fields: &[&str]) -> String {
 }
 
 fn unquote(value: &str) -> String {
-    value.trim_matches('"').to_string()
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return trimmed.trim_matches('"').to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            out.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            out.push(character);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
 }
 
 fn split_node(node: &str, line: usize) -> Result<(String, String), String> {
@@ -596,6 +694,7 @@ fn clean_zero(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eda_core::netlist::{Cell, CellKind, Dir};
 
     const SPEF: &str = r#"
 *SPEF "IEEE 1481-1998"
@@ -667,5 +766,213 @@ mod tests {
                     < 1e-9
             );
         }
+    }
+
+    #[test]
+    fn writing_nondefault_units_converts_physical_quantities() {
+        let source = r#"
+*SPEF "IEEE 1481-1998"
+*DESIGN "units"
+*T_UNIT 1 PS
+*C_UNIT 2 FF
+*R_UNIT 2 KOHM
+*D_NET converted 6
+*CONN
+*I u:A I *C 1.25 -2.5
+*CAP
+1 converted 2
+2 converted neighbour 4
+*RES
+1 converted u:A 5
+*END
+"#;
+        let original = parse_spef(source).unwrap();
+        assert_eq!(original.units.capacitance_farads_per_unit, 2e-15);
+        assert_eq!(original.units.resistance_ohms_per_unit, 2e3);
+        assert_eq!(original.nets["converted"].connections[0].x, Some(1.25));
+        assert_eq!(original.nets["converted"].connections[0].y, Some(-2.5));
+
+        let text = write_spef(&original).unwrap();
+        assert!(text.contains("*T_UNIT 1 NS"), "{text}");
+        assert!(text.contains("*C_UNIT 1 PF"), "{text}");
+        assert!(text.contains("*R_UNIT 1 OHM"), "{text}");
+        let round = parse_spef(&text).unwrap();
+        let net = &round.nets["converted"];
+        assert_eq!(net.total_capacitance, 0.012);
+        assert_eq!(net.caps[0].value, 0.004);
+        assert_eq!(net.caps[1].value, 0.008);
+        assert_eq!(net.resistors[0].value, 10_000.0);
+        assert!((net.grounded_capacitance(round.units) - 4e-15).abs() < 1e-24);
+        assert!((net.coupling_capacitance(round.units) - 8e-15).abs() < 1e-24);
+        assert_eq!(net.total_resistance(round.units), 10_000.0);
+        assert_eq!(net.connections[0].x, Some(1.25));
+        assert_eq!(net.connections[0].y, Some(-2.5));
+        assert!(
+            (net.estimated_delay_seconds(round.units)
+                - original.nets["converted"].estimated_delay_seconds(original.units))
+            .abs()
+                < 1e-21
+        );
+    }
+
+    #[test]
+    fn escaped_design_and_net_names_round_trip() {
+        let mut spef = Spef {
+            version: "test".into(),
+            design: "top\\one".into(),
+            units: SpefUnits::default(),
+            nets: BTreeMap::new(),
+        };
+        spef.nets.insert(
+            "bus\\a".into(),
+            SpefNet {
+                name: "bus\\a".into(),
+                total_capacitance: 0.001,
+                connections: Vec::new(),
+                caps: vec![SpefCap {
+                    id: 1,
+                    node1: "bus\\a".into(),
+                    node2: None,
+                    value: 0.001,
+                }],
+                resistors: Vec::new(),
+            },
+        );
+        let round = parse_spef(&write_spef(&spef).unwrap()).unwrap();
+        assert_eq!(round.design, "top\\one");
+        assert!(round.nets.contains_key("bus\\a"));
+        assert_eq!(round.nets["bus\\a"].caps[0].node1, "bus\\a");
+    }
+
+    #[test]
+    fn analyze_reports_totals_unmatched_nets_and_worst_delay() {
+        let mut nl = Netlist::new("top");
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u_and".into(),
+            kind: CellKind::And,
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, vec![a]);
+        nl.add_port("b", Dir::In, vec![b]);
+        nl.add_port("y", Dir::Out, vec![y]);
+
+        let spef = parse_spef(SPEF).unwrap();
+        let result = analyze(&nl, &spef).unwrap();
+        assert_eq!(result.design, "top");
+        assert_eq!(result.net_count, 2);
+        assert_eq!(result.unmatched_netlist_nets, vec!["b".to_string()]);
+        assert_eq!(result.nets.len(), 2);
+        assert!((result.total_grounded_cap_pf - 0.016).abs() < 1e-12);
+        assert!((result.total_coupling_cap_pf - 0.004).abs() < 1e-12);
+        assert!((result.total_resistance_ohm - 37.5).abs() < 1e-12);
+        assert!((result.worst_delay_ns - 0.000138).abs() < 1e-12);
+        let text = report(&result);
+        assert!(text.contains("unmatched netlist nets: b"), "{text}");
+        assert!(text.contains("NET a"), "{text}");
+    }
+
+    #[test]
+    fn writes_sdf_interconnect_annotations_for_spef_nets() {
+        let mut nl = Netlist::new("top");
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u_and".into(),
+            kind: CellKind::And,
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, vec![a]);
+        nl.add_port("b", Dir::In, vec![b]);
+        nl.add_port("y", Dir::Out, vec![y]);
+        let spef = parse_spef(SPEF).unwrap();
+        let sdf = write_sdf(&nl, &spef).unwrap();
+        assert!(sdf.contains("(DELAYFILE"), "{sdf}");
+        assert!(sdf.contains("(TIMESCALE 1ns)"), "{sdf}");
+        assert!(sdf.contains("(INTERCONNECT a a ("), "{sdf}");
+    }
+
+    #[test]
+    fn rejects_malformed_or_inconsistent_spef() {
+        assert_eq!(
+            parse_spef("*D_NET a 1\n*END\n").unwrap_err(),
+            "SPEF has no *DESIGN statement"
+        );
+        assert_eq!(
+            parse_spef("*DESIGN top\n").unwrap_err(),
+            "SPEF has no *D_NET sections"
+        );
+        assert!(parse_spef("*DESIGN top\nnoise\n*D_NET a 1\n*END\n")
+            .unwrap_err()
+            .contains("outside *D_NET"));
+        assert!(parse_spef("*DESIGN top\n*D_NET a NaN\n*END\n")
+            .unwrap_err()
+            .contains("invalid total capacitance"));
+        assert!(parse_spef("*DESIGN top\n*D_NET a 1\n*CAP\n1 a -1\n*END\n")
+            .unwrap_err()
+            .contains("capacitance value"));
+        assert!(
+            parse_spef("*DESIGN top\n*D_NET a 1\n*RES\n1 a b -1\n*END\n")
+                .unwrap_err()
+                .contains("resistance value")
+        );
+        assert!(
+            parse_spef("*DESIGN top\n*D_NET a 1\n*END\n*D_NET a 1\n*END\n")
+                .unwrap_err()
+                .contains("duplicate SPEF net")
+        );
+        assert!(
+            parse_spef("*DESIGN top\n*D_NET a 1\n*CAP\n1 a 1\n1 a 1\n*END\n")
+                .unwrap_err()
+                .contains("repeats capacitor id")
+        );
+        assert!(
+            parse_spef("*DESIGN top\n*D_NET a 1\n*RES\n1 a b 1\n1 a b 1\n*END\n")
+                .unwrap_err()
+                .contains("repeats resistor id")
+        );
+        assert!(parse_spef("*DESIGN top\n*T_UNIT 0 NS\n*D_NET a 1\n*END\n")
+            .unwrap_err()
+            .contains("unit scale must be positive"));
+        assert!(
+            parse_spef("*DESIGN top\n*T_UNIT 1 YEARS\n*D_NET a 1\n*END\n")
+                .unwrap_err()
+                .contains("unsupported unit")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_spef_objects_before_writing() {
+        let mut spef = parse_spef(SPEF).unwrap();
+        spef.design = " ".into();
+        assert_eq!(
+            write_spef(&spef).unwrap_err(),
+            "cannot write SPEF without a design name"
+        );
+
+        let mut spef = parse_spef(SPEF).unwrap();
+        spef.nets.clear();
+        assert_eq!(
+            write_spef(&spef).unwrap_err(),
+            "cannot write SPEF without nets"
+        );
+
+        let mut spef = parse_spef(SPEF).unwrap();
+        spef.units.capacitance_farads_per_unit = 0.0;
+        assert_eq!(
+            write_spef(&spef).unwrap_err(),
+            "cannot write SPEF with nonpositive units"
+        );
+
+        let mut spef = parse_spef(SPEF).unwrap();
+        spef.nets.get_mut("a").unwrap().caps[0].value = f64::NAN;
+        assert!(write_spef(&spef)
+            .unwrap_err()
+            .contains("non-finite parasitics"));
     }
 }

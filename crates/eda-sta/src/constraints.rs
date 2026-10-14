@@ -1,6 +1,9 @@
 //! Minimal SDC timing constraints and constrained slack evaluation.
 //!
 //! Supported commands:
+//! - `set_units`
+//!   - time/capacitance scaling into canonical ns/pF
+//!   - resistance/voltage/current metadata
 //! - `create_clock`
 //! - `create_generated_clock`
 //! - `set_clock_uncertainty`
@@ -399,6 +402,8 @@ impl TimingPin {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimingConstraints {
+    /// Source-unit metadata; all numeric fields remain canonical ns/pF.
+    pub units: SdcUnits,
     pub clocks: BTreeMap<String, Clock>,
     pub clock_groups: Vec<ClockGroup>,
     pub input_delays: BTreeMap<String, PortDelay>,
@@ -436,6 +441,42 @@ pub struct TimingConstraints {
     pub input_transitions: Vec<ScopedQualityLimit>,
     /// Object-scoped port/pin loads in picofarads.
     pub load_capacitances: Vec<ScopedQualityLimit>,
+}
+
+/// Canonical SDC source-unit metadata.
+///
+/// Parsers normalize values into nanoseconds/picofarads before timing or
+/// quality analysis. These fields preserve the last source representation for
+/// tool reporting and scenario serialization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SdcUnits {
+    pub time_unit: String,
+    pub time_to_ns_factor: f64,
+    pub capacitance_unit: String,
+    pub capacitance_to_pf_factor: f64,
+    pub resistance_unit: String,
+    pub resistance_to_ohm_factor: f64,
+    pub voltage_unit: String,
+    pub voltage_to_v_factor: f64,
+    pub current_unit: String,
+    pub current_to_a_factor: f64,
+}
+
+impl Default for SdcUnits {
+    fn default() -> Self {
+        Self {
+            time_unit: "ns".into(),
+            time_to_ns_factor: 1.0,
+            capacitance_unit: "pf".into(),
+            capacitance_to_pf_factor: 1.0,
+            resistance_unit: "ohm".into(),
+            resistance_to_ohm_factor: 1.0,
+            voltage_unit: "v".into(),
+            voltage_to_v_factor: 1.0,
+            current_unit: "a".into(),
+            current_to_a_factor: 1.0,
+        }
+    }
 }
 
 /// Semantic difference between two SDC constraint sets.
@@ -1538,6 +1579,7 @@ pub fn constrained_report(r: &ConstrainedTiming) -> String {
 /// Parse an SDC subset. Each command must be on its own line.
 pub fn parse_sdc(source: &str) -> Result<TimingConstraints, String> {
     let mut out = TimingConstraints::default();
+    let mut units = SdcUnits::default();
     for (index, raw) in source.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(raw).trim();
@@ -1545,7 +1587,15 @@ pub fn parse_sdc(source: &str) -> Result<TimingConstraints, String> {
             continue;
         }
         let tokens = tokenize(line).map_err(|e| format!("line {}: {}", line_number, e))?;
-        parse_command(&mut out, &tokens).map_err(|e| format!("line {}: {}", line_number, e))?;
+        if tokens.first().map(String::as_str) == Some("set_units") {
+            parse_set_units(&mut units, &tokens)
+                .map_err(|e| format!("line {}: {}", line_number, e))?;
+            out.units = units.clone();
+            continue;
+        }
+        let normalized = normalize_unit_values(&tokens, &units)
+            .map_err(|e| format!("line {}: {}", line_number, e))?;
+        parse_command(&mut out, &normalized).map_err(|e| format!("line {}: {}", line_number, e))?;
     }
     Ok(out)
 }
@@ -1624,6 +1674,177 @@ fn parse_command(out: &mut TimingConstraints, tokens: &[String]) -> Result<(), S
         Some(other) => Err(format!("unsupported SDC command '{}'", other)),
         None => Err("empty SDC command".into()),
     }
+}
+
+fn unit_factor(value: &str, dimension: &str) -> Result<(String, f64), String> {
+    let normalized = value.trim().trim_start_matches('1').to_ascii_lowercase();
+    let normalized = normalized.replace('_', "");
+    if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(format!("invalid {dimension} unit '{value}'"));
+    }
+    let factor = match dimension {
+        "time" => match normalized.as_str() {
+            "fs" => 1.0e-6,
+            "ps" => 1.0e-3,
+            "ns" => 1.0,
+            "us" => 1.0e3,
+            "ms" => 1.0e6,
+            "s" => 1.0e9,
+            _ => return Err(format!("unsupported time unit '{value}'")),
+        },
+        "capacitance" => match normalized.as_str() {
+            "ff" => 1.0e-3,
+            "pf" => 1.0,
+            "nf" => 1.0e3,
+            "uf" => 1.0e6,
+            "mf" => 1.0e9,
+            "f" => 1.0e-3,
+            _ => return Err(format!("unsupported capacitance unit '{value}'")),
+        },
+        "resistance" => match normalized.as_str() {
+            "mohm" => 1.0e-3,
+            "ohm" => 1.0,
+            "kohm" => 1.0e3,
+            "megohm" => 1.0e6,
+            "gohm" => 1.0e9,
+            _ => return Err(format!("unsupported resistance unit '{value}'")),
+        },
+        "voltage" => match normalized.as_str() {
+            "uv" => 1.0e-6,
+            "mv" => 1.0e-3,
+            "v" => 1.0,
+            "kv" => 1.0e3,
+            _ => return Err(format!("unsupported voltage unit '{value}'")),
+        },
+        "current" => match normalized.as_str() {
+            "ua" => 1.0e-6,
+            "ma" => 1.0e-3,
+            "a" => 1.0,
+            "ka" => 1.0e3,
+            _ => return Err(format!("unsupported current unit '{value}'")),
+        },
+        _ => return Err(format!("unknown unit dimension '{dimension}'")),
+    };
+    Ok((normalized, factor))
+}
+
+fn parse_set_units(units: &mut SdcUnits, tokens: &[String]) -> Result<(), String> {
+    const OPTIONS: [(&str, &str); 5] = [
+        ("-time", "time"),
+        ("-capacitance", "capacitance"),
+        ("-resistance", "resistance"),
+        ("-voltage", "voltage"),
+        ("-current", "current"),
+    ];
+    let mut seen = BTreeSet::new();
+    for flag in tokens[1..].iter().filter(|token| token.starts_with('-')) {
+        if tokens[1..]
+            .iter()
+            .filter(|other| other.as_str() == flag.as_str())
+            .count()
+            > 1
+        {
+            return Err(format!("duplicate set_units option '{flag}'"));
+        }
+    }
+    for (flag, dimension) in OPTIONS {
+        let Some(value) = value_after(tokens, flag)? else {
+            continue;
+        };
+        if !seen.insert(flag.to_string()) {
+            return Err(format!("duplicate set_units option '{flag}'"));
+        }
+        let (unit, factor) = unit_factor(&value, dimension)?;
+        match dimension {
+            "time" => {
+                units.time_unit = unit;
+                units.time_to_ns_factor = factor;
+            }
+            "capacitance" => {
+                units.capacitance_unit = unit;
+                units.capacitance_to_pf_factor = factor;
+            }
+            "resistance" => {
+                units.resistance_unit = unit;
+                units.resistance_to_ohm_factor = factor;
+            }
+            "voltage" => {
+                units.voltage_unit = unit;
+                units.voltage_to_v_factor = factor;
+            }
+            "current" => {
+                units.current_unit = unit;
+                units.current_to_a_factor = factor;
+            }
+            _ => unreachable!(),
+        }
+    }
+    if seen.is_empty() {
+        return Err("set_units requires at least one unit option".into());
+    }
+    for token in &tokens[1..] {
+        if token.starts_with('-') && !seen.contains(token) {
+            return Err(format!("unsupported set_units option '{token}'"));
+        }
+    }
+    Ok(())
+}
+
+fn scale_token_at(tokens: &mut [String], index: usize, factor: f64) {
+    if let Some(token) = tokens.get(index) {
+        if let Ok(value) = token.parse::<f64>() {
+            tokens[index] = format!("{}", value * factor);
+        }
+    }
+}
+
+fn first_number_position(tokens: &[String]) -> Option<usize> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, token)| token.parse::<f64>().is_ok())
+        .map(|(index, _)| index)
+}
+
+fn normalize_unit_values(tokens: &[String], units: &SdcUnits) -> Result<Vec<String>, String> {
+    let mut out = tokens.to_vec();
+    let command = tokens.first().map(String::as_str).unwrap_or_default();
+    match command {
+        "create_clock" => {
+            if let Some(index) = tokens.iter().position(|token| token == "-period") {
+                scale_token_at(&mut out, index + 1, units.time_to_ns_factor);
+            }
+            for flag in ["-edge_rise", "-rise", "-edge_fall", "-fall"] {
+                if let Some(index) = tokens.iter().position(|token| token == flag) {
+                    scale_token_at(&mut out, index + 1, units.time_to_ns_factor);
+                }
+            }
+        }
+        "set_input_delay"
+        | "set_output_delay"
+        | "set_clock_uncertainty"
+        | "set_max_delay"
+        | "set_min_delay"
+        | "set_input_transition"
+        | "set_max_transition" => scale_token_at(&mut out, 1, units.time_to_ns_factor),
+        "set_clock_latency" | "set_clock_transition" => {
+            if let Some(index) = first_number_position(tokens) {
+                scale_token_at(&mut out, index, units.time_to_ns_factor);
+            }
+        }
+        "set_max_capacitance" => scale_token_at(&mut out, 1, units.capacitance_to_pf_factor),
+        "set_load" => {
+            let index = if tokens.get(1).map(String::as_str) == Some("-pin_load") {
+                2
+            } else {
+                1
+            };
+            scale_token_at(&mut out, index, units.capacitance_to_pf_factor);
+        }
+        _ => {}
+    }
+    Ok(out)
 }
 
 fn value_after(tokens: &[String], flag: &str) -> Result<Option<String>, String> {
@@ -4475,6 +4696,44 @@ mod tests {
         assert_eq!(s.timing_derate.late, 1.1);
         assert_eq!(s.cell_timing_derates["u1"].early, 0.7);
         assert_eq!(s.cell_timing_derates["u1"].late, 1.3);
+    }
+
+    #[test]
+    fn set_units_normalizes_subsequent_time_and_capacitance_values() {
+        let source = r#"
+            set_units -time 1ps -capacitance 1ff -resistance 1kohm -voltage 1mv -current 1ma
+            create_clock -name clk -period 100 [get_ports clk]
+            set_clock_uncertainty 10 -setup [get_clocks clk]
+            set_clock_latency 20 [get_clocks clk]
+            set_clock_transition 3 [get_clocks clk]
+            set_input_delay 40 -clock clk [get_ports a]
+            set_max_delay 300 -from [get_ports a] -to [get_ports y]
+            set_max_transition 6
+            set_max_capacitance 200
+            set_load 70 [get_ports y]
+        "#;
+        let constraints = parse_sdc(source).unwrap();
+        assert_eq!(constraints.units.time_unit, "ps");
+        assert_eq!(constraints.units.capacitance_unit, "ff");
+        assert_eq!(constraints.units.resistance_unit, "kohm");
+        assert_eq!(constraints.units.voltage_unit, "mv");
+        assert_eq!(constraints.units.current_unit, "ma");
+        assert_eq!(constraints.clocks["clk"].period, 0.1);
+        assert_eq!(constraints.clocks["clk"].fall, 0.05);
+        assert_eq!(constraints.clock_uncertainty_ns["clk"], 0.01);
+        assert_eq!(constraints.clocks["clk"].network_latency_ns, 0.02);
+        assert_eq!(constraints.clocks["clk"].rise_transition_ns, 0.003);
+        assert_eq!(constraints.input_delays["a"].delay, 0.04);
+        assert_eq!(constraints.max_delay_paths[0].limit, 0.3);
+        assert_eq!(constraints.max_transition_ns, Some(0.006));
+        assert_eq!(constraints.max_capacitance_pf, Some(0.2));
+        assert_eq!(constraints.load_capacitances[0].limit, 0.07);
+
+        let defaults = parse_sdc("set_units -time ns -capacitance pf\n").unwrap();
+        assert_eq!(defaults.units, SdcUnits::default());
+        assert!(parse_sdc("set_units -time parsecs").is_err());
+        assert!(parse_sdc("set_units -time 1ps -time 1ns").is_err());
+        assert!(parse_sdc("set_units -unknown 1").is_err());
     }
 
     #[test]

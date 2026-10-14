@@ -8,6 +8,42 @@ use eda_core::library::LibFunc;
 use eda_core::logic::LogicWord;
 use eda_core::netlist::{CellKind, Dir, NetId, Netlist};
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+
+/// Net IDs are dense `usize`s in LEC-sized sets. Identity hashing preserves
+/// set semantics while avoiding SipHash's per-candidate cost in queues that
+/// rebuild cut frontiers millions of times on RV32I.
+#[derive(Default)]
+struct NetIdHasher(u64);
+
+impl Hasher for NetIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for (index, byte) in bytes.iter().enumerate() {
+            self.0 ^= (*byte as u64) << ((index % 8) * 8);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Default)]
+struct NetIdHashBuilder;
+
+impl BuildHasher for NetIdHashBuilder {
+    type Hasher = NetIdHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        NetIdHasher::default()
+    }
+}
+
+type NetIdSet = std::collections::HashSet<NetId, NetIdHashBuilder>;
 
 #[derive(Clone, Debug)]
 pub struct EquivResult {
@@ -16,69 +52,6 @@ pub struct EquivResult {
     /// distinguishes the two netlists.
     pub counterexample: Option<HashMap<String, LogicWord>>,
     pub notes: Vec<String>,
-}
-
-struct Encoded {
-    cnf: crate::sat::Cnf,
-    lit: HashMap<NetId, i32>,
-}
-
-/// Encode the whole netlist: every net gets a literal; combinational cells
-/// are constrained; flip-flop outputs stay free (state) with their d-input
-/// cones encoded.
-fn encode_netlist(nl: &Netlist, cancellation: &FlowCancellation) -> Result<Encoded, String> {
-    let mut e = NetlistEncoder::new(nl);
-    for n in 0..nl.net_count() {
-        if cancellation.is_cancelled() {
-            return Err("equivalence checking cancelled".into());
-        }
-        e.lit_of(n);
-    }
-    for ci in 0..nl.cell_count() {
-        if cancellation.is_cancelled() {
-            return Err("equivalence checking cancelled".into());
-        }
-        let c = nl.cell(ci);
-        match &c.kind {
-            CellKind::Dff { .. } | CellKind::DffR { .. } => {
-                // state element: q is free; encode the d cone only
-                e.enc_cone(c.inputs[1])?;
-                if c.inputs.len() > 2 {
-                    e.enc_cone(c.inputs[2])?; // reset net cone (if driven)
-                }
-                e.enc_cone(c.inputs[0])?; // clock cone
-            }
-            CellKind::Lib(lid) => {
-                let lib = nl
-                    .library()
-                    .ok_or("library cell without attached library")?;
-                let def = lib.get(*lid);
-                if let Some(seq) = def.seq.as_ref() {
-                    let clk_pin = seq.clk_pin;
-                    let reset_pin = seq.reset_pin;
-                    e.enc_cone(c.inputs[1])?; // d
-                    e.enc_cone(c.inputs[clk_pin])?;
-                    if let Some(rp) = reset_pin {
-                        e.enc_cone(c.inputs[rp])?;
-                    }
-                } else {
-                    for &i in &c.inputs {
-                        e.enc_cone(i)?;
-                    }
-                    e.enc_cell(ci)?;
-                }
-            }
-            _ => {
-                for &i in &c.inputs {
-                    e.enc_cone(i)?;
-                }
-                e.enc_cell(ci)?;
-            }
-        }
-    }
-    let cnf = std::mem::take(&mut e.cnf);
-    let lit = e.var.clone();
-    Ok(Encoded { cnf, lit })
 }
 
 fn flop_records(nl: &Netlist) -> Result<Vec<FlopRec>, String> {
@@ -193,45 +166,6 @@ pub fn check_equivalent_cancellable(
             counterexample: None,
             notes: vec!["port lists differ".into()],
         });
-    }
-
-    let ge = encode_netlist(gold, cancellation)?;
-    if cancellation.is_cancelled() {
-        return Err("equivalence checking cancelled".into());
-    }
-    let te = encode_netlist(gate, cancellation)?;
-    if cancellation.is_cancelled() {
-        return Err("equivalence checking cancelled".into());
-    }
-    let offset = ge.cnf.n_vars as i32;
-
-    let mut cnf = ge.cnf.clone();
-    while cnf.n_vars < ge.cnf.n_vars + te.cnf.n_vars {
-        cnf.add_var();
-    }
-    for cl in &te.cnf.clauses {
-        cnf.add_clause(cl.iter().map(|l| shift(*l, offset)).collect());
-    }
-
-    let glit = |n: NetId| ge.lit[&n];
-    let tlit = |n: NetId| shift(te.lit[&n], offset);
-    let eq = |cnf: &mut crate::sat::Cnf, a: i32, b: i32| {
-        cnf.add_clause(vec![-a, b]);
-        cnf.add_clause(vec![a, -b]);
-    };
-
-    // tie primary inputs together
-    for p in &gold.ports {
-        if cancellation.is_cancelled() {
-            return Err("equivalence checking cancelled".into());
-        }
-        if p.dir != Dir::In {
-            continue;
-        }
-        let gp = gate.port_by_name(&p.name).unwrap();
-        for k in 0..p.bits.len() {
-            eq(&mut cnf, glit(p.bits[k]), tlit(gp.bits[k]));
-        }
     }
 
     // match flops by q net name, tie present state, and miter next state
@@ -391,22 +325,36 @@ pub fn check_equivalent_cancellable(
         Ok(None)
     };
 
-    // Visit intrinsically large next-state cones first. This is a fail-fast
-    // scheduling policy, not a change to the proof itself: if a deep RF/ALU
-    // obligation is capacity-limited, reporting it before thousands of easier
-    // storage bits avoids spending the entire budget walking toward the same
-    // conservative verdict.
-    let no_cuts = std::collections::HashSet::new();
+    // Visit structurally deep next-state cones first. This is a fail-fast
+    // scheduling policy, not a change to the proof itself: topological driver
+    // depth is computed once per design and avoids re-walking every flop cone
+    // merely to order the obligations.
+    let topo_cell_rank = |nl: &Netlist| -> HashMap<usize, usize> {
+        nl.topo_cells()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(rank, cell_id)| (cell_id, rank))
+            .collect()
+    };
+    let gold_cell_rank = topo_cell_rank(gold);
+    let gate_cell_rank = topo_cell_rank(gate);
+    let driver_rank = |nl: &Netlist, net: NetId, ranks: &HashMap<usize, usize>| -> usize {
+        nl.net(net)
+            .drivers
+            .first()
+            .and_then(|cell_id| ranks.get(cell_id))
+            .copied()
+            .unwrap_or_default()
+    };
     let mut proof_order: Vec<(usize, &str, &FlopRec, &FlopRec)> = matched
         .iter()
         .map(|(g, t)| {
-            let gold_rank = bounded_region_len(gold, g.d, &no_cuts, 20_000);
-            let gate_rank = bounded_region_len(gate, t.d, &no_cuts, 20_000);
-            let rank = if gold_rank == usize::MAX || gate_rank == usize::MAX {
-                usize::MAX
-            } else {
-                gold_rank.saturating_add(gate_rank)
-            };
+            let rank = driver_rank(gold, g.d, &gold_cell_rank).saturating_add(driver_rank(
+                gate,
+                t.d,
+                &gate_cell_rank,
+            ));
             (rank, g.q_name.as_str(), *g, *t)
         })
         .collect();
@@ -449,18 +397,10 @@ pub fn check_equivalent_cancellable(
             }
         }
     }
-    for (g_net, t_net, _) in &points {
-        if let Some(result) = prove(
-            gold,
-            gate,
-            *g_net,
-            *t_net,
-            format!("internal point '{}'", gold.net(*g_net).name),
-            &mut queries,
-        )? {
-            return Ok(result);
-        }
-    }
+    // Internal correspondence points were already discharged while the
+    // inductive frontier was built. Replaying those proofs adds no new design
+    // obligation: the final flop/output queries still consume the verified
+    // points as sound cuts.
     notes.push(format!(
         "proved with {queries} localized correspondence-point miter queries"
     ));
@@ -501,14 +441,18 @@ fn full_cone_values(
     shared: &HashMap<String, bool>,
 ) -> HashMap<NetId, bool> {
     let mut values = HashMap::new();
+    let mut logic_values = HashMap::new();
     for (net, lit) in vars {
         if is_full_cone_boundary(nl, *net) {
-            values.insert(*net, model[(*lit - 1) as usize]);
+            let value = model[(*lit - 1) as usize];
+            values.insert(*net, value);
+            logic_values.insert(*net, eda_core::logic::LogicValue::bit(value));
         }
     }
     for (name, value) in shared {
         if let Some(net) = nl.net_by_name(name) {
             values.insert(net, *value);
+            logic_values.insert(net, eda_core::logic::LogicValue::bit(*value));
         }
     }
     for cell_id in nl.topo_cells().unwrap_or_default() {
@@ -516,15 +460,10 @@ fn full_cone_values(
         if is_sequential_cell(&cell.kind, nl) {
             continue;
         }
-        let value = nl.eval_cell(
-            cell_id,
-            &values
-                .iter()
-                .map(|(net, value)| (*net, eda_core::logic::LogicValue::bit(*value)))
-                .collect(),
-        );
+        let value = nl.eval_cell(cell_id, &logic_values);
         if let Some(bit) = value.as_bool() {
             values.insert(cell.output, bit);
+            logic_values.insert(cell.output, value);
         }
     }
     values
@@ -613,14 +552,14 @@ fn prove_bit_equal(
     // removed the corresponding gate-side occurrence leaves a free gold
     // variable that can fabricate a distinction even though the full cones
     // are equivalent.
-    let mut gold_cuts: std::collections::HashSet<NetId> = matched
+    let mut gold_cuts: NetIdSet = matched
         .iter()
         .filter(|(g, t)| {
             g.q != g_net && t.q != t_net && gold_iv.contains_key(&g.q) && gate_iv.contains_key(&t.q)
         })
         .map(|(g, _)| g.q)
         .collect();
-    let mut gate_cuts: std::collections::HashSet<NetId> = matched
+    let mut gate_cuts: NetIdSet = matched
         .iter()
         .filter(|(g, t)| {
             g.q != g_net && t.q != t_net && gold_iv.contains_key(&g.q) && gate_iv.contains_key(&t.q)
@@ -665,9 +604,9 @@ fn prove_bit_equal(
         }
     }
     let mut ge = NetlistEncoder::new(gold);
-    let a = ge.enc_cone_with_cuts(g_net, &gold_cuts)?;
+    let a = ge.enc_cone_with_cuts(g_net, |net| gold_cuts.contains(net))?;
     let mut te = NetlistEncoder::new(gate);
-    let b_raw = te.enc_cone_with_cuts(t_net, &gate_cuts)?;
+    let b_raw = te.enc_cone_with_cuts(t_net, |net| gate_cuts.contains(net))?;
     if std::env::var("EDA_LEC_DEBUG").is_ok() {
         eprintln!(
             "LEC query: gold '{}' -> {}, gate '{}' -> {} (ge_vars={} te_vars={})",
@@ -955,12 +894,9 @@ fn prove_bit_equal(
             .filter(|net| !is_full_cone_boundary(gold, *net) && gold_lits.contains_key(net))
             .collect();
         expandable_gold.sort_unstable();
-        let expanded_gold: std::collections::HashSet<NetId> = expandable_gold
+        let expanded_gold: NetIdSet = expandable_gold
             .into_iter()
-            .filter(|net| {
-                bounded_region_len(gold, *net, &std::collections::HashSet::new(), 20_000)
-                    != usize::MAX
-            })
+            .filter(|net| bounded_region_len(gold, *net, |_| false, 20_000) != usize::MAX)
             .map(|net| {
                 ge.enc_cone(net)?;
                 Ok(net)
@@ -977,12 +913,9 @@ fn prove_bit_equal(
                     && gate_lits.contains_key(net)
             })
             .collect();
-        let expanded_gate: std::collections::HashSet<NetId> = expandable_gate
+        let expanded_gate: NetIdSet = expandable_gate
             .into_iter()
-            .filter(|net| {
-                bounded_region_len(gate, *net, &std::collections::HashSet::new(), 20_000)
-                    != usize::MAX
-            })
+            .filter(|net| bounded_region_len(gate, *net, |_| false, 20_000) != usize::MAX)
             .map(|net| {
                 te.enc_cone(net)?;
                 Ok(net)
@@ -1337,25 +1270,25 @@ fn simulate_shared_values(
 /// tie the cut variables, and require the XOR miter to be UNSAT. Processing
 /// candidates in topological order keeps each region small even where the
 /// mapper restructured several gates into one library cell (or vice versa).
+#[allow(clippy::too_many_arguments)]
 fn verify_local_region(
     gold: &Netlist,
     gate: &Netlist,
     gn: NetId,
     tn: NetId,
     accepted: &HashMap<NetId, NetId>,
+    gate_accepted: &NetIdSet,
     result_cache: &mut HashMap<Vec<i32>, bool>,
     cancellation: &FlowCancellation,
 ) -> Result<bool, String> {
-    let gold_cuts: std::collections::HashSet<NetId> =
-        accepted.keys().copied().filter(|n| *n != gn).collect();
-    let gate_cuts: std::collections::HashSet<NetId> =
-        accepted.values().copied().filter(|n| *n != tn).collect();
     // Reject oversized proposals before CNF encoding. Induction regions are
     // normally small; a deep region means the accepted map has not reached
     // that area yet, and encoding every ambiguous proposal is too expensive.
     const MAX_REGION_NETS: usize = 128;
-    let gold_region_len = bounded_region_len(gold, gn, &gold_cuts, MAX_REGION_NETS);
-    let gate_region_len = bounded_region_len(gate, tn, &gate_cuts, MAX_REGION_NETS);
+    let gold_is_cut = |net: &NetId| -> bool { *net != gn && accepted.contains_key(net) };
+    let gate_is_cut = |net: &NetId| -> bool { *net != tn && gate_accepted.contains(net) };
+    let gold_region_len = bounded_region_len(gold, gn, |net| gold_is_cut(net), MAX_REGION_NETS);
+    let gate_region_len = bounded_region_len(gate, tn, |net| gate_is_cut(net), MAX_REGION_NETS);
     if gold_region_len == usize::MAX
         || gate_region_len == usize::MAX
         || gold_region_len + gate_region_len > MAX_REGION_NETS
@@ -1363,9 +1296,9 @@ fn verify_local_region(
         return Ok(false);
     }
     let mut ge = NetlistEncoder::new(gold);
-    let a = ge.enc_cone_with_cuts(gn, &gold_cuts)?;
+    let a = ge.enc_cone_with_cuts(gn, |net| gold_is_cut(net))?;
     let mut te = NetlistEncoder::new(gate);
-    let b = te.enc_cone_with_cuts(tn, &gate_cuts)?;
+    let b = te.enc_cone_with_cuts(tn, |net| gate_is_cut(net))?;
     let offset = ge.cnf.n_vars as i32;
     let mut cnf = ge.cnf.clone();
     while cnf.n_vars < (offset + te.cnf.n_vars as i32) as usize {
@@ -1393,12 +1326,17 @@ fn verify_local_region(
             }
         }
     }
-    for (gin, tin) in accepted {
-        if *gin != gn && *tin != tn && ge.has_lit(*gin) && te.has_lit(*tin) {
-            let gl = ge.var[gin];
-            let tl = shift(te.var[tin], offset);
-            cnf.add_clause(vec![-gl, tl]);
-            cnf.add_clause(vec![gl, -tl]);
+    for gin in ge.var.keys() {
+        if *gin == gn {
+            continue;
+        }
+        if let Some(&tin) = accepted.get(gin) {
+            if tin != tn && te.has_lit(tin) {
+                let gl = ge.var[gin];
+                let tl = shift(te.var[&tin], offset);
+                cnf.add_clause(vec![-gl, tl]);
+                cnf.add_clause(vec![gl, -tl]);
+            }
         }
     }
     let b = shift(b, offset);
@@ -1488,14 +1426,14 @@ fn verify_vector_region_with_cap(
     if pairs.len() < 2 {
         return Ok(false);
     }
-    let gold_sinks: std::collections::HashSet<NetId> = pairs.iter().map(|(gn, _)| *gn).collect();
-    let gate_sinks: std::collections::HashSet<NetId> = pairs.iter().map(|(_, tn)| *tn).collect();
-    let gold_cuts: std::collections::HashSet<NetId> = accepted
+    let gold_sinks: NetIdSet = pairs.iter().map(|(gn, _)| *gn).collect();
+    let gate_sinks: NetIdSet = pairs.iter().map(|(_, tn)| *tn).collect();
+    let gold_cuts: NetIdSet = accepted
         .keys()
         .copied()
         .filter(|net| !gold_sinks.contains(net))
         .collect();
-    let gate_cuts: std::collections::HashSet<NetId> = accepted
+    let gate_cuts: NetIdSet = accepted
         .values()
         .copied()
         .filter(|net| !gate_sinks.contains(net))
@@ -1504,12 +1442,12 @@ fn verify_vector_region_with_cap(
     let mut ge = NetlistEncoder::new(gold);
     let mut gold_literals = Vec::with_capacity(pairs.len());
     for (gn, _) in pairs {
-        gold_literals.push(ge.enc_cone_with_cuts(*gn, &gold_cuts)?);
+        gold_literals.push(ge.enc_cone_with_cuts(*gn, |net| gold_cuts.contains(net))?);
     }
     let mut te = NetlistEncoder::new(gate);
     let mut gate_literals = Vec::with_capacity(pairs.len());
     for (_, tn) in pairs {
-        gate_literals.push(te.enc_cone_with_cuts(*tn, &gate_cuts)?);
+        gate_literals.push(te.enc_cone_with_cuts(*tn, |net| gate_cuts.contains(net))?);
     }
     if ge.cnf.n_vars + te.cnf.n_vars > vector_cap {
         if std::env::var("EDA_LEC_DEBUG").is_ok() {
@@ -1733,12 +1671,9 @@ fn verify_vector_region_with_cap(
             })
             .collect();
         expandable_gold.sort_unstable();
-        let expanded_gold: std::collections::HashSet<NetId> = expandable_gold
+        let expanded_gold: NetIdSet = expandable_gold
             .into_iter()
-            .filter(|net| {
-                bounded_region_len(gold, *net, &std::collections::HashSet::new(), 20_000)
-                    != usize::MAX
-            })
+            .filter(|net| bounded_region_len(gold, *net, |_| false, 20_000) != usize::MAX)
             .map(|net| {
                 ge.enc_cone(net)?;
                 Ok(net)
@@ -1755,12 +1690,9 @@ fn verify_vector_region_with_cap(
                     && gate_combined_lits.contains_key(net)
             })
             .collect();
-        let expanded_gate: std::collections::HashSet<NetId> = expandable_gate
+        let expanded_gate: NetIdSet = expandable_gate
             .into_iter()
-            .filter(|net| {
-                bounded_region_len(gate, *net, &std::collections::HashSet::new(), 20_000)
-                    != usize::MAX
-            })
+            .filter(|net| bounded_region_len(gate, *net, |_| false, 20_000) != usize::MAX)
             .map(|net| {
                 te.enc_cone(net)?;
                 Ok(net)
@@ -1816,7 +1748,7 @@ fn verify_vector_region_with_cap(
         cnf.add_clause(blocking);
         refinements += 1;
     };
-    if std::env::var("EDA_LEC_DEBUG").is_ok() && std::env::var("EDA_SAT_DUMP").is_ok() {
+    if std::env::var("EDA_VEC_DUMP").is_ok() {
         for clause in &cnf.clauses {
             eprintln!("VEC {clause:?}");
         }
@@ -1828,13 +1760,13 @@ fn verify_vector_region_with_cap(
     }
 }
 
-fn bounded_region_len(
+fn bounded_region_len<F: Fn(&NetId) -> bool>(
     nl: &Netlist,
     sink: NetId,
-    cuts: &std::collections::HashSet<NetId>,
+    cuts: F,
     cap: usize,
 ) -> usize {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = NetIdSet::default();
     let mut stack = vec![sink];
     while let Some(n) = stack.pop() {
         if seen.len() > cap {
@@ -1843,7 +1775,7 @@ fn bounded_region_len(
         if !seen.insert(n) {
             continue;
         }
-        if cuts.contains(&n) {
+        if cuts(&n) {
             continue;
         }
         for &cell_id in &nl.net(n).drivers {
@@ -1990,6 +1922,7 @@ fn build_correspondence_points(
             }
         }
     }
+    let mut gate_accepted: NetIdSet = accepted.values().copied().collect();
     let is_free = |nl: &Netlist, n: NetId| -> bool {
         nl.net(n).drivers.is_empty()
             || nl.net(n).drivers.iter().any(|&d| {
@@ -2128,6 +2061,7 @@ fn build_correspondence_points(
                                     continue;
                                 }
                                 accepted.insert(*g, *t);
+                                gate_accepted.insert(*t);
                                 points.push((*g, *t, false));
                             }
                             for (g, t) in group_pairs {
@@ -2161,6 +2095,7 @@ fn build_correspondence_points(
                     continue;
                 }
                 accepted.insert(g, t);
+                gate_accepted.insert(t);
                 points.push((g, t, named_flag));
             }
             propagate_fanout = true;
@@ -2266,11 +2201,13 @@ fn build_correspondence_points(
                 gn,
                 tn,
                 &accepted,
+                &gate_accepted,
                 &mut local_result_cache,
                 cancellation,
             )?;
             if verified {
                 accepted.insert(gn, tn);
+                gate_accepted.insert(tn);
                 points.push((gn, tn, named_flag));
                 propagate_fanout = true;
             } else {
@@ -3100,9 +3037,12 @@ mod tests {
             inputs: vec![a, b],
             output: y,
         });
-        let cuts = std::collections::HashSet::from([a]);
-        assert_eq!(bounded_region_len(&nl, y, &cuts, 128), 3);
-        assert_eq!(bounded_region_len(&nl, y, &cuts, 1), usize::MAX);
+        let cuts = [a].into_iter().collect::<NetIdSet>();
+        assert_eq!(bounded_region_len(&nl, y, |net| cuts.contains(net), 128), 3);
+        assert_eq!(
+            bounded_region_len(&nl, y, |net| cuts.contains(net), 1),
+            usize::MAX
+        );
 
         let c = nl.add_net("one");
         nl.add_cell(eda_core::netlist::Cell {

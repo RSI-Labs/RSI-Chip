@@ -1578,6 +1578,11 @@ pub struct MosfetModel {
     pub gate_drain_overlap_cap_per_m: f64,
     pub gate_bulk_cap_per_m2: f64,
     pub gate_oxide_cap_per_m2: f64,
+    pub source_junction_sidewall_cap_per_m: f64,
+    pub drain_junction_sidewall_cap_per_m: f64,
+    pub junction_potential_v: f64,
+    pub junction_grading_coefficient: f64,
+    pub junction_forward_knee: f64,
     pub saturation_charge_partition: f64,
     pub flicker_coefficient_a2: f64,
     pub flicker_current_exponent: f64,
@@ -1653,6 +1658,11 @@ impl Default for MosfetModel {
             gate_drain_overlap_cap_per_m: 0.0,
             gate_bulk_cap_per_m2: 0.0,
             gate_oxide_cap_per_m2: 0.0,
+            source_junction_sidewall_cap_per_m: 0.0,
+            drain_junction_sidewall_cap_per_m: 0.0,
+            junction_potential_v: 0.8,
+            junction_grading_coefficient: 0.5,
+            junction_forward_knee: 0.5,
             saturation_charge_partition: 0.0,
             flicker_coefficient_a2: 0.0,
             flicker_current_exponent: 1.0,
@@ -1692,6 +1702,20 @@ impl MosfetModel {
         ensure_finite_nonnegative(self.gate_drain_overlap_cap_per_m, "MOS CGDO")?;
         ensure_finite_nonnegative(self.gate_bulk_cap_per_m2, "MOS CGB")?;
         ensure_finite_nonnegative(self.gate_oxide_cap_per_m2, "MOS COX")?;
+        ensure_finite_nonnegative(self.source_junction_sidewall_cap_per_m, "MOS CJSW/CJSWS")?;
+        ensure_finite_nonnegative(self.drain_junction_sidewall_cap_per_m, "MOS CJSW/CJSWD")?;
+        ensure_finite_positive(self.junction_potential_v, "MOS PB")?;
+        if !self.junction_grading_coefficient.is_finite()
+            || !(0.0..=1.0).contains(&self.junction_grading_coefficient)
+        {
+            return Err("MOS MJ must be finite and between zero and one".into());
+        }
+        if !self.junction_forward_knee.is_finite()
+            || self.junction_forward_knee < 0.0
+            || self.junction_forward_knee >= 1.0
+        {
+            return Err("MOS FC must be finite and between zero and one".into());
+        }
         ensure_finite_nonnegative(
             self.saturation_charge_partition,
             "MOS saturation charge partition",
@@ -1779,6 +1803,8 @@ pub struct BjtModel {
     pub saturation_current_a: f64,
     pub forward_beta: f64,
     pub reverse_beta: f64,
+    pub forward_early_voltage_v: f64,
+    pub reverse_early_voltage_v: f64,
     pub base_emitter_zero_bias_cap_f: f64,
     pub base_collector_zero_bias_cap_f: f64,
     pub base_emitter_junction_potential_v: f64,
@@ -1802,6 +1828,8 @@ impl Default for BjtModel {
             saturation_current_a: 1e-14,
             forward_beta: 100.0,
             reverse_beta: 1.0,
+            forward_early_voltage_v: 0.0,
+            reverse_early_voltage_v: 0.0,
             base_emitter_zero_bias_cap_f: 0.0,
             base_collector_zero_bias_cap_f: 0.0,
             base_emitter_junction_potential_v: 0.7,
@@ -1825,6 +1853,8 @@ impl BjtModel {
         ensure_finite_positive(self.saturation_current_a, "BJT IS")?;
         ensure_finite_positive(self.forward_beta, "BJT BF")?;
         ensure_finite_positive(self.reverse_beta, "BJT BR")?;
+        ensure_finite_nonnegative(self.forward_early_voltage_v, "BJT VAF")?;
+        ensure_finite_nonnegative(self.reverse_early_voltage_v, "BJT VAR")?;
         ensure_finite_nonnegative(self.base_emitter_zero_bias_cap_f, "BJT CJE")?;
         ensure_finite_nonnegative(self.base_collector_zero_bias_cap_f, "BJT CJC")?;
         ensure_finite_positive(self.base_emitter_junction_potential_v, "BJT VJE")?;
