@@ -1,0 +1,15 @@
+[package]
+name = "eda-formal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-assert = { path = "../eda-assert" }
+eda-core = { path = "../eda-core" }
+eda-waveform = { path = "../eda-waveform" }
+
+[dev-dependencies]
+eda-hdl = { path = "../eda-hdl" }
+eda-synth = { path = "../eda-synth" }
+eda-sim = { path = "../eda-sim" }

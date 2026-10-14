@@ -1,0 +1,9 @@
+[package]
+name = "eda-assert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-waveform = { path = "../eda-waveform" }

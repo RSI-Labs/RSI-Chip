@@ -1,0 +1,11 @@
+[package]
+name = "eda-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-power = { path = "../eda-power" }
+eda-pnr = { path = "../eda-pnr" }
+eda-upf = { path = "../eda-upf" }

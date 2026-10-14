@@ -1,0 +1,118 @@
+use eda_core::ir::{Expr, LValue, Range, Sens, Stmt};
+use std::collections::HashSet;
+
+fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
+    match e {
+        Expr::Const(_) => {}
+        Expr::Ref { net, .. } => {
+            out.insert(*net);
+        }
+        Expr::Un { a, .. } => expr_nets(a, out),
+        Expr::Bin { a, b, .. } => {
+            expr_nets(a, out);
+            expr_nets(b, out);
+        }
+        Expr::Cond { c, t, f } => {
+            expr_nets(c, out);
+            expr_nets(t, out);
+            expr_nets(f, out);
+        }
+        Expr::Concat(v) => v.iter().for_each(|e| expr_nets(e, out)),
+        Expr::Repeat { e, .. } => expr_nets(e, out),
+        Expr::Index { e, .. } => expr_nets(e, out),
+        Expr::Signed { e, .. } => expr_nets(e, out),
+    }
+}
+
+fn lv_bits(lv: &LValue) -> Vec<usize> {
+    match lv.range {
+        Range::Bit(b) => vec![lv.net + b],
+        Range::Span { msb, lsb } => ((lv.net + lsb)..=(lv.net + msb)).collect(),
+    }
+}
+
+fn feedback(s: &Stmt) -> bool {
+    fn walk(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSet<usize>) {
+        match s {
+            Stmt::Block(v) => v.iter().for_each(|s| walk(s, reads, writes)),
+            Stmt::Forever(b) => walk(b, reads, writes),
+            Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
+                expr_nets(e, reads);
+                writes.extend(lv_bits(lv));
+            }
+            Stmt::NBlIndexed {
+                net,
+                decl_width,
+                start,
+                e,
+                ..
+            }
+            | Stmt::BlIndexed {
+                net,
+                decl_width,
+                start,
+                e,
+                ..
+            } => {
+                expr_nets(start, reads);
+                expr_nets(e, reads);
+                writes.extend(*net..*net + *decl_width);
+            }
+            Stmt::If { c, t, f } => {
+                expr_nets(c, reads);
+                walk(t, reads, writes);
+                if let Some(fs) = f {
+                    walk(fs, reads, writes);
+                }
+            }
+            Stmt::Case { e, arms, dflt } => {
+                expr_nets(e, reads);
+                for (ae, st) in arms {
+                    expr_nets(ae, reads);
+                    walk(st, reads, writes);
+                }
+                if let Some(d) = dflt {
+                    walk(d, reads, writes);
+                }
+            }
+            Stmt::Delay { body, .. } => walk(body, reads, writes),
+            Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+                expr_nets(cond, reads)
+            }
+            Stmt::Display { .. } | Stmt::Finish => {}
+        }
+    }
+    let mut r = HashSet::new();
+    let mut w = HashSet::new();
+    walk(s, &mut r, &mut w);
+    let both: Vec<_> = r.intersection(&w).collect();
+    if !both.is_empty() {
+        println!("  reads∩writes has {} nets", both.len());
+    }
+    !both.is_empty()
+}
+
+fn main() {
+    let mut src = String::new();
+    for f in [
+        "primitives",
+        "ripple_adder16",
+        "alu16",
+        "regfile16",
+        "cpu8086",
+        "ram64x16",
+        "sys8086",
+    ] {
+        src.push_str(&std::fs::read_to_string(format!("cpu8086/rtl/{f}.v")).unwrap());
+        src.push('\n');
+    }
+    let d = eda_api::compile(&src, Some("sys8086")).expect("compile");
+    let mut n = 0;
+    for (i, p) in d.processes.iter().enumerate() {
+        if matches!(p.sens, Sens::Comb) && feedback(&p.body) {
+            println!("comb process #{i} flagged");
+            n += 1;
+        }
+    }
+    println!("{n} flagged of {} processes", d.processes.len());
+}

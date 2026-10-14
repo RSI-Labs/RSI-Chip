@@ -1,0 +1,13 @@
+[package]
+name = "eda-cts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-pnr = { path = "../eda-pnr" }
+
+[dev-dependencies]
+eda-hdl = { path = "../eda-hdl" }
+eda-synth = { path = "../eda-synth" }

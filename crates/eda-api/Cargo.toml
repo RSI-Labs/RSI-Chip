@@ -1,0 +1,30 @@
+[package]
+name = "eda-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-hdl = { path = "../eda-hdl" }
+eda-sim = { path = "../eda-sim" }
+eda-ams = { path = "../eda-ams" }
+eda-schematic = { path = "../eda-schematic" }
+eda-synth = { path = "../eda-synth" }
+eda-formal = { path = "../eda-formal" }
+eda-sta = { path = "../eda-sta" }
+eda-pnr = { path = "../eda-pnr" }
+eda-power = { path = "../eda-power" }
+eda-waveform = { path = "../eda-waveform" }
+eda-lvs = { path = "../eda-lvs" }
+eda-assert = { path = "../eda-assert" }
+eda-sdf = { path = "../eda-sdf" }
+eda-spef = { path = "../eda-spef" }
+eda-dft = { path = "../eda-dft" }
+eda-fault = { path = "../eda-fault" }
+eda-eco = { path = "../eda-eco" }
+eda-upf = { path = "../eda-upf" }
+eda-cts = { path = "../eda-cts" }
+eda-coverage = { path = "../eda-coverage" }
+eda-cdc = { path = "../eda-cdc" }
+eda-ir = { path = "../eda-ir" }

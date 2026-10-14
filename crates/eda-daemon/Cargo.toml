@@ -1,0 +1,9 @@
+[package]
+name = "eda-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-api = { path = "../eda-api" }
+eda-pnr = { path = "../eda-pnr" }

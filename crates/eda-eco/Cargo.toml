@@ -1,0 +1,9 @@
+[package]
+name = "eda-eco"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-pnr = { path = "../eda-pnr" }

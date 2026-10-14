@@ -1,0 +1,10 @@
+[package]
+name = "eda-power"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-sim = { path = "../eda-sim" }
+eda-waveform = { path = "../eda-waveform" }

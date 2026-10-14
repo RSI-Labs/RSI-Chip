@@ -1,0 +1,8 @@
+[package]
+name = "eda-upf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }

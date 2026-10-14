@@ -1,0 +1,12 @@
+[package]
+name = "eda-fault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+
+[dev-dependencies]
+eda-hdl = { path = "../eda-hdl" }
+eda-synth = { path = "../eda-synth" }

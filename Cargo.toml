@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eda-core",
+    "crates/eda-hdl",
+  "crates/eda-sim",
+  "crates/eda-ams",
+  "crates/eda-schematic",
+  "crates/eda-synth",
+    "crates/eda-formal",
+    "crates/eda-sta",
+    "crates/eda-pnr",
+    "crates/eda-power",
+    "crates/eda-waveform",
+    "crates/eda-lvs",
+    "crates/eda-assert",
+    "crates/eda-sdf",
+    "crates/eda-spef",
+    "crates/eda-dft",
+    "crates/eda-fault",
+    "crates/eda-eco",
+    "crates/eda-upf",
+    "crates/eda-cts",
+    "crates/eda-ir",
+    "crates/eda-coverage",
+    "crates/eda-cdc",
+  "crates/eda-api",
+  "crates/eda-daemon",
+  "crates/eda-cli",
+    "crates/eda-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+debug = true

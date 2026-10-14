@@ -1,0 +1,399 @@
+//! Lower a gate-level [`Netlist`] back into a RTL [`Design`] so the same
+//! event-driven simulator can run gate-level netlists.
+
+use crate::ir;
+use crate::library::LibFunc;
+use crate::logic::LogicWord;
+use crate::netlist::{self, CellKind, Netlist};
+
+pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
+    let mut d = ir::Design {
+        name: nl.name.clone(),
+        ..Default::default()
+    };
+    // One 1-bit declaration per net, name preserved for probing.
+    let mut net_base: Vec<usize> = Vec::with_capacity(nl.net_count());
+    for n in nl.nets() {
+        let base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: n.name.clone(),
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base,
+        });
+        net_base.push(base);
+        d.n_nets += 1;
+    }
+    let bit = |i: usize| ir::Expr::Ref {
+        net: net_base[i],
+        decl_width: 1,
+        range: ir::Range::Bit(0),
+        signed: false,
+    };
+
+    // Ports: fresh contiguous vector declarations, connected by assigns.
+    for p in &nl.ports {
+        let base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: p.name.clone(),
+            width: p.bits.len(),
+            is_reg: false,
+            is_signed: false,
+            base,
+        });
+        d.n_nets += p.bits.len();
+        d.ports.push(ir::PortDecl {
+            name: p.name.clone(),
+            dir: match p.dir {
+                netlist::Dir::In => ir::Dir::In,
+                netlist::Dir::Out => ir::Dir::Out,
+            },
+            base,
+            width: p.bits.len(),
+        });
+        // Port bits are stored MSB-first; port-declaration bit k (LSB-first)
+        // corresponds to p.bits[len-1-k].
+        let w = p.bits.len();
+        for k in 0..w {
+            let n = p.bits[w - 1 - k];
+            let port_bit = ir::Expr::Ref {
+                net: base + k,
+                decl_width: w,
+                range: ir::Range::Bit(0),
+                signed: false,
+            };
+            match p.dir {
+                netlist::Dir::In => d.assigns.push(ir::Assign {
+                    lv: ir::LValue {
+                        net: net_base[n],
+                        decl_width: 1,
+                        range: ir::Range::Bit(0),
+                    },
+                    e: port_bit,
+                    delay: 0,
+                }),
+                netlist::Dir::Out => d.assigns.push(ir::Assign {
+                    lv: ir::LValue {
+                        net: base + k,
+                        decl_width: w,
+                        range: ir::Range::Bit(0),
+                    },
+                    e: bit(n),
+                    delay: 0,
+                }),
+            }
+        }
+    }
+
+    // Cells: combinational become continuous assigns, flops become clocked
+    // processes.
+    for c in nl.cells() {
+        let out = c.output;
+        let lv_out = ir::LValue {
+            net: net_base[out],
+            decl_width: 1,
+            range: ir::Range::Bit(0),
+        };
+        let in_ref = |k: usize| bit(c.inputs[k]);
+        match &c.kind {
+            CellKind::Const(v) => d.assigns.push(ir::Assign {
+                lv: lv_out,
+                e: ir::Expr::Const(LogicWord::new_const(1, *v)),
+                delay: 0,
+            }),
+            CellKind::Not => d.assigns.push(ir::Assign {
+                lv: lv_out,
+                e: ir::Expr::Un {
+                    op: ir::UnOp::Not,
+                    a: Box::new(in_ref(0)),
+                },
+                delay: 0,
+            }),
+            CellKind::Buf => d.assigns.push(ir::Assign {
+                lv: lv_out,
+                e: in_ref(0),
+                delay: 0,
+            }),
+            CellKind::And | CellKind::Or | CellKind::Xor => {
+                let op = match c.kind {
+                    CellKind::And => ir::BinOp::And,
+                    CellKind::Or => ir::BinOp::Or,
+                    _ => ir::BinOp::Xor,
+                };
+                let e = fold_exprs((0..c.inputs.len()).map(in_ref), op, LogicWord::ones(1));
+                d.assigns.push(ir::Assign {
+                    lv: lv_out,
+                    e,
+                    delay: 0,
+                });
+            }
+            CellKind::Nand | CellKind::Nor | CellKind::Xnor => {
+                let op = match c.kind {
+                    CellKind::Nand => ir::BinOp::And,
+                    CellKind::Nor => ir::BinOp::Or,
+                    _ => ir::BinOp::Xor,
+                };
+                let inner = fold_exprs((0..c.inputs.len()).map(in_ref), op, LogicWord::ones(1));
+                d.assigns.push(ir::Assign {
+                    lv: lv_out,
+                    e: ir::Expr::Un {
+                        op: ir::UnOp::Not,
+                        a: Box::new(inner),
+                    },
+                    delay: 0,
+                });
+            }
+            CellKind::Mux => d.assigns.push(ir::Assign {
+                lv: lv_out,
+                e: ir::Expr::Cond {
+                    c: Box::new(in_ref(0)),
+                    t: Box::new(in_ref(2)),
+                    f: Box::new(in_ref(1)),
+                },
+                delay: 0,
+            }),
+            CellKind::Dff { posedge } => {
+                d.processes.push(ir::Process {
+                    sens: edge_sens(*posedge, net_base[c.inputs[0]]),
+                    body: ir::Stmt::NBl {
+                        lv: lv_out,
+                        e: in_ref(1),
+                    },
+                });
+            }
+            CellKind::DffR {
+                posedge,
+                reset_high,
+            } => {
+                d.processes.push(ir::Process {
+                    sens: ir::Sens::List(vec![
+                        edge_sens(*posedge, net_base[c.inputs[0]]),
+                        edge_sens(*reset_high, net_base[c.inputs[2]]),
+                    ]),
+                    body: ir::Stmt::If {
+                        c: if *reset_high {
+                            in_ref(2)
+                        } else {
+                            ir::Expr::Un {
+                                op: ir::UnOp::Not,
+                                a: Box::new(in_ref(2)),
+                            }
+                        },
+                        t: Box::new(ir::Stmt::NBl {
+                            lv: lv_out.clone(),
+                            e: ir::Expr::Const(LogicWord::zero(1)),
+                        }),
+                        f: Some(Box::new(ir::Stmt::NBl {
+                            lv: lv_out.clone(),
+                            e: in_ref(1),
+                        })),
+                    },
+                });
+            }
+            CellKind::Lib(lid) => {
+                if let Some(lib) = &nl.lib_cache {
+                    let def = lib.get(*lid);
+                    if let Some(seq) = &def.seq {
+                        let rst_pin = seq.reset_pin;
+                        let body = if let Some(rp) = rst_pin {
+                            ir::Stmt::If {
+                                c: in_ref(rp),
+                                t: Box::new(ir::Stmt::NBl {
+                                    lv: lv_out.clone(),
+                                    e: ir::Expr::Const(LogicWord::zero(1)),
+                                }),
+                                f: Some(Box::new(ir::Stmt::NBl {
+                                    lv: lv_out.clone(),
+                                    e: in_ref(1),
+                                })),
+                            }
+                        } else {
+                            ir::Stmt::NBl {
+                                lv: lv_out.clone(),
+                                e: in_ref(1),
+                            }
+                        };
+                        let mut sens = vec![edge_sens(true, net_base[c.inputs[seq.clk_pin]])];
+                        if let Some(rp) = rst_pin {
+                            sens.push(edge_sens(true, net_base[c.inputs[rp]]));
+                        }
+                        d.processes.push(ir::Process {
+                            sens: ir::Sens::List(sens),
+                            body,
+                        });
+                    } else {
+                        let e = libfunc_expr(&def.func, &in_ref);
+                        d.assigns.push(ir::Assign {
+                            lv: lv_out,
+                            e,
+                            delay: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    d
+}
+
+fn edge_sens(posedge: bool, net: usize) -> ir::Sens {
+    if posedge {
+        ir::Sens::Posedge(net)
+    } else {
+        ir::Sens::Negedge(net)
+    }
+}
+
+fn fold_exprs(items: impl Iterator<Item = ir::Expr>, op: ir::BinOp, unit: LogicWord) -> ir::Expr {
+    items
+        .reduce(|a, b| ir::Expr::Bin {
+            op,
+            a: Box::new(a),
+            b: Box::new(b),
+        })
+        .unwrap_or(ir::Expr::Const(unit))
+}
+
+fn libfunc_expr(f: &LibFunc, pin: &dyn Fn(usize) -> ir::Expr) -> ir::Expr {
+    match f {
+        LibFunc::Const(v) => ir::Expr::Const(LogicWord::new_const(1, *v)),
+        LibFunc::Id(i) => pin(*i),
+        LibFunc::Not(e) => ir::Expr::Un {
+            op: ir::UnOp::Not,
+            a: Box::new(libfunc_expr(e, pin)),
+        },
+        LibFunc::And(es) => fold_exprs(
+            es.iter().map(|e| libfunc_expr(e, pin)),
+            ir::BinOp::And,
+            LogicWord::ones(1),
+        ),
+        LibFunc::Or(es) => fold_exprs(
+            es.iter().map(|e| libfunc_expr(e, pin)),
+            ir::BinOp::Or,
+            LogicWord::zero(1),
+        ),
+        LibFunc::Xor(es) => fold_exprs(
+            es.iter().map(|e| libfunc_expr(e, pin)),
+            ir::BinOp::Xor,
+            LogicWord::zero(1),
+        ),
+        LibFunc::Nand(es) => ir::Expr::Un {
+            op: ir::UnOp::Not,
+            a: Box::new(fold_exprs(
+                es.iter().map(|e| libfunc_expr(e, pin)),
+                ir::BinOp::And,
+                LogicWord::ones(1),
+            )),
+        },
+        LibFunc::Nor(es) => ir::Expr::Un {
+            op: ir::UnOp::Not,
+            a: Box::new(fold_exprs(
+                es.iter().map(|e| libfunc_expr(e, pin)),
+                ir::BinOp::Or,
+                LogicWord::zero(1),
+            )),
+        },
+        LibFunc::Xnor(es) => ir::Expr::Un {
+            op: ir::UnOp::Not,
+            a: Box::new(fold_exprs(
+                es.iter().map(|e| libfunc_expr(e, pin)),
+                ir::BinOp::Xor,
+                LogicWord::zero(1),
+            )),
+        },
+        LibFunc::Mux { sel, a, b } => ir::Expr::Cond {
+            c: Box::new(libfunc_expr(sel, pin)),
+            t: Box::new(libfunc_expr(b, pin)),
+            f: Box::new(libfunc_expr(a, pin)),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::library::CellLibrary;
+    use crate::netlist::{Cell, Netlist};
+    use std::sync::Arc;
+
+    #[test]
+    fn round_trip_simple_netlist() {
+        let mut nl = Netlist::new("and_inv");
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let n1 = nl.add_net("n1");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u1".into(),
+            kind: CellKind::And,
+            inputs: vec![a, b],
+            output: n1,
+        });
+        nl.add_cell(Cell {
+            name: "u2".into(),
+            kind: CellKind::Not,
+            inputs: vec![n1],
+            output: y,
+        });
+        nl.add_port("a", netlist::Dir::In, vec![a]);
+        nl.add_port("b", netlist::Dir::In, vec![b]);
+        nl.add_port("y", netlist::Dir::Out, vec![y]);
+        let d = netlist_to_design(&nl);
+        assert_eq!(d.name, "and_inv");
+        assert_eq!(d.ports.len(), 3);
+        // 4 internal nets + 3 port decls
+        assert_eq!(d.net_decls.len(), 7);
+        // 2 logic assigns + 2 input feeds + 1 output feed
+        assert_eq!(d.assigns.len(), 5);
+        assert_eq!(d.processes.len(), 0);
+    }
+
+    #[test]
+    fn flop_netlist_becomes_process() {
+        let mut nl = Netlist::new("flop");
+        let clk = nl.add_net("clk");
+        let din = nl.add_net("d");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "ff".into(),
+            kind: CellKind::Dff { posedge: true },
+            inputs: vec![clk, din],
+            output: q,
+        });
+        nl.add_port("clk", netlist::Dir::In, vec![clk]);
+        nl.add_port("d", netlist::Dir::In, vec![din]);
+        nl.add_port("q", netlist::Dir::Out, vec![q]);
+        let d = netlist_to_design(&nl);
+        assert_eq!(d.processes.len(), 1);
+        assert!(matches!(d.processes[0].sens, ir::Sens::Posedge(_)));
+    }
+
+    #[test]
+    fn lib_cell_becomes_assign() {
+        let lib = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("nand");
+        nl.set_library(lib.clone());
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u".into(),
+            kind: CellKind::Lib(lib.find("NAND2").unwrap()),
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", netlist::Dir::In, vec![a]);
+        nl.add_port("b", netlist::Dir::In, vec![b]);
+        nl.add_port("y", netlist::Dir::Out, vec![y]);
+        let d = netlist_to_design(&nl);
+        assert_eq!(d.processes.len(), 0);
+        assert!(d.assigns.iter().any(|a| matches!(
+            a.e,
+            ir::Expr::Un {
+                op: ir::UnOp::Not,
+                ..
+            }
+        )));
+    }
+}

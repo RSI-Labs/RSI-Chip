@@ -1,0 +1,57 @@
+== RV32I 分段签核报告 ==
+设计: rv32i_top (rv32i_core + 顶层包装)
+工艺角: fast FF/1.9V/-40C, slow SS/1.6V/125C
+
+-- 物理签核（模型相关 / 双角 timing / DRC / 物理库）--
+PDK signoff: pdk=rv32i-signoff-pdk version=1.0 design=rv32i_top netlist=rv32i_top
+Model correlation nmos.VTO: nominal=0.450000000 golden=0.452000000 error=0.004444% tolerance=0.010000% PASS
+PDK corner result fast: process=FF V=1.900 T=-40.0 C scale=0.800000 library=lib1-x0.800000 imported-liberty=false liberty-checksum=not-supplied timing=128.720000 ns equivalent=true DRC=0 errors/13594 warnings physical-db=PASS
+PDK corner result slow: process=SS V=1.600 T=125.0 C scale=1.250000 library=lib1-x1.250000 imported-liberty=false liberty-checksum=not-supplied timing=201.125000 ns equivalent=true DRC=0 errors/13594 warnings physical-db=PASS
+Check model-correlation: PASS (1/1 model correlations within tolerance)
+Check timing: PASS (2/2 corner timing results finite; worst 201.125000 ns)
+Check drc: PASS (0 DRC errors, 27188 warnings)
+Check physical-database: PASS (LEF, DEF, and SDF databases generated in every corner)
+Overall signoff: PASS
+
+-- 功耗与静态 IR --
+总功耗: 2670.856 uW（6 活动向量，18311 映射单元）
+总电流: 0.002671 A；最差压降: 0.000001 V（row Some(43)）
+
+-- 电源网格（单层 Gauss-Seidel IR）--
+节点: 128；线段: 464；迭代: 43（收敛残差 9.12e-10 V）
+网格总电流: 0.003737 A；最差节点压降: 0.000002 V；最差线段电流: 0.000055 A
+
+-- 多层电源网格（M8/M7 + Black EM）--
+节点: 256；线段: 928；迭代: 43（收敛残差 9.12e-10 V）
+总电流: 0.003737 A；最差压降: 0.000002 V；最差线段电流: 0.000055 A；最差 EM 寿命: 3.320e10 h
+
+-- UPF 电源域 IR --
+总功耗: 3737.386 uW；总电流: 0.003737 A；最差压降: 0.000001 V（域 Some("TOP")）
+域 DEFAULT：0 单元；电流 0.000000 A
+域 TOP：18311 单元；电流 0.003737 A；多层网格 256 节点 / 928 线段 / 43 迭代
+
+-- 时钟树综合 --
+树数: 1；插入缓冲: 1245（原 18311 单元）
+
+-- LEC（独立跟踪项）--
+状态: 容量受限未证明（fail-closed）
+证据: 差分仿真（真实程序、全 RTL 命名网络）无行为分歧；
+      miter 模型组合求值 0/2051 次态不一致；假 counterexample 根因
+      （同名无驱动网络未绑定）已修复；剩余为深锥 SAT 容量上限。
+      当前引擎已加入按名触发器种子、同名自由变量局部绑定、显式常量
+      many-to-one 割点、近 sink 割点 frontier 与局部 SAT 预算；所有
+      unknown 仍 fail-closed。结构同构路径递归匹配交换律输入并回收中间
+      对应点；重复局部 CNF 精确缓存；SAT learnt-clause 数据库可缩减。
+      综合与映射输出已消除 HashSet/HashMap 遍历随机性；独立进程生成
+      相同 netlist 签名与相同 fail-closed LEC 结论。确定性 topological
+      候选队列加入直接 fanout、失败结构匹配的独立子图回收、唯一输入签
+      名桥接与 many-to-one 对应；RTL 命名向量尝试共享多 bit 局部 miter
+      并做 full-cone CEGAR，超尺寸向量退回相邻 4-bit slice；触发器边界只在两侧查询锥同时出现时互切，
+      cut model 补齐/绑定 source literals，恢复 frontier 精确
+      关系后重试，复用 incremental CDCL context；最终触发器义务按锥规模
+      从大到小调度。当前 profile 可接受 4107 个 correspondence points；
+      hardest-first 代表点为 dut.x31[31]，抽象查询 gold/mapped 为
+      9374/4564 vars，扩展 106/25 个 gold/mapped cuts、绑定 1616 个
+      source guards 后，仍在 16672 vars / 69549 clauses / 1120 conflicts
+      处容量受限且 fail-closed，无 counterexample。
+结论: 物理签核 PASS；LEC 交付门保持独立开启。
