@@ -66,8 +66,8 @@ const CAPABILITIES: &[Capability] = &[
         domain: "simulation",
         name: "temperature_dependent_models",
         status: CapabilityStatus::Implemented,
-        evidence: ".temp, SHEET/L/W, imported .rmodel layer tables, width-bin sheet/WOFF interpolation, and MOS mobility scaling",
-        limitation: "no certified tool-specific foundry file, self-heating, or spatial thermal network",
+        evidence: ".temp, SHEET/L/W, imported .rmodel layer tables, width-bin sheet/WOFF interpolation, MOS mobility scaling, and lumped MOS/BJT RTH/CTH self-heating including typed per-device transient temperature state, reports, and CSV export",
+        limitation: "no certified tool-specific foundry file, coupled thermal-node network, or spatial thermal network",
     },
     Capability {
         domain: "simulation",
@@ -108,8 +108,8 @@ const CAPABILITIES: &[Capability] = &[
         domain: "simulation",
         name: "mosfet_bjt_behavioral",
         status: CapabilityStatus::Partial,
-        evidence: "Level-1 MOS; BSIM3 LEVEL=8 core with VTH0/K1/K2/TOX/U0/UA/UB/UC/VSAT, DVT0/DVT1/DVT2 short-channel/DIBL reduction, DVT0W/DVT1W/W0 narrow-width threshold shift, KT1/KT2/KT1L/UTE temperature scaling, WMIN/WMAX/LMIN/LMAX geometry-bin selection, and CJSW/CJSWS/CJSWD/PB/MJ/FC voltage-dependent source/drain junction sidewall capacitance; local/global parameter sensitivity, MOS charge; Ebers-Moll BJT with VAF/VAR forward/reverse Early effect and diode/BJT transit charge",
-        limitation: "BSIM3 uses simplified geometry and temperature subsets with rectangular W/L bins only; full DVT, full charge, NQS, self-heating, full noise, and PSP/HiSIM/VBIC/HICUM-class models are not implemented",
+        evidence: "Level-1 MOS; BSIM3 LEVEL=8 core with VTH0/K1/K2/TOX/U0/UA/UB/UC/VSAT, DVT0/DVT1/DVT2 short-channel/DIBL reduction, DVT0W/DVT1W/W0 narrow-width threshold shift, KT1/KT2/KT1L/UTE temperature scaling, RTH/CTH self-heating with transient device temperature, WMIN/WMAX/LMIN/LMAX geometry-bin selection, and CJSW/CJSWS/CJSWD/PB/MJ/FC voltage-dependent source/drain junction sidewall capacitance; local/global parameter sensitivity, self-heated MOS charge; Ebers-Moll BJT with VAF/VAR forward/reverse Early effect, RTH/CTH self-heating and self-heated transit charge, and diode transit charge",
+        limitation: "BSIM3 uses simplified geometry/temperature/electrothermal subsets with rectangular W/L bins only; full DVT, full charge, NQS, coupled spatial thermal networks, full noise, and PSP/HiSIM/VBIC/HICUM-class models are not implemented",
     },
     Capability {
         domain: "simulation",
@@ -157,7 +157,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "timing",
         name: "sta_constraints_mmmc_waivers",
         status: CapabilityStatus::Implemented,
-        evidence: "eda_sta constrained timing, generated clocks, clock groups, independent min/max clock transitions, set_units time/capacitance normalization, design-wide/object-scoped transition/capacitance/fanout plus input-transition/load SDC quality rules, MMMC, violation registry",
+        evidence: "eda_sta constrained timing, generated clocks, clock groups, setup/hold-scoped false/multicycle path exceptions, independent min/max clock transitions, set_units time/capacitance normalization, design-wide/object-scoped transition/capacitance/fanout plus input-transition/load SDC quality rules, MMMC, violation registry",
         limitation: "not a full commercial SDC parser",
     },
     Capability {
@@ -206,7 +206,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "integration",
         name: "persistent_agent_daemon",
         status: CapabilityStatus::Partial,
-        evidence: "line-delimited JSON TCP RPC with ping/capabilities/cooperatively cancellable SPICE-DC/all-AMS-analysis/functional-coverage/waveform-assertions/waveform-clock-pulse-comparison/layout-rule-deck/layout-polygon-via-DRC-with-waivers/persistent-layout-DRC-waiver-registries/any-angle-layout-routing/any-angle-layout-maze-routing/any-angle-layout-Boolean/RTL-equivalence/RTL-two-view-equivalence/RTL-standalone-STA/RTL-signal-quality/RTL-timing-waiver-audit/persistent-timing-waiver-registry-lifecycle/RTL-MMMC-scenario-timing/RTL-MMMC-setup-hold-reset-paths/RTL-MMMC-timing-violations/RTL-MMMC-scenario-diff/RTL-incremental-MMMC-timing/RTL-incremental-MMMC-timing-violations/RTL-standalone-PnR-with-configurable-DRC/RTL-antenna-repair/RTL-DFT-scan-insertion/RTL-CTS-clock-tree-synthesis/RTL-structural-ECO/RTL-CDC/RTL-LVS/RTL-UPF-power-intent/RTL-k-induction-safety/RTL-physical-timing-SPEF-SDF/RTL-combinational-stuck-at-fault-grading-STIL/RTL-timed-simulation/RTL-power/RTL-power-grid-IR-EM/RTL-multi-scenario-post-route-power-IR/VCD-driven-RTL-multi-scenario-post-route-power-IR/RTL-multi-scenario-UPF-power-mode-IR-EM/VCD-driven-RTL-multi-scenario-UPF-power-mode-IR-EM/RTL-temporal-property-BMC/RTL-flow-with-structured-STA-PnR-DRC/cached-RTL-flow/cache-stats/cache-clear/PDK-signoff plus remote jobSubmit/jobStatus/jobCancel/jobWait, typed asynchronous job manager with service-owned flow-cache, timing-waiver-registry, and layout-DRC-waiver-registry dispatch, cancellation-before-start, cooperative RTL/PDK stage, SAT/BMC/equivalence/k-induction search, simulator delta scheduling, global/maze/rip-up routing, single-corner physical-timing extraction/STA/antenna/hold/optimization stages, and DC operating-point/sweep Newton, AMS transient/Monte-Carlo/Sobol/PSS/optimizer/quantized-refine loop cancellation, and concurrent clients",
+        evidence: "line-delimited JSON TCP RPC with ping/capabilities/cooperatively cancellable SPICE-DC/all-AMS-analysis/structured-transient-samples-with-device-temperatures/functional-coverage/waveform-assertions/waveform-clock-pulse-comparison/layout-rule-deck/layout-polygon-via-DRC-with-waivers/persistent-layout-DRC-waiver-registries/any-angle-layout-routing/any-angle-layout-maze-routing/any-angle-layout-Boolean/RTL-equivalence/RTL-two-view-equivalence/RTL-standalone-STA/RTL-signal-quality/RTL-timing-waiver-audit/persistent-timing-waiver-registry-lifecycle/RTL-MMMC-scenario-timing/RTL-MMMC-setup-hold-reset-paths/RTL-MMMC-timing-violations/RTL-MMMC-scenario-diff/RTL-incremental-MMMC-timing/RTL-incremental-MMMC-timing-violations/RTL-standalone-PnR-with-configurable-DRC/RTL-antenna-repair/RTL-DFT-scan-insertion/RTL-CTS-clock-tree-synthesis/RTL-structural-ECO/RTL-CDC/RTL-LVS/RTL-UPF-power-intent/RTL-k-induction-safety/RTL-physical-timing-SPEF-SDF/RTL-combinational-stuck-at-fault-grading-STIL/RTL-timed-simulation/RTL-power/RTL-power-grid-IR-EM/RTL-multi-scenario-post-route-power-IR/VCD-driven-RTL-multi-scenario-post-route-power-IR/RTL-multi-scenario-UPF-power-mode-IR-EM/VCD-driven-RTL-multi-scenario-UPF-power-mode-IR-EM/RTL-temporal-property-BMC/RTL-flow-with-structured-STA-PnR-DRC/cached-RTL-flow/cache-stats/cache-clear/PDK-signoff plus remote jobSubmit/jobSubmitRemote/jobStatus/jobCancel/jobWait/jobWorkerStats/jobArtifactList/jobArtifactGet/jobArtifactDelete/workerRegister/workerHeartbeat/workerList/workerClaim/workerClaimStatus/workerComplete/workerExpireLeases, typed asynchronous local multi-worker and priority/label-routed RPC remote-worker scheduling job manager with lease timeout, idle-worker pruning, owner-checked reassignment, globally LRU-bounded checksummed UTF-8/base64 result-artifact storage with pagination and an optional restart-safe local artifact-store/job-ID watermark, and bounded remote retry budgets with service-owned flow-cache, timing-waiver-registry, and layout-DRC-waiver-registry dispatch, cancellation-before-start, cooperative RTL/PDK stage, SAT/BMC/equivalence/k-induction search, simulator delta scheduling, global/maze/rip-up routing, single-corner physical-timing extraction/STA/antenna/hold/optimization stages, and DC operating-point/sweep Newton, AMS transient/Monte-Carlo/Sobol/PSS/optimizer/quantized-refine loop cancellation, and concurrent clients",
         limitation: "daemon exposes RTL, AMS, waveform/layout, and PDK signoff flows but not every specialized toolchain API; cancellation is not yet supported inside every nested multi-corner physical-timing stage",
     },
     Capability {
@@ -227,7 +227,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "signoff",
         name: "foundry_calibrated_pdk_signoff",
         status: CapabilityStatus::Partial,
-        evidence: "typed PDK manifests with layers, PVT-tagged delay-scale corners, checksummed inline per-corner Liberty views, checksummed and pre-validated inline layer/via rule decks, model correlations, and required checks; deterministic per-corner RTL-to-equivalence/timing/DRC/LEF-DEF-SDF MMMC signoff",
+        evidence: "typed PDK manifests with layers, PVT-tagged delay-scale corners, checksummed inline per-corner Liberty views, checksummed/pre-validated/antenna-ratio-applying inline layer/via rule decks, model correlations, and required checks; deterministic per-corner RTL-to-equivalence/timing/DRC/LEF-DEF-SDF MMMC signoff",
         limitation: "manifest is portable but not certified by an external foundry; Liberty/rule-deck SHA-256 detects accidental corruption but does not establish foundry provenance, and advanced compact-model correlation is not vendor-calibrated",
     },
 ];
@@ -320,7 +320,7 @@ mod tests {
             )));
         assert!(CAPABILITIES.iter().any(|capability| capability
             .evidence
-            .contains("checksummed and pre-validated inline layer/via rule decks")));
+            .contains("antenna-ratio-applying inline layer/via rule decks")));
         assert!(CAPABILITIES.iter().any(|capability| capability
             .evidence
             .contains("set_units time/capacitance normalization")));
@@ -369,6 +369,24 @@ mod tests {
                 && capability
                     .evidence
                     .contains("persistent-layout-DRC-waiver-registries")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("local multi-worker")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("RPC remote-worker scheduling")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability
+                    .evidence
+                    .contains("lease timeout, idle-worker pruning, owner-checked reassignment")));
+        assert!(CAPABILITIES
+            .iter()
+            .any(|capability| capability.name == "persistent_agent_daemon"
+                && capability.evidence.contains("bounded remote retry budgets")));
         assert!(CAPABILITIES
             .iter()
             .any(|capability| capability.name == "persistent_agent_daemon"

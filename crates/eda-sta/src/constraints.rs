@@ -103,6 +103,42 @@ pub struct PathException {
     /// instance matching this pattern.
     pub instance_pattern: Option<String>,
     pub multicycle: Option<f64>,
+    /// Timing-check class selected by `-setup` or `-hold`.
+    pub check: PathExceptionCheck,
+}
+
+/// The setup/hold class to which an exception applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathExceptionCheck {
+    Both,
+    Setup,
+    Hold,
+}
+
+impl PathExceptionCheck {
+    pub fn applies_setup(self) -> bool {
+        matches!(self, Self::Both | Self::Setup)
+    }
+
+    pub fn applies_hold(self) -> bool {
+        matches!(self, Self::Both | Self::Hold)
+    }
+
+    pub fn applies_early(self, early: bool) -> bool {
+        if early {
+            self.applies_hold()
+        } else {
+            self.applies_setup()
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "setup+hold",
+            Self::Setup => "setup",
+            Self::Hold => "hold",
+        }
+    }
 }
 
 /// A `set_disable_timing` object or arc selector.
@@ -2303,6 +2339,18 @@ fn parse_exception(
         Vec::new()
     };
     let instance_pattern = parse_instance_pattern(tokens, "path exception")?;
+    let setup = tokens.iter().any(|token| token == "-setup");
+    let hold = tokens.iter().any(|token| token == "-hold");
+    if setup && hold {
+        return Err("path exception cannot select both -setup and -hold".into());
+    }
+    let check = if setup {
+        PathExceptionCheck::Setup
+    } else if hold {
+        PathExceptionCheck::Hold
+    } else {
+        PathExceptionCheck::Both
+    };
     if from_object.is_none() && to_object.is_none() && through_groups.is_empty() {
         return Err("path exception requires -from, -to, or -through".into());
     }
@@ -2336,6 +2384,7 @@ fn parse_exception(
             through_groups,
             instance_pattern: instance_pattern.clone(),
             multicycle: Some(multiplier),
+            check,
         }
     } else {
         PathException {
@@ -2347,6 +2396,7 @@ fn parse_exception(
             through_groups,
             instance_pattern,
             multicycle: None,
+            check,
         }
     };
     if multicycle {
@@ -3795,7 +3845,7 @@ pub fn excluded_timing_paths(nl: &Netlist, timing: &ConstrainedTiming) -> Vec<Ex
             .get(&key)
             .into_iter()
             .flatten()
-            .filter(|exception| exception.multicycle.is_none())
+            .filter(|exception| exception.multicycle.is_none() && exception.check.applies_setup())
         {
             out.push(ExcludedTimingPath {
                 check: ExcludedTimingCheck::Setup,
@@ -3815,7 +3865,7 @@ pub fn excluded_timing_paths(nl: &Netlist, timing: &ConstrainedTiming) -> Vec<Ex
             .get(&key)
             .into_iter()
             .flatten()
-            .filter(|exception| exception.multicycle.is_none())
+            .filter(|exception| exception.multicycle.is_none() && exception.check.applies_hold())
         {
             out.push(ExcludedTimingPath {
                 check: ExcludedTimingCheck::Hold,
@@ -3836,7 +3886,14 @@ pub fn excluded_timing_paths(nl: &Netlist, timing: &ConstrainedTiming) -> Vec<Ex
                 .get(&key)
                 .into_iter()
                 .flatten()
-                .filter(|exception| exception.multicycle.is_none())
+                .filter(|exception| {
+                    exception.multicycle.is_none()
+                        && if check == ExcludedTimingCheck::Recovery {
+                            exception.check.applies_setup()
+                        } else {
+                            exception.check.applies_hold()
+                        }
+                })
             {
                 out.push(ExcludedTimingPath {
                     check,
@@ -3982,13 +4039,22 @@ fn push_path_exceptions_report(exceptions: &[PathException], out: &mut String) {
             .unwrap_or_default();
         if let Some(multicycle) = exception.multicycle {
             out.push_str(&format!(
-                "      multicycle {:.6}, from {} to {}{}{}\n",
-                multicycle, from, to, through, instance
+                "      multicycle {:.6} ({}), from {} to {}{}{}\n",
+                multicycle,
+                exception.check.as_str(),
+                from,
+                to,
+                through,
+                instance
             ));
         } else {
             out.push_str(&format!(
-                "      false path from {} to {}{}{}\n",
-                from, to, through, instance
+                "      false path ({}), from {} to {}{}{}\n",
+                exception.check.as_str(),
+                from,
+                to,
+                through,
+                instance
             ));
         }
     }
@@ -4483,6 +4549,7 @@ fn matching_path_exceptions(
     c.false_paths
         .iter()
         .chain(c.multicycle_paths.iter())
+        .filter(|ex| ex.check.applies_early(early))
         .filter(|ex| matches(ex))
         .cloned()
         .collect()
@@ -4688,6 +4755,8 @@ mod tests {
         assert_eq!(s.output_delays["y"].delay, 0.40);
         assert_eq!(s.false_paths.len(), 1);
         assert_eq!(s.multicycle_paths.len(), 1);
+        assert_eq!(s.false_paths[0].check, PathExceptionCheck::Both);
+        assert_eq!(s.multicycle_paths[0].check, PathExceptionCheck::Both);
         assert_eq!(s.disabled_timing_arcs.len(), 1);
         assert_eq!(s.case_analyses.len(), 1);
         assert_eq!(s.max_delay_paths.len(), 1);
@@ -5554,6 +5623,50 @@ mod tests {
     }
 
     #[test]
+    fn setup_or_hold_scoped_false_paths_apply_independently() {
+        let source = |option: &str| {
+            format!(
+                r#"
+                create_clock -name clk -period 4.0 [get_ports clk]
+                set_input_delay 1.0 -clock clk [get_ports d]
+                set_clock_uncertainty 0.10 -setup [get_clocks clk]
+                set_clock_uncertainty 0.05 -hold [get_clocks clk]
+                set_false_path {option} -to [get_ports d]
+            "#
+            )
+        };
+        let nl = two_flop_netlist();
+
+        let setup_only = parse_sdc(&source("-setup")).unwrap();
+        assert_eq!(setup_only.false_paths[0].check, PathExceptionCheck::Setup);
+        let setup_result = analyze_with_sdc(&nl, &setup_only).unwrap();
+        assert!(setup_result.in2reg_slack.is_infinite());
+        assert!((setup_result.in2reg_hold_slack - 0.75).abs() < 1e-9);
+        let setup_excluded = excluded_timing_paths(&nl, &setup_result);
+        assert!(setup_excluded
+            .iter()
+            .any(|path| path.check == ExcludedTimingCheck::Setup));
+        assert!(setup_excluded
+            .iter()
+            .all(|path| path.check != ExcludedTimingCheck::Hold));
+
+        let hold_only = parse_sdc(&source("-hold")).unwrap();
+        assert_eq!(hold_only.false_paths[0].check, PathExceptionCheck::Hold);
+        let hold_result = analyze_with_sdc(&nl, &hold_only).unwrap();
+        assert!((hold_result.in2reg_slack - 2.3).abs() < 1e-9);
+        assert!(hold_result.in2reg_hold_slack.is_infinite());
+        let hold_excluded = excluded_timing_paths(&nl, &hold_result);
+        assert!(hold_excluded
+            .iter()
+            .any(|path| path.check == ExcludedTimingCheck::Hold));
+        assert!(hold_excluded
+            .iter()
+            .all(|path| path.check != ExcludedTimingCheck::Setup));
+
+        assert!(parse_sdc(&source("-setup -hold")).is_err());
+    }
+
+    #[test]
     fn instance_scoped_false_path_applies_only_to_matching_hierarchy() {
         let mut nl = and_netlist();
         let y = nl.net_by_name("y").unwrap();
@@ -5732,16 +5845,28 @@ mod tests {
     #[test]
     fn multicycle_path_doubles_output_requirement() {
         let nl = and_netlist();
-        let c = parse_sdc(
-            r#"
+        let source = |check: &str| {
+            format!(
+                r#"
             create_clock -name clk -period 2.0 [get_ports clk]
             set_input_delay 0.3 -clock clk [get_ports a]
             set_output_delay 0.4 -clock clk [get_ports y]
-            set_multicycle_path 2 -from [get_ports a] -to [get_ports y]
-        "#,
-        )
-        .unwrap();
+            set_multicycle_path 2 {check} -from [get_ports a] -to [get_ports y]
+        "#
+            )
+        };
+        let c = parse_sdc(&source("")).unwrap();
         let r = analyze_with_sdc(&nl, &c).unwrap();
         assert!((r.output_slack - 2.3).abs() < 1e-9);
+
+        let setup = parse_sdc(&source("-setup")).unwrap();
+        assert_eq!(setup.multicycle_paths[0].check, PathExceptionCheck::Setup);
+        let setup_result = analyze_with_sdc(&nl, &setup).unwrap();
+        assert!((setup_result.output_slack - 2.3).abs() < 1e-9);
+
+        let hold = parse_sdc(&source("-hold")).unwrap();
+        assert_eq!(hold.multicycle_paths[0].check, PathExceptionCheck::Hold);
+        let hold_result = analyze_with_sdc(&nl, &hold).unwrap();
+        assert!((hold_result.output_slack - 0.3).abs() < 1e-9);
     }
 }

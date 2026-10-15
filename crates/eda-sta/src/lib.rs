@@ -39,10 +39,11 @@ pub use constraints::{
     AppliedTimingDelayLimit, CaseAnalysis, Clock, ClockGroup, ClockGroupKind,
     ConstrainedHoldTimingPath, ConstrainedResetTimingPath, ConstrainedTiming,
     ConstrainedTimingPath, DisabledTimingArc, ExcludedTimingCheck, ExcludedTimingPath,
-    MinPulsePolarity, MinPulseWidthCheck, NetSlack, PathDelayLimit, PathException, PortDelay,
-    ResetCheckKind, ScopedCellTimingDerate, ScopedPinTimingDerate, SdcUnits, TimingClockEdge,
-    TimingClockEdgeKind, TimingConstraintDiff, TimingConstraints, TimingDerate, TimingObjectKind,
-    TimingObjectPattern, TimingObjectPatternToken, TimingObjectRef, TimingPathClocks, TimingPin,
+    MinPulsePolarity, MinPulseWidthCheck, NetSlack, PathDelayLimit, PathException,
+    PathExceptionCheck, PortDelay, ResetCheckKind, ScopedCellTimingDerate, ScopedPinTimingDerate,
+    SdcUnits, TimingClockEdge, TimingClockEdgeKind, TimingConstraintDiff, TimingConstraints,
+    TimingDerate, TimingObjectKind, TimingObjectPattern, TimingObjectPatternToken, TimingObjectRef,
+    TimingPathClocks, TimingPin,
 };
 pub use multicorner::{
     analyze_timing_scenario_definitions, analyze_timing_scenarios, diff_timing_scenario_sets,

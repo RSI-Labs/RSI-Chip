@@ -152,6 +152,9 @@ pub fn report_transient(result: &TransientResult) -> String {
         for (node, voltage) in &sample.node_voltages {
             out.push_str(&format!(" V({})={:.9}", node, voltage));
         }
+        for (element, temperature) in &sample.device_temperatures {
+            out.push_str(&format!(" T({})={:.9}K", element, temperature));
+        }
         out.push('\n');
     }
     out
@@ -501,11 +504,23 @@ pub fn threshold_crossings(
 
 /// Export selected node waveforms as CSV. Empty selection exports all nodes.
 pub fn write_transient_csv(result: &TransientResult, nodes: &[&str]) -> Result<String, String> {
+    write_transient_csv_with_temperatures(result, nodes, &[])
+}
+
+/// Export node waveforms and optional lumped device temperatures as CSV.
+///
+/// Empty node/device selections export every available quantity.
+pub fn write_transient_csv_with_temperatures(
+    result: &TransientResult,
+    nodes: &[&str],
+    thermal_devices: &[&str],
+) -> Result<String, String> {
     let all_nodes: Vec<String> = result
         .samples
         .first()
         .map(|sample| sample.node_voltages.keys().cloned().collect())
         .unwrap_or_default();
+    let all_devices = result.device_names();
     let selected: Vec<String> = if nodes.is_empty() {
         all_nodes
     } else {
@@ -520,12 +535,29 @@ pub fn write_transient_csv(result: &TransientResult, nodes: &[&str]) -> Result<S
             })
             .collect::<Result<Vec<_>, _>>()?
     };
-    if selected.is_empty() {
-        return Err("cannot export a transient with no nodes".into());
+    let selected_devices: Vec<String> = if thermal_devices.is_empty() {
+        all_devices
+    } else {
+        thermal_devices
+            .iter()
+            .map(|device| {
+                if all_devices.iter().any(|existing| existing == device) {
+                    Ok(device.to_string())
+                } else {
+                    Err(format!("unknown thermal device '{}'", device))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if selected.is_empty() && selected_devices.is_empty() {
+        return Err("cannot export a transient with no nodes or thermal devices".into());
     }
     let mut out = String::from("time_s");
     for node in &selected {
         out.push_str(&format!(",V({})", node));
+    }
+    for device in &selected_devices {
+        out.push_str(&format!(",T({})", device));
     }
     out.push('\n');
     for sample in &result.samples {
@@ -536,6 +568,14 @@ pub fn write_transient_csv(result: &TransientResult, nodes: &[&str]) -> Result<S
                 .get(node)
                 .copied()
                 .ok_or_else(|| format!("sample has no node '{}'", node))?;
+            out.push_str(&format!(",{:.12}", value));
+        }
+        for device in &selected_devices {
+            let value = sample
+                .device_temperatures
+                .get(device)
+                .copied()
+                .ok_or_else(|| format!("sample has no thermal device '{}'", device))?;
             out.push_str(&format!(",{:.12}", value));
         }
         out.push('\n');
@@ -908,6 +948,106 @@ M2 e g 0 0 NM W=500n L=400n
         let base = op.node_voltages["b"];
         assert!(base > 0.5 && base < 0.8, "{base}");
         assert!((collector - 0.8).abs() < 1e-7, "{collector}");
+    }
+
+    #[test]
+    fn bjt_self_heating_changes_current_and_round_trips() {
+        let make = |thermal_resistance: &str| {
+            format!(
+                "bjt self heating\nV1 c 0 1.8\nV2 b 0 0.65\nQ1 c b 0 NPN\n.model NPN NPN(IS=1e-12 BF=100 XTI=3 RTH={thermal_resistance})\n.op\n.end"
+            )
+        };
+        let isothermal = parse_spice(&make("0")).unwrap();
+        let self_heated = parse_spice(&make("50k")).unwrap();
+        assert_eq!(
+            self_heated,
+            parse_spice(&write_spice(&self_heated).unwrap()).unwrap()
+        );
+        assert_eq!(
+            self_heated.bjt_models["NPN"].self_heating_thermal_resistance_k_per_w,
+            50_000.0
+        );
+
+        let terminal_voltages = [1.8, 0.65, 0.0, 0.0];
+        let isothermal_current = crate::analysis::nonlinear_terminal_currents(
+            &isothermal,
+            &isothermal.elements[2],
+            &terminal_voltages,
+        )
+        .unwrap()[0];
+        let self_heated_current = crate::analysis::nonlinear_terminal_currents(
+            &self_heated,
+            &self_heated.elements[2],
+            &terminal_voltages,
+        )
+        .unwrap()[0];
+        assert!(
+            self_heated_current > isothermal_current,
+            "{self_heated_current} {isothermal_current}"
+        );
+        assert!(parse_spice(&make("-1")).is_err());
+    }
+
+    #[test]
+    fn bjt_dynamic_charge_uses_self_heated_temperature() {
+        let make = |thermal_resistance: &str| {
+            format!(
+                "bjt thermal charge\nV1 c 0 1.8\nV2 b 0 0.65\nQ1 c b 0 NPN\n.model NPN NPN(IS=1e-12 BF=100 TF=1n RTH={thermal_resistance})\n.op\n.end"
+            )
+        };
+        let isothermal = parse_spice(&make("0")).unwrap();
+        let self_heated = parse_spice(&make("1meg")).unwrap();
+        let voltages = [("c".to_string(), 1.8), ("b".to_string(), 0.65)]
+            .into_iter()
+            .collect();
+        let cold =
+            crate::analysis::dynamic_capacitors(&isothermal, &isothermal.elements[2], &voltages)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _, _, _)| name == "Q1:cbe")
+                .unwrap()
+                .3;
+        let hot =
+            crate::analysis::dynamic_capacitors(&self_heated, &self_heated.elements[2], &voltages)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _, _, _)| name == "Q1:cbe")
+                .unwrap()
+                .3;
+        assert!(hot > cold, "{cold} {hot}");
+    }
+
+    #[test]
+    fn bjt_thermal_capacitance_creates_transient_temperature_state() {
+        let source = "bjt thermal transient\nVdd vdd 0 1.8\nRc vdd c 1k\nIb 0 b 10u\nQ1 c b 0 NPN\n.model NPN NPN(IS=1e-12 BF=100 XTI=3 RTH=1k CTH=10n)\n.tran 1m 10m method=trapezoidal\n.end";
+        let circuit = parse_spice(source).unwrap();
+        assert_eq!(
+            circuit,
+            parse_spice(&write_spice(&circuit).unwrap()).unwrap()
+        );
+        let result = transient(&circuit, &circuit.analyses[0]).unwrap();
+        let temperatures: Vec<_> = result
+            .samples
+            .iter()
+            .map(|sample| sample.device_temperatures["Q1"])
+            .collect();
+        assert!(
+            (temperatures[0] - circuit.temperature_k).abs() < 1e-9,
+            "{temperatures:?}"
+        );
+        assert!(
+            temperatures.windows(2).all(|pair| pair[1] >= pair[0]),
+            "{temperatures:?}"
+        );
+        assert!(
+            temperatures
+                .last()
+                .copied()
+                .unwrap_or(circuit.temperature_k)
+                > circuit.temperature_k,
+            "{temperatures:?}"
+        );
+        assert!(parse_spice("bad\nQ1 c b 0 NPN\n.model NPN NPN(CTH=1u)\n.tran 1 1\n.end").is_err());
     }
 
     #[test]
@@ -1710,6 +1850,125 @@ D1 a 0 DN
         );
         assert!((hot_drain - expected(398.15)).abs() < 1e-8, "{hot_drain}");
         assert!(hot_drain > nominal_drain);
+    }
+
+    #[test]
+    fn mos_self_heating_reduces_drain_current_and_round_trips() {
+        let make = |thermal_resistance: &str| {
+            format!(
+                "mos self heating\nVdd d 0 1.8\nVg g 0 1\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5 MEXP=1.5 RTH={thermal_resistance})\n.op\n.end"
+            )
+        };
+        let isothermal = parse_spice(&make("0")).unwrap();
+        let self_heated = parse_spice(&make("100k")).unwrap();
+        assert_eq!(
+            self_heated,
+            parse_spice(&write_spice(&self_heated).unwrap()).unwrap()
+        );
+        assert_eq!(
+            self_heated.mosfet_models["NM"].self_heating_thermal_resistance_k_per_w,
+            100_000.0
+        );
+
+        let isothermal_current = -dc_operating_point(&isothermal).unwrap().branch_currents["Vdd"];
+        let self_heated_current = -dc_operating_point(&self_heated).unwrap().branch_currents["Vdd"];
+        assert!(
+            self_heated_current < isothermal_current,
+            "{self_heated_current} {isothermal_current}"
+        );
+        assert!(
+            (isothermal_current - 0.5 * 1e-3 * (1e-6 / 180e-9) * 0.5_f64.powi(2)).abs() < 1e-10,
+            "{isothermal_current}"
+        );
+
+        assert!(parse_spice(&make("-1")).is_err());
+    }
+
+    #[test]
+    fn mos_dynamic_charge_uses_self_heated_temperature() {
+        let make = |thermal_resistance: &str| {
+            format!(
+                "mos thermal charge\nV1 d 0 1.8\nV2 g 0 0.52\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(LEVEL=8 VTH0=0.45 TOX=2n U0=0.04 VSAT=80k KT1=-0.16 COX=10m RTH={thermal_resistance})\n.op\n.end"
+            )
+        };
+        let isothermal = parse_spice(&make("0")).unwrap();
+        let self_heated = parse_spice(&make("1meg")).unwrap();
+        let voltages = [
+            ("d".to_string(), 1.8),
+            ("g".to_string(), 0.52),
+            ("b".to_string(), 0.0),
+        ]
+        .into_iter()
+        .collect();
+        let cold =
+            crate::analysis::dynamic_capacitors(&isothermal, &isothermal.elements[2], &voltages)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _, _, _)| name == "M1:cgs")
+                .unwrap()
+                .3;
+        let hot =
+            crate::analysis::dynamic_capacitors(&self_heated, &self_heated.elements[2], &voltages)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _, _, _)| name == "M1:cgs")
+                .unwrap()
+                .3;
+        assert!(hot > cold, "{cold} {hot}");
+    }
+
+    #[test]
+    fn mos_thermal_capacitance_creates_transient_temperature_state() {
+        let make = |thermal_capacitance: &str| {
+            format!(
+                "mos thermal transient\nV1 d 0 1.8\nV2 g 0 1\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5 MEXP=1.5 RTH=100k CTH={thermal_capacitance})\n.tran 10m 100m method=trapezoidal\n.end"
+            )
+        };
+        let thermal = parse_spice(&make("1u")).unwrap();
+        assert_eq!(
+            thermal,
+            parse_spice(&write_spice(&thermal).unwrap()).unwrap()
+        );
+        let result = transient(&thermal, &thermal.analyses[0]).unwrap();
+        assert_eq!(result.device_names(), vec!["M1".to_string()]);
+        let temperatures: Vec<_> = result
+            .samples
+            .iter()
+            .map(|sample| sample.device_temperatures["M1"])
+            .collect();
+        assert!(
+            (temperatures[0] - thermal.temperature_k).abs() < 1e-9,
+            "{temperatures:?}"
+        );
+        assert!(
+            temperatures.windows(2).all(|pair| pair[1] >= pair[0]),
+            "{temperatures:?}"
+        );
+
+        let static_model = parse_spice(&make("0")).unwrap();
+        let static_result = transient(&static_model, &static_model.analyses[0]).unwrap();
+        let static_temperature = static_result.samples.last().unwrap().device_temperatures["M1"];
+        assert!(
+            temperatures[0] < temperatures[temperatures.len() - 1]
+                && temperatures[temperatures.len() - 1] < static_temperature,
+            "{temperatures:?} static={static_temperature}"
+        );
+        assert_eq!(
+            result.device_temperature_values("M1").unwrap(),
+            temperatures
+        );
+        assert!(result.device_temperature_values("missing").is_err());
+        let report = report_transient(&result);
+        assert!(report.contains("T(M1)="), "{report}");
+        let csv = write_transient_csv_with_temperatures(&result, &["d"], &["M1"]).unwrap();
+        assert!(csv.contains("V(d),T(M1)"), "{csv}");
+        assert!(write_transient_csv_with_temperatures(&result, &["d"], &["missing"]).is_err());
+
+        assert!(parse_spice(&make("-1")).is_err());
+        assert!(parse_spice(
+            "bad\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(CTH=1u)\n.tran 1 1\n.end"
+        )
+        .is_err());
     }
 
     #[test]

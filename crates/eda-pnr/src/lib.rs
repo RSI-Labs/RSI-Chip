@@ -354,6 +354,12 @@ impl Default for DrcOptions {
 }
 
 impl DrcOptions {
+    pub fn new_with_antenna_ratio(max_antenna_ratio: f64) -> Result<Self, String> {
+        let options = Self { max_antenna_ratio };
+        options.validate()?;
+        Ok(options)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !self.max_antenna_ratio.is_finite() || self.max_antenna_ratio <= 0.0 {
             return Err("maximum antenna ratio must be finite and positive".into());

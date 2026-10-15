@@ -359,6 +359,31 @@ impl AnyAnglePolygon {
             || other.points.iter().any(|point| self.contains_point(*point))
     }
 
+    fn strictly_contains_point(&self, point: LayoutPoint) -> bool {
+        self.contains_point(point) && !self.segments().any(|(a, b)| point_on_segment(point, a, b))
+    }
+
+    /// Return whether two simple polygons share a positive-area interior.
+    ///
+    /// Boundary-only contact returns false, as required by DRC short checks.
+    pub fn positive_area_intersects(&self, other: &Self) -> bool {
+        if self.points == other.points {
+            return true;
+        }
+        self.points
+            .iter()
+            .any(|point| other.strictly_contains_point(*point))
+            || other
+                .points
+                .iter()
+                .any(|point| self.strictly_contains_point(*point))
+            || self.segments().any(|(a, b)| {
+                other
+                    .segments()
+                    .any(|(c, d)| segments_properly_cross_exact(a, b, c, d))
+            })
+    }
+
     pub fn intersects_segment(&self, a: LayoutPoint, b: LayoutPoint) -> bool {
         self.segments()
             .any(|(c, d)| general_segments_intersect(a, b, c, d))
@@ -419,6 +444,23 @@ impl AnyAnglePolygon {
             .map(|length| (length as f64).sqrt())
             .sum()
     }
+}
+
+fn segments_properly_cross_exact(
+    a: LayoutPoint,
+    b: LayoutPoint,
+    c: LayoutPoint,
+    d: LayoutPoint,
+) -> bool {
+    fn orientation(a: LayoutPoint, b: LayoutPoint, point: LayoutPoint) -> i128 {
+        i128::from(b.x - a.x) * i128::from(point.y - a.y)
+            - i128::from(b.y - a.y) * i128::from(point.x - a.x)
+    }
+    let abc = orientation(a, b, c);
+    let abd = orientation(a, b, d);
+    let cda = orientation(c, d, a);
+    let cdb = orientation(c, d, b);
+    abc.signum() * abd.signum() < 0 && cda.signum() * cdb.signum() < 0
 }
 
 fn gcd_u128(left: u128, right: u128) -> u128 {
@@ -1197,6 +1239,46 @@ mod tests {
         assert!((distance.sqrt() - f64::sqrt(60.5)).abs() < 1e-12);
         assert!(left.check_spacing_to(&right, 7).unwrap().compliant);
         assert!(!left.check_spacing_to(&right, 8).unwrap().compliant);
+    }
+
+    #[test]
+    fn positive_area_intersection_distinguishes_boundary_contact() {
+        let make = |width, height| {
+            AnyAnglePolygon::new([
+                LayoutPoint::new(0, 0),
+                LayoutPoint::new(width, 0),
+                LayoutPoint::new(width, height),
+                LayoutPoint::new(width / 2, height / 4),
+                LayoutPoint::new(0, height),
+            ])
+            .unwrap()
+        };
+        for width in [10_i64, 18] {
+            let height = if width == 10 { 24 } else { 16 };
+            let left = make(width, height);
+            let touching = left.translated(width, 0).unwrap();
+            assert!(left.intersects(&touching));
+            assert!(!left.positive_area_intersects(&touching));
+
+            let overlapping = left.translated(width - 1, 0).unwrap();
+            assert!(left.positive_area_intersects(&overlapping));
+        }
+
+        let triangle = AnyAnglePolygon::new([
+            LayoutPoint::new(0, 0),
+            LayoutPoint::new(10, 0),
+            LayoutPoint::new(0, 10),
+        ])
+        .unwrap();
+        let identical = triangle.clone();
+        let contained = AnyAnglePolygon::new([
+            LayoutPoint::new(1, 1),
+            LayoutPoint::new(4, 1),
+            LayoutPoint::new(1, 4),
+        ])
+        .unwrap();
+        assert!(triangle.positive_area_intersects(&identical));
+        assert!(triangle.positive_area_intersects(&contained));
     }
 
     #[test]

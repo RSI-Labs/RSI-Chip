@@ -145,6 +145,238 @@ fn mos_saturation_drain_voltage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mos_drain_current_at_temperature(
+    settings: &MosfetModel,
+    width_m: f64,
+    length_m: f64,
+    multiplier: f64,
+    v_gs: f64,
+    v_ds: f64,
+    v_bs: f64,
+    temperature_k: f64,
+) -> f64 {
+    let threshold = mos_threshold(settings, v_bs, length_m, width_m, v_ds, temperature_k);
+    let overdrive = v_gs - threshold;
+    let effective_kp = mos_effective_kp(settings, overdrive, v_bs, temperature_k);
+    let saturation_vds = mos_saturation_drain_voltage(settings, overdrive, effective_kp, length_m);
+    let effective_vds = v_ds.min(saturation_vds.max(0.0));
+    if overdrive <= 0.0 {
+        0.0
+    } else {
+        effective_kp * width_m / length_m
+            * multiplier
+            * (overdrive * effective_vds - effective_vds * effective_vds / 2.0)
+            * (1.0 + settings.channel_length_modulation_per_v * v_ds)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn self_heated_mos_drain_current(
+    settings: &MosfetModel,
+    width_m: f64,
+    length_m: f64,
+    multiplier: f64,
+    v_gs: f64,
+    v_ds: f64,
+    v_bs: f64,
+    ambient_temperature_k: f64,
+) -> f64 {
+    self_heated_mos_state(
+        settings,
+        width_m,
+        length_m,
+        multiplier,
+        v_gs,
+        v_ds,
+        v_bs,
+        ambient_temperature_k,
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn self_heated_mos_state(
+    settings: &MosfetModel,
+    width_m: f64,
+    length_m: f64,
+    multiplier: f64,
+    v_gs: f64,
+    v_ds: f64,
+    v_bs: f64,
+    ambient_temperature_k: f64,
+) -> (f64, f64) {
+    let mut local_temperature = ambient_temperature_k;
+    let mut current = mos_drain_current_at_temperature(
+        settings,
+        width_m,
+        length_m,
+        multiplier,
+        v_gs,
+        v_ds,
+        v_bs,
+        local_temperature,
+    );
+    if settings.self_heating_thermal_resistance_k_per_w == 0.0 || v_ds == 0.0 {
+        return (current, local_temperature);
+    }
+    for _ in 0..24 {
+        let power = current.abs() * v_ds.abs();
+        let target = (ambient_temperature_k
+            + settings.self_heating_thermal_resistance_k_per_w * power)
+            .min(ambient_temperature_k + 300.0);
+        let next_temperature = local_temperature + 0.5 * (target - local_temperature);
+        if !next_temperature.is_finite() || next_temperature <= 0.0 {
+            break;
+        }
+        let next_current = mos_drain_current_at_temperature(
+            settings,
+            width_m,
+            length_m,
+            multiplier,
+            v_gs,
+            v_ds,
+            v_bs,
+            next_temperature,
+        );
+        let temperature_converged = (next_temperature - local_temperature).abs() < 1e-7;
+        local_temperature = next_temperature;
+        let previous_current = current;
+        current = next_current;
+        if temperature_converged
+            && (current - previous_current).abs() <= 1e-12 * (1.0 + current.abs())
+        {
+            break;
+        }
+    }
+    (current, local_temperature)
+}
+
+fn bjt_terminal_currents_at_temperature(
+    settings: &BjtModel,
+    area: f64,
+    collector_voltage: f64,
+    base_voltage: f64,
+    emitter_voltage: f64,
+    temperature_k: f64,
+) -> [f64; 4] {
+    let polarity = match settings.polarity {
+        BjtPolarity::Npn => 1.0,
+        BjtPolarity::Pnp => -1.0,
+    };
+    let v_be = polarity * (base_voltage - emitter_voltage);
+    let v_bc = polarity * (base_voltage - collector_voltage);
+    let thermal_voltage = thermal_voltage_at(temperature_k, 1.0);
+    let saturation_current = temperature_scaled_saturation_current(
+        settings.saturation_current_a,
+        1.0,
+        settings.energy_gap_ev,
+        settings.saturation_current_temperature_exponent,
+        temperature_k,
+    );
+    let forward_early_factor = if settings.forward_early_voltage_v > 0.0 {
+        (1.0 - v_bc / settings.forward_early_voltage_v).max(1.0e-3)
+    } else {
+        1.0
+    };
+    let reverse_early_factor = if settings.reverse_early_voltage_v > 0.0 {
+        (1.0 - v_be / settings.reverse_early_voltage_v).max(1.0e-3)
+    } else {
+        1.0
+    };
+    let forward = saturation_current
+        * area
+        * ((v_be / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
+        * forward_early_factor;
+    let reverse = saturation_current
+        * area
+        * ((v_bc / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
+        * reverse_early_factor;
+    let transport = forward - reverse;
+    let collector_current = transport - reverse / settings.reverse_beta;
+    let base_current = forward / settings.forward_beta + reverse / settings.reverse_beta;
+    let emitter_current = forward / settings.forward_beta + transport;
+    [
+        polarity * collector_current,
+        polarity * base_current,
+        -polarity * emitter_current,
+        0.0,
+    ]
+}
+
+fn self_heated_bjt_terminal_currents(
+    settings: &BjtModel,
+    area: f64,
+    collector_voltage: f64,
+    base_voltage: f64,
+    emitter_voltage: f64,
+    ambient_temperature_k: f64,
+) -> [f64; 4] {
+    self_heated_bjt_state(
+        settings,
+        area,
+        collector_voltage,
+        base_voltage,
+        emitter_voltage,
+        ambient_temperature_k,
+    )
+    .0
+}
+
+fn self_heated_bjt_state(
+    settings: &BjtModel,
+    area: f64,
+    collector_voltage: f64,
+    base_voltage: f64,
+    emitter_voltage: f64,
+    ambient_temperature_k: f64,
+) -> ([f64; 4], f64) {
+    let mut local_temperature = ambient_temperature_k;
+    let mut currents = bjt_terminal_currents_at_temperature(
+        settings,
+        area,
+        collector_voltage,
+        base_voltage,
+        emitter_voltage,
+        local_temperature,
+    );
+    if settings.self_heating_thermal_resistance_k_per_w == 0.0 {
+        return (currents, local_temperature);
+    }
+    for _ in 0..24 {
+        let power = (collector_voltage - emitter_voltage).abs() * currents[0].abs()
+            + (base_voltage - emitter_voltage).abs() * currents[1].abs();
+        let target = (ambient_temperature_k
+            + settings.self_heating_thermal_resistance_k_per_w * power)
+            .min(ambient_temperature_k + 300.0);
+        let next_temperature = local_temperature + 0.25 * (target - local_temperature);
+        if !next_temperature.is_finite() || next_temperature <= 0.0 {
+            break;
+        }
+        let next_currents = bjt_terminal_currents_at_temperature(
+            settings,
+            area,
+            collector_voltage,
+            base_voltage,
+            emitter_voltage,
+            next_temperature,
+        );
+        let temperature_converged = (next_temperature - local_temperature).abs() < 1e-7;
+        local_temperature = next_temperature;
+        let old_currents = currents;
+        currents = next_currents;
+        if temperature_converged
+            && old_currents
+                .iter()
+                .zip(currents.iter())
+                .all(|(old, new)| (old - new).abs() <= 1e-12 * (1.0 + old.abs().max(new.abs())))
+        {
+            break;
+        }
+    }
+    (currents, local_temperature)
+}
+
 fn effective_resistance(
     resistance: f64,
     first_temperature_coefficient_per_k: f64,
@@ -276,6 +508,166 @@ pub fn transient(circuit: &SpiceCircuit, analysis: &Analysis) -> Result<Transien
     transient_cancellable(circuit, analysis, &FlowCancellation::new())
 }
 
+fn transistor_thermal_parameters(
+    circuit: &SpiceCircuit,
+    element: &SpiceElement,
+) -> Result<Option<(f64, f64)>, String> {
+    match &element.kind {
+        SpiceElementKind::Mosfet {
+            model,
+            width_m,
+            length_m,
+            ..
+        } => {
+            let settings = circuit.mosfet_model_for(model, *width_m, *length_m)?;
+            Ok(Some((
+                settings.self_heating_thermal_resistance_k_per_w,
+                settings.self_heating_thermal_capacitance_j_per_k,
+            )))
+        }
+        SpiceElementKind::BipolarJunctionTransistor { model, .. } => {
+            let settings = circuit
+                .bjt_models
+                .get(model)
+                .ok_or_else(|| format!("unknown BJT model '{}'", model))?;
+            Ok(Some((
+                settings.self_heating_thermal_resistance_k_per_w,
+                settings.self_heating_thermal_capacitance_j_per_k,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn sample_terminal_voltages(sample: &TransientSample, element: &SpiceElement) -> Vec<f64> {
+    let mut values = vec![0.0; element.nodes.len().max(4)];
+    for (index, node) in element.nodes.iter().take(4).enumerate() {
+        values[index] = sample.node_voltages.get(node).copied().unwrap_or(0.0);
+    }
+    values
+}
+
+fn static_transistor_temperature(
+    circuit: &SpiceCircuit,
+    element: &SpiceElement,
+    terminal_voltages: &[f64],
+) -> Result<Option<f64>, String> {
+    match &element.kind {
+        SpiceElementKind::Mosfet {
+            model,
+            width_m,
+            length_m,
+            multiplier,
+        } => {
+            let settings = circuit.mosfet_model_for(model, *width_m, *length_m)?;
+            let polarity = match settings.polarity {
+                MosfetPolarity::Nmos => 1.0,
+                MosfetPolarity::Pmos => -1.0,
+            };
+            let [drain, gate, source, bulk] = terminal_voltages else {
+                return Err("MOSFET needs four thermal voltage slots".into());
+            };
+            Ok(Some(
+                self_heated_mos_state(
+                    settings,
+                    *width_m,
+                    *length_m,
+                    *multiplier,
+                    polarity * (gate - source),
+                    polarity * (drain - source),
+                    polarity * (bulk - source),
+                    circuit.temperature_k,
+                )
+                .1,
+            ))
+        }
+        SpiceElementKind::BipolarJunctionTransistor { model, area } => {
+            let settings = circuit
+                .bjt_models
+                .get(model)
+                .ok_or_else(|| format!("unknown BJT model '{}'", model))?;
+            let [collector, base, emitter, _substrate] = terminal_voltages else {
+                return Err("BJT needs four thermal voltage slots".into());
+            };
+            Ok(Some(
+                self_heated_bjt_state(
+                    settings,
+                    *area,
+                    *collector,
+                    *base,
+                    *emitter,
+                    circuit.temperature_k,
+                )
+                .1,
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn update_device_temperatures(
+    circuit: &SpiceCircuit,
+    sample: &mut TransientSample,
+    previous: Option<&TransientSample>,
+    step_s: f64,
+) -> Result<(), String> {
+    for element in &circuit.elements {
+        let Some((thermal_resistance, thermal_capacitance)) =
+            transistor_thermal_parameters(circuit, element)?
+        else {
+            continue;
+        };
+        let terminal_voltages = sample_terminal_voltages(sample, element);
+        if thermal_capacitance == 0.0 {
+            let temperature = static_transistor_temperature(circuit, element, &terminal_voltages)?
+                .ok_or_else(|| format!("missing static temperature for '{}'", element.name))?;
+            sample
+                .device_temperatures
+                .insert(element.name.clone(), temperature);
+            continue;
+        }
+
+        let Some(previous_temperature) = previous
+            .and_then(|previous| previous.device_temperatures.get(&element.name))
+            .copied()
+        else {
+            sample
+                .device_temperatures
+                .insert(element.name.clone(), circuit.temperature_k);
+            continue;
+        };
+        let currents = nonlinear_terminal_currents_at_temperature(
+            circuit,
+            element,
+            &terminal_voltages,
+            Some(previous_temperature),
+        )?;
+        let power = terminal_voltages
+            .iter()
+            .zip(currents.iter())
+            .map(|(voltage, current)| voltage * current)
+            .sum::<f64>();
+        // Integrate Cth*dT/dt = P - (T-Tamb)/Rth with power held at the
+        // previous electrical step. This explicit-power / implicit-temperature
+        // companion is stable for the thermal pole and keeps the electrical
+        // Jacobian independent of an extra thermal unknown.
+        let thermal_conductance_w_per_k = 1.0 / thermal_resistance;
+        let denominator = 1.0 + step_s * thermal_conductance_w_per_k / thermal_capacitance;
+        let temperature = if denominator.is_finite() && denominator > 0.0 {
+            (previous_temperature
+                + step_s * (power + thermal_conductance_w_per_k * circuit.temperature_k)
+                    / thermal_capacitance)
+                / denominator
+        } else {
+            circuit.temperature_k
+        };
+        sample
+            .device_temperatures
+            .insert(element.name.clone(), temperature);
+    }
+    Ok(())
+}
+
 /// Integrate a transient analysis with cooperative checks at every time step.
 pub fn transient_cancellable(
     circuit: &SpiceCircuit,
@@ -322,7 +714,9 @@ pub fn transient_cancellable(
             node_voltages: op.node_voltages.clone(),
             branch_currents: op.branch_currents.clone(),
             capacitor_currents: BTreeMap::new(),
+            device_temperatures: BTreeMap::new(),
         };
+        update_device_temperatures(circuit, &mut sample, previous.as_ref(), *step_s)?;
         if let Some(prev) = &previous {
             for element in &circuit.elements {
                 if let SpiceElementKind::Capacitor { capacitance, .. } = element.kind {
@@ -347,9 +741,13 @@ pub fn transient_cancellable(
                 }
             }
             for element in &circuit.elements {
-                for (name, plus, minus, capacitance) in
-                    dynamic_capacitors(circuit, element, &prev.node_voltages)?
-                {
+                let thermal_temperature = sample.device_temperatures.get(&element.name).copied();
+                for (name, plus, minus, capacitance) in dynamic_capacitors_at_temperature(
+                    circuit,
+                    element,
+                    &prev.node_voltages,
+                    thermal_temperature,
+                )? {
                     let v_now = node_difference(&op.node_voltages, &plus, &minus);
                     let v_prev = node_difference(&prev.node_voltages, &plus, &minus);
                     let current = match method {
@@ -6139,6 +6537,15 @@ pub(crate) fn nonlinear_terminal_currents(
     element: &SpiceElement,
     terminal_voltages: &[f64],
 ) -> Result<[f64; 4], String> {
+    nonlinear_terminal_currents_at_temperature(circuit, element, terminal_voltages, None)
+}
+
+fn nonlinear_terminal_currents_at_temperature(
+    circuit: &SpiceCircuit,
+    element: &SpiceElement,
+    terminal_voltages: &[f64],
+    thermal_temperature_k: Option<f64>,
+) -> Result<[f64; 4], String> {
     match &element.kind {
         SpiceElementKind::Mosfet {
             model,
@@ -6157,26 +6564,27 @@ pub(crate) fn nonlinear_terminal_currents(
             let v_gs = polarity * (gate - source);
             let v_ds = polarity * (drain - source);
             let v_bs = polarity * (bulk - source);
-            let threshold = mos_threshold(
-                settings,
-                v_bs,
-                *length_m,
-                *width_m,
-                v_ds,
-                circuit.temperature_k,
-            );
-            let overdrive = v_gs - threshold;
-            let effective_kp = mos_effective_kp(settings, overdrive, v_bs, circuit.temperature_k);
-            let saturation_vds =
-                mos_saturation_drain_voltage(settings, overdrive, effective_kp, *length_m);
-            let effective_vds = v_ds.min(saturation_vds.max(0.0));
-            let current = if overdrive <= 0.0 {
-                0.0
-            } else {
-                effective_kp * width_m / length_m
-                    * multiplier
-                    * (overdrive * effective_vds - effective_vds * effective_vds / 2.0)
-                    * (1.0 + settings.channel_length_modulation_per_v * v_ds)
+            let current = match thermal_temperature_k {
+                Some(temperature) => mos_drain_current_at_temperature(
+                    settings,
+                    *width_m,
+                    *length_m,
+                    *multiplier,
+                    v_gs,
+                    v_ds,
+                    v_bs,
+                    temperature,
+                ),
+                None => self_heated_mos_drain_current(
+                    settings,
+                    *width_m,
+                    *length_m,
+                    *multiplier,
+                    v_gs,
+                    v_ds,
+                    v_bs,
+                    circuit.temperature_k,
+                ),
             } * polarity;
             Ok([current, 0.0, -current, 0.0])
         }
@@ -6188,48 +6596,24 @@ pub(crate) fn nonlinear_terminal_currents(
             let [collector, base, emitter, _substrate] = terminal_voltages else {
                 return Err("BJT needs four terminal-voltage slots".into());
             };
-            let polarity = match settings.polarity {
-                BjtPolarity::Npn => 1.0,
-                BjtPolarity::Pnp => -1.0,
-            };
-            let v_be = polarity * (base - emitter);
-            let v_bc = polarity * (base - collector);
-            let thermal_voltage = thermal_voltage_at(circuit.temperature_k, 1.0);
-            let saturation_current = temperature_scaled_saturation_current(
-                settings.saturation_current_a,
-                1.0,
-                settings.energy_gap_ev,
-                settings.saturation_current_temperature_exponent,
-                circuit.temperature_k,
-            );
-            let forward_early_factor = if settings.forward_early_voltage_v > 0.0 {
-                (1.0 - v_bc / settings.forward_early_voltage_v).max(1.0e-3)
-            } else {
-                1.0
-            };
-            let reverse_early_factor = if settings.reverse_early_voltage_v > 0.0 {
-                (1.0 - v_be / settings.reverse_early_voltage_v).max(1.0e-3)
-            } else {
-                1.0
-            };
-            let forward = saturation_current
-                * area
-                * ((v_be / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
-                * forward_early_factor;
-            let reverse = saturation_current
-                * area
-                * ((v_bc / thermal_voltage).clamp(-80.0, 80.0)).exp_m1()
-                * reverse_early_factor;
-            let transport = forward - reverse;
-            let collector_current = transport - reverse / settings.reverse_beta;
-            let base_current = forward / settings.forward_beta + reverse / settings.reverse_beta;
-            let emitter_current = forward / settings.forward_beta + transport;
-            Ok([
-                polarity * collector_current,
-                polarity * base_current,
-                -polarity * emitter_current,
-                0.0,
-            ])
+            Ok(match thermal_temperature_k {
+                Some(temperature) => bjt_terminal_currents_at_temperature(
+                    settings,
+                    *area,
+                    *collector,
+                    *base,
+                    *emitter,
+                    temperature,
+                ),
+                None => self_heated_bjt_terminal_currents(
+                    settings,
+                    *area,
+                    *collector,
+                    *base,
+                    *emitter,
+                    circuit.temperature_k,
+                ),
+            })
         }
         _ => Err("element is not a compact nonlinear transistor".into()),
     }
@@ -6252,10 +6636,19 @@ fn terminal_voltages(
 
 type DynamicCapacitor = (String, String, String, f64);
 
-fn dynamic_capacitors(
+pub(crate) fn dynamic_capacitors(
     circuit: &SpiceCircuit,
     element: &SpiceElement,
     voltages: &BTreeMap<String, f64>,
+) -> Result<Vec<DynamicCapacitor>, String> {
+    dynamic_capacitors_at_temperature(circuit, element, voltages, None)
+}
+
+fn dynamic_capacitors_at_temperature(
+    circuit: &SpiceCircuit,
+    element: &SpiceElement,
+    voltages: &BTreeMap<String, f64>,
+    thermal_temperature_k: Option<f64>,
 ) -> Result<Vec<DynamicCapacitor>, String> {
     let mut out = Vec::new();
     match &element.kind {
@@ -6278,16 +6671,26 @@ fn dynamic_capacitors(
             let vds = polarity * node_difference(voltages, drain, source);
             let vbs = polarity * node_difference(voltages, bulk, source);
             let vbd = polarity * node_difference(voltages, bulk, drain);
-            let threshold = mos_threshold(
-                settings,
-                vbs,
-                *length_m,
-                *width_m,
-                vds,
-                circuit.temperature_k,
-            );
+            let local_temperature = match thermal_temperature_k {
+                Some(temperature) => temperature,
+                None => {
+                    self_heated_mos_state(
+                        settings,
+                        *width_m,
+                        *length_m,
+                        *multiplier,
+                        vgs,
+                        vds,
+                        vbs,
+                        circuit.temperature_k,
+                    )
+                    .1
+                }
+            };
+            let threshold =
+                mos_threshold(settings, vbs, *length_m, *width_m, vds, local_temperature);
             let overdrive = vgs - threshold;
-            let effective_kp = mos_effective_kp(settings, overdrive, vbs, circuit.temperature_k);
+            let effective_kp = mos_effective_kp(settings, overdrive, vbs, local_temperature);
             let saturation_vds =
                 mos_saturation_drain_voltage(settings, overdrive, effective_kp, *length_m);
             let gate_oxide_cap = settings.gate_oxide_cap_per_m2 * width_m * length_m * multiplier;
@@ -6396,6 +6799,20 @@ fn dynamic_capacitors(
             };
             let vbe = polarity * node_difference(voltages, base, emitter);
             let vbc = polarity * node_difference(voltages, base, collector);
+            let local_temperature = match thermal_temperature_k {
+                Some(temperature) => temperature,
+                None => {
+                    self_heated_bjt_state(
+                        settings,
+                        *area,
+                        *voltages.get(collector).unwrap_or(&0.0),
+                        *voltages.get(base).unwrap_or(&0.0),
+                        *voltages.get(emitter).unwrap_or(&0.0),
+                        circuit.temperature_k,
+                    )
+                    .1
+                }
+            };
             let cbe = junction_capacitance(
                 settings.base_emitter_zero_bias_cap_f,
                 settings.base_emitter_junction_potential_v,
@@ -6408,9 +6825,9 @@ fn dynamic_capacitors(
                 1.0,
                 settings.energy_gap_ev,
                 settings.saturation_current_temperature_exponent,
-                circuit.temperature_k,
+                local_temperature,
             ) * area;
-            let bjt_thermal_voltage = thermal_voltage_at(circuit.temperature_k, 1.0);
+            let bjt_thermal_voltage = thermal_voltage_at(local_temperature, 1.0);
             let forward_charge_capacitance = settings.forward_transit_time_s
                 * bjt_saturation_current
                 * (vbe / bjt_thermal_voltage).clamp(-80.0, 80.0).exp()
@@ -6555,9 +6972,15 @@ fn linearized_transistor_stamp(
     b: &mut [f64],
     element: &SpiceElement,
     guess: &[f64],
+    thermal_temperature_k: Option<f64>,
 ) -> Result<(), String> {
     let voltages = terminal_voltages(system, element, guess)?;
-    let currents = nonlinear_terminal_currents(circuit, element, &voltages)?;
+    let currents = nonlinear_terminal_currents_at_temperature(
+        circuit,
+        element,
+        &voltages,
+        thermal_temperature_k,
+    )?;
     let mut jacobian = [[0.0_f64; 4]; 4];
     let epsilon = 1e-6_f64;
     for terminal in 0..element.nodes.len().min(4) {
@@ -6565,8 +6988,18 @@ fn linearized_transistor_stamp(
         let mut decreased = voltages.clone();
         increased[terminal] += epsilon;
         decreased[terminal] -= epsilon;
-        let high = nonlinear_terminal_currents(circuit, element, &increased)?;
-        let low = nonlinear_terminal_currents(circuit, element, &decreased)?;
+        let high = nonlinear_terminal_currents_at_temperature(
+            circuit,
+            element,
+            &increased,
+            thermal_temperature_k,
+        )?;
+        let low = nonlinear_terminal_currents_at_temperature(
+            circuit,
+            element,
+            &decreased,
+            thermal_temperature_k,
+        )?;
         for row in 0..4 {
             jacobian[row][terminal] = (high[row] - low[row]) / (2.0 * epsilon);
         }
@@ -6843,11 +7276,25 @@ fn build_real_system(
             }
             SpiceElementKind::Mosfet { .. }
             | SpiceElementKind::BipolarJunctionTransistor { .. } => {
-                linearized_transistor_stamp(circuit, system, &mut a, &mut b, element, guess)?;
+                let thermal_temperature_k = previous
+                    .and_then(|previous| previous.device_temperatures.get(&element.name))
+                    .copied();
+                linearized_transistor_stamp(
+                    circuit,
+                    system,
+                    &mut a,
+                    &mut b,
+                    element,
+                    guess,
+                    thermal_temperature_k,
+                )?;
                 if let (Some(h), Some(previous)) = (step_s, previous) {
-                    for (name, plus, minus, capacitance) in
-                        dynamic_capacitors(circuit, element, &previous.node_voltages)?
-                    {
+                    for (name, plus, minus, capacitance) in dynamic_capacitors_at_temperature(
+                        circuit,
+                        element,
+                        &previous.node_voltages,
+                        thermal_temperature_k,
+                    )? {
                         stamp_internal_capacitor(
                             &mut a,
                             &mut b,

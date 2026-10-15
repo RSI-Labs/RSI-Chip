@@ -1588,6 +1588,8 @@ pub struct MosfetModel {
     pub flicker_current_exponent: f64,
     pub flicker_frequency_exponent: f64,
     pub mobility_temperature_exponent: f64,
+    pub self_heating_thermal_resistance_k_per_w: f64,
+    pub self_heating_thermal_capacitance_j_per_k: f64,
     pub bsim3_body_bias_threshold_coefficient: f64,
     pub bsim3_low_field_mobility_m2_per_v_s: f64,
     pub bsim3_mobility_degradation_first_order_m_per_v: f64,
@@ -1668,6 +1670,8 @@ impl Default for MosfetModel {
             flicker_current_exponent: 1.0,
             flicker_frequency_exponent: 1.0,
             mobility_temperature_exponent: 1.5,
+            self_heating_thermal_resistance_k_per_w: 0.0,
+            self_heating_thermal_capacitance_j_per_k: 0.0,
             bsim3_body_bias_threshold_coefficient: 0.0,
             bsim3_low_field_mobility_m2_per_v_s: 0.045,
             bsim3_mobility_degradation_first_order_m_per_v: 1.0e-15,
@@ -1727,6 +1731,13 @@ impl MosfetModel {
         ensure_finite_nonnegative(self.flicker_current_exponent, "MOS AF")?;
         ensure_finite_nonnegative(self.flicker_frequency_exponent, "MOS EF")?;
         ensure_finite_nonnegative(self.mobility_temperature_exponent, "MOS MEXP")?;
+        ensure_finite_nonnegative(self.self_heating_thermal_resistance_k_per_w, "MOS RTH")?;
+        ensure_finite_nonnegative(self.self_heating_thermal_capacitance_j_per_k, "MOS CTH")?;
+        if self.self_heating_thermal_capacitance_j_per_k > 0.0
+            && self.self_heating_thermal_resistance_k_per_w == 0.0
+        {
+            return Err("MOS CTH requires a positive RTH".into());
+        }
         ensure_finite_nonnegative(self.bsim3_body_bias_threshold_coefficient, "BSIM3 K2")?;
         ensure_finite_positive(self.bsim3_low_field_mobility_m2_per_v_s, "BSIM3 U0")?;
         ensure_finite_nonnegative(
@@ -1817,6 +1828,8 @@ pub struct BjtModel {
     pub flicker_frequency_exponent: f64,
     pub energy_gap_ev: f64,
     pub saturation_current_temperature_exponent: f64,
+    pub self_heating_thermal_resistance_k_per_w: f64,
+    pub self_heating_thermal_capacitance_j_per_k: f64,
     pub forward_transit_time_s: f64,
     pub reverse_transit_time_s: f64,
 }
@@ -1842,6 +1855,8 @@ impl Default for BjtModel {
             flicker_frequency_exponent: 1.0,
             energy_gap_ev: 1.12,
             saturation_current_temperature_exponent: 3.0,
+            self_heating_thermal_resistance_k_per_w: 0.0,
+            self_heating_thermal_capacitance_j_per_k: 0.0,
             forward_transit_time_s: 0.0,
             reverse_transit_time_s: 0.0,
         }
@@ -1875,6 +1890,13 @@ impl BjtModel {
         ensure_finite_nonnegative(self.flicker_frequency_exponent, "BJT EF")?;
         ensure_finite_positive(self.energy_gap_ev, "BJT EG")?;
         ensure_finite_nonnegative(self.saturation_current_temperature_exponent, "BJT XTI")?;
+        ensure_finite_nonnegative(self.self_heating_thermal_resistance_k_per_w, "BJT RTH")?;
+        ensure_finite_nonnegative(self.self_heating_thermal_capacitance_j_per_k, "BJT CTH")?;
+        if self.self_heating_thermal_capacitance_j_per_k > 0.0
+            && self.self_heating_thermal_resistance_k_per_w == 0.0
+        {
+            return Err("BJT CTH requires a positive RTH".into());
+        }
         ensure_finite_nonnegative(self.forward_transit_time_s, "BJT TF")?;
         ensure_finite_nonnegative(self.reverse_transit_time_s, "BJT TR")?;
         Ok(())
@@ -2052,6 +2074,8 @@ pub struct TransientSample {
     pub node_voltages: BTreeMap<String, f64>,
     pub branch_currents: BTreeMap<String, f64>,
     pub capacitor_currents: BTreeMap<String, f64>,
+    /// Local lumped electrothermal state per MOS/BJT element name.
+    pub device_temperatures: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2077,6 +2101,29 @@ impl TransientResult {
                     .get(node)
                     .copied()
                     .ok_or_else(|| format!("unknown node '{}'", node))
+            })
+            .collect()
+    }
+
+    pub fn device_names(&self) -> Vec<String> {
+        self.samples
+            .iter()
+            .flat_map(|sample| sample.device_temperatures.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn device_temperature_values(&self, element: &str) -> Result<Vec<f64>, String> {
+        self.samples
+            .iter()
+            .map(|sample| {
+                sample
+                    .device_temperatures
+                    .get(element)
+                    .copied()
+                    .ok_or_else(|| format!("unknown thermal device '{}'", element))
             })
             .collect()
     }

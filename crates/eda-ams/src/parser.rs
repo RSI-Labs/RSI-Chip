@@ -1186,6 +1186,18 @@ fn parse_model(circuit: &mut SpiceCircuit, parts: &[String], line_no: usize) -> 
                     line_no,
                 )?,
                 mobility_temperature_exponent,
+                self_heating_thermal_resistance_k_per_w: model_number(
+                    &properties,
+                    "rth",
+                    default.self_heating_thermal_resistance_k_per_w,
+                    line_no,
+                )?,
+                self_heating_thermal_capacitance_j_per_k: model_number(
+                    &properties,
+                    "cth",
+                    default.self_heating_thermal_capacitance_j_per_k,
+                    line_no,
+                )?,
                 bsim3_body_bias_threshold_coefficient: model_number(
                     &properties,
                     "k2",
@@ -1381,6 +1393,18 @@ fn parse_model(circuit: &mut SpiceCircuit, parts: &[String], line_no: usize) -> 
                     &properties,
                     "xti",
                     default.saturation_current_temperature_exponent,
+                    line_no,
+                )?,
+                self_heating_thermal_resistance_k_per_w: model_number(
+                    &properties,
+                    "rth",
+                    default.self_heating_thermal_resistance_k_per_w,
+                    line_no,
+                )?,
+                self_heating_thermal_capacitance_j_per_k: model_number(
+                    &properties,
+                    "cth",
+                    default.self_heating_thermal_capacitance_j_per_k,
                     line_no,
                 )?,
                 forward_transit_time_s: model_number(
@@ -2802,7 +2826,7 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
         };
         let body = match model.kind {
             MosfetModelKind::Level1 => format!(
-                "KP={} VTO={} LAMBDA={} GAMMA={} PHI={} THETA={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} MEXP={}",
+                "KP={} VTO={} LAMBDA={} GAMMA={} PHI={} THETA={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} MEXP={} RTH={} CTH={}",
                 format_number(model.transconductance_a_per_v2),
                 format_number(model.threshold_voltage_v),
                 format_number(model.channel_length_modulation_per_v),
@@ -2823,10 +2847,12 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
                 format_number(model.flicker_coefficient_a2),
                 format_number(model.flicker_current_exponent),
                 format_number(model.flicker_frequency_exponent),
-                format_number(model.mobility_temperature_exponent)
+                format_number(model.mobility_temperature_exponent),
+                format_number(model.self_heating_thermal_resistance_k_per_w),
+                format_number(model.self_heating_thermal_capacitance_j_per_k)
             ),
             MosfetModelKind::Bsim3LongChannel => format!(
-                "LEVEL=8 VTH0={} K1={} K2={} DVT0={} DVT1={} DVT2={} DVT0W={} DVT1W={} W0={} KT1={} KT2={} KT1L={} LAMBDA={} PHI={} TOX={} U0={} UA={} UB={} UC={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} UTE={}",
+                "LEVEL=8 VTH0={} K1={} K2={} DVT0={} DVT1={} DVT2={} DVT0W={} DVT1W={} W0={} KT1={} KT2={} KT1L={} LAMBDA={} PHI={} TOX={} U0={} UA={} UB={} UC={} VSAT={} CGSO={} CGDO={} CGB={} COX={} CJSWS={} CJSWD={} PB={} MJ={} FC={} XPART={} KF={} AF={} EF={} UTE={} RTH={} CTH={}",
                 format_number(model.threshold_voltage_v),
                 format_number(model.body_effect_v_per_sqrt_v),
                 format_number(model.bsim3_body_bias_threshold_coefficient),
@@ -2860,7 +2886,9 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
                 format_number(model.flicker_coefficient_a2),
                 format_number(model.flicker_current_exponent),
                 format_number(model.flicker_frequency_exponent),
-                format_number(model.mobility_temperature_exponent)
+                format_number(model.mobility_temperature_exponent),
+                format_number(model.self_heating_thermal_resistance_k_per_w),
+                format_number(model.self_heating_thermal_capacitance_j_per_k)
             ),
         };
         let body = if let Some(bin) = model.geometry_bin {
@@ -2878,7 +2906,7 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
     }
     for (name, model) in &circuit.bjt_models {
         out.push_str(&format!(
-            ".model {} {}(IS={} BF={} BR={} VAF={} VAR={} CJE={} CJC={} VJE={} VJC={} MJE={} MJC={} FC={} KF={} AF={} EF={} EG={} XTI={} TF={} TR={})\n",
+            ".model {} {}(IS={} BF={} BR={} VAF={} VAR={} CJE={} CJC={} VJE={} VJC={} MJE={} MJC={} FC={} KF={} AF={} EF={} EG={} XTI={} RTH={} CTH={} TF={} TR={})\n",
             name,
             match model.polarity {
                 BjtPolarity::Npn => "NPN",
@@ -2901,6 +2929,8 @@ pub fn write_spice(circuit: &SpiceCircuit) -> Result<String, String> {
             format_number(model.flicker_frequency_exponent),
             format_number(model.energy_gap_ev),
             format_number(model.saturation_current_temperature_exponent),
+            format_number(model.self_heating_thermal_resistance_k_per_w),
+            format_number(model.self_heating_thermal_capacitance_j_per_k),
             format_number(model.forward_transit_time_s),
             format_number(model.reverse_transit_time_s)
         ));

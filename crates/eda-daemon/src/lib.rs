@@ -46,18 +46,25 @@ use eda_api::{
 };
 use eda_core::logic::LogicWord;
 use eda_core::netlist::Netlist;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::fs::{self, File};
 use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{spawn, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: usize = 1;
 const MAX_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_JOB_ARTIFACTS_PER_JOB: usize = 64;
+const MAX_REMOTE_JOB_ARTIFACT_BYTES_PER_JOB: usize = 8 * 1024 * 1024;
+const MAX_REMOTE_JOB_ARTIFACT_PAGE_SIZE: usize = 256;
+const MAX_REMOTE_JOB_ARTIFACT_REGISTRY_COUNT: usize = 512;
+const MAX_REMOTE_JOB_ARTIFACT_REGISTRY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Minimal, dependency-free JSON value used by the RPC wire protocol.
 #[derive(Clone, Debug, PartialEq)]
@@ -627,31 +634,55 @@ pub struct RpcService {
 
 impl RpcService {
     pub fn new() -> Self {
-        Self::with_flow_cache_capacity(128).expect("default RPC flow cache capacity")
+        Self::with_flow_cache_capacity_and_worker_count(128, 4)
+            .expect("default RPC service configuration")
     }
 
     pub fn with_flow_cache_capacity(capacity: usize) -> Result<Self, String> {
+        Self::with_flow_cache_capacity_and_worker_count(capacity, 4)
+    }
+
+    pub fn with_flow_cache_capacity_and_worker_count(
+        capacity: usize,
+        worker_count: usize,
+    ) -> Result<Self, String> {
+        Self::with_flow_cache_capacity_worker_count_and_artifact_store(capacity, worker_count, None)
+    }
+
+    pub fn with_flow_cache_capacity_worker_count_and_artifact_store(
+        capacity: usize,
+        worker_count: usize,
+        artifact_store: Option<&Path>,
+    ) -> Result<Self, String> {
+        if worker_count == 0 {
+            return Err("RPC service requires at least one job worker".into());
+        }
         let flow_cache = SharedFlowCache::new(capacity)?;
         let dispatcher_cache = flow_cache.clone();
         let timing_waiver_registries = Arc::new(Mutex::new(BTreeMap::new()));
         let dispatcher_registries = timing_waiver_registries.clone();
         let layout_drc_waiver_registries = Arc::new(Mutex::new(BTreeMap::new()));
         let dispatcher_layout_registries = layout_drc_waiver_registries.clone();
-        let manager = RpcJobManager::new_with_dispatcher(Arc::new(move |request, cancellation| {
-            dispatch_result_with_flow_cache(
-                &request,
-                &cancellation,
-                &dispatcher_cache,
-                &dispatcher_registries,
-                &dispatcher_layout_registries,
-            )
-        }));
-        Ok(Self {
+        let manager = RpcJobManager::try_new_with_dispatcher_worker_count_and_artifact_store(
+            Arc::new(move |request, cancellation| {
+                dispatch_result_with_flow_cache(
+                    &request,
+                    &cancellation,
+                    &dispatcher_cache,
+                    &dispatcher_registries,
+                    &dispatcher_layout_registries,
+                )
+            }),
+            worker_count,
+            artifact_store,
+        )?;
+        let service = Self {
             manager: Arc::new(Mutex::new(manager)),
             flow_cache,
             timing_waiver_registries,
             layout_drc_waiver_registries,
-        })
+        };
+        Ok(service)
     }
 
     pub fn dispatch(&self, request: &RpcRequest) -> RpcResponse {
@@ -664,9 +695,21 @@ impl RpcService {
     fn dispatch_result(&self, request: &RpcRequest) -> Result<Json, String> {
         match request.method.as_str() {
             "jobSubmit" => self.job_submit(&request.params),
+            "jobSubmitRemote" => self.job_submit_remote(&request.params),
             "jobStatus" => self.job_status(&request.params),
             "jobCancel" => self.job_cancel(&request.params),
             "jobWait" => self.job_wait(&request.params),
+            "jobWorkerStats" => self.job_worker_stats(),
+            "jobArtifactList" => self.job_artifact_list(&request.params),
+            "jobArtifactGet" => self.job_artifact_get(&request.params),
+            "jobArtifactDelete" => self.job_artifact_delete(&request.params),
+            "workerRegister" => self.worker_register(&request.params),
+            "workerHeartbeat" => self.worker_heartbeat(&request.params),
+            "workerList" => self.worker_list(),
+            "workerExpireLeases" => self.worker_expire_leases(),
+            "workerClaim" => self.worker_claim(&request.params),
+            "workerClaimStatus" => self.worker_claim_status(&request.params),
+            "workerComplete" => self.worker_complete(&request.params),
             "rtlFlowCache" => dispatch_result_with_flow_cache(
                 request,
                 &FlowCancellation::new(),
@@ -701,6 +744,48 @@ impl RpcService {
         Ok(Json::object([
             ("jobId", Json::number(id as f64)?),
             ("state", Json::string("queued")),
+        ]))
+    }
+
+    fn job_submit_remote(&self, params: &Json) -> Result<Json, String> {
+        let nested = required_value(params, "request")?;
+        let request = RpcRequest::parse(&nested.write())?;
+        let fields = params
+            .as_object()
+            .ok_or_else(|| "params must be an object".to_string())?;
+        let max_attempts = match fields.get("maxAttempts") {
+            None | Some(Json::Null) => 3_usize,
+            Some(Json::Number(value)) => {
+                if *value <= 0.0 || value.fract() != 0.0 || *value > usize::MAX as f64 {
+                    return Err("'maxAttempts' must be a positive usize".into());
+                }
+                *value as usize
+            }
+            Some(_) => return Err("'maxAttempts' must be a positive usize".into()),
+        };
+        let priority = match fields.get("priority") {
+            None | Some(Json::Null) => 0_u32,
+            Some(Json::Number(value)) => {
+                if *value < 0.0 || value.fract() != 0.0 || *value > u32::MAX as f64 {
+                    return Err("'priority' must be a non-negative u32".into());
+                }
+                *value as u32
+            }
+            Some(_) => return Err("'priority' must be a non-negative u32".into()),
+        };
+        let required_worker_labels = parse_string_map(params, "requiredWorkerLabels")?;
+        let id = self.manager()?.submit_remote(
+            request,
+            max_attempts,
+            priority,
+            required_worker_labels,
+        )?;
+        Ok(Json::object([
+            ("jobId", Json::number(id as f64)?),
+            ("state", Json::string("queued")),
+            ("scheduled", Json::string("remote")),
+            ("maxAttempts", Json::from(max_attempts as u64)),
+            ("priority", Json::from(u64::from(priority))),
         ]))
     }
 
@@ -754,6 +839,241 @@ impl RpcService {
         }
     }
 
+    fn job_worker_stats(&self) -> Result<Json, String> {
+        let stats = self.manager()?.job_stats()?;
+        Ok(Json::object([
+            ("workerCount", Json::from(stats.worker_count as u64)),
+            (
+                "remoteWorkerCount",
+                Json::from(stats.remote_worker_count as u64),
+            ),
+            (
+                "remoteActiveJobCount",
+                Json::from(stats.remote_active_job_count as u64),
+            ),
+            (
+                "remoteArtifactCount",
+                Json::from(stats.remote_artifact_count as u64),
+            ),
+            (
+                "remoteArtifactBytes",
+                Json::from(stats.remote_artifact_bytes as u64),
+            ),
+            (
+                "remoteArtifactCapacity",
+                Json::from(stats.remote_artifact_capacity as u64),
+            ),
+            (
+                "remoteArtifactByteCapacity",
+                Json::from(stats.remote_artifact_byte_capacity as u64),
+            ),
+            (
+                "remoteArtifactEvictions",
+                Json::from(stats.remote_artifact_evictions),
+            ),
+            (
+                "remoteReassignments",
+                Json::from(stats.remote_reassignments),
+            ),
+            (
+                "remoteRetryExhausted",
+                Json::from(stats.remote_retry_exhausted),
+            ),
+            (
+                "remoteWorkerExpirations",
+                Json::from(stats.remote_worker_expirations),
+            ),
+            ("queued", Json::from(stats.queued as u64)),
+            ("running", Json::from(stats.running as u64)),
+            ("completed", Json::from(stats.completed as u64)),
+            ("failed", Json::from(stats.failed as u64)),
+            ("cancelled", Json::from(stats.cancelled as u64)),
+            (
+                "activeJobIds",
+                Json::Array(stats.active_job_ids.into_iter().map(Json::from).collect()),
+            ),
+        ]))
+    }
+
+    fn job_artifact_list(&self, params: &Json) -> Result<Json, String> {
+        let job_id = required_job_id(params)?;
+        let offset = optional_nonnegative_usize(params, "offset", 0)?;
+        let limit = optional_positive_usize(params, "limit", MAX_REMOTE_JOB_ARTIFACT_PAGE_SIZE)?;
+        if limit > MAX_REMOTE_JOB_ARTIFACT_PAGE_SIZE {
+            return Err(format!(
+                "'limit' cannot exceed {MAX_REMOTE_JOB_ARTIFACT_PAGE_SIZE}"
+            ));
+        }
+        let artifacts = self.manager()?.remote_job_artifacts(job_id)?;
+        let total = artifacts.len();
+        let values = artifacts
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(remote_job_artifact_metadata_json)
+            .collect::<Vec<_>>();
+        Ok(Json::object([
+            ("jobId", Json::number(job_id as f64)?),
+            ("count", Json::from(values.len() as u64)),
+            ("total", Json::from(total as u64)),
+            ("offset", Json::from(offset as u64)),
+            ("limit", Json::from(limit as u64)),
+            ("artifacts", Json::Array(values)),
+        ]))
+    }
+
+    fn job_artifact_get(&self, params: &Json) -> Result<Json, String> {
+        let job_id = required_job_id(params)?;
+        let name = required_artifact_name(params)?;
+        let artifact = self.manager()?.remote_job_artifact(job_id, &name)?;
+        remote_job_artifact_json(&artifact)
+    }
+
+    fn job_artifact_delete(&self, params: &Json) -> Result<Json, String> {
+        let job_id = required_job_id(params)?;
+        let name = required_artifact_name(params)?;
+        let artifact = self.manager()?.delete_remote_job_artifact(job_id, &name)?;
+        Ok(Json::object([
+            ("jobId", Json::number(job_id as f64)?),
+            ("name", Json::string(artifact.name)),
+            ("deleted", Json::Bool(true)),
+            ("sha256", Json::string(artifact.sha256)),
+            ("sizeBytes", Json::from(artifact.size_bytes as u64)),
+        ]))
+    }
+
+    fn worker_register(&self, params: &Json) -> Result<Json, String> {
+        let worker_id = required_string(params, "workerId")?;
+        let fields = params
+            .as_object()
+            .ok_or_else(|| "params must be an object".to_string())?;
+        let capacity = match fields.get("capacity") {
+            None | Some(Json::Null) => 1_usize,
+            Some(Json::Number(value)) => {
+                if *value <= 0.0 || value.fract() != 0.0 || *value > usize::MAX as f64 {
+                    return Err("'capacity' must be a positive usize".into());
+                }
+                *value as usize
+            }
+            Some(_) => return Err("'capacity' must be a positive usize".into()),
+        };
+        let lease_timeout_seconds = match fields.get("leaseTimeoutSeconds") {
+            None | Some(Json::Null) => 60_u64,
+            Some(Json::Number(value)) => {
+                if *value <= 0.0 || value.fract() != 0.0 || *value > u64::MAX as f64 {
+                    return Err("'leaseTimeoutSeconds' must be a positive u64".into());
+                }
+                *value as u64
+            }
+            Some(_) => return Err("'leaseTimeoutSeconds' must be a positive u64".into()),
+        };
+        let snapshot = self.manager()?.register_remote_worker(
+            &worker_id,
+            capacity,
+            Duration::from_secs(lease_timeout_seconds),
+            parse_string_map(params, "labels")?,
+        )?;
+        remote_worker_json(&snapshot)
+    }
+
+    fn worker_heartbeat(&self, params: &Json) -> Result<Json, String> {
+        let worker_id = required_string(params, "workerId")?;
+        let snapshot = self.manager()?.remote_worker_heartbeat(&worker_id)?;
+        remote_worker_json(&snapshot)
+    }
+
+    fn worker_list(&self) -> Result<Json, String> {
+        let workers = self.manager()?.remote_workers()?;
+        let values = workers
+            .iter()
+            .map(remote_worker_json)
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Json::object([
+            ("count", Json::from(values.len() as u64)),
+            ("workers", Json::Array(values)),
+        ]))
+    }
+
+    fn worker_expire_leases(&self) -> Result<Json, String> {
+        let expiration = self.manager()?.expire_remote_leases()?;
+        Ok(Json::object([
+            (
+                "expiredCount",
+                Json::from(expiration.expired_job_ids.len() as u64),
+            ),
+            (
+                "expiredJobIds",
+                Json::Array(
+                    expiration
+                        .expired_job_ids
+                        .into_iter()
+                        .map(Json::from)
+                        .collect(),
+                ),
+            ),
+            (
+                "removedWorkerCount",
+                Json::from(expiration.removed_worker_ids.len() as u64),
+            ),
+            (
+                "removedWorkerIds",
+                Json::Array(
+                    expiration
+                        .removed_worker_ids
+                        .into_iter()
+                        .map(Json::string)
+                        .collect(),
+                ),
+            ),
+        ]))
+    }
+
+    fn worker_claim(&self, params: &Json) -> Result<Json, String> {
+        let worker_id = required_string(params, "workerId")?;
+        let Some(claim) = self.manager()?.claim_remote_job(&worker_id)? else {
+            return Ok(Json::Null);
+        };
+        Ok(Json::object([
+            ("jobId", Json::number(claim.job_id as f64)?),
+            ("workerId", Json::string(claim.worker_id)),
+            ("request", parse_json(&claim.request.wire())?),
+            ("attempt", Json::from(claim.attempt as u64)),
+            ("maxAttempts", Json::from(claim.max_attempts as u64)),
+            ("priority", Json::from(u64::from(claim.priority))),
+            (
+                "requiredWorkerLabels",
+                string_map_json(&claim.required_worker_labels),
+            ),
+        ]))
+    }
+
+    fn worker_claim_status(&self, params: &Json) -> Result<Json, String> {
+        let job_id = required_job_id(params)?;
+        let cancelled = self.manager()?.remote_claim_status(job_id)?;
+        Ok(Json::object([("cancelled", Json::Bool(cancelled))]))
+    }
+
+    fn worker_complete(&self, params: &Json) -> Result<Json, String> {
+        let worker_id = required_string(params, "workerId")?;
+        let job_id = required_job_id(params)?;
+        let fields = params
+            .as_object()
+            .ok_or_else(|| "params must be an object".to_string())?;
+        let result = if let Some(error) = fields.get("error") {
+            let Json::String(error) = error else {
+                return Err("'error' must be a string".into());
+            };
+            Err(error.clone())
+        } else {
+            Ok(fields.get("result").cloned().unwrap_or(Json::Null))
+        };
+        let artifacts = parse_remote_job_artifacts(params, job_id)?;
+        let status = self
+            .manager()?
+            .complete_remote_job(&worker_id, job_id, result, artifacts)?;
+        job_status_json(job_id, &status)
+    }
+
     fn shutdown(&self) -> Result<(), String> {
         self.manager()?.shutdown_background()
     }
@@ -783,6 +1103,235 @@ fn required_job_id(params: &Json) -> Result<u64, String> {
     }
 }
 
+fn required_artifact_name(params: &Json) -> Result<String, String> {
+    let name = required_string(params, "name")?;
+    if name.trim().is_empty() {
+        return Err("'name' cannot be empty".into());
+    }
+    Ok(name)
+}
+
+fn parse_string_map(params: &Json, name: &str) -> Result<BTreeMap<String, String>, String> {
+    let Some(fields) = params.as_object() else {
+        return Err("params must be an object".to_string());
+    };
+    let values = match fields.get(name) {
+        None | Some(Json::Null) => return Ok(BTreeMap::new()),
+        Some(Json::Object(values)) => values,
+        Some(_) => return Err(format!("'{name}' must be an object of strings")),
+    };
+    let mut parsed = BTreeMap::new();
+    for (key, value) in values {
+        let Json::String(value) = value else {
+            return Err(format!("'{name}' values must be strings"));
+        };
+        if key.trim().is_empty() {
+            return Err(format!("'{name}' keys cannot be empty"));
+        }
+        if value.trim().is_empty() {
+            return Err(format!("'{name}'['{key}'] cannot be empty"));
+        }
+        parsed.insert(key.clone(), value.clone());
+    }
+    Ok(parsed)
+}
+
+fn string_map_json(values: &BTreeMap<String, String>) -> Json {
+    Json::object(
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), Json::string(value.clone()))),
+    )
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_value(byte: u8) -> Option<u8> {
+    BASE64_ALPHABET
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map(|position| position as u8)
+}
+
+fn base64_encode(message: &[u8]) -> String {
+    let mut encoded = String::with_capacity(message.len().div_ceil(3) * 4);
+    for chunk in message.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        let word = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+        encoded.push(BASE64_ALPHABET[(word >> 18) as usize & 0x3f] as char);
+        encoded.push(BASE64_ALPHABET[(word >> 12) as usize & 0x3f] as char);
+        if chunk.len() > 1 {
+            encoded.push(BASE64_ALPHABET[(word >> 6) as usize & 0x3f] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(BASE64_ALPHABET[word as usize & 0x3f] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(4) {
+        return Err("artifact base64 content must use padded four-byte groups".into());
+    }
+    let padding = value.bytes().filter(|byte| *byte == b'=').count();
+    if padding > 2 {
+        return Err("artifact base64 content has invalid padding".into());
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 4 * 3);
+    for group in value.as_bytes().chunks_exact(4) {
+        let mut symbols = [0_u8; 4];
+        for (index, byte) in group.iter().enumerate() {
+            if *byte == b'=' {
+                if index < 2 || group[..index].contains(&b'=') {
+                    return Err("artifact base64 content has misplaced padding".into());
+                }
+                symbols[index] = 0;
+                continue;
+            }
+            symbols[index] = base64_value(*byte)
+                .ok_or_else(|| "artifact content is not canonical base64".to_string())?;
+        }
+        let word = ((symbols[0] as u32) << 18)
+            | ((symbols[1] as u32) << 12)
+            | ((symbols[2] as u32) << 6)
+            | symbols[3] as u32;
+        decoded.push((word >> 16) as u8);
+        if group[2] != b'=' {
+            decoded.push((word >> 8) as u8);
+        }
+        if group[3] != b'=' {
+            decoded.push(word as u8);
+        }
+    }
+    if base64_encode(&decoded) != value {
+        return Err("artifact content is not canonical base64".into());
+    }
+    Ok(decoded)
+}
+
+fn parse_remote_job_artifacts(
+    params: &Json,
+    job_id: u64,
+) -> Result<Vec<RemoteJobArtifact>, String> {
+    let Some(fields) = params.as_object() else {
+        return Err("params must be an object".to_string());
+    };
+    let artifacts = match fields.get("artifacts") {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::Array(artifacts)) => artifacts,
+        Some(_) => return Err("'artifacts' must be an array".into()),
+    };
+    if artifacts.len() > MAX_REMOTE_JOB_ARTIFACTS_PER_JOB {
+        return Err(format!(
+            "remote RPC job accepts at most {MAX_REMOTE_JOB_ARTIFACTS_PER_JOB} artifacts"
+        ));
+    }
+
+    let mut parsed = BTreeMap::<String, RemoteJobArtifact>::new();
+    let mut total_decoded_bytes = 0_usize;
+    for artifact in artifacts {
+        let Some(fields) = artifact.as_object() else {
+            return Err("each artifact must be an object".into());
+        };
+        let Json::String(name) = fields.get("name").ok_or("artifact 'name' is required")? else {
+            return Err("artifact 'name' must be a string".into());
+        };
+        if name.trim().is_empty() {
+            return Err("artifact 'name' cannot be empty".into());
+        }
+        let Json::String(content) = fields
+            .get("content")
+            .ok_or("artifact 'content' is required")?
+        else {
+            return Err("artifact 'content' must be a string".into());
+        };
+        let content_type = match fields.get("contentType") {
+            None | Some(Json::Null) => "text/plain".to_string(),
+            Some(Json::String(value)) => {
+                if value.trim().is_empty() {
+                    return Err("artifact 'contentType' cannot be empty".into());
+                }
+                value.clone()
+            }
+            Some(_) => return Err("artifact 'contentType' must be a string".into()),
+        };
+        let content_encoding = match fields.get("contentEncoding") {
+            None | Some(Json::Null) => "utf-8".to_string(),
+            Some(Json::String(value)) => {
+                if value != "utf-8" && value != "base64" {
+                    return Err(
+                        "artifact 'contentEncoding' must be either 'utf-8' or 'base64'".into(),
+                    );
+                }
+                value.clone()
+            }
+            Some(_) => {
+                return Err("artifact 'contentEncoding' must be either 'utf-8' or 'base64'".into())
+            }
+        };
+        if parsed.contains_key(name) {
+            return Err(format!("duplicate remote RPC artifact name '{name}'"));
+        }
+        let content_bytes = if content_encoding == "base64" {
+            base64_decode(content)?
+        } else {
+            content.as_bytes().to_vec()
+        };
+        let size_bytes = content_bytes.len();
+        total_decoded_bytes = total_decoded_bytes
+            .checked_add(size_bytes)
+            .ok_or_else(|| "remote RPC artifact byte quota overflowed".to_string())?;
+        if total_decoded_bytes > MAX_REMOTE_JOB_ARTIFACT_BYTES_PER_JOB {
+            return Err(format!(
+                "remote RPC job accepts at most {MAX_REMOTE_JOB_ARTIFACT_BYTES_PER_JOB} decoded artifact bytes"
+            ));
+        }
+        let sha256 = eda_api::pdk_liberty_sha256_bytes(&content_bytes);
+        match fields.get("sha256") {
+            None | Some(Json::Null) => {}
+            Some(Json::String(expected)) => {
+                if expected != &sha256 {
+                    return Err(format!("remote RPC artifact '{name}' checksum mismatch"));
+                }
+            }
+            Some(_) => return Err("artifact 'sha256' must be a string".into()),
+        }
+        match fields.get("sizeBytes") {
+            None | Some(Json::Null) => {}
+            Some(Json::Number(expected)) => {
+                if *expected < 0.0
+                    || expected.fract() != 0.0
+                    || *expected > usize::MAX as f64
+                    || *expected as usize != size_bytes
+                {
+                    return Err(format!("remote RPC artifact '{name}' size mismatch"));
+                }
+            }
+            Some(_) => return Err("artifact 'sizeBytes' must be a non-negative integer".into()),
+        }
+        let artifact = RemoteJobArtifact {
+            job_id,
+            name: name.clone(),
+            content_type,
+            content_encoding,
+            content: content.clone(),
+            sha256,
+            size_bytes,
+            last_access: Instant::now(),
+        };
+        parsed.insert(name.clone(), artifact);
+    }
+    Ok(parsed.into_values().collect())
+}
+
 fn optional_positive_usize(params: &Json, name: &str, default: usize) -> Result<usize, String> {
     let fields = params
         .as_object()
@@ -796,6 +1345,22 @@ fn optional_positive_usize(params: &Json, name: &str, default: usize) -> Result<
             Ok(*value as usize)
         }
         Some(_) => Err(format!("'{name}' must be a positive integer")),
+    }
+}
+
+fn optional_nonnegative_usize(params: &Json, name: &str, default: usize) -> Result<usize, String> {
+    let fields = params
+        .as_object()
+        .ok_or_else(|| "params must be an object".to_string())?;
+    match fields.get(name) {
+        None | Some(Json::Null) => Ok(default),
+        Some(Json::Number(value)) => {
+            if *value < 0.0 || value.fract() != 0.0 || *value > usize::MAX as f64 {
+                return Err(format!("'{name}' must be a non-negative integer"));
+            }
+            Ok(*value as usize)
+        }
+        Some(_) => Err(format!("'{name}' must be a non-negative integer")),
     }
 }
 
@@ -2418,10 +2983,55 @@ fn spice_run(params: &Json, cancellation: &FlowCancellation) -> Result<Json, Str
         .get(index)
         .ok_or_else(|| format!("circuit has no analysis at index {index}"))?;
     let result = run_ams_analysis_cancellable(&circuit, analysis, cancellation)?;
+    let mut fields = vec![
+        ("kind".to_string(), ams_kind(&result)),
+        ("analysisIndex".to_string(), Json::number(index as f64)?),
+        (
+            "report".to_string(),
+            Json::string(report_ams_result(&result)),
+        ),
+    ];
+    if let AmsResult::Transient(transient) = &result {
+        fields.push(("result".to_string(), transient_result_json(transient)?));
+    }
+    Ok(Json::Object(fields.into_iter().collect()))
+}
+
+fn transient_result_json(result: &eda_api::TransientResult) -> Result<Json, String> {
+    fn numeric_map(values: &BTreeMap<String, f64>) -> Result<Json, String> {
+        let mut out = BTreeMap::new();
+        for (name, value) in values {
+            out.insert(name.clone(), Json::number(*value)?);
+        }
+        Ok(Json::Object(out))
+    }
+    let samples = result
+        .samples
+        .iter()
+        .map(|sample| {
+            let nodes = numeric_map(&sample.node_voltages)?;
+            let branches = numeric_map(&sample.branch_currents)?;
+            let capacitors = numeric_map(&sample.capacitor_currents)?;
+            let temperatures = numeric_map(&sample.device_temperatures)?;
+            Ok(Json::object([
+                ("timeS", Json::number(sample.time_s)?),
+                ("nodeVoltages", nodes),
+                ("branchCurrents", branches),
+                ("capacitorCurrents", capacitors),
+                ("deviceTemperatures", temperatures),
+            ]))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(Json::object([
-        ("kind", ams_kind(&result)),
-        ("analysisIndex", Json::number(index as f64)?),
-        ("report", Json::string(report_ams_result(&result))),
+        ("method", Json::string(result.method.as_str())),
+        ("stepS", Json::number(result.step_s)?),
+        ("stopS", Json::number(result.stop_s)?),
+        (
+            "convergenceFailures",
+            Json::from(result.convergence_failures as u64),
+        ),
+        ("sampleCount", Json::from(samples.len() as u64)),
+        ("samples", Json::Array(samples)),
     ]))
 }
 
@@ -3675,6 +4285,65 @@ fn timing_waiver_registry_response(
         ]),
     );
     Ok(Json::Object(fields))
+}
+
+fn remote_worker_json(worker: &RemoteWorkerSnapshot) -> Result<Json, String> {
+    Ok(Json::object([
+        ("workerId", Json::string(worker.worker_id.clone())),
+        ("capacity", Json::from(worker.capacity as u64)),
+        (
+            "leaseTimeoutSeconds",
+            Json::from(worker.lease_timeout_seconds),
+        ),
+        ("labels", string_map_json(&worker.labels)),
+        (
+            "activeJobIds",
+            Json::Array(
+                worker
+                    .active_job_ids
+                    .iter()
+                    .map(|id| Json::from(*id))
+                    .collect(),
+            ),
+        ),
+        (
+            "activeJobCount",
+            Json::from(worker.active_job_ids.len() as u64),
+        ),
+        (
+            "lastHeartbeatAgeSeconds",
+            Json::from(worker.last_heartbeat_age_seconds),
+        ),
+    ]))
+}
+
+fn remote_job_artifact_metadata_json(artifact: &RemoteJobArtifactMetadata) -> Json {
+    Json::object([
+        ("jobId", Json::from(artifact.job_id)),
+        ("name", Json::string(artifact.name.clone())),
+        ("contentType", Json::string(artifact.content_type.clone())),
+        (
+            "contentEncoding",
+            Json::string(artifact.content_encoding.clone()),
+        ),
+        ("sha256", Json::string(artifact.sha256.clone())),
+        ("sizeBytes", Json::from(artifact.size_bytes as u64)),
+    ])
+}
+
+fn remote_job_artifact_json(artifact: &RemoteJobArtifact) -> Result<Json, String> {
+    Ok(Json::object([
+        ("jobId", Json::number(artifact.job_id as f64)?),
+        ("name", Json::string(artifact.name.clone())),
+        ("contentType", Json::string(artifact.content_type.clone())),
+        (
+            "contentEncoding",
+            Json::string(artifact.content_encoding.clone()),
+        ),
+        ("content", Json::string(artifact.content.clone())),
+        ("sha256", Json::string(artifact.sha256.clone())),
+        ("sizeBytes", Json::from(artifact.size_bytes as u64)),
+    ]))
 }
 
 fn timing_waiver_registry_create(
@@ -7026,6 +7695,14 @@ fn pdk_signoff(params: &Json, cancellation: &FlowCancellation) -> Result<Json, S
             "layoutRuleDeckValidated",
             Json::Bool(result.layout_rule_deck_validated),
         ),
+        (
+            "layoutRuleDeckAntennaRatio",
+            result
+                .layout_rule_deck_antenna_ratio
+                .map_or(Json::Null, |value| {
+                    Json::number(value).unwrap_or(Json::Null)
+                }),
+        ),
         ("report", Json::string(report_pdk_signoff(&result))),
     ]))
 }
@@ -7068,16 +7745,164 @@ enum WorkerCommand {
     Shutdown,
 }
 
+#[derive(Clone)]
+struct WorkerChannel {
+    commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
+    condition: Arc<Condvar>,
+}
+
+impl WorkerChannel {
+    fn new() -> Self {
+        Self {
+            commands: Arc::new(Mutex::new(VecDeque::new())),
+            condition: Arc::new(Condvar::new()),
+        }
+    }
+
+    fn send(&self, command: WorkerCommand) -> Result<(), String> {
+        let mut commands = self
+            .commands
+            .lock()
+            .map_err(|_| "RPC worker queue mutex poisoned".to_string())?;
+        commands.push_back(command);
+        self.condition.notify_one();
+        Ok(())
+    }
+
+    fn receive(&self) -> Option<WorkerCommand> {
+        let Ok(mut commands) = self.commands.lock() else {
+            return None;
+        };
+        loop {
+            if let Some(command) = commands.pop_front() {
+                return Some(command);
+            }
+            let condition = Arc::clone(&self.condition);
+            commands = match condition.wait(commands) {
+                Ok(state) => state,
+                Err(_) => return None,
+            };
+        }
+    }
+}
+
 type SharedJobs = Arc<Mutex<BTreeMap<u64, RpcJobStatus>>>;
 type SharedRunning = Arc<Mutex<BTreeMap<u64, FlowCancellation>>>;
+type SharedPendingJobs = Arc<Mutex<BTreeMap<u64, RemoteJobRecord>>>;
+type SharedRemoteClaims = Arc<Mutex<BTreeMap<u64, RemoteJobLease>>>;
+type SharedRemoteWorkers = Arc<Mutex<BTreeMap<String, RemoteWorker>>>;
+type SharedRemoteJobArtifacts = Arc<Mutex<BTreeMap<u64, BTreeMap<String, RemoteJobArtifact>>>>;
 
-/// Typed, persistent job queue backed by one deterministic worker thread.
+#[derive(Clone, Debug)]
+struct RemoteWorker {
+    worker_id: String,
+    capacity: usize,
+    lease_timeout: Duration,
+    labels: BTreeMap<String, String>,
+    active_jobs: BTreeSet<u64>,
+    last_heartbeat: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteWorkerSnapshot {
+    pub worker_id: String,
+    pub capacity: usize,
+    pub lease_timeout_seconds: u64,
+    pub labels: BTreeMap<String, String>,
+    pub active_job_ids: Vec<u64>,
+    pub last_heartbeat_age_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteJobLease {
+    worker_id: String,
+    record: RemoteJobRecord,
+    last_heartbeat: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteJobRecord {
+    request: RpcRequest,
+    attempts: usize,
+    max_attempts: usize,
+    priority: u32,
+    required_worker_labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteJobClaim {
+    pub job_id: u64,
+    pub worker_id: String,
+    pub request: RpcRequest,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub priority: u32,
+    pub required_worker_labels: BTreeMap<String, String>,
+}
+
+/// Result of expiring remote leases and pruning idle fleet entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteLeaseExpirationResult {
+    pub expired_job_ids: Vec<u64>,
+    pub removed_worker_ids: Vec<String>,
+}
+
+/// A result artifact returned by a remote worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteJobArtifact {
+    pub job_id: u64,
+    pub name: String,
+    pub content_type: String,
+    pub content_encoding: String,
+    pub content: String,
+    pub sha256: String,
+    pub size_bytes: usize,
+    pub last_access: Instant,
+}
+
+/// Artifact metadata safe to expose without transferring full contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteJobArtifactMetadata {
+    pub job_id: u64,
+    pub name: String,
+    pub content_type: String,
+    pub content_encoding: String,
+    pub sha256: String,
+    pub size_bytes: usize,
+}
+
+impl From<&RemoteJobArtifact> for RemoteJobArtifactMetadata {
+    fn from(artifact: &RemoteJobArtifact) -> Self {
+        Self {
+            job_id: artifact.job_id,
+            name: artifact.name.clone(),
+            content_type: artifact.content_type.clone(),
+            content_encoding: artifact.content_encoding.clone(),
+            sha256: artifact.sha256.clone(),
+            size_bytes: artifact.size_bytes,
+        }
+    }
+}
+
+/// Typed, persistent job queue backed by one or more local worker threads.
 pub struct RpcJobManager {
     next_id: AtomicU64,
     jobs: SharedJobs,
     running: SharedRunning,
-    sender: Sender<WorkerCommand>,
-    worker: Option<JoinHandle<()>>,
+    sender: WorkerChannel,
+    pending_remote_jobs: SharedPendingJobs,
+    remote_claims: SharedRemoteClaims,
+    remote_workers: SharedRemoteWorkers,
+    remote_job_artifacts: SharedRemoteJobArtifacts,
+    artifact_store: Option<PathBuf>,
+    remote_artifact_capacity: usize,
+    remote_artifact_byte_capacity: usize,
+    remote_reassignments: AtomicU64,
+    remote_retry_exhausted: AtomicU64,
+    remote_worker_expirations: AtomicU64,
+    remote_artifact_evictions: AtomicU64,
+    workers: Option<Vec<JoinHandle<()>>>,
+    worker_count: usize,
 }
 
 impl RpcJobManager {
@@ -7088,21 +7913,81 @@ impl RpcJobManager {
     }
 
     fn new_with_dispatcher(dispatcher: RpcDispatcher) -> Self {
-        let (sender, receiver) = channel();
+        Self::new_with_dispatcher_and_worker_count(dispatcher, 1)
+    }
+
+    fn new_with_dispatcher_and_worker_count(
+        dispatcher: RpcDispatcher,
+        worker_count: usize,
+    ) -> Self {
+        Self::try_new_with_dispatcher_worker_count_and_artifact_store(
+            dispatcher,
+            worker_count,
+            None,
+        )
+        .expect("RPC job manager configuration")
+    }
+
+    fn try_new_with_dispatcher_worker_count_and_artifact_store(
+        dispatcher: RpcDispatcher,
+        worker_count: usize,
+        artifact_store: Option<&Path>,
+    ) -> Result<Self, String> {
+        if worker_count == 0 {
+            panic!("RPC job manager requires at least one worker");
+        }
+        if let Some(root) = artifact_store {
+            fs::create_dir_all(root).map_err(|error| {
+                format!(
+                    "failed to create RPC artifact store {}: {error}",
+                    root.display()
+                )
+            })?;
+        }
+        let receiver = WorkerChannel::new();
+        let sender = receiver.clone();
         let jobs = Arc::new(Mutex::new(BTreeMap::new()));
+        let pending_remote_jobs = Arc::new(Mutex::new(BTreeMap::new()));
         let worker_jobs = Arc::clone(&jobs);
         let running = Arc::new(Mutex::new(BTreeMap::new()));
+        let remote_claims = Arc::new(Mutex::new(BTreeMap::new()));
+        let remote_workers = Arc::new(Mutex::new(BTreeMap::new()));
+        let remote_job_artifacts = Arc::new(Mutex::new(BTreeMap::new()));
         let worker_running = Arc::clone(&running);
         let worker_dispatcher = Arc::clone(&dispatcher);
-        let worker =
-            spawn(move || worker_loop(receiver, worker_jobs, worker_running, worker_dispatcher));
-        Self {
+        let workers = (0..worker_count
+            .min(std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)))
+            .map(|_| {
+                let receiver = receiver.clone();
+                let jobs = Arc::clone(&worker_jobs);
+                let running = Arc::clone(&worker_running);
+                let dispatcher = Arc::clone(&worker_dispatcher);
+                spawn(move || worker_loop(receiver, jobs, running, dispatcher))
+            })
+            .collect::<Vec<_>>();
+        let manager = Self {
             next_id: AtomicU64::new(1),
             jobs,
             running,
             sender,
-            worker: Some(worker),
+            pending_remote_jobs,
+            remote_claims,
+            remote_workers,
+            remote_job_artifacts,
+            artifact_store: artifact_store.map(Path::to_path_buf),
+            remote_artifact_capacity: MAX_REMOTE_JOB_ARTIFACT_REGISTRY_COUNT,
+            remote_artifact_byte_capacity: MAX_REMOTE_JOB_ARTIFACT_REGISTRY_BYTES,
+            remote_reassignments: AtomicU64::new(0),
+            remote_retry_exhausted: AtomicU64::new(0),
+            remote_worker_expirations: AtomicU64::new(0),
+            remote_artifact_evictions: AtomicU64::new(0),
+            workers: Some(workers),
+            worker_count,
+        };
+        if let Some(root) = artifact_store {
+            manager.load_remote_job_records(root)?;
         }
+        Ok(manager)
     }
 
     pub fn submit(&self, request: RpcRequest) -> Result<u64, String> {
@@ -7117,6 +8002,41 @@ impl RpcJobManager {
         Ok(id)
     }
 
+    /// Queue a job for an RPC-visible remote worker instead of local execution.
+    pub fn submit_remote(
+        &self,
+        request: RpcRequest,
+        max_attempts: usize,
+        priority: u32,
+        required_worker_labels: BTreeMap<String, String>,
+    ) -> Result<u64, String> {
+        if max_attempts == 0 {
+            return Err("remote RPC job requires a positive attempt limit".into());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if let Some(root) = &self.artifact_store {
+            write_remote_job_next_id(root, id.saturating_add(1))?;
+        }
+        self.jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?
+            .insert(id, RpcJobStatus::Queued);
+        self.pending_remote_jobs
+            .lock()
+            .map_err(|_| "remote job queue mutex poisoned".to_string())?
+            .insert(
+                id,
+                RemoteJobRecord {
+                    request,
+                    attempts: 0,
+                    max_attempts,
+                    priority,
+                    required_worker_labels,
+                },
+            );
+        Ok(id)
+    }
+
     pub fn poll(&self, id: u64) -> Result<Option<RpcJobStatus>, String> {
         Ok(self
             .jobs
@@ -7124,6 +8044,627 @@ impl RpcJobManager {
             .map_err(|_| "job state mutex poisoned".to_string())?
             .get(&id)
             .cloned())
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    fn load_remote_job_records(&self, root: &Path) -> Result<(), String> {
+        let mut maximum_job_id = 0_u64;
+        let entries = fs::read_dir(root).map_err(|error| {
+            format!(
+                "failed to read RPC artifact store {}: {error}",
+                root.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to scan RPC artifact store {}: {error}",
+                    root.display()
+                )
+            })?;
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if !file_name.ends_with(".json") {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path()).map_err(|error| {
+                format!(
+                    "failed to read RPC job record {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            let record = parse_json(&text)?;
+            let fields = record.as_object().ok_or_else(|| {
+                format!(
+                    "RPC job record {} must be an object",
+                    entry.path().display()
+                )
+            })?;
+            if fields.get("schemaVersion") != Some(&Json::from(1_u64)) {
+                return Err(format!(
+                    "unsupported RPC job record schema in {}",
+                    entry.path().display()
+                ));
+            }
+            let Some(job_id) = fields
+                .get("jobId")
+                .and_then(Json::as_number)
+                .filter(|value| **value >= 0.0 && value.fract() == 0.0)
+                .map(|value| *value as u64)
+            else {
+                return Err(format!(
+                    "RPC job record {} has an invalid jobId",
+                    entry.path().display()
+                ));
+            };
+            if file_name != format!("{job_id}.json") {
+                return Err(format!(
+                    "RPC job record filename {file_name} does not match job {job_id}"
+                ));
+            }
+            let status = remote_job_status_from_record(&record)?;
+            let artifacts = parse_remote_job_artifacts(&record, job_id)?;
+            let artifact_map = artifacts
+                .into_iter()
+                .map(|artifact| (artifact.name.clone(), artifact))
+                .collect::<BTreeMap<_, _>>();
+            {
+                let mut remote_artifacts = self
+                    .remote_job_artifacts
+                    .lock()
+                    .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+                let mut jobs = self
+                    .jobs
+                    .lock()
+                    .map_err(|_| "job state mutex poisoned".to_string())?;
+                if jobs.contains_key(&job_id) {
+                    return Err(format!("duplicate persisted RPC job record {job_id}"));
+                }
+                jobs.insert(job_id, status);
+                remote_artifacts.insert(job_id, artifact_map);
+            }
+            maximum_job_id = maximum_job_id.max(job_id);
+        }
+        let watermark_path = remote_job_next_id_path(root);
+        if watermark_path.exists() {
+            let watermark = fs::read_to_string(&watermark_path)
+                .map_err(|error| {
+                    format!(
+                        "failed to read RPC job ID watermark {}: {error}",
+                        watermark_path.display()
+                    )
+                })?
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| {
+                    format!(
+                        "invalid RPC job ID watermark in {}",
+                        watermark_path.display()
+                    )
+                })?;
+            self.next_id.fetch_max(watermark, Ordering::SeqCst);
+        }
+        self.next_id
+            .fetch_max(maximum_job_id.saturating_add(1), Ordering::SeqCst);
+        let mut remote_artifacts = self
+            .remote_job_artifacts
+            .lock()
+            .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+        enforce_remote_artifact_limits_locked(
+            &mut remote_artifacts,
+            0,
+            self.remote_artifact_capacity,
+            self.remote_artifact_byte_capacity,
+            &self.remote_artifact_evictions,
+        )?;
+        Ok(())
+    }
+
+    pub fn job_stats(&self) -> Result<RpcJobStats, String> {
+        let (remote_artifact_count, remote_artifact_bytes) = {
+            let artifacts = self
+                .remote_job_artifacts
+                .lock()
+                .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+            remote_artifact_registry_totals(&artifacts)
+        };
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| "running job state mutex poisoned".to_string())?;
+        let mut stats = RpcJobStats {
+            worker_count: self.worker_count,
+            ..RpcJobStats::default()
+        };
+        stats.remote_artifact_count = remote_artifact_count;
+        stats.remote_artifact_bytes = remote_artifact_bytes;
+        stats.remote_artifact_capacity = self.remote_artifact_capacity;
+        stats.remote_artifact_byte_capacity = self.remote_artifact_byte_capacity;
+        stats.remote_artifact_evictions = self.remote_artifact_evictions.load(Ordering::SeqCst);
+        for (id, status) in jobs.iter() {
+            match status {
+                RpcJobStatus::Queued => stats.queued += 1,
+                RpcJobStatus::Running => stats.running += 1,
+                RpcJobStatus::Completed(_) => stats.completed += 1,
+                RpcJobStatus::Failed(_) => stats.failed += 1,
+                RpcJobStatus::Cancelled => stats.cancelled += 1,
+            }
+            if matches!(status, RpcJobStatus::Queued | RpcJobStatus::Running) {
+                stats.active_job_ids.push(*id);
+            }
+        }
+        for id in running.keys() {
+            if !stats.active_job_ids.contains(id) {
+                stats.active_job_ids.push(*id);
+            }
+        }
+        let remote_workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        stats.remote_worker_count = remote_workers.len();
+        stats.remote_active_job_count = remote_workers
+            .values()
+            .map(|worker| worker.active_jobs.len())
+            .sum();
+        stats.remote_reassignments = self.remote_reassignments.load(Ordering::SeqCst);
+        stats.remote_retry_exhausted = self.remote_retry_exhausted.load(Ordering::SeqCst);
+        stats.remote_worker_expirations = self.remote_worker_expirations.load(Ordering::SeqCst);
+        stats.active_job_ids.sort_unstable();
+        stats.active_job_ids.dedup();
+        Ok(stats)
+    }
+
+    pub fn register_remote_worker(
+        &self,
+        worker_id: &str,
+        capacity: usize,
+        lease_timeout: Duration,
+        labels: BTreeMap<String, String>,
+    ) -> Result<RemoteWorkerSnapshot, String> {
+        if worker_id.trim().is_empty() {
+            return Err("remote RPC worker ID cannot be empty".into());
+        }
+        if capacity == 0 {
+            return Err("remote RPC worker capacity must be positive".into());
+        }
+        if lease_timeout.is_zero() {
+            return Err("remote RPC worker lease timeout must be positive".into());
+        }
+        let mut workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        if let Some(existing) = workers.get(worker_id) {
+            if !existing.active_jobs.is_empty() {
+                return Err(format!(
+                    "remote RPC worker '{worker_id}' cannot be re-registered while jobs are active"
+                ));
+            }
+        }
+        let worker = RemoteWorker {
+            worker_id: worker_id.to_string(),
+            capacity,
+            lease_timeout,
+            labels,
+            active_jobs: BTreeSet::new(),
+            last_heartbeat: Instant::now(),
+        };
+        let snapshot = remote_worker_snapshot(&worker);
+        workers.insert(worker_id.to_string(), worker);
+        Ok(snapshot)
+    }
+
+    pub fn remote_worker_heartbeat(&self, worker_id: &str) -> Result<RemoteWorkerSnapshot, String> {
+        let mut workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        let worker = workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("unknown remote RPC worker '{worker_id}'"))?;
+        worker.last_heartbeat = Instant::now();
+        let snapshot = remote_worker_snapshot(worker);
+        drop(workers);
+        let now = Instant::now();
+        self.remote_claims
+            .lock()
+            .map_err(|_| "remote claim mutex poisoned".to_string())?
+            .values_mut()
+            .filter(|lease| lease.worker_id == worker_id)
+            .for_each(|lease| lease.last_heartbeat = now);
+        Ok(snapshot)
+    }
+
+    pub fn remote_workers(&self) -> Result<Vec<RemoteWorkerSnapshot>, String> {
+        let workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        Ok(workers.values().map(remote_worker_snapshot).collect())
+    }
+
+    /// Requeue remote claims whose worker lease has timed out.
+    ///
+    /// A lease is renewed by worker registration, claim, or heartbeat. Expired
+    /// ownership is removed before the request is returned to the remote queue,
+    /// so a late completion from the previous owner cannot overwrite the job.
+    /// Idle workers whose registration heartbeat has also expired are removed.
+    pub fn expire_remote_leases(&self) -> Result<RemoteLeaseExpirationResult, String> {
+        let mut claims = self
+            .remote_claims
+            .lock()
+            .map_err(|_| "remote claim mutex poisoned".to_string())?;
+        let mut expired = Vec::<(u64, RemoteJobLease)>::new();
+        {
+            let mut workers = self
+                .remote_workers
+                .lock()
+                .map_err(|_| "remote worker mutex poisoned".to_string())?;
+            for (job_id, lease) in claims.iter() {
+                let timeout = workers
+                    .get(&lease.worker_id)
+                    .map_or(Duration::from_secs(60), |worker| worker.lease_timeout);
+                if lease.last_heartbeat.elapsed() < timeout {
+                    continue;
+                }
+                if let Some(worker) = workers.get_mut(&lease.worker_id) {
+                    worker.active_jobs.remove(job_id);
+                }
+                expired.push((*job_id, lease.clone()));
+            }
+        }
+        let expired_ids = expired.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+
+        if !expired.is_empty() {
+            let mut running = self
+                .running
+                .lock()
+                .map_err(|_| "running job state mutex poisoned".to_string())?;
+            let mut pending = self
+                .pending_remote_jobs
+                .lock()
+                .map_err(|_| "remote job queue mutex poisoned".to_string())?;
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| "job state mutex poisoned".to_string())?;
+            for (job_id, lease) in expired {
+                claims.remove(&job_id);
+                running.remove(&job_id);
+                if lease.record.attempts >= lease.record.max_attempts {
+                    jobs.insert(
+                        job_id,
+                        RpcJobStatus::Failed(format!(
+                            "remote RPC job {job_id} exhausted {} attempt(s)",
+                            lease.record.max_attempts
+                        )),
+                    );
+                    self.remote_retry_exhausted.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    pending.insert(job_id, lease.record);
+                    jobs.insert(job_id, RpcJobStatus::Queued);
+                    self.remote_reassignments.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+
+        drop(claims);
+        let mut removed_worker_ids = Vec::new();
+        let mut workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        workers.retain(|worker_id, worker| {
+            if worker.active_jobs.is_empty()
+                && worker.last_heartbeat.elapsed() >= worker.lease_timeout
+            {
+                removed_worker_ids.push(worker_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !removed_worker_ids.is_empty() {
+            self.remote_worker_expirations
+                .fetch_add(removed_worker_ids.len() as u64, Ordering::SeqCst);
+        }
+        Ok(RemoteLeaseExpirationResult {
+            expired_job_ids: expired_ids,
+            removed_worker_ids,
+        })
+    }
+
+    pub fn claim_remote_job(&self, worker_id: &str) -> Result<Option<RemoteJobClaim>, String> {
+        self.expire_remote_leases()?;
+        let worker_labels;
+        {
+            let workers = self
+                .remote_workers
+                .lock()
+                .map_err(|_| "remote worker mutex poisoned".to_string())?;
+            let Some(worker) = workers.get(worker_id) else {
+                return Err(format!("unknown remote RPC worker '{worker_id}'"));
+            };
+            if worker.active_jobs.len() >= worker.capacity {
+                return Ok(None);
+            }
+            worker_labels = worker.labels.clone();
+        }
+
+        let mut pending = self
+            .pending_remote_jobs
+            .lock()
+            .map_err(|_| "remote job queue mutex poisoned".to_string())?;
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        let mut selected_job = None::<(u64, u32)>;
+        for (id, record) in pending.iter() {
+            let queued = jobs
+                .get(id)
+                .is_some_and(|status| matches!(status, RpcJobStatus::Queued));
+            let labels_match = record
+                .required_worker_labels
+                .iter()
+                .all(|(name, value)| worker_labels.get(name) == Some(value));
+            if queued
+                && labels_match
+                && selected_job.is_none_or(|(_, priority)| record.priority > priority)
+            {
+                selected_job = Some((*id, record.priority));
+            }
+        }
+        let Some(job_id) = selected_job.map(|(job_id, _)| job_id) else {
+            return Ok(None);
+        };
+        let mut record = pending
+            .remove(&job_id)
+            .ok_or_else(|| format!("remote RPC job {job_id} vanished from queue"))?;
+        record.attempts += 1;
+        let request = record.request.clone();
+        drop(pending);
+        drop(jobs);
+
+        let cancellation = FlowCancellation::new();
+        self.running
+            .lock()
+            .map_err(|_| "running job state mutex poisoned".to_string())?
+            .insert(job_id, cancellation);
+        self.remote_claims
+            .lock()
+            .map_err(|_| "remote claim mutex poisoned".to_string())?
+            .insert(
+                job_id,
+                RemoteJobLease {
+                    worker_id: worker_id.to_string(),
+                    record: record.clone(),
+                    last_heartbeat: Instant::now(),
+                },
+            );
+        self.jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?
+            .insert(job_id, RpcJobStatus::Running);
+        let mut workers = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?;
+        let worker = workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("unknown remote RPC worker '{worker_id}'"))?;
+        worker.active_jobs.insert(job_id);
+        worker.last_heartbeat = Instant::now();
+        Ok(Some(RemoteJobClaim {
+            job_id,
+            worker_id: worker_id.to_string(),
+            request,
+            attempt: record.attempts,
+            max_attempts: record.max_attempts,
+            priority: record.priority,
+            required_worker_labels: record.required_worker_labels,
+        }))
+    }
+
+    pub fn remote_claim_status(&self, job_id: u64) -> Result<bool, String> {
+        if !self
+            .remote_claims
+            .lock()
+            .map_err(|_| "remote claim mutex poisoned".to_string())?
+            .contains_key(&job_id)
+        {
+            return Err(format!("RPC job {job_id} is not remotely claimed"));
+        }
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| "running job state mutex poisoned".to_string())?;
+        Ok(running
+            .get(&job_id)
+            .is_some_and(FlowCancellation::is_cancelled))
+    }
+
+    pub fn complete_remote_job(
+        &self,
+        worker_id: &str,
+        job_id: u64,
+        result: Result<Json, String>,
+        artifacts: Vec<RemoteJobArtifact>,
+    ) -> Result<RpcJobStatus, String> {
+        let cancelled;
+        let status;
+        {
+            let mut claims = self
+                .remote_claims
+                .lock()
+                .map_err(|_| "remote claim mutex poisoned".to_string())?;
+            let Some(lease) = claims.get(&job_id) else {
+                return Err(format!("RPC job {job_id} is not remotely claimed"));
+            };
+            if lease.worker_id != worker_id {
+                return Err(format!(
+                    "remote RPC worker '{worker_id}' does not own job {job_id}"
+                ));
+            }
+            cancelled = self
+                .running
+                .lock()
+                .map_err(|_| "running job state mutex poisoned".to_string())?
+                .remove(&job_id)
+                .is_some_and(|token| token.is_cancelled());
+            status = if cancelled {
+                RpcJobStatus::Cancelled
+            } else {
+                match result {
+                    Ok(value) => RpcJobStatus::Completed(value),
+                    Err(error) => RpcJobStatus::Failed(error),
+                }
+            };
+            if let Some(root) = &self.artifact_store {
+                let record = remote_job_record_json(job_id, &status, &artifacts)?;
+                write_remote_job_record(root, &record)?;
+            }
+            claims.remove(&job_id);
+            drop(claims);
+        }
+        let mut remote_job_artifacts = self
+            .remote_job_artifacts
+            .lock()
+            .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        if cancelled {
+            remote_job_artifacts.remove(&job_id);
+        } else {
+            let job_artifacts = remote_job_artifacts.entry(job_id).or_default();
+            for artifact in artifacts {
+                job_artifacts.insert(artifact.name.clone(), artifact);
+            }
+            enforce_remote_artifact_limits_locked(
+                &mut remote_job_artifacts,
+                job_id,
+                self.remote_artifact_capacity,
+                self.remote_artifact_byte_capacity,
+                &self.remote_artifact_evictions,
+            )?;
+        }
+        jobs.insert(job_id, status.clone());
+        if let Some(worker) = self
+            .remote_workers
+            .lock()
+            .map_err(|_| "remote worker mutex poisoned".to_string())?
+            .get_mut(worker_id)
+        {
+            worker.active_jobs.remove(&job_id);
+            worker.last_heartbeat = Instant::now();
+        }
+        Ok(status)
+    }
+
+    pub fn remote_job_artifacts(
+        &self,
+        job_id: u64,
+    ) -> Result<Vec<RemoteJobArtifactMetadata>, String> {
+        let artifacts = self
+            .remote_job_artifacts
+            .lock()
+            .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        if !jobs.contains_key(&job_id) {
+            return Err(format!("unknown RPC job {job_id}"));
+        }
+        Ok(artifacts
+            .get(&job_id)
+            .map(BTreeMap::values)
+            .map_or_else(Vec::new, |values| {
+                values.map(RemoteJobArtifactMetadata::from).collect()
+            }))
+    }
+
+    pub fn remote_job_artifact(
+        &self,
+        job_id: u64,
+        name: &str,
+    ) -> Result<RemoteJobArtifact, String> {
+        let mut artifacts = self
+            .remote_job_artifacts
+            .lock()
+            .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        if !jobs.contains_key(&job_id) {
+            return Err(format!("unknown RPC job {job_id}"));
+        }
+        let artifact = artifacts
+            .get_mut(&job_id)
+            .and_then(|artifacts| artifacts.get_mut(name))
+            .ok_or_else(|| format!("RPC job {job_id} has no artifact '{name}'"))?;
+        artifact.last_access = Instant::now();
+        Ok(artifact.clone())
+    }
+
+    pub fn delete_remote_job_artifact(
+        &self,
+        job_id: u64,
+        name: &str,
+    ) -> Result<RemoteJobArtifactMetadata, String> {
+        let mut artifacts = self
+            .remote_job_artifacts
+            .lock()
+            .map_err(|_| "remote job artifact mutex poisoned".to_string())?;
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "job state mutex poisoned".to_string())?;
+        if !jobs.contains_key(&job_id) {
+            return Err(format!("unknown RPC job {job_id}"));
+        }
+        let Some(job_artifacts) = artifacts.get_mut(&job_id) else {
+            return Err(format!("RPC job {job_id} has no artifact '{name}'"));
+        };
+        let Some(artifact) = job_artifacts.get(name) else {
+            return Err(format!("RPC job {job_id} has no artifact '{name}'"));
+        };
+        let metadata = RemoteJobArtifactMetadata::from(artifact);
+        let remaining = job_artifacts
+            .values()
+            .filter(|artifact| artifact.name != name)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(root) = &self.artifact_store {
+            let status = jobs
+                .get(&job_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown RPC job {job_id}"))?;
+            let record = remote_job_record_json(job_id, &status, &remaining)?;
+            write_remote_job_record(root, &record)?;
+        }
+        job_artifacts.remove(name);
+        Ok(metadata)
     }
 
     /// Cancel a queued job or request cooperative cancellation of a running job.
@@ -7179,15 +8720,253 @@ impl RpcJobManager {
     }
 
     pub fn shutdown_background(&mut self) -> Result<(), String> {
-        self.sender
-            .send(WorkerCommand::Shutdown)
-            .map_err(|_| "daemon worker already stopped".to_string())?;
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| "daemon worker panicked".to_string())?;
+        if let Some(workers) = self.workers.take() {
+            for _ in &workers {
+                self.sender
+                    .send(WorkerCommand::Shutdown)
+                    .map_err(|_| "daemon worker already stopped".to_string())?;
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| "daemon worker panicked".to_string())?;
+            }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RpcJobStats {
+    pub worker_count: usize,
+    pub remote_worker_count: usize,
+    pub remote_active_job_count: usize,
+    pub remote_artifact_count: usize,
+    pub remote_artifact_bytes: usize,
+    pub remote_artifact_capacity: usize,
+    pub remote_artifact_byte_capacity: usize,
+    pub remote_artifact_evictions: u64,
+    pub remote_reassignments: u64,
+    pub remote_retry_exhausted: u64,
+    pub remote_worker_expirations: u64,
+    pub queued: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub active_job_ids: Vec<u64>,
+}
+
+fn remote_worker_snapshot(worker: &RemoteWorker) -> RemoteWorkerSnapshot {
+    RemoteWorkerSnapshot {
+        worker_id: worker.worker_id.clone(),
+        capacity: worker.capacity,
+        lease_timeout_seconds: worker.lease_timeout.as_secs(),
+        labels: worker.labels.clone(),
+        active_job_ids: worker.active_jobs.iter().copied().collect(),
+        last_heartbeat_age_seconds: worker.last_heartbeat.elapsed().as_secs(),
+    }
+}
+
+fn remote_job_record_path(root: &Path, job_id: u64) -> PathBuf {
+    root.join(format!("{job_id}.json"))
+}
+
+fn remote_job_next_id_path(root: &Path) -> PathBuf {
+    root.join("next-id")
+}
+
+fn write_remote_job_next_id(root: &Path, next_id: u64) -> Result<(), String> {
+    let temporary = root.join("next-id.tmp");
+    let target = remote_job_next_id_path(root);
+    let mut file = File::options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "failed to open temporary RPC job ID watermark {}: {error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(next_id.to_string().as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to write temporary RPC job ID watermark {}: {error}",
+                temporary.display()
+            )
+        })?;
+    drop(file);
+    fs::rename(&temporary, &target).map_err(|error| {
+        format!(
+            "failed to publish RPC job ID watermark {}: {error}",
+            target.display()
+        )
+    })
+}
+
+fn remote_job_record_json(
+    job_id: u64,
+    status: &RpcJobStatus,
+    artifacts: &[RemoteJobArtifact],
+) -> Result<Json, String> {
+    let (state, result, error) = match status {
+        RpcJobStatus::Queued => ("queued", None, None),
+        RpcJobStatus::Running => ("running", None, None),
+        RpcJobStatus::Completed(value) => ("completed", Some(value.clone()), None),
+        RpcJobStatus::Failed(message) => ("failed", None, Some(message.clone())),
+        RpcJobStatus::Cancelled => ("cancelled", None, None),
+    };
+    let mut fields = vec![
+        ("schemaVersion".to_string(), Json::from(1_u64)),
+        ("jobId".to_string(), Json::from(job_id)),
+        ("state".to_string(), Json::string(state)),
+    ];
+    if let Some(result) = result {
+        fields.push(("result".to_string(), result));
+    }
+    if let Some(error) = error {
+        fields.push(("error".to_string(), Json::string(error)));
+    }
+    fields.push((
+        "artifacts".to_string(),
+        Json::Array(
+            artifacts
+                .iter()
+                .map(|artifact| {
+                    Json::object([
+                        ("name", Json::string(artifact.name.clone())),
+                        ("contentType", Json::string(artifact.content_type.clone())),
+                        (
+                            "contentEncoding",
+                            Json::string(artifact.content_encoding.clone()),
+                        ),
+                        ("content", Json::string(artifact.content.clone())),
+                        ("sha256", Json::string(artifact.sha256.clone())),
+                        ("sizeBytes", Json::from(artifact.size_bytes as u64)),
+                    ])
+                })
+                .collect(),
+        ),
+    ));
+    Ok(Json::Object(fields.into_iter().collect()))
+}
+
+fn write_remote_job_record(root: &Path, record: &Json) -> Result<(), String> {
+    let job_id = record
+        .as_object()
+        .and_then(|fields| fields.get("jobId"))
+        .and_then(Json::as_number)
+        .copied()
+        .ok_or_else(|| "RPC job record has no numeric jobId".to_string())? as u64;
+    let temporary = root.join(format!("{job_id}.json.tmp"));
+    let target = remote_job_record_path(root, job_id);
+    let mut file = File::options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "failed to open temporary RPC job record {}: {error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(record.write().as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to write temporary RPC job record {}: {error}",
+                temporary.display()
+            )
+        })?;
+    drop(file);
+    fs::rename(&temporary, &target).map_err(|error| {
+        format!(
+            "failed to publish RPC job record {}: {error}",
+            target.display()
+        )
+    })
+}
+
+fn remote_job_status_from_record(record: &Json) -> Result<RpcJobStatus, String> {
+    let fields = record
+        .as_object()
+        .ok_or_else(|| "RPC job record must be an object".to_string())?;
+    let state = fields
+        .get("state")
+        .and_then(Json::as_str)
+        .ok_or_else(|| "RPC job record 'state' must be a string".to_string())?;
+    match state {
+        "completed" => Ok(RpcJobStatus::Completed(
+            fields.get("result").cloned().unwrap_or(Json::Null),
+        )),
+        "failed" => Ok(RpcJobStatus::Failed(
+            fields
+                .get("error")
+                .and_then(Json::as_str)
+                .ok_or_else(|| "failed RPC job record requires a string error".to_string())?
+                .to_string(),
+        )),
+        "cancelled" => Ok(RpcJobStatus::Cancelled),
+        _ => Err(format!(
+            "RPC job record has unsupported terminal state '{state}'"
+        )),
+    }
+}
+
+fn remote_artifact_registry_totals(
+    artifacts: &BTreeMap<u64, BTreeMap<String, RemoteJobArtifact>>,
+) -> (usize, usize) {
+    artifacts.values().flat_map(BTreeMap::values).fold(
+        (0_usize, 0_usize),
+        |(count, bytes), artifact| {
+            (
+                count.saturating_add(1),
+                bytes.saturating_add(artifact.size_bytes),
+            )
+        },
+    )
+}
+
+fn enforce_remote_artifact_limits_locked(
+    artifacts: &mut BTreeMap<u64, BTreeMap<String, RemoteJobArtifact>>,
+    protected_job_id: u64,
+    count_capacity: usize,
+    byte_capacity: usize,
+    evictions: &AtomicU64,
+) -> Result<(), String> {
+    loop {
+        let (count, bytes) = remote_artifact_registry_totals(artifacts);
+        if count <= count_capacity && bytes <= byte_capacity {
+            return Ok(());
+        }
+        let candidates = artifacts
+            .iter()
+            .filter(|(job_id, _)| **job_id != protected_job_id)
+            .flat_map(|(job_id, artifacts)| {
+                artifacts
+                    .iter()
+                    .map(move |(name, artifact)| (*job_id, name.clone(), artifact.last_access))
+            })
+            .collect::<Vec<_>>();
+        let Some((victim_job_id, victim_name, _)) = candidates
+            .into_iter()
+            .min_by_key(|(_, _, last_access)| *last_access)
+        else {
+            return Err(format!(
+                "remote artifact registry cannot hold protected job {protected_job_id} within {count_capacity} artifact(s) and {byte_capacity} byte(s)"
+            ));
+        };
+        if let Some(job_artifacts) = artifacts.get_mut(&victim_job_id) {
+            job_artifacts.remove(&victim_name);
+            if job_artifacts.is_empty() {
+                artifacts.remove(&victim_job_id);
+            }
+        }
+        evictions.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -7201,12 +8980,12 @@ impl Default for RpcJobManager {
 }
 
 fn worker_loop(
-    receiver: Receiver<WorkerCommand>,
+    receiver: WorkerChannel,
     jobs: SharedJobs,
     running: SharedRunning,
     dispatcher: RpcDispatcher,
 ) {
-    while let Ok(command) = receiver.recv() {
+    while let Some(command) = receiver.receive() {
         match command {
             WorkerCommand::Shutdown => break,
             WorkerCommand::Submit(id, request, provided_cancellation) => {
@@ -7346,6 +9125,13 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn bind(address: &str) -> Result<Self, String> {
+        Self::bind_with_artifact_store(address, None)
+    }
+
+    pub fn bind_with_artifact_store(
+        address: &str,
+        artifact_store: Option<&Path>,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(address)
             .map_err(|error| format!("failed to bind EDA daemon to {address}: {error}"))?;
         let local_address = listener
@@ -7354,7 +9140,11 @@ impl Daemon {
             .map_err(|error| format!("failed to resolve EDA daemon address: {error}"))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let service = RpcService::new();
+        let service = RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(
+            128,
+            4,
+            artifact_store,
+        )?;
         let worker_service = service.clone();
         let worker = spawn(move || {
             accept_loop(listener, worker_shutdown, worker_service.clone());
@@ -8997,6 +10787,37 @@ via VIA1 cut_layer V1 bottom_layer M1 top_layer M2 cut_width 20 cut_height 20 bo
             Json::Array(vec![Json::string("acSweep"), Json::string("transient")])
         );
         assert_eq!(fields["count"], Json::Number(2.0));
+    }
+
+    #[test]
+    fn rpc_spice_transient_returns_structured_thermal_state() {
+        let source = "rpc thermal transient\nV1 d 0 1.8\nV2 g 0 1\nM1 d g 0 0 NM W=1u L=180n\n.model NM NMOS(KP=1m VTO=0.5 MEXP=1.5 RTH=100k CTH=1u)\n.tran 10m 30m method=trapezoidal\n.end";
+        let request = RpcRequest::new(1, "spiceRun").with_params(Json::object([
+            ("source", Json::string(source)),
+            ("analysisIndex", Json::Number(0.0)),
+        ]));
+        let response = dispatch(&request).result.unwrap();
+        let fields = response.as_object().unwrap();
+        assert_eq!(fields["kind"], Json::string("transient"));
+        let result = fields["result"].as_object().unwrap();
+        assert_eq!(result["method"], Json::string("trapezoidal"));
+        assert_eq!(result["sampleCount"], Json::from(4_u64));
+        let Json::Array(samples) = &result["samples"] else {
+            panic!("transient RPC result should contain samples");
+        };
+        let first = samples[0].as_object().unwrap();
+        let final_sample = samples
+            .last()
+            .and_then(|sample| sample.as_object())
+            .unwrap();
+        let first_temperatures = first["deviceTemperatures"].as_object().unwrap();
+        let final_temperatures = final_sample["deviceTemperatures"].as_object().unwrap();
+        assert!(
+            first_temperatures["M1"].as_number().unwrap()
+                < final_temperatures["M1"].as_number().unwrap(),
+            "{first_temperatures:?} {final_temperatures:?}"
+        );
+        assert!(fields["report"].as_str().unwrap().contains("T(M1)="));
     }
 
     #[test]
@@ -11027,6 +12848,1814 @@ signoff physical-database
     }
 
     #[test]
+    fn rpc_service_reports_local_worker_pool_stats() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        let initial = service
+            .dispatch(&RpcRequest::new(1, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let initial_fields = initial.as_object().unwrap();
+        assert_eq!(initial_fields["workerCount"], Json::from(2_u64));
+        assert_eq!(initial_fields["activeJobIds"], Json::Array(Vec::new()));
+
+        let first_nested = parse_json(&RpcRequest::new("first", "ping").wire()).unwrap();
+        let first = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmit")
+                    .with_params(Json::object([("request", first_nested)])),
+            )
+            .result
+            .unwrap();
+        let first_id = first.as_object().unwrap()["jobId"].clone();
+        let second_nested = parse_json(&RpcRequest::new("second", "ping").wire()).unwrap();
+        let second = service
+            .dispatch(
+                &RpcRequest::new(3, "jobSubmit")
+                    .with_params(Json::object([("request", second_nested)])),
+            )
+            .result
+            .unwrap();
+        let second_id = second.as_object().unwrap()["jobId"].clone();
+
+        for job_id in [first_id.clone(), second_id.clone()] {
+            let waited = service
+                .dispatch(&RpcRequest::new(4, "jobWait").with_params(Json::object([
+                    ("jobId", job_id),
+                    ("timeoutMs", Json::Number(2_000.0)),
+                ])))
+                .result
+                .unwrap();
+            assert_eq!(
+                waited.as_object().unwrap()["state"],
+                Json::string("completed")
+            );
+        }
+        let final_stats = service
+            .dispatch(&RpcRequest::new(5, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let fields = final_stats.as_object().unwrap();
+        assert_eq!(fields["workerCount"], Json::from(2_u64));
+        assert_eq!(fields["completed"], Json::from(2_u64));
+        assert_eq!(fields["activeJobIds"], Json::Array(Vec::new()));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_dispatches_remote_worker_jobs() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        let initial_workers = service
+            .dispatch(&RpcRequest::new(1, "workerList"))
+            .result
+            .unwrap();
+        assert_eq!(
+            initial_workers.as_object().unwrap()["count"],
+            Json::from(0_u64)
+        );
+
+        let registered = service
+            .dispatch(
+                &RpcRequest::new(2, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("capacity", Json::from(1_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+        let registered_fields = registered.as_object().unwrap();
+        assert_eq!(registered_fields["workerId"], Json::string("node-1"));
+        assert_eq!(registered_fields["capacity"], Json::from(1_u64));
+
+        let nested = parse_json(&RpcRequest::new("remote", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(3, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let submit_fields = submitted.as_object().unwrap();
+        assert_eq!(submit_fields["scheduled"], Json::string("remote"));
+        let job_id = submit_fields["jobId"].clone();
+
+        std::thread::sleep(Duration::from_millis(10));
+        let status = service
+            .dispatch(
+                &RpcRequest::new(4, "jobStatus")
+                    .with_params(Json::object([("jobId", job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(status.as_object().unwrap()["state"], Json::string("queued"));
+
+        let claim = service
+            .dispatch(
+                &RpcRequest::new(5, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        let claim_fields = claim.as_object().unwrap();
+        assert_eq!(claim_fields["jobId"], job_id);
+        assert_eq!(claim_fields["workerId"], Json::string("node-1"));
+        let request = claim_fields["request"].as_object().unwrap();
+        assert_eq!(request["method"], Json::string("ping"));
+
+        let stats = service
+            .dispatch(&RpcRequest::new(6, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let stats_fields = stats.as_object().unwrap();
+        assert_eq!(stats_fields["remoteWorkerCount"], Json::from(1_u64));
+        assert_eq!(stats_fields["remoteActiveJobCount"], Json::from(1_u64));
+        assert_eq!(stats_fields["running"], Json::from(1_u64));
+
+        let heartbeat = service
+            .dispatch(
+                &RpcRequest::new(7, "workerHeartbeat")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            heartbeat.as_object().unwrap()["activeJobIds"],
+            Json::Array(vec![job_id.clone()])
+        );
+
+        let completed = service
+            .dispatch(
+                &RpcRequest::new(8, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", job_id.clone()),
+                    (
+                        "result",
+                        Json::object([
+                            ("protocol", Json::Number(1.0)),
+                            ("service", Json::string("eda")),
+                        ]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            completed.as_object().unwrap()["state"],
+            Json::string("completed")
+        );
+        let final_stats = service
+            .dispatch(&RpcRequest::new(9, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let fields = final_stats.as_object().unwrap();
+        assert_eq!(fields["remoteActiveJobCount"], Json::from(0_u64));
+        assert_eq!(fields["activeJobIds"], Json::Array(Vec::new()));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_respects_capacity_and_cancellation() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("capacity", Json::from(1_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let submit = |rpc_id: i32, name: &str| {
+            let nested = parse_json(&RpcRequest::new(name, "ping").wire()).unwrap();
+            service
+                .dispatch(
+                    &RpcRequest::new(rpc_id, "jobSubmitRemote")
+                        .with_params(Json::object([("request", nested)])),
+                )
+                .result
+                .unwrap()
+                .as_object()
+                .unwrap()["jobId"]
+                .clone()
+        };
+        let first = submit(2, "first");
+        let second = submit(3, "second");
+        let first_claim = service
+            .dispatch(
+                &RpcRequest::new(4, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(first_claim.as_object().unwrap()["jobId"], first);
+        let no_second = service
+            .dispatch(
+                &RpcRequest::new(5, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(no_second, Json::Null);
+
+        let claim_status = service
+            .dispatch(
+                &RpcRequest::new(6, "workerClaimStatus")
+                    .with_params(Json::object([("jobId", first.clone())])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            claim_status.as_object().unwrap()["cancelled"],
+            Json::Bool(false)
+        );
+        let cancel = service
+            .dispatch(
+                &RpcRequest::new(7, "jobCancel")
+                    .with_params(Json::object([("jobId", first.clone())])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(cancel.as_object().unwrap()["cancelled"], Json::Bool(true));
+        let cancelled_status = service
+            .dispatch(
+                &RpcRequest::new(8, "workerClaimStatus")
+                    .with_params(Json::object([("jobId", first.clone())])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            cancelled_status.as_object().unwrap()["cancelled"],
+            Json::Bool(true)
+        );
+
+        let wrong_owner = service
+            .dispatch(
+                &RpcRequest::new(9, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("not-owner")),
+                    ("jobId", first.clone()),
+                    ("result", Json::Null),
+                ])),
+            )
+            .result;
+        assert!(wrong_owner.unwrap_err().contains("does not own job"));
+        let completed = service
+            .dispatch(
+                &RpcRequest::new(10, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", first.clone()),
+                    ("result", Json::Null),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            completed.as_object().unwrap()["state"],
+            Json::string("cancelled")
+        );
+
+        let second_claim = service
+            .dispatch(
+                &RpcRequest::new(11, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(second_claim.as_object().unwrap()["jobId"], second);
+        let failed = service
+            .dispatch(
+                &RpcRequest::new(12, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", second),
+                    ("error", Json::string("remote execution failed")),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(failed.as_object().unwrap()["state"], Json::string("failed"));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_artifacts_are_checksummed_and_managed() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("capacity", Json::from(4_u64)),
+                    ("leaseTimeoutSeconds", Json::from(60_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let nested = parse_json(&RpcRequest::new("artifact-job", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let fields = submitted.as_object().unwrap();
+        let job_id = fields["jobId"].clone();
+        let claim = service
+            .dispatch(
+                &RpcRequest::new(3, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(claim.as_object().unwrap()["jobId"], job_id);
+
+        let duplicate = service
+            .dispatch(
+                &RpcRequest::new(4, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![
+                            Json::object([
+                                ("name", Json::string("report")),
+                                ("content", Json::string("first")),
+                            ]),
+                            Json::object([
+                                ("name", Json::string("report")),
+                                ("content", Json::string("second")),
+                            ]),
+                        ]),
+                    ),
+                ])),
+            )
+            .result;
+        assert!(duplicate
+            .unwrap_err()
+            .contains("duplicate remote RPC artifact name"));
+
+        let stale_owner = service
+            .dispatch(
+                &RpcRequest::new(5, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-2")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("stale")),
+                            ("content", Json::string("must not persist")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result;
+        assert!(stale_owner.unwrap_err().contains("does not own job"));
+        let before_completion = service
+            .dispatch(
+                &RpcRequest::new(6, "jobArtifactList")
+                    .with_params(Json::object([("jobId", job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            before_completion.as_object().unwrap()["count"],
+            Json::from(0_u64)
+        );
+
+        let report = "signoff report\n";
+        let waveform = r#"{"vcd":"stub"}"#;
+        let completed = service
+            .dispatch(
+                &RpcRequest::new(7, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![
+                            Json::object([
+                                ("name", Json::string("report.txt")),
+                                ("content", Json::string(report)),
+                            ]),
+                            Json::object([
+                                ("name", Json::string("waveform.json")),
+                                ("contentType", Json::string("application/json")),
+                                ("content", Json::string(waveform)),
+                            ]),
+                        ]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            completed.as_object().unwrap()["state"],
+            Json::string("completed")
+        );
+
+        let listed = service
+            .dispatch(
+                &RpcRequest::new(8, "jobArtifactList")
+                    .with_params(Json::object([("jobId", job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        let list_fields = listed.as_object().unwrap();
+        assert_eq!(list_fields["count"], Json::from(2_u64));
+        assert!(!listed.write().contains("signoff report"));
+        let Json::Array(artifacts) = &list_fields["artifacts"] else {
+            panic!("artifact list must return an array");
+        };
+        assert_eq!(
+            artifacts[0].as_object().unwrap()["contentType"],
+            Json::string("text/plain")
+        );
+        assert_eq!(
+            artifacts[1].as_object().unwrap()["contentType"],
+            Json::string("application/json")
+        );
+
+        let fetched = service
+            .dispatch(
+                &RpcRequest::new(9, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", job_id.clone()),
+                    ("name", Json::string("report.txt")),
+                ])),
+            )
+            .result
+            .unwrap();
+        let fetched_fields = fetched.as_object().unwrap();
+        assert_eq!(fetched_fields["content"], Json::string(report));
+        assert_eq!(
+            fetched_fields["sha256"],
+            Json::string(eda_api::pdk_liberty_sha256(report))
+        );
+        assert_eq!(fetched_fields["sizeBytes"], Json::from(report.len() as u64));
+
+        let deleted = service
+            .dispatch(
+                &RpcRequest::new(10, "jobArtifactDelete").with_params(Json::object([
+                    ("jobId", job_id.clone()),
+                    ("name", Json::string("waveform.json")),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            deleted.as_object().unwrap()["sha256"],
+            Json::string(eda_api::pdk_liberty_sha256(waveform))
+        );
+        let missing = service
+            .dispatch(
+                &RpcRequest::new(11, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", job_id.clone()),
+                    ("name", Json::string("waveform.json")),
+                ])),
+            )
+            .result;
+        assert!(missing.unwrap_err().contains("has no artifact"));
+
+        let failed_nested = parse_json(&RpcRequest::new("diagnostic", "ping").wire()).unwrap();
+        let failed_submitted = service
+            .dispatch(
+                &RpcRequest::new(12, "jobSubmitRemote")
+                    .with_params(Json::object([("request", failed_nested)])),
+            )
+            .result
+            .unwrap();
+        let failed_job_id = failed_submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(13, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        let failed = service
+            .dispatch(
+                &RpcRequest::new(14, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", failed_job_id.clone()),
+                    ("error", Json::string("worker diagnostics")),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("worker.log")),
+                            ("content", Json::string("failure diagnostic")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(failed.as_object().unwrap()["state"], Json::string("failed"));
+        let diagnostic = service
+            .dispatch(
+                &RpcRequest::new(15, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", failed_job_id),
+                    ("name", Json::string("worker.log")),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            diagnostic.as_object().unwrap()["content"],
+            Json::string("failure diagnostic")
+        );
+
+        let cancelled_nested = parse_json(&RpcRequest::new("cancelled", "ping").wire()).unwrap();
+        let cancelled_submitted = service
+            .dispatch(
+                &RpcRequest::new(16, "jobSubmitRemote")
+                    .with_params(Json::object([("request", cancelled_nested)])),
+            )
+            .result
+            .unwrap();
+        let cancelled_job_id = cancelled_submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(17, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(18, "jobCancel")
+                    .with_params(Json::object([("jobId", cancelled_job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        let cancelled = service
+            .dispatch(
+                &RpcRequest::new(19, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", cancelled_job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("partial.txt")),
+                            ("content", Json::string("partial")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            cancelled.as_object().unwrap()["state"],
+            Json::string("cancelled")
+        );
+        let cancelled_artifacts = service
+            .dispatch(
+                &RpcRequest::new(20, "jobArtifactList")
+                    .with_params(Json::object([("jobId", cancelled_job_id)])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            cancelled_artifacts.as_object().unwrap()["count"],
+            Json::from(0_u64)
+        );
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_artifact_store_survives_restart_and_preserves_ids() {
+        let unique = format!(
+            "eda-rpc-artifact-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(&unique);
+        let service =
+            RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(4, 2, Some(&root))
+                .unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([(
+                    "workerId",
+                    Json::string("persistent-node"),
+                )])),
+            )
+            .result
+            .unwrap();
+        let nested = parse_json(&RpcRequest::new("persisted", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(3, "workerClaim").with_params(Json::object([(
+                    "workerId",
+                    Json::string("persistent-node"),
+                )])),
+            )
+            .result
+            .unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(4, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("persistent-node")),
+                    ("jobId", job_id.clone()),
+                    (
+                        "result",
+                        Json::object([
+                            ("protocol", Json::from(PROTOCOL_VERSION as u64)),
+                            ("service", Json::string("eda")),
+                        ]),
+                    ),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("report.txt")),
+                            ("content", Json::string("persistent report")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        service.shutdown().unwrap();
+
+        let restarted =
+            RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(4, 2, Some(&root))
+                .unwrap();
+        let restored_status = restarted
+            .dispatch(
+                &RpcRequest::new(1, "jobStatus").with_params(Json::object([("jobId", job_id)])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            restored_status.as_object().unwrap()["state"],
+            Json::string("completed")
+        );
+        let restored_artifact = restarted
+            .dispatch(
+                &RpcRequest::new(2, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", Json::from(1_u64)),
+                    ("name", Json::string("report.txt")),
+                ])),
+            )
+            .result
+            .unwrap();
+        let artifact_fields = restored_artifact.as_object().unwrap();
+        assert_eq!(
+            artifact_fields["content"],
+            Json::string("persistent report")
+        );
+        assert_eq!(
+            artifact_fields["sha256"],
+            Json::string(eda_api::pdk_liberty_sha256("persistent report"))
+        );
+
+        restarted
+            .dispatch(
+                &RpcRequest::new(3, "workerRegister").with_params(Json::object([(
+                    "workerId",
+                    Json::string("persistent-node"),
+                )])),
+            )
+            .result
+            .unwrap();
+        let second_nested = parse_json(&RpcRequest::new("uncompleted", "ping").wire()).unwrap();
+        let second_submitted = restarted
+            .dispatch(
+                &RpcRequest::new(4, "jobSubmitRemote")
+                    .with_params(Json::object([("request", second_nested)])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            second_submitted.as_object().unwrap()["jobId"],
+            Json::from(2_u64)
+        );
+        restarted.shutdown().unwrap();
+
+        let third =
+            RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(4, 2, Some(&root))
+                .unwrap();
+        third
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([(
+                    "workerId",
+                    Json::string("persistent-node"),
+                )])),
+            )
+            .result
+            .unwrap();
+        let third_nested = parse_json(&RpcRequest::new("watermark", "ping").wire()).unwrap();
+        let third_submitted = third
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote")
+                    .with_params(Json::object([("request", third_nested)])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            third_submitted.as_object().unwrap()["jobId"],
+            Json::from(3_u64)
+        );
+        let checksum_root = std::env::temp_dir().join(format!("{unique}-bad-checksum"));
+        fs::create_dir_all(&checksum_root).unwrap();
+        let mut checksum_record =
+            parse_json(&fs::read_to_string(root.join("1.json")).unwrap()).unwrap();
+        let Json::Object(fields) = &mut checksum_record else {
+            panic!("persisted job record must be an object");
+        };
+        let Json::Array(artifacts) = fields.get_mut("artifacts").unwrap() else {
+            panic!("persisted job artifacts must be an array");
+        };
+        let Json::Object(artifact) = &mut artifacts[0] else {
+            panic!("persisted artifact must be an object");
+        };
+        artifact.insert("content".into(), Json::string("tampered"));
+        write_remote_job_record(&checksum_root, &checksum_record).unwrap();
+        let bad_checksum = RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(
+            4,
+            2,
+            Some(&checksum_root),
+        );
+        let bad_checksum_error = match bad_checksum {
+            Ok(service) => {
+                service.shutdown().unwrap();
+                panic!("tampered artifact checksum unexpectedly loaded");
+            }
+            Err(error) => error,
+        };
+        assert!(bad_checksum_error.contains("checksum mismatch"));
+        let deleted = third
+            .dispatch(
+                &RpcRequest::new(3, "jobArtifactDelete").with_params(Json::object([
+                    ("jobId", Json::from(1_u64)),
+                    ("name", Json::string("report.txt")),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(deleted.as_object().unwrap()["deleted"], Json::Bool(true));
+        third.shutdown().unwrap();
+
+        let after_delete =
+            RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(4, 2, Some(&root))
+                .unwrap();
+        let empty = after_delete
+            .dispatch(
+                &RpcRequest::new(1, "jobArtifactList")
+                    .with_params(Json::object([("jobId", Json::from(1_u64))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(empty.as_object().unwrap()["count"], Json::from(0_u64));
+        after_delete.shutdown().unwrap();
+
+        let corrupt_root = std::env::temp_dir().join(format!("{unique}-corrupt"));
+        fs::create_dir_all(&corrupt_root).unwrap();
+        fs::write(corrupt_root.join("1.json"), "not-json").unwrap();
+        let corrupt = RpcService::with_flow_cache_capacity_worker_count_and_artifact_store(
+            4,
+            2,
+            Some(&corrupt_root),
+        );
+        let corrupt_error = match corrupt {
+            Ok(service) => {
+                service.shutdown().unwrap();
+                panic!("corrupt artifact store unexpectedly loaded");
+            }
+            Err(error) => error,
+        };
+        assert!(!corrupt_error.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&checksum_root).unwrap();
+        fs::remove_dir_all(&corrupt_root).unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_artifact_quotas_and_pagination() {
+        let oversized = "x".repeat(MAX_REMOTE_JOB_ARTIFACT_BYTES_PER_JOB / 2 + 1);
+        let quota_params = Json::object([
+            ("jobId", Json::from(1_u64)),
+            (
+                "artifacts",
+                Json::Array(vec![
+                    Json::object([
+                        ("name", Json::string("first.bin")),
+                        ("content", Json::string(oversized.clone())),
+                    ]),
+                    Json::object([
+                        ("name", Json::string("second.bin")),
+                        ("content", Json::string(oversized)),
+                    ]),
+                ]),
+            ),
+        ]);
+        assert!(parse_remote_job_artifacts(&quota_params, 1)
+            .unwrap_err()
+            .contains("decoded artifact bytes"));
+
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister")
+                    .with_params(Json::object([("workerId", Json::string("quota-node"))])),
+            )
+            .result
+            .unwrap();
+        let nested = parse_json(&RpcRequest::new("quota", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(3, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("quota-node"))])),
+            )
+            .result
+            .unwrap();
+
+        let too_many = (0..=MAX_REMOTE_JOB_ARTIFACTS_PER_JOB)
+            .map(|index| {
+                Json::object([
+                    ("name", Json::string(format!("artifact-{index}"))),
+                    ("content", Json::string("x")),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let rejected = service
+            .dispatch(
+                &RpcRequest::new(4, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("quota-node")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    ("artifacts", Json::Array(too_many)),
+                ])),
+            )
+            .result;
+        assert!(rejected.unwrap_err().contains("at most 64 artifacts"));
+
+        let three_artifacts = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(|name| {
+                Json::object([
+                    ("name", Json::string(format!("{name}.log"))),
+                    ("content", Json::string(name)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        service
+            .dispatch(
+                &RpcRequest::new(5, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("quota-node")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    ("artifacts", Json::Array(three_artifacts)),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let default_list = service
+            .dispatch(
+                &RpcRequest::new(6, "jobArtifactList")
+                    .with_params(Json::object([("jobId", job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        let default_fields = default_list.as_object().unwrap();
+        assert_eq!(default_fields["total"], Json::from(3_u64));
+        assert_eq!(default_fields["count"], Json::from(3_u64));
+        assert_eq!(default_fields["offset"], Json::from(0_u64));
+        assert_eq!(default_fields["limit"], Json::from(256_u64));
+
+        let page = service
+            .dispatch(
+                &RpcRequest::new(7, "jobArtifactList").with_params(Json::object([
+                    ("jobId", job_id.clone()),
+                    ("offset", Json::from(1_u64)),
+                    ("limit", Json::from(1_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+        let page_fields = page.as_object().unwrap();
+        assert_eq!(page_fields["total"], Json::from(3_u64));
+        assert_eq!(page_fields["count"], Json::from(1_u64));
+        let Json::Array(page_artifacts) = &page_fields["artifacts"] else {
+            panic!("artifact page must be an array");
+        };
+        assert_eq!(
+            page_artifacts[0].as_object().unwrap()["name"],
+            Json::string("beta.log")
+        );
+
+        let beyond_end = service
+            .dispatch(
+                &RpcRequest::new(8, "jobArtifactList").with_params(Json::object([
+                    ("jobId", job_id.clone()),
+                    ("offset", Json::from(3_u64)),
+                    ("limit", Json::from(2_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(beyond_end.as_object().unwrap()["count"], Json::from(0_u64));
+
+        assert!(service
+            .dispatch(
+                &RpcRequest::new(9, "jobArtifactList").with_params(Json::object([
+                    ("jobId", job_id),
+                    ("limit", Json::from(0_u64)),
+                ])),
+            )
+            .result
+            .unwrap_err()
+            .contains("'limit' must be a positive integer"));
+        assert!(service
+            .dispatch(
+                &RpcRequest::new(10, "jobArtifactList").with_params(Json::object([
+                    ("jobId", Json::from(1_u64)),
+                    ("limit", Json::from(257_u64)),
+                ])),
+            )
+            .result
+            .unwrap_err()
+            .contains("'limit' cannot exceed 256"));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_binary_artifacts_use_base64_checksums() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister")
+                    .with_params(Json::object([("workerId", Json::string("binary-node"))])),
+            )
+            .result
+            .unwrap();
+        let nested = parse_json(&RpcRequest::new("gds", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(3, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("binary-node"))])),
+            )
+            .result
+            .unwrap();
+
+        let unsupported_encoding = service
+            .dispatch(
+                &RpcRequest::new(4, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("binary-node")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("layout.gds")),
+                            ("contentEncoding", Json::string("hex")),
+                            ("content", Json::string("001f")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result;
+        assert!(unsupported_encoding
+            .unwrap_err()
+            .contains("'contentEncoding' must be either 'utf-8' or 'base64'"));
+        let invalid_base64 = service
+            .dispatch(
+                &RpcRequest::new(5, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("binary-node")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("layout.gds")),
+                            ("contentEncoding", Json::string("base64")),
+                            ("content", Json::string("A")),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result;
+        assert!(invalid_base64
+            .unwrap_err()
+            .contains("padded four-byte groups"));
+
+        let bytes = [0_u8, 1, 2, 255, 100];
+        let encoded = base64_encode(&bytes);
+        assert_eq!(base64_decode("YWJj").unwrap(), b"abc".as_slice());
+        assert!(base64_decode("YR==").is_err());
+        assert!(base64_decode("YW Jj").is_err());
+        let completed = service
+            .dispatch(
+                &RpcRequest::new(6, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("binary-node")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                    (
+                        "artifacts",
+                        Json::Array(vec![Json::object([
+                            ("name", Json::string("layout.gds")),
+                            ("contentType", Json::string("application/octet-stream")),
+                            ("contentEncoding", Json::string("base64")),
+                            ("content", Json::string(encoded.clone())),
+                        ])]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            completed.as_object().unwrap()["state"],
+            Json::string("completed")
+        );
+
+        let artifact = service
+            .dispatch(
+                &RpcRequest::new(7, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", job_id),
+                    ("name", Json::string("layout.gds")),
+                ])),
+            )
+            .result
+            .unwrap();
+        let fields = artifact.as_object().unwrap();
+        assert_eq!(fields["content"], Json::string(encoded));
+        assert_eq!(fields["contentEncoding"], Json::string("base64"));
+        assert_eq!(fields["sizeBytes"], Json::from(bytes.len() as u64));
+        assert_eq!(
+            fields["sha256"],
+            Json::string(eda_api::pdk_liberty_sha256_bytes(&bytes))
+        );
+        assert_eq!(
+            base64_decode(fields["content"].as_str().unwrap()).unwrap(),
+            bytes
+        );
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_artifact_registry_is_globally_bounded_lru() {
+        fn complete_with_artifact(
+            service: &RpcService,
+            worker_id: &str,
+            label: &str,
+        ) -> Result<u64, String> {
+            let nested = parse_json(&RpcRequest::new(label, "ping").wire()).unwrap();
+            let submitted = service
+                .dispatch(
+                    &RpcRequest::new(1, "jobSubmitRemote")
+                        .with_params(Json::object([("request", nested)])),
+                )
+                .result?;
+            let job_id = submitted.as_object().unwrap()["jobId"]
+                .as_number()
+                .copied()
+                .unwrap() as u64;
+            service
+                .dispatch(
+                    &RpcRequest::new(2, "workerClaim")
+                        .with_params(Json::object([("workerId", Json::string(worker_id))])),
+                )
+                .result?;
+            service
+                .dispatch(
+                    &RpcRequest::new(3, "workerComplete").with_params(Json::object([
+                        ("workerId", Json::string(worker_id)),
+                        ("jobId", Json::from(job_id)),
+                        ("result", Json::Null),
+                        (
+                            "artifacts",
+                            Json::Array(vec![Json::object([
+                                ("name", Json::string(format!("{label}.log"))),
+                                ("content", Json::string(label)),
+                            ])]),
+                        ),
+                    ])),
+                )
+                .result?;
+            Ok(job_id)
+        }
+
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister")
+                    .with_params(Json::object([("workerId", Json::string("lru-node"))])),
+            )
+            .result
+            .unwrap();
+        {
+            let mut manager = service.manager.lock().unwrap();
+            manager.remote_artifact_capacity = 2;
+        }
+
+        let first = complete_with_artifact(&service, "lru-node", "first").unwrap();
+        let second = complete_with_artifact(&service, "lru-node", "second").unwrap();
+        let touched = service
+            .dispatch(
+                &RpcRequest::new(4, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", Json::from(first)),
+                    ("name", Json::string("first.log")),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            touched.as_object().unwrap()["name"],
+            Json::string("first.log")
+        );
+        let third = complete_with_artifact(&service, "lru-node", "third").unwrap();
+
+        let evicted = service
+            .dispatch(
+                &RpcRequest::new(5, "jobArtifactList")
+                    .with_params(Json::object([("jobId", Json::from(second))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(evicted.as_object().unwrap()["count"], Json::from(0_u64));
+        for (job_id, name) in [(first, "first.log"), (third, "third.log")] {
+            let retained = service
+                .dispatch(
+                    &RpcRequest::new(6, "jobArtifactGet").with_params(Json::object([
+                        ("jobId", Json::from(job_id)),
+                        ("name", Json::string(name)),
+                    ])),
+                )
+                .result
+                .unwrap();
+            assert_eq!(retained.as_object().unwrap()["name"], Json::string(name));
+        }
+        let count_stats = service
+            .dispatch(&RpcRequest::new(7, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let count_fields = count_stats.as_object().unwrap();
+        assert_eq!(count_fields["remoteArtifactCount"], Json::from(2_u64));
+        assert_eq!(count_fields["remoteArtifactCapacity"], Json::from(2_u64));
+        assert_eq!(count_fields["remoteArtifactEvictions"], Json::from(1_u64));
+        service.shutdown().unwrap();
+
+        let byte_service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        byte_service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister")
+                    .with_params(Json::object([("workerId", Json::string("byte-node"))])),
+            )
+            .result
+            .unwrap();
+        {
+            let mut manager = byte_service.manager.lock().unwrap();
+            manager.remote_artifact_byte_capacity = 4;
+        }
+        let wide = complete_with_artifact(&byte_service, "byte-node", "abc").unwrap();
+        let _narrow = complete_with_artifact(&byte_service, "byte-node", "de").unwrap();
+        let missing = byte_service
+            .dispatch(
+                &RpcRequest::new(2, "jobArtifactGet").with_params(Json::object([
+                    ("jobId", Json::from(wide)),
+                    ("name", Json::string("abc.log")),
+                ])),
+            )
+            .result;
+        assert!(missing.unwrap_err().contains("has no artifact"));
+        let byte_stats = byte_service
+            .dispatch(&RpcRequest::new(3, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let byte_fields = byte_stats.as_object().unwrap();
+        assert_eq!(byte_fields["remoteArtifactBytes"], Json::from(2_u64));
+        assert_eq!(byte_fields["remoteArtifactByteCapacity"], Json::from(4_u64));
+        assert_eq!(byte_fields["remoteArtifactEvictions"], Json::from(1_u64));
+        byte_service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_jobs_claim_highest_priority_first() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("priority-node")),
+                    ("capacity", Json::from(1_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let submissions = [
+            ("low", 1_u32),
+            ("high", 100_u32),
+            ("default", 0_u32),
+            ("medium", 10_u32),
+        ];
+        let mut job_ids = Vec::new();
+        for (index, (name, priority)) in submissions.iter().enumerate() {
+            let nested = parse_json(&RpcRequest::new(*name, "ping").wire()).unwrap();
+            let submitted = service
+                .dispatch(
+                    &RpcRequest::new(index as i64 + 2, "jobSubmitRemote").with_params(
+                        Json::object([
+                            ("request", nested),
+                            ("priority", Json::from(u64::from(*priority))),
+                        ]),
+                    ),
+                )
+                .result
+                .unwrap();
+            let fields = submitted.as_object().unwrap();
+            assert_eq!(fields["priority"], Json::from(u64::from(*priority)));
+            job_ids.push(fields["jobId"].clone());
+        }
+
+        for (expected_job_id, expected_priority) in [
+            (job_ids[1].clone(), 100_u32),
+            (job_ids[3].clone(), 10_u32),
+            (job_ids[0].clone(), 1_u32),
+            (job_ids[2].clone(), 0_u32),
+        ] {
+            let claim = service
+                .dispatch(
+                    &RpcRequest::new(20, "workerClaim")
+                        .with_params(Json::object([("workerId", Json::string("priority-node"))])),
+                )
+                .result
+                .unwrap();
+            let fields = claim.as_object().unwrap();
+            assert_eq!(fields["jobId"], expected_job_id);
+            assert_eq!(fields["priority"], Json::from(u64::from(expected_priority)));
+            service
+                .dispatch(
+                    &RpcRequest::new(21, "workerComplete").with_params(Json::object([
+                        ("workerId", Json::string("priority-node")),
+                        ("jobId", expected_job_id),
+                        ("result", Json::Null),
+                    ])),
+                )
+                .result
+                .unwrap();
+        }
+
+        let invalid = service
+            .dispatch(
+                &RpcRequest::new(22, "jobSubmitRemote").with_params(Json::object([
+                    (
+                        "request",
+                        parse_json(&RpcRequest::new("bad", "ping").wire()).unwrap(),
+                    ),
+                    ("priority", Json::Number(-1.0)),
+                ])),
+            )
+            .result;
+        assert!(invalid
+            .unwrap_err()
+            .contains("'priority' must be a non-negative u32"));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_expires_idle_remote_workers_and_keeps_active_leases() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        for worker_id in ["fresh-node", "stale-node", "active-node"] {
+            service
+                .dispatch(
+                    &RpcRequest::new(worker_id, "workerRegister").with_params(Json::object([
+                        ("workerId", Json::string(worker_id)),
+                        ("leaseTimeoutSeconds", Json::from(60_u64)),
+                    ])),
+                )
+                .result
+                .unwrap();
+        }
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut workers = manager.remote_workers.lock().unwrap();
+            workers.get_mut("stale-node").unwrap().last_heartbeat =
+                Instant::now() - Duration::from_secs(61);
+        }
+
+        let expiration = service
+            .dispatch(&RpcRequest::new(4, "workerExpireLeases"))
+            .result
+            .unwrap();
+        let fields = expiration.as_object().unwrap();
+        assert_eq!(fields["expiredCount"], Json::from(0_u64));
+        assert_eq!(fields["removedWorkerCount"], Json::from(1_u64));
+        assert_eq!(
+            fields["removedWorkerIds"],
+            Json::Array(vec![Json::string("stale-node")])
+        );
+
+        let workers = service
+            .dispatch(&RpcRequest::new(5, "workerList"))
+            .result
+            .unwrap();
+        assert!(workers.write().contains("fresh-node"));
+        assert!(!workers.write().contains("stale-node"));
+
+        let nested = parse_json(&RpcRequest::new("active", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(6, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        service
+            .dispatch(
+                &RpcRequest::new(7, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("active-node"))])),
+            )
+            .result
+            .unwrap();
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut workers = manager.remote_workers.lock().unwrap();
+            workers.get_mut("active-node").unwrap().last_heartbeat =
+                Instant::now() - Duration::from_secs(61);
+        }
+        let active_expiration = service
+            .dispatch(&RpcRequest::new(8, "workerExpireLeases"))
+            .result
+            .unwrap();
+        let active_fields = active_expiration.as_object().unwrap();
+        assert_eq!(active_fields["expiredCount"], Json::from(0_u64));
+        assert_eq!(active_fields["removedWorkerCount"], Json::from(0_u64));
+        assert_eq!(active_fields["removedWorkerIds"], Json::Array(Vec::new()));
+
+        let stats = service
+            .dispatch(&RpcRequest::new(9, "jobWorkerStats"))
+            .result
+            .unwrap();
+        assert_eq!(
+            stats.as_object().unwrap()["remoteWorkerExpirations"],
+            Json::from(1_u64)
+        );
+        assert_eq!(
+            stats.as_object().unwrap()["remoteActiveJobCount"],
+            Json::from(1_u64)
+        );
+        let _ = job_id;
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_worker_labels_route_claims() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        let invalid_labels = service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("bad-node")),
+                    ("labels", Json::object([("pool", Json::from(7_i64))])),
+                ])),
+            )
+            .result;
+        assert!(invalid_labels
+            .unwrap_err()
+            .contains("'labels' values must be strings"));
+
+        service
+            .dispatch(
+                &RpcRequest::new(2, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("sim-node")),
+                    (
+                        "labels",
+                        Json::object([("pool", Json::string("simulation"))]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(3, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("signoff-node")),
+                    ("capacity", Json::from(4_u64)),
+                    (
+                        "labels",
+                        Json::object([
+                            ("pool", Json::string("signoff")),
+                            ("license", Json::string("foundry")),
+                        ]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let workers = service
+            .dispatch(&RpcRequest::new(4, "workerList"))
+            .result
+            .unwrap();
+        let worker_text = workers.write();
+        assert!(worker_text.contains("\"pool\":\"simulation\""));
+        assert!(worker_text.contains("\"pool\":\"signoff\""));
+        assert!(worker_text.contains("\"license\":\"foundry\""));
+
+        let nested = parse_json(&RpcRequest::new("routed", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(5, "jobSubmitRemote").with_params(Json::object([
+                    ("request", nested),
+                    (
+                        "requiredWorkerLabels",
+                        Json::object([("pool", Json::string("signoff"))]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        let wrong_worker = service
+            .dispatch(
+                &RpcRequest::new(6, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("sim-node"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(wrong_worker, Json::Null);
+
+        let matching_worker = service
+            .dispatch(
+                &RpcRequest::new(7, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("signoff-node"))])),
+            )
+            .result
+            .unwrap();
+        let claim_fields = matching_worker.as_object().unwrap();
+        assert_eq!(claim_fields["jobId"], job_id);
+        assert_eq!(
+            claim_fields["requiredWorkerLabels"],
+            Json::object([("pool", Json::string("signoff"))])
+        );
+
+        let second_nested = parse_json(&RpcRequest::new("simulation", "ping").wire()).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(8, "jobSubmitRemote").with_params(Json::object([
+                    ("request", second_nested),
+                    (
+                        "requiredWorkerLabels",
+                        Json::object([("pool", Json::string("simulation"))]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        let wrong_pool = service
+            .dispatch(
+                &RpcRequest::new(9, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("signoff-node"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(wrong_pool, Json::Null);
+        let matching_pool = service
+            .dispatch(
+                &RpcRequest::new(10, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("sim-node"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            matching_pool.as_object().unwrap()["requiredWorkerLabels"],
+            Json::object([("pool", Json::string("simulation"))])
+        );
+
+        let unmatched_nested = parse_json(&RpcRequest::new("unmatched", "ping").wire()).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(11, "jobSubmitRemote").with_params(Json::object([
+                    ("request", unmatched_nested),
+                    (
+                        "requiredWorkerLabels",
+                        Json::object([
+                            ("pool", Json::string("signoff")),
+                            ("license", Json::string("missing")),
+                        ]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        let unmatched = service
+            .dispatch(
+                &RpcRequest::new(12, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("signoff-node"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(unmatched, Json::Null);
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_reassigns_expired_remote_worker_leases() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        for (rpc_id, worker) in [(1, "node-1"), (2, "node-2")] {
+            let registered = service
+                .dispatch(
+                    &RpcRequest::new(rpc_id, "workerRegister").with_params(Json::object([
+                        ("workerId", Json::string(worker)),
+                        ("capacity", Json::from(1_u64)),
+                        ("leaseTimeoutSeconds", Json::from(60_u64)),
+                    ])),
+                )
+                .result
+                .unwrap();
+            assert_eq!(
+                registered.as_object().unwrap()["leaseTimeoutSeconds"],
+                Json::from(60_u64)
+            );
+        }
+
+        let nested = parse_json(&RpcRequest::new("remote", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(3, "jobSubmitRemote")
+                    .with_params(Json::object([("request", nested)])),
+            )
+            .result
+            .unwrap();
+        let job_id = submitted.as_object().unwrap()["jobId"].clone();
+        let first_claim = service
+            .dispatch(
+                &RpcRequest::new(4, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(first_claim.as_object().unwrap()["jobId"], job_id);
+
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut claims = manager.remote_claims.lock().unwrap();
+            claims.get_mut(&1).unwrap().last_heartbeat = Instant::now() - Duration::from_secs(61);
+        }
+        let expired = service
+            .dispatch(&RpcRequest::new(5, "workerExpireLeases"))
+            .result
+            .unwrap();
+        let expired_fields = expired.as_object().unwrap();
+        assert_eq!(expired_fields["expiredCount"], Json::from(1_u64));
+        assert_eq!(
+            expired_fields["expiredJobIds"],
+            Json::Array(vec![job_id.clone()])
+        );
+
+        let stats = service
+            .dispatch(&RpcRequest::new(6, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let stats_fields = stats.as_object().unwrap();
+        assert_eq!(stats_fields["queued"], Json::from(1_u64));
+        assert_eq!(stats_fields["running"], Json::from(0_u64));
+        assert_eq!(stats_fields["remoteActiveJobCount"], Json::from(0_u64));
+        assert_eq!(stats_fields["remoteReassignments"], Json::from(1_u64));
+
+        let second_claim = service
+            .dispatch(
+                &RpcRequest::new(7, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-2"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(second_claim.as_object().unwrap()["jobId"], job_id);
+        let stale_owner = service
+            .dispatch(
+                &RpcRequest::new(8, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("jobId", job_id.clone()),
+                    ("result", Json::Null),
+                ])),
+            )
+            .result;
+        assert!(stale_owner.unwrap_err().contains("does not own job"));
+
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut claims = manager.remote_claims.lock().unwrap();
+            claims.get_mut(&1).unwrap().last_heartbeat = Instant::now() - Duration::from_secs(61);
+        }
+        let heartbeat = service
+            .dispatch(
+                &RpcRequest::new(9, "workerHeartbeat")
+                    .with_params(Json::object([("workerId", Json::string("node-2"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            heartbeat.as_object().unwrap()["activeJobIds"],
+            Json::Array(vec![job_id.clone()])
+        );
+        let still_active = service
+            .dispatch(&RpcRequest::new(10, "workerExpireLeases"))
+            .result
+            .unwrap();
+        assert_eq!(
+            still_active.as_object().unwrap()["expiredCount"],
+            Json::from(0_u64)
+        );
+
+        let completed = service
+            .dispatch(
+                &RpcRequest::new(11, "workerComplete").with_params(Json::object([
+                    ("workerId", Json::string("node-2")),
+                    ("jobId", job_id),
+                    (
+                        "result",
+                        Json::object([
+                            ("protocol", Json::Number(1.0)),
+                            ("service", Json::string("eda")),
+                        ]),
+                    ),
+                ])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            completed.as_object().unwrap()["state"],
+            Json::string("completed")
+        );
+
+        let second_nested = parse_json(&RpcRequest::new("remote-2", "ping").wire()).unwrap();
+        let second_submitted = service
+            .dispatch(
+                &RpcRequest::new(12, "jobSubmitRemote")
+                    .with_params(Json::object([("request", second_nested)])),
+            )
+            .result
+            .unwrap();
+        let second_fields = second_submitted.as_object().unwrap();
+        let second_job_id = second_fields["jobId"].as_number().copied().unwrap() as u64;
+        let second_claim = service
+            .dispatch(
+                &RpcRequest::new(13, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            second_claim.as_object().unwrap()["jobId"],
+            second_fields["jobId"]
+        );
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut claims = manager.remote_claims.lock().unwrap();
+            claims.get_mut(&second_job_id).unwrap().last_heartbeat =
+                Instant::now() - Duration::from_secs(61);
+        }
+        let automatically_reassigned = service
+            .dispatch(
+                &RpcRequest::new(14, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-2"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(
+            automatically_reassigned.as_object().unwrap()["jobId"],
+            second_fields["jobId"]
+        );
+        let final_stats = service
+            .dispatch(&RpcRequest::new(15, "jobWorkerStats"))
+            .result
+            .unwrap();
+        assert_eq!(
+            final_stats.as_object().unwrap()["remoteReassignments"],
+            Json::from(2_u64)
+        );
+        service.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rpc_service_remote_retry_budget_fails_closed() {
+        let service = RpcService::with_flow_cache_capacity_and_worker_count(4, 2).unwrap();
+        service
+            .dispatch(
+                &RpcRequest::new(1, "workerRegister").with_params(Json::object([
+                    ("workerId", Json::string("node-1")),
+                    ("capacity", Json::from(1_u64)),
+                    ("leaseTimeoutSeconds", Json::from(60_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+
+        let nested = parse_json(&RpcRequest::new("retry", "ping").wire()).unwrap();
+        let submitted = service
+            .dispatch(
+                &RpcRequest::new(2, "jobSubmitRemote").with_params(Json::object([
+                    ("request", nested),
+                    ("maxAttempts", Json::from(1_u64)),
+                ])),
+            )
+            .result
+            .unwrap();
+        let fields = submitted.as_object().unwrap();
+        assert_eq!(fields["maxAttempts"], Json::from(1_u64));
+        let job_id = fields["jobId"].clone();
+        let claim = service
+            .dispatch(
+                &RpcRequest::new(3, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        let claim_fields = claim.as_object().unwrap();
+        assert_eq!(claim_fields["jobId"], job_id);
+        assert_eq!(claim_fields["attempt"], Json::from(1_u64));
+        assert_eq!(claim_fields["maxAttempts"], Json::from(1_u64));
+
+        {
+            let manager = service.manager.lock().unwrap();
+            let mut claims = manager.remote_claims.lock().unwrap();
+            claims.get_mut(&1).unwrap().last_heartbeat = Instant::now() - Duration::from_secs(61);
+        }
+        let expired = service
+            .dispatch(&RpcRequest::new(4, "workerExpireLeases"))
+            .result
+            .unwrap();
+        assert_eq!(
+            expired.as_object().unwrap()["expiredJobIds"],
+            Json::Array(vec![job_id.clone()])
+        );
+        let status = service
+            .dispatch(
+                &RpcRequest::new(5, "jobStatus")
+                    .with_params(Json::object([("jobId", job_id.clone())])),
+            )
+            .result
+            .unwrap();
+        let status_fields = status.as_object().unwrap();
+        assert_eq!(status_fields["state"], Json::string("failed"));
+        assert_eq!(
+            status_fields["error"],
+            Json::string("remote RPC job 1 exhausted 1 attempt(s)")
+        );
+
+        let stats = service
+            .dispatch(&RpcRequest::new(6, "jobWorkerStats"))
+            .result
+            .unwrap();
+        let stats_fields = stats.as_object().unwrap();
+        assert_eq!(stats_fields["remoteReassignments"], Json::from(0_u64));
+        assert_eq!(stats_fields["remoteRetryExhausted"], Json::from(1_u64));
+        assert_eq!(stats_fields["activeJobIds"], Json::Array(Vec::new()));
+        let no_retry = service
+            .dispatch(
+                &RpcRequest::new(7, "workerClaim")
+                    .with_params(Json::object([("workerId", Json::string("node-1"))])),
+            )
+            .result
+            .unwrap();
+        assert_eq!(no_retry, Json::Null);
+
+        let invalid = service
+            .dispatch(
+                &RpcRequest::new(8, "jobSubmitRemote").with_params(Json::object([
+                    (
+                        "request",
+                        parse_json(&RpcRequest::new("bad", "ping").wire()).unwrap(),
+                    ),
+                    ("maxAttempts", Json::from(0_u64)),
+                ])),
+            )
+            .result;
+        assert!(invalid
+            .unwrap_err()
+            .contains("'maxAttempts' must be a positive usize"));
+        service.shutdown().unwrap();
+    }
+
+    #[test]
     fn service_line_protocol_supports_job_submit_and_wait() {
         let nested = parse_json(&RpcRequest::new("work", "ping").wire()).unwrap();
         let input = format!(
@@ -11066,6 +14695,42 @@ signoff physical-database
             .run_to_completion(RpcRequest::new(2, "unknown"))
             .unwrap();
         assert!(matches!(failed, RpcJobStatus::Failed(_)));
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn job_manager_runs_multiple_workers_concurrently() {
+        if std::thread::available_parallelism().is_ok_and(|count| count.get() < 2) {
+            return;
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let dispatcher_barrier = Arc::clone(&barrier);
+        let manager = RpcJobManager::new_with_dispatcher_and_worker_count(
+            Arc::new(move |_request, _cancellation| {
+                dispatcher_barrier.wait();
+                Ok(Json::string("concurrent"))
+            }),
+            2,
+        );
+        assert_eq!(manager.worker_count(), 2);
+        let first = manager.submit(RpcRequest::new(1, "ping")).unwrap();
+        let second = manager.submit(RpcRequest::new(2, "ping")).unwrap();
+        let mut completed = 0;
+        for _ in 0..2_000 {
+            completed = [first, second]
+                .into_iter()
+                .filter(|id| matches!(manager.poll(*id).unwrap(), Some(RpcJobStatus::Completed(_))))
+                .count();
+            if completed == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(completed, 2);
+        let stats = manager.job_stats().unwrap();
+        assert_eq!(stats.worker_count, 2);
+        assert_eq!(stats.completed, 2);
+        assert!(stats.active_job_ids.is_empty());
         manager.shutdown().unwrap();
     }
 

@@ -1,7 +1,7 @@
 //! # eda — command-line interface
 //!
 //! Usage: `eda <command> <file.v> [--top <module>]`
-//! Commands: info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon
+//! Commands: info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
 //! Library: `--lib <file.lib>` imports a Liberty subset.
 //! Activity: `--vcd <file.vcd>` drives `eda power` and `eda assert`.
 //! Properties: `--sva <file.sva>` drives `eda assert`.
@@ -533,6 +533,7 @@ fn main() -> ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("daemon") {
         let mut listen = "127.0.0.1:7822".to_string();
+        let mut artifact_store = None::<String>;
         let mut index = 2;
         while index < args.len() {
             if args[index] == "--listen" {
@@ -542,12 +543,22 @@ fn main() -> ExitCode {
                 };
                 listen = value.clone();
                 index += 2;
+            } else if args[index] == "--artifact-store" {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("error: --artifact-store requires <directory>");
+                    return ExitCode::from(2);
+                };
+                artifact_store = Some(value.clone());
+                index += 2;
             } else {
                 eprintln!("error: unknown daemon option '{}'", args[index]);
                 return ExitCode::from(2);
             }
         }
-        return match eda_daemon::Daemon::bind(&listen) {
+        return match eda_daemon::Daemon::bind_with_artifact_store(
+            &listen,
+            artifact_store.as_deref().map(std::path::Path::new),
+        ) {
             Ok(daemon) => {
                 println!("EDA daemon listening on {}", daemon.local_address());
                 match daemon.wait() {
@@ -566,7 +577,7 @@ fn main() -> ExitCode {
     }
     if args.len() < 3 {
         eprintln!(
-            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] | eda <info|synth|equiv|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>]"
+            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|synth|equiv|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>]"
         );
         return ExitCode::from(2);
     }

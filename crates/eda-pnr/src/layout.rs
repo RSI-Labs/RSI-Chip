@@ -845,6 +845,7 @@ pub fn layout_drc_waiver_report(result: &LayoutDrcWaiverResult) -> String {
 pub struct LayoutDocument {
     layer_rules: BTreeMap<String, LayoutLayerRule>,
     via_rules: BTreeMap<String, LayoutViaRule>,
+    antenna_ratio: Option<f64>,
     shapes: Vec<LayoutShape>,
     vias: Vec<LayoutVia>,
 }
@@ -1086,6 +1087,19 @@ fn rule_deck_u32(tokens: &[&str], index: usize, line_no: usize) -> Result<u32, S
         .ok_or_else(|| format!("rule deck line {line_no} requires a u32 argument"))
 }
 
+fn rule_deck_positive_f64(tokens: &[&str], index: usize, line_no: usize) -> Result<f64, String> {
+    let value = tokens
+        .get(index)
+        .and_then(|value| value.parse::<f64>().ok())
+        .ok_or_else(|| format!("rule deck line {line_no} requires a positive number"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "rule deck line {line_no} requires a positive number"
+        ));
+    }
+    Ok(value)
+}
+
 /// Serialize only a document's layer/via rule deck in deterministic text form.
 pub fn write_layout_rule_deck(document: &LayoutDocument) -> Result<String, String> {
     for rule in document.layer_rules.values() {
@@ -1095,6 +1109,9 @@ pub fn write_layout_rule_deck(document: &LayoutDocument) -> Result<String, Strin
         rule.validate()?;
     }
     let mut out = String::from("version 1\n");
+    if let Some(ratio) = document.antenna_ratio {
+        out.push_str(&format!("antenna_ratio {ratio}\n"));
+    }
     for rule in document.layer_rules.values() {
         out.push_str(&format!(
             "layer {} min_width {} min_spacing {} min_area {}",
@@ -1149,6 +1166,7 @@ pub fn read_layout_rule_deck(source: &str) -> Result<LayoutDocument, String> {
     let mut seen_layers = BTreeSet::new();
     let mut seen_vias = BTreeSet::new();
     let mut seen_spacing = BTreeSet::new();
+    let mut saw_antenna_ratio = false;
     let mut saw_version = false;
     for (line_index, raw) in source.lines().enumerate() {
         let line_no = line_index + 1;
@@ -1165,6 +1183,18 @@ pub fn read_layout_rule_deck(source: &str) -> Result<LayoutDocument, String> {
                     ));
                 }
                 saw_version = true;
+            }
+            Some("antenna_ratio") => {
+                if !saw_version {
+                    return Err("rule deck requires an initial 'version 1'".into());
+                }
+                if tokens.len() != 2 || saw_antenna_ratio {
+                    return Err(format!(
+                        "rule deck line {line_no} must contain one positive antenna_ratio"
+                    ));
+                }
+                document.antenna_ratio = Some(rule_deck_positive_f64(&tokens, 1, line_no)?);
+                saw_antenna_ratio = true;
             }
             Some("layer") => {
                 if !saw_version {
@@ -1332,6 +1362,18 @@ impl LayoutDocument {
 
     pub fn via_rule(&self, via: &str) -> Option<&LayoutViaRule> {
         self.via_rules.get(via)
+    }
+
+    pub fn antenna_ratio(&self) -> Option<f64> {
+        self.antenna_ratio
+    }
+
+    pub fn set_antenna_ratio(&mut self, ratio: f64) -> Result<(), String> {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return Err("layout antenna ratio must be finite and positive".into());
+        }
+        self.antenna_ratio = Some(ratio);
+        Ok(())
     }
 
     pub fn add_shape(&mut self, shape: LayoutShape) -> Result<(), String> {
@@ -2967,9 +3009,14 @@ fn positive_area_overlap(left: &LayoutGeometry, right: &LayoutGeometry) -> Resul
         return manhattan_boolean(left, right, ManhattanBooleanOp::Intersection)
             .map(|result| result.area > 0);
     }
+    let left_polygon = left.try_into_any_angle()?;
+    let right_polygon = right.try_into_any_angle()?;
+    if !left_polygon.positive_area_intersects(&right_polygon) {
+        return Ok(false);
+    }
     any_angle_boolean(
-        &left.try_into_any_angle()?,
-        &right.try_into_any_angle()?,
+        &left_polygon,
+        &right_polygon,
         AnyAngleBooleanOperation::Intersection,
     )
     .map(|result| result.total_area > 0.0)
@@ -3403,6 +3450,7 @@ mod tests {
     #[test]
     fn layout_rule_deck_round_trips_all_typed_rules() {
         let mut document = LayoutDocument::new();
+        document.set_antenna_ratio(20.0).unwrap();
         document
             .set_layer_rule(
                 LayoutLayerRule::new("M1", 10, 20, 100)
@@ -3433,6 +3481,7 @@ mod tests {
         assert_eq!(restored.layer_rule("M1"), document.layer_rule("M1"));
         assert_eq!(restored.layer_rule("M2"), document.layer_rule("M2"));
         assert_eq!(restored.via_rule("VIA1"), document.via_rule("VIA1"));
+        assert_eq!(restored.antenna_ratio(), Some(20.0));
         assert_eq!(write_layout_rule_deck(&restored).unwrap(), written);
 
         assert!(read_layout_rule_deck("").is_err());
@@ -3440,6 +3489,8 @@ mod tests {
         assert!(read_layout_rule_deck("version 1\nlayer M1\n").is_err());
         assert!(read_layout_rule_deck("version 1\nspacing M1 M2 10\n").is_err());
         assert!(read_layout_rule_deck("version 1\nvia V1 V1 M1 M2\n").is_err());
+        assert!(read_layout_rule_deck("version 1\nantenna_ratio 0\n").is_err());
+        assert!(read_layout_rule_deck("version 1\nantenna_ratio 1\nantenna_ratio 2\n").is_err());
     }
 
     #[test]

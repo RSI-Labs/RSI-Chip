@@ -533,6 +533,11 @@ pub fn pdk_liberty_sha256(source: &str) -> String {
     sha256_hex(source.as_bytes())
 }
 
+/// Return the lowercase SHA-256 digest of arbitrary binary API payloads.
+pub fn pdk_liberty_sha256_bytes(message: &[u8]) -> String {
+    sha256_hex(message)
+}
+
 fn sha256_hex(message: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -682,6 +687,7 @@ pub struct PdkSignoffResult {
     pub drc_warnings: usize,
     pub layout_rule_deck_sha256: Option<String>,
     pub layout_rule_deck_validated: bool,
+    pub layout_rule_deck_antenna_ratio: Option<f64>,
     pub model_correlations: Vec<PdkModelCorrelationResult>,
     pub checks: Vec<PdkSignoffCheckResult>,
     pub passed: bool,
@@ -792,6 +798,19 @@ pub fn run_pdk_signoff_cancellable(
         return Err("PDK signoff cancelled".into());
     }
     let correlations = correlate_pdk_models(pdk)?;
+    let rule_deck_document = pdk
+        .layout_rule_deck_source
+        .as_ref()
+        .map(|source| crate::read_layout_rule_deck(source))
+        .transpose()?;
+    let antenna_options = rule_deck_document
+        .as_ref()
+        .and_then(|document| {
+            document
+                .antenna_ratio()
+                .map(eda_pnr::DrcOptions::new_with_antenna_ratio)
+        })
+        .transpose()?;
 
     let mut corner_results = Vec::new();
     let mut corner_flows = Vec::new();
@@ -811,7 +830,7 @@ pub fn run_pdk_signoff_cancellable(
         let include_lec = pdk
             .required_checks
             .contains(&PdkSignoffCheckKind::Equivalence);
-        let flow = run_flow_staged_cancellable(
+        let mut flow = run_flow_staged_cancellable(
             rtl,
             top,
             &library,
@@ -819,6 +838,10 @@ pub fn run_pdk_signoff_cancellable(
             include_lec,
             cancellation,
         )?;
+        if let Some(options) = antenna_options {
+            flow.drc =
+                eda_pnr::drc_with_options(&flow.netlist, &flow.placement, &flow.routing, &options)?;
+        }
         let drc_errors = flow
             .drc
             .violations
@@ -850,7 +873,7 @@ pub fn run_pdk_signoff_cancellable(
         });
         corner_flows.push(flow);
     }
-    let flow = if pdk.corners.is_empty() {
+    let mut flow = if pdk.corners.is_empty() {
         run_flow_staged_cancellable(
             rtl,
             top,
@@ -873,6 +896,12 @@ pub fn run_pdk_signoff_cancellable(
             .unwrap_or(0);
         corner_flows.remove(worst)
     };
+    if pdk.corners.is_empty() {
+        if let Some(options) = antenna_options {
+            flow.drc =
+                eda_pnr::drc_with_options(&flow.netlist, &flow.placement, &flow.routing, &options)?;
+        }
+    }
     if cancellation.is_cancelled() {
         return Err("PDK signoff cancelled".into());
     }
@@ -996,6 +1025,9 @@ pub fn run_pdk_signoff_cancellable(
         drc_warnings: total_drc_warnings,
         layout_rule_deck_sha256: pdk.layout_rule_deck_sha256.clone(),
         layout_rule_deck_validated: pdk.layout_rule_deck_source.is_some(),
+        layout_rule_deck_antenna_ratio: antenna_options
+            .as_ref()
+            .map(|options| options.max_antenna_ratio),
         model_correlations: correlations,
         corner_results,
         checks,
@@ -1015,6 +1047,9 @@ pub fn report_pdk_signoff(result: &PdkSignoffResult) -> String {
             .as_deref()
             .unwrap_or("not-supplied")
     ));
+    if let Some(ratio) = result.layout_rule_deck_antenna_ratio {
+        out.push_str(&format!("Layout antenna rule: max ratio {ratio:.6}\n"));
+    }
     for correlation in &result.model_correlations {
         out.push_str(&format!(
             "Model correlation {}.{}: nominal={:.9} golden={:.9} error={:.6}% tolerance={:.6}% {}\n",
@@ -1091,6 +1126,7 @@ mod tests {
     #[test]
     fn pdk_layout_rule_deck_is_checksummed_and_validated() {
         let rule_deck = r#"version 1
+antenna_ratio 0.001
 layer M1 min_width 10 min_spacing 20 min_area 100 min_notch 25
 layer M2 min_width 10 min_spacing 20 min_area 100
 spacing M1 M2 30
@@ -1116,11 +1152,15 @@ via VIA1 cut_layer V1 bottom_layer M1 top_layer M2 cut_width 20 cut_height 20 bo
         let rtl = "module top(input a, output y); assign y = ~a; endmodule";
         let signoff = run_pdk_signoff(rtl, Some("top"), &definition).unwrap();
         assert!(signoff.layout_rule_deck_validated);
+        assert_eq!(signoff.layout_rule_deck_antenna_ratio, Some(0.001));
+        assert!(signoff.drc_warnings > 0);
+        assert_eq!(signoff.drc_errors, 0);
         assert_eq!(
             signoff.layout_rule_deck_sha256.as_deref(),
             Some(checksum.as_str())
         );
         assert!(report_pdk_signoff(&signoff).contains(&format!("Layout rule deck: {checksum}")));
+        assert!(report_pdk_signoff(&signoff).contains("Layout antenna rule: max ratio 0.001000"));
 
         let bad_checksum = "0".repeat(64);
         let bad = source.replace(&checksum, &bad_checksum);
@@ -1278,6 +1318,10 @@ signoff physical-database
         assert_eq!(
             pdk_liberty_sha256("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            pdk_liberty_sha256_bytes(&[0, 1, 2, 255]),
+            "3d1f57c984978ef98a18378c8166c1cb8ede02c03eeb6aee7e2f121dfeee3e56"
         );
     }
 }

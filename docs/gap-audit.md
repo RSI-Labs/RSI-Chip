@@ -73,9 +73,11 @@ has now been advanced from “missing” to “partial”:
 * W/L/M instance scaling;
 * forward/reverse Ebers-Moll NPN/PNP terminal currents;
 * `VAF/VAR` forward/reverse Early output-resistance modulation;
+* lumped BJT `RTH/CTH` self-heating with transient device temperature;
 * AREA instance scaling;
 * nonlinear Jacobian stamping and Newton solution;
 * logarithmic source-step continuation for BJT convergence;
+* lumped MOS `RTH/CTH` self-heating with transient device temperature;
 * SPICE model and instance parsing/writer round trips.
 
 ### Follow-up: small-signal noise
@@ -98,10 +100,25 @@ included.
 
 Temperature is no longer fixed: `.temp` now controls resistor thermal noise,
 junction thermal voltage, diode/BJT saturation-current scaling, MOS mobility
-scaling, and resistor `TC1/TC2` coefficients. Geometry-derived `SHEET`,
-`.rmodel LAYER`, imported generic layer tables, and width-bin interpolation are
-supported. Certified tool-specific foundry files, self-heating, and spatial
-thermal networks remain future work.
+scaling, and resistor `TC1/TC2` coefficients. MOS cards with `RTH` solve a
+lumped power/temperature/current fixed-point iteration, so DC current falls as
+local mobility and BSIM threshold temperature scaling respond to dissipation.
+BJT cards use the same thermal-resistance convention with their
+temperature-scaled saturation current, thermal voltage, and Early factors.
+The local electrothermal solution also feeds MOS intrinsic charge and BJT
+transit charge, so AC/transient companion stamps use the same temperature as
+the nonlinear DC operating point rather than the ambient circuit temperature.
+When `CTH` is present, transient samples carry a typed per-element temperature
+map and integrate the lumped thermal pole with an explicit-power,
+implicit-temperature companion. `CTH=0` retains the quasi-static `RTH`
+fixed-point solution. `TransientResult` exposes sorted device names and
+temperature vectors, reports include `T(element)=...K`, CSV export can mix
+`V(node)` and `T(element)` columns, and the daemon `spiceRun` response returns
+structured transient samples with `deviceTemperatures` in addition to the text
+report.
+Geometry-derived `SHEET`, `.rmodel LAYER`, imported generic layer tables, and
+width-bin interpolation are supported. Certified tool-specific foundry files,
+coupled thermal-node networks, and spatial thermal networks remain future work.
 
 ### Follow-up: deterministic power-law aging
 
@@ -262,10 +279,12 @@ low/high-temperature, and binned geometry.
 dynamic engine now also stamps bias-dependent source/drain junction sidewall
 capacitances from the same cards, scales them by W/M, and round-trips the
 typed fields through the SPICE writer. The
-remaining gap is the full advanced foundry model surface: complete DVT
-equations, vendor parameter interpolation/binning semantics,
-PSP/HiSIM/VBIC/HICUM equations, nonlinear foundry charge, self-heating, and
-advanced noise.
+`RTH/CTH` cards add lumped DC and transient self-heating to the same
+temperature-dependent threshold, mobility, charge, and BJT transit equations.
+The remaining gap is the full advanced foundry model surface: complete DVT
+equations, vendor parameter
+interpolation/binning semantics, PSP/HiSIM/VBIC/HICUM equations, nonlinear
+foundry charge, coupled spatial thermal networks, and advanced noise.
 
 ### Follow-up: foundational transistor charge storage
 
@@ -391,7 +410,8 @@ traces, custom-port scan-chain audits, PDK correlation results, and
 clock-domain CTS summaries, structural ECO change logs, sampled VCD assertion statuses, clock-domain crossings/findings, stuck-at fault detections/STIL patterns, PDK
 correlation results, and Verilog/LEF/DEF/SDF artifacts. Remote agents can
 also use
-`jobSubmit`, `jobStatus`, `jobCancel`, and bounded `jobWait`; all TCP
+`jobSubmit`, `jobStatus`, `jobCancel`, bounded `jobWait`, and the remote
+worker/artifact RPCs; all TCP
 connections share the same persistent typed job manager with deterministic
 worker execution, status polling, failure capture, cancellation before start,
 cooperative cancellation at RTL/PDK major-stage boundaries, inside CDCL SAT
@@ -411,7 +431,8 @@ The API now parses and writes typed PDK manifests containing routing-layer
 geometry, process/voltage/temperature corners, optional per-corner delay
 scales, inline per-corner Liberty views with optional SHA-256 integrity checks,
 an optional inline layer/via rule deck with SHA-256 integrity and full typed
-rule validation, nominal-versus-golden model
+rule validation, an optional foundry antenna-ratio rule that replaces the
+default physical-verification threshold, nominal-versus-golden model
 correlations with relative-error tolerances, and the required signoff checks.
 `run_pdk_signoff` imports an inline Liberty view when present (or creates a
 scaled built-in library otherwise), reruns the RTL implementation flow for
@@ -542,11 +563,14 @@ a spacing violation. The daemon parses a `spacingTo` object in each remote layer
 rule.
 
 Same-layer different-net shapes are additionally checked for positive-area
-overlap using exact Manhattan or arbitrary-angle Boolean intersection. A real
-overlap reports `LAYOUT.SHORT` even when a legacy deck sets `minSpacing` to
-zero; boundary-only touching remains governed by the explicit spacing rule and
-is legal at zero spacing. Same-net overlap remains legal and is unioned for
-density accounting.
+overlap using exact Manhattan or arbitrary-angle Boolean intersection. The
+arbitrary-angle path first applies an exact positive-area predicate: identical,
+contained, or properly crossing interiors are Boolean-intersected, while
+boundary-only contact skips the degenerate line result. A real overlap reports
+`LAYOUT.SHORT` even when a legacy deck sets `minSpacing` to zero;
+boundary-only touching remains governed by the explicit spacing rule and is
+legal at zero spacing. Same-net overlap remains legal and is unioned for density
+accounting.
 
 The typed layer/via rule deck now has deterministic text import/export. The
 format carries version, all layer width/area/spacing/notch/density fields,
@@ -1178,6 +1202,14 @@ constrained timing recomputation.
 The regression suite adds 100 generated-clock divide-by cases and 100 clock-group
 relationship cases rotating across all three group kinds.
 
+Timing exceptions now honor `-setup` and `-hold` scoping. A false path or
+multicycle path without a check flag remains applied to both classes. With
+`-setup`, it suppresses/modifies late setup and recovery checks without
+relaxing early hold/removal analysis; with `-hold`, the reverse is true. The
+typed `PathExceptionCheck` is public through the STA and facade APIs, reports
+label the selected class, and excluded-path audit entries only contain the
+checks actually waived.
+
 The parser now also accepts `set_units` with time and capacitance dimensions.
 Subsequent clock periods/edges, uncertainty, latency, transition, IO delay,
 max/min delay, transition limit, input transition, capacitance limit, and load
@@ -1239,6 +1271,79 @@ and async jobs. New `rtlFlowCache`, `flowCacheStats`, and `flowCacheClear`
 methods return the complete structured RTL flow plus `cacheHit`/`cacheId`;
 `jobSubmit` executes cached flows through the service-owned dispatcher rather
 than a stateless global path.
+
+The async job manager now uses a bounded local worker pool (four workers by
+default, configurable at service construction) instead of one execution thread.
+Workers share the flow cache and persistent timing/layout waiver registries,
+preserve queued/running cancellation semantics, and shutdown deterministically.
+New `jobWorkerStats` returns worker count, queued/running/completed/failed/
+cancelled counts, and active job IDs.
+
+Cross-host execution is also RPC-addressable. `jobSubmitRemote` reserves a job
+for an external worker rather than enqueueing it locally. It accepts a positive
+`maxAttempts` budget, defaults to three, and returns the limit with the job ID.
+It also accepts a non-negative `priority`; larger values are claimed first,
+the default is zero, the value survives lease reassignment, and `workerClaim`
+echoes it. Remote agents
+register with `workerRegister`, refresh `workerHeartbeat`, list peers with
+`workerList`, pull work with `workerClaim`, observe cooperative cancellation
+through `workerClaimStatus`, and return typed success/failure with
+`workerComplete`. Claims are owner-checked, respect remote capacity, integrate
+with `jobStatus`/`jobWait`/`jobCancel`, and appear in `jobWorkerStats` as
+remote active jobs.
+
+Workers may register string metadata labels such as pool, architecture, tool
+version, or license class. A remote submission can require an exact subset of
+those labels with `requiredWorkerLabels`; claims are then routed only to
+matching workers, the constraint survives lease reassignment, and the claim
+response echoes it. `workerList` exposes each peer's labels so agents can
+inspect the discovered fleet. Network-level peer discovery and object storage
+remain external at this stage.
+
+Each remote claim owns a timestamped lease with a positive per-worker timeout
+(60 seconds by default). Registration, heartbeat, and claim renew the lease;
+`workerExpireLeases` explicitly requeues expired requests, while every
+`workerClaim` first performs the same check so another healthy worker can take
+over stale work. Reassignment removes the old running token and ownership
+before restoring the queued request, counts the transition in
+`jobWorkerStats.remoteReassignments`, and rejects late completion from the
+previous owner. The same expiration pass prunes idle workers whose
+registration heartbeat has exceeded their lease timeout; active workers with a
+live claim are retained, removed IDs are returned by `workerExpireLeases`, and
+`jobWorkerStats.remoteWorkerExpirations` counts fleet cleanup. The daemon does
+not bundle network object storage or an automatic worker fleet; those remain
+future work. When an expired lease has
+already consumed the attempt budget, the job transitions directly to a typed
+failed state instead of being requeued; `jobWorkerStats.remoteRetryExhausted`
+counts that terminal condition and the claim response exposes
+`attempt`/`maxAttempts`.
+
+Remote completion now accepts string and binary result artifacts alongside
+success or failure. Each artifact requires a unique non-empty name. UTF-8 is
+the default encoding; canonical padded base64 can carry GDS/OASIS, FSDB, or
+other binary tool output. Every artifact records its content type, encoding,
+decoded byte size, and SHA-256 checksum of the decoded bytes. `jobArtifactList`
+exposes metadata only and supports bounded `offset`/`limit` pagination,
+`jobArtifactGet` returns transfer content and its checksum, and
+`jobArtifactDelete` removes one artifact. A completion accepts at most 64
+artifacts and 8 MiB of decoded payload, fail-closed before the claim is
+released. Artifacts are persisted only after the owner-checked claim is
+finalized: failed jobs may retain diagnostics, cancelled jobs retain none, and
+a stale owner cannot write them. The whole service registry is additionally
+bounded to 512 artifacts and 64 MiB; when a new completion exceeds that budget,
+the least-recently-fetched artifact from another job is evicted first.
+`jobWorkerStats` reports current count/bytes, both capacities, and cumulative
+evictions.
+
+The daemon can also use a local persistent artifact store. `eda daemon
+--artifact-store <dir>` (or the typed service constructor) creates the
+directory, atomically publishes one checksum-validating JSON record per
+terminal remote job, rewrites the record after artifact deletion, and reloads
+terminal job state plus artifacts on restart. A separate atomically published
+job-ID watermark prevents a new daemon instance from reusing an ID allocated
+before a crash even when that job never reached a terminal record. Loaded
+artifacts are still subject to the in-memory global LRU budget. This is a
+single-daemon local object store, not yet concurrent network object storage.
 
 ### Follow-up: safe sequential ECO replacement
 
@@ -1565,14 +1670,14 @@ async jobs share cancellation.
 
 | Priority | Gap | Why it matters |
 |---|---|---|
-| P0 | Advanced foundry MOSFET/BJT compact and charge models | A BSIM3 I-V core with simplified short-channel/DIBL/narrow-width/temperature behavior, MOS intrinsic/overlap charge, and voltage-dependent source/drain junction sidewall capacitance now exists, but full BSIM3/4 DVT/binning, charge, NQS, self-heating/noise and PSP/HiSIM/VBIC/HICUM-class signoff models do not |
+| P0 | Advanced foundry MOSFET/BJT compact and charge models | A BSIM3 I-V core with simplified short-channel/DIBL/narrow-width/temperature behavior, lumped MOS/BJT RTH/CTH self-heating including transient device temperature, MOS intrinsic/overlap charge, and voltage-dependent source/drain junction sidewall capacitance now exists, but full BSIM3/4 DVT/binning, charge, NQS, coupled spatial thermal networks, foundry noise, and PSP/HiSIM/VBIC/HICUM-class signoff models do not |
 | P0 | Certified foundry PDK calibration | Typed PDK signoff exists, but external vendor certification and golden compact-model correlation remain required |
 | P1 | Temperature/foundry noise correlation, arbitrary covariance/vendor distributions, autonomous startup/HB | Commercial analog analysis breadth |
 | P1 | Full SystemVerilog/UVM and SDC semantics | Parameterized generate-if/for/case, parameter packages/imports/scoped constants, local/package enum, packed struct, and packed union typedefs, simple local/package functions with non-recursive nested inlining, recursion rejection, scalar, packed struct/union, fixed multidimensional unpacked-array locals, fixed multidimensional unpacked module nets and ports, constant-base/runtime-module-read/runtime-function-read/runtime-blocking-write/runtime-NBA-write-and-synthesis/reversed-packed-module-function-continuous-read-write/scalar-runtime-packed-base-continuous-write/runtime-array-element-constant-packed-base-continuous-write/procedural-runtime-module-array-element-read-write-and-synthesis/runtime-function-array-element-read-write indexed part-selects, if/else assignment merging, exact/wildcard-case assignment merging, bounded canonical for-loop unrolling, constant-repeat unrolling, constant-condition bounded while-loop unrolling, shared-interface signal connectivity with explicit modport direction checks, fixed multidimensional interface/module arrays, and static virtual ports, immediate assertions and clocked assert/assume/cover properties with fixed/bounded-range delays, fixed/range bounded consecutive, goto, and nonconsecutive repetition, bounded fixed-delay two-sequence and/or composition, and disable-iff aborts, signed arithmetic/casts/literals, common variable types/default widths, casez/casex, generated clocks, clock groups, and `set_units` time/capacitance normalization are implemented, but dynamic non-interface aggregates, dynamic/multidimensional virtual interfaces, unbounded temporal repetition, full arbitrary-length sequence composition, classes/UVM, and broader commercial SDC semantics remain |
 | P1 | Advanced polygon/via layout operations and rule-deck breadth | A typed Manhattan polygon/via database with editing, exact Boolean operations, spacing, width/area, cut, enclosure DRC, and fix suggestions exists, and arbitrary-angle polygons are integrated into document storage, hit testing, SVG, movement, exact area checks, same-layer spacing DRC, dedicated API/browser creation, unconstrained vertex editing, exact two-polygon union/intersection/difference, direct two-pin routing, bounded visibility-graph maze routing, and negotiated arbitrary-angle rip-up/congestion refinement; the candidate graph remains bounded and complete foundry rule decks remain |
 | P2 | Native/production-grade GUI shell | Browser hosts drive schematic and layout sessions, including zoom/pan, property grids, rectangle/polygon/via editing, polygon vertices, and DRC; a native shell and broader production workflow integration remain |
 | P2 | Full daemon/RPC method surface | Foundational JSON/TCP RPC and job manager exist with cooperative RTL/PDK/SAT/BMC/equivalence/k-induction/router/AMS-loop cancellation including optimizers, but every toolchain API is not yet remotely callable and cancellation is not yet supported inside every nested solver |
-| P2 | Distributed/cloud simulation backend | Daemon-shared bounded LRU regression caching is implemented; distributed workers, network storage, and scheduling are not bundled |
+| P2 | Distributed/cloud simulation backend | Daemon-shared bounded LRU regression caching, a local multi-worker pool, owner-checked priority/label-routed RPC remote-worker registration/claim/heartbeat/completion, timestamped lease timeout/reassignment, bounded remote retry budgets, and an optional restart-safe local artifact store are implemented; concurrent network object storage and an automatic worker fleet are not bundled |
 
 ## Verification gates closed in this iteration
 
