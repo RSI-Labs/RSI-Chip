@@ -82,12 +82,13 @@ has now been advanced from “missing” to “partial”:
 
 The AMS analysis implementation is split by analysis responsibility:
 `analysis.rs` owns the public DC/transient/AC/PSS/envelope/aging/noise facade,
-`devices.rs` compact-device temperature/electrothermal helpers, `solver.rs`
-nonlinear MNA and device stamps, `statistical.rs` Monte Carlo sampling,
-`derivatives.rs` local/global sensitivity and derivative mathematics,
-`optimization.rs` scalar/Pareto optimization, and `random.rs` deterministic
-correlated sampling/circuit mutation. The public `eda_ams::analysis` API is
-unchanged.
+`analysis/devices.rs` compact-device temperature/electrothermal helpers,
+`analysis/solver.rs` nonlinear MNA and device stamps,
+`analysis/statistical.rs` Monte Carlo sampling, `analysis/optimization.rs`
+scalar/Pareto optimization, and `analysis/random.rs` deterministic correlated
+sampling/circuit mutation. The derivative domain is further divided into local
+DC, transient, AC/Jet, shared parameter discovery, and global variance modules
+under `analysis/derivatives/`. The public `eda_ams::analysis` API is unchanged.
 
 ### Follow-up: small-signal noise
 
@@ -677,6 +678,73 @@ panning, keyboard view controls, Ctrl-wheel zoom, a view reset, and a typed
 selection property grid. `/properties` and every event response expose the same
 selection metadata used by the HTML grid, so automation can query the editor
 state without parsing SVG.
+
+The HDL elaborator is now organized by responsibility rather than as one
+monolithic implementation. `elab.rs` owns the public compile/elaborate entry,
+top selection, generate flattening, package constant resolution, and `Env`;
+`elab/types.rs` state/net/package/type models; `elab/substitution.rs`
+parameter substitution; `elab/classes.rs` built-in UVM class collection;
+`elab/arrays.rs` net/array/indexed-select helpers; `elab/modules.rs`
+module/gate/interface/instance elaboration; `elab/statements.rs` procedural
+statements and lvalues; `elab/expressions.rs` expression lowering;
+`elab/functions.rs` function inlining and aggregate-state evaluation;
+`elab/strings.rs` string methods; and `elab/class_elab.rs` the runtime class
+object model. Elaborator tests live in `elab/tests.rs`; the public HDL API is
+unchanged. The data-driven HDL integration cases are likewise split by domain
+under `eda-tests/src/hdl_cases/` into lexer/parser/indexed-array structure,
+packages/functions/aggregates, interfaces/properties, and class/UVM suites,
+with `hdl_cases.rs` retaining only the stable registration facade.
+
+The `eda-api` facade follows the same structure. `lib.rs` keeps the facade
+imports, common compile/design helpers, `Flow`, and physical-timing option
+types; `rtl.rs` owns RTL analysis/implementation/simulation APIs; `routing.rs`
+placement/routing/interconnect APIs; `timing_flow.rs` physical-timing
+iteration; `timing.rs` constraints/MMMC/waivers; `physical.rs`
+SDF/SPEF/antenna/power/post-route IR; `integration.rs` waveform, DFT, ECO,
+hold repair, CTS, and UPF helpers; `formal.rs` equivalence/BMC/safety wrappers;
+and `cancellation_tests.rs` the cross-flow cancellation suite. Public API paths
+remain unchanged through module re-exports.
+
+The STA constraint implementation is split into typed constraint/state
+definitions in `constraints.rs`, SDC tokenization and command parsing in
+`constraints/parser.rs`, constrained slack analysis in
+`constraints/analysis.rs`, and path reconstruction/reporting/object matching in
+`constraints/paths.rs`, with focused tests under `constraints/tests.rs`.
+The timing-violation lifecycle is likewise split into typed violation/store
+models, stable-name dirty-object derivation, path extraction, scenario stores,
+cross-corner registries, waiver serialization, and reports under
+`violations/`. Likewise `eda_pnr::layout` now separates shared geometry primitives in
+`layout/geometry.rs`, document/rule-deck/DRC/SVG behavior in
+`layout/document.rs`, editor/session behavior in `layout/editor.rs`, and tests
+in `layout/tests.rs`; public paths remain stable through re-exports.
+The same cleanup now reaches the IR, AMS, simulator, STA core, and PnR core
+facades. `eda-ir` separates types, single-layer mesh solving, multilayer
+mesh/EM, UPF analysis, validation, and reports under `src/ir/`. `eda-ams`
+separates typed circuit/device/analysis/result models under `src/types/`,
+SPICE directive, element, model, utility, and writer parsing under
+`src/parser/`, and its unit tests into core/device/statistical/dynamic/
+derivative/optimization/advanced domains. `eda-sim` keeps the runtime engine in
+`lib.rs` while tests are grouped into core, property, aggregate/interface, and
+function/local-state domains. The STA core separates public timing types,
+arrival propagation, library/device delay helpers, incremental updates,
+analysis APIs, and path reports under `src/timing/`; the PnR core separates its
+shared model, placement, global/maze routing, and routing/DRC checks under
+`src/pnr/`. The large STA/API/AMS/HDL integration case files use stable
+registration facades over domain-specific child modules, preserving every named
+regression case and public Rust API path. The CLI similarly moves formal-proof,
+timing/MMMC reporting, and physical/parasitic export helpers into focused
+modules under `src/cli/` while retaining argument parsing/output handling in
+`main.rs`; the command match itself is isolated in `cli/dispatch.rs` with a
+typed read-only `RunContext`. The formal temporal-property implementation is
+separated into typed result models, SAT encoding/unrolling, bounded-model
+checking, report formatting, VCD replay/verification, and temporal semantics
+under `eda-formal/src/property/`. HDL module elaboration is split into module
+body, instance/gate/interface, and dynamic-array method domains. Interface,
+SDC/MMMC, and class/UVM integration-case suites have additional domain-specific
+child modules, while the CLI end-to-end tests are split into AMS, STA/PDK,
+core/daemon, and physical-flow groups.
+These splits improve maintainability but do not expand process coverage or
+foundry certification beyond the behavior already described in this audit.
 
 ### Follow-up: parameterized generate elaboration
 
