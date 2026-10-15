@@ -80,6 +80,15 @@ has now been advanced from “missing” to “partial”:
 * lumped MOS `RTH/CTH` self-heating with transient device temperature;
 * SPICE model and instance parsing/writer round trips.
 
+The AMS analysis implementation is split by analysis responsibility:
+`analysis.rs` owns the public DC/transient/AC/PSS/envelope/aging/noise facade,
+`devices.rs` compact-device temperature/electrothermal helpers, `solver.rs`
+nonlinear MNA and device stamps, `statistical.rs` Monte Carlo sampling,
+`derivatives.rs` local/global sensitivity and derivative mathematics,
+`optimization.rs` scalar/Pareto optimization, and `random.rs` deterministic
+correlated sampling/circuit mutation. The public `eda_ams::analysis` API is
+unchanged.
+
 ### Follow-up: small-signal noise
 
 The AMS engine now supports `.noise`:
@@ -1271,6 +1280,14 @@ and async jobs. New `rtlFlowCache`, `flowCacheStats`, and `flowCacheClear`
 methods return the complete structured RTL flow plus `cacheHit`/`cacheId`;
 `jobSubmit` executes cached flows through the service-owned dispatcher rather
 than a stateless global path.
+
+The daemon source is organized by responsibility rather than as one monolithic
+implementation: `protocol.rs` owns JSON/request wire types, `service.rs` the
+shared service facade, `jobs.rs` local/remote scheduling and artifacts,
+`server.rs` line/TCP lifecycle, and domain handlers live in `analysis.rs`,
+`implementation.rs`, `layout.rs`, `physical.rs`, `physical_timing.rs`,
+`timing.rs`, and `verification.rs`. Integration tests mirror those domains
+under `src/tests/`, keeping the public crate API unchanged.
 
 The async job manager now uses a bounded local worker pool (four workers by
 default, configurable at service construction) instead of one execution thread.
