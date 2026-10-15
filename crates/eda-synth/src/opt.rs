@@ -344,11 +344,17 @@ fn dedup(nl: &Netlist) -> (bool, Netlist) {
     (true, out)
 }
 
-/// Remove cells not reachable from output ports (sequential cells keep their
-/// clock/reset nets but are themselves only kept when reachable).
+/// Remove cells not reachable from output ports while preserving sequential
+/// state for name-based equivalence checking and auditable physical netlists.
 fn remove_dead(nl: &Netlist, warnings: &mut Vec<String>) -> (bool, Netlist, usize) {
     let mut keep_cell = vec![false; nl.cell_count()];
     let mut stack: Vec<NetId> = Vec::new();
+    for (ci, keep) in keep_cell.iter_mut().enumerate() {
+        if nl.cell_is_sequential(&nl.cell(ci).kind) {
+            *keep = true;
+            stack.extend(nl.cell(ci).inputs.iter().copied());
+        }
+    }
     for p in &nl.ports {
         if p.dir == Dir::Out {
             for &b in &p.bits {

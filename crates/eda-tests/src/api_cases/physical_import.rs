@@ -2,6 +2,27 @@
 
 use super::*;
 
+fn force_layer_change_placement(
+    nl: &eda_core::netlist::Netlist,
+    placement: &eda_pnr::Placement,
+) -> Result<eda_pnr::Placement, String> {
+    let mut forced = placement.clone();
+    forced.cell_pos[0] = eda_pnr::Pos { row: 0, site: 0 };
+    let (mut row, mut site) = (1usize, 0usize);
+    for ci in 1..nl.cell_count() {
+        let width = forced.cell_width[ci].max(1);
+        if site + width > eda_pnr::SITES_PER_ROW {
+            row += 1;
+            site = 0;
+        }
+        forced.cell_pos[ci] = eda_pnr::Pos { row, site };
+        site += width;
+    }
+    forced.rows = row + 1;
+    eda_pnr::check_legal(nl, &forced)?;
+    Ok(forced)
+}
+
 pub(super) fn register(c: &mut CaseList) {
     c.add("api_timing_driven_placement_from_sta", || {
         let src = "module m(input a, b, c, output y); assign y = (a & b) | c; endmodule";
@@ -43,15 +64,16 @@ pub(super) fn register(c: &mut CaseList) {
                 if (rst) q <= 4'd0; else q <= q + 4'd1;
          endmodule";
         let flow = eda_api::run_flow(src, None)?;
-        let (_, def_text) =
-            eda_api::export_physical(&flow.netlist, &flow.placement, &flow.routing)?;
+        let placement = force_layer_change_placement(&flow.netlist, &flow.placement)?;
+        let routing = eda_pnr::route(&flow.netlist, &placement)?;
+        let (_, def_text) = eda_api::export_physical(&flow.netlist, &placement, &routing)?;
         let def = eda_api::parse_physical_def(&def_text)?;
         let via_count = def.nets.iter().map(|net| net.vias.len()).sum::<usize>();
-        if via_count != flow.routing.via_locations.len() || via_count == 0 {
+        if via_count != routing.via_locations.len() || via_count == 0 {
             Err(format!(
                 "DEF vias={} explicit={}",
                 via_count,
-                flow.routing.via_locations.len()
+                routing.via_locations.len()
             ))
         } else {
             Ok(())

@@ -30,10 +30,12 @@ pub fn place_with_blockages(
         .ok_or_else(|| "cannot place: combinational loop".to_string())?;
     let widths: Vec<usize> = (0..nl.cell_count()).map(|ci| width_of(nl, ci)).collect();
     let mut occupied: Vec<Vec<bool>> = Vec::new();
+    let mut first_free_site = Vec::new();
     for blockage in blockages {
         blockage.validate()?;
         if occupied.len() <= blockage.row {
             occupied.resize(blockage.row + 1, vec![false; SITES_PER_ROW]);
+            first_free_site.resize(blockage.row + 1, 0);
         }
         for (site, occupied_site) in occupied[blockage.row]
             .iter_mut()
@@ -49,10 +51,14 @@ pub fn place_with_blockages(
             }
             *occupied_site = true;
         }
+        first_free_site[blockage.row] = (0..SITES_PER_ROW)
+            .find(|&site| !occupied[blockage.row][site])
+            .unwrap_or(SITES_PER_ROW);
     }
 
     let mut cell_pos = vec![Pos { row: 0, site: 0 }; nl.cell_count()];
     let mut rows = occupied.len().max(1);
+    first_free_site.resize(occupied.len(), 0);
     for ci in order {
         let w = widths[ci].max(1);
         if w > SITES_PER_ROW {
@@ -67,9 +73,10 @@ pub fn place_with_blockages(
         'rows: for row in 0..=occupied.len() {
             if row == occupied.len() {
                 occupied.push(vec![false; SITES_PER_ROW]);
+                first_free_site.push(0);
                 rows = rows.max(row + 1);
             }
-            for site in 0..=(SITES_PER_ROW - w) {
+            for site in first_free_site[row]..=(SITES_PER_ROW - w) {
                 if (site..site + w).all(|slot| !occupied[row][slot]) {
                     allocated = Some((row, site));
                     break 'rows;
@@ -78,6 +85,11 @@ pub fn place_with_blockages(
         }
         let (row, site) = allocated.expect("a fresh row always has capacity");
         occupied[row][site..site + w].fill(true);
+        let mut next = first_free_site[row];
+        while next < SITES_PER_ROW && occupied[row][next] {
+            next += 1;
+        }
+        first_free_site[row] = next;
         cell_pos[ci] = Pos { row, site };
     }
     Ok(Placement {

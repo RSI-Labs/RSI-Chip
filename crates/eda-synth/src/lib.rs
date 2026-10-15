@@ -944,23 +944,78 @@ impl<'a> Synth<'a> {
             Stmt::Case { e, arms, dflt } => {
                 let sel = self.blast(e, e.width())?;
                 let saved_sym = self.sym.clone();
-                let (mut result, mut all_written) = if let Some(d) = dflt {
+                let (default_state, default_written) = if let Some(d) = dflt {
                     self.sym = saved_sym.clone();
                     self.written.clear();
                     self.exec_stmt(d)?;
-                    (self.sym.clone(), self.written.clone())
+                    (Some(self.sym.clone()), Some(self.written.clone()))
                 } else {
-                    // No default arm: unwritten case values hold current state.
-                    (saved_sym.clone(), HashSet::new())
+                    (None, None)
                 };
-                for (label, body) in arms.iter().rev() {
+
+                let mut arm_states = Vec::with_capacity(arms.len());
+                let mut arm_written_sets = Vec::with_capacity(arms.len());
+                for (label, body) in arms {
                     let lv = self.blast(label, e.width())?;
-                    let eq = self.eq_net(&sel, &lv);
                     self.sym = saved_sym.clone();
                     self.written.clear();
                     self.exec_stmt(body)?;
-                    let arm_state = self.sym.clone();
-                    let arm_written = self.written.clone();
+                    let eq = self.eq_net(&sel, &lv);
+                    arm_states.push((eq, self.sym.clone()));
+                    arm_written_sets.push(self.written.clone());
+                }
+
+                let mut all_written: HashSet<usize> = default_written.clone().unwrap_or_default();
+                for written in &arm_written_sets {
+                    all_written.extend(written.iter().copied());
+                }
+                let ordered_all_written = sorted_set(&all_written);
+
+                let exhaustive_without_default =
+                    dflt.is_none() && exact_case_is_exhaustive(e, arms);
+                let mut result = if let Some(state) = default_state {
+                    let mut state = state;
+                    for target in ordered_all_written.iter().copied() {
+                        state
+                            .entry(target)
+                            .or_insert_with(|| self.base_nets(target));
+                    }
+                    state
+                } else if exhaustive_without_default {
+                    let mut state = saved_sym.clone();
+                    // Variables assigned by every arm cannot observably retain
+                    // their old value when the constant labels cover the full
+                    // selector space. Starting from the old value would create
+                    // a false combinational loop through the target itself.
+                    for target in ordered_all_written.iter().copied() {
+                        if arm_written_sets
+                            .iter()
+                            .all(|written| written.contains(&target))
+                        {
+                            let width = self.base_nets(target).len();
+                            state.insert(
+                                target,
+                                (0..width)
+                                    .map(|_| self.const_net(LogicValue::Zero))
+                                    .collect(),
+                            );
+                        }
+                    }
+                    state
+                } else {
+                    // No default arm: unwritten case values hold current state.
+                    let mut state = saved_sym.clone();
+                    for target in ordered_all_written.iter().copied() {
+                        state
+                            .entry(target)
+                            .or_insert_with(|| self.base_nets(target));
+                    }
+                    state
+                };
+
+                for ((eq, arm_state), arm_written) in
+                    arm_states.into_iter().zip(arm_written_sets).rev()
+                {
                     for k in sorted_set(&arm_written) {
                         let cur = result.get(&k).cloned().unwrap_or_else(|| self.base_nets(k));
                         let arm_v = arm_state
@@ -972,7 +1027,6 @@ impl<'a> Synth<'a> {
                             merged.push(self.mux(eq, arm_v[i], cur[i]));
                         }
                         result.insert(k, merged);
-                        all_written.insert(k);
                     }
                 }
                 self.sym = result;
@@ -1133,6 +1187,30 @@ fn strip_block(s: &Stmt) -> &Stmt {
     }
 }
 
+/// Recognize a small, exact, constant-label case selector that covers every
+/// binary value. This is conservative: unknown labels, non-constant labels,
+/// width changes, and selectors wider than 24 bits do not claim full coverage.
+fn exact_case_is_exhaustive(e: &Expr, arms: &[(Expr, Stmt)]) -> bool {
+    let width = e.width();
+    if width == 0 || width > 24 || arms.len() < (1usize << width) {
+        return false;
+    }
+    let mut values = HashSet::with_capacity(arms.len());
+    for (label, _) in arms {
+        if label.width() != width {
+            return false;
+        }
+        let Expr::Const(word) = label else {
+            return false;
+        };
+        if !word.bits.iter().all(|bit| bit.is_01()) {
+            return false;
+        }
+        values.insert(word.bits.clone());
+    }
+    values.len() == (1usize << width)
+}
+
 fn lv_bits(lv: &LValue) -> Vec<usize> {
     match &lv.range {
         Range::Bit(b) => vec![lv.net + b],
@@ -1150,6 +1228,69 @@ mod tests {
     fn synth(src: &str) -> SynthResult {
         let d = compile(src, None).unwrap();
         synthesize(&d, &SynthOptions::default()).unwrap_or_else(|e| panic!("synth failed: {}", e))
+    }
+
+    #[test]
+    fn exhaustive_case_without_default_does_not_create_a_false_loop() {
+        let r = synth(
+            r#"
+                module m(input [2:0] sel, input [1:0] d, output reg [1:0] y);
+                    always @(*) begin
+                        case (sel)
+                            3'd0: y = d;
+                            3'd1: y = ~d;
+                            3'd2: y = d & 2'b10;
+                            3'd3: y = d | 2'b01;
+                            3'd4: y = d ^ 2'b11;
+                            3'd5: y = {d[0], d[1]};
+                            3'd6: y = d + 2'b01;
+                            3'd7: y = 2'b00;
+                        endcase
+                    end
+                endmodule
+            "#,
+        );
+        assert!(
+            r.netlist.topo_cells().is_some(),
+            "an exhaustive exact case must not feed its own output back to itself"
+        );
+    }
+
+    #[test]
+    fn incomplete_case_without_default_still_preserves_the_old_value() {
+        let r = synth(
+            r#"
+                module m(input [1:0] sel, input d, output reg y);
+                    always @(*) begin
+                        case (sel)
+                            2'd0: y = d;
+                            2'd1: y = ~d;
+                        endcase
+                    end
+                endmodule
+            "#,
+        );
+        assert!(
+            r.netlist.topo_cells().is_none(),
+            "an incomplete combinational case intentionally models value retention"
+        );
+    }
+
+    #[test]
+    fn optimization_preserves_named_dead_state_for_sequential_audits() {
+        let r = synth(
+            r#"
+                module m(input clk, d, output reg active);
+                    reg hidden;
+                    always @(posedge clk) begin
+                        hidden <= ~d;
+                        active <= d;
+                    end
+                endmodule
+            "#,
+        );
+        assert!(r.netlist.net_by_name("hidden").is_some());
+        assert_eq!(r.netlist.stats().seq, 2);
     }
 
     #[test]

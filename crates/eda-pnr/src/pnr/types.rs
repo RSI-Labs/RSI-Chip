@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 
 /// Sites per placement row.
-pub const SITES_PER_ROW: usize = 32;
+/// Keep the default grid large enough for the complete RV32I regression
+/// vehicle; explicit PDK layer data can still override routing capacity.
+pub const SITES_PER_ROW: usize = 256;
 /// Global-routing tracks available in each horizontal/vertical channel.
-pub const TRACKS_PER_CHANNEL: usize = 8;
+/// RV32I's default-grid route peaks at 254 occupied vertical tracks, so 256
+/// is the smallest power-of-two default observed to close that release gate.
+pub const TRACKS_PER_CHANNEL: usize = 256;
 /// Conservative antenna threshold in routing-length units per connected pin.
 pub const MAX_ANTENNA_RATIO: f64 = 16.0;
 

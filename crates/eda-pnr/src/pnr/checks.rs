@@ -222,21 +222,22 @@ pub fn drc_with_options(
         }
     }
 
+    let mut segments_by_net = vec![Vec::<Segment>::new(); nl.net_count()];
+    let mut vias_by_net = vec![Vec::<Via>::new(); nl.net_count()];
+    for seg in &r.segments {
+        if seg.net < segments_by_net.len() {
+            segments_by_net[seg.net].push(*seg);
+        }
+    }
+    for via in &r.via_locations {
+        if via.net < vias_by_net.len() {
+            vias_by_net[via.net].push(*via);
+        }
+    }
+
     for ni in 0..nl.net_count() {
         let pins = net_pins(nl, p, ni);
-        let segments: Vec<Segment> = r
-            .segments
-            .iter()
-            .copied()
-            .filter(|seg| seg.net == ni)
-            .collect();
-        let net_vias: Vec<Via> = r
-            .via_locations
-            .iter()
-            .copied()
-            .filter(|via| via.net == ni)
-            .collect();
-        let components = connected_pin_components(&pins, &segments, &net_vias);
+        let components = connected_pin_components(&pins, &segments_by_net[ni], &vias_by_net[ni]);
 
         if pins.len() >= 2 && components > 1 {
             out.violations.push(DrcViolation {
@@ -255,7 +256,11 @@ pub fn drc_with_options(
         }
 
         let pin_count = pins.len().max(1);
-        let ratio = segments.iter().map(Segment::length).sum::<usize>() as f64 / pin_count as f64;
+        let ratio = segments_by_net[ni]
+            .iter()
+            .map(Segment::length)
+            .sum::<usize>() as f64
+            / pin_count as f64;
         if ratio > options.max_antenna_ratio {
             out.violations.push(DrcViolation {
                 code: "ANT-001".into(),
@@ -273,7 +278,7 @@ pub fn drc_with_options(
             });
         }
 
-        if !segments.is_empty() && pins.is_empty() {
+        if !segments_by_net[ni].is_empty() && pins.is_empty() {
             out.violations.push(DrcViolation {
                 code: "DANGLE-001".into(),
                 severity: DrcSeverity::Error,

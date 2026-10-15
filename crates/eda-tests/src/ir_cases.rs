@@ -61,7 +61,10 @@ pub fn register(c: &mut CaseList) {
         let placed = eda_pnr::place(&nl)?;
         let placement = eda_pnr::Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: placed.cell_width.clone(),
             blockages: Vec::new(),
         };
@@ -82,7 +85,10 @@ pub fn register(c: &mut CaseList) {
         let placed = eda_pnr::place(&nl)?;
         let placement = eda_pnr::Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: placed.cell_width.clone(),
             blockages: Vec::new(),
         };
@@ -165,7 +171,10 @@ pub fn register(c: &mut CaseList) {
         let placed = eda_pnr::place(&nl)?;
         let placement = eda_pnr::Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: placed.cell_width.clone(),
             blockages: Vec::new(),
         };
@@ -251,7 +260,7 @@ pub fn register(c: &mut CaseList) {
         let placed = eda_pnr::place(&nl)?;
         let placement = eda_pnr::Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos { row: 1, site: eda_pnr::SITES_PER_ROW / 2 - 1 }],
             cell_width: placed.cell_width.clone(),
             blockages: Vec::new(),
         };
@@ -316,7 +325,10 @@ pub fn register(c: &mut CaseList) {
         let placement = eda_pnr::Placement {
             rows: 3,
             cell_pos: vec![
-                eda_pnr::Pos { row: 1, site: 15 },
+                eda_pnr::Pos {
+                    row: 1,
+                    site: eda_pnr::SITES_PER_ROW / 2 - 1,
+                },
                 eda_pnr::Pos { row: 1, site: 25 },
             ],
             cell_width: placed.cell_width.clone(),
@@ -693,7 +705,10 @@ pub fn register(c: &mut CaseList) {
         let placed = eda_pnr::place(&nl)?;
         let placement = eda_pnr::Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: placed.cell_width.clone(),
             blockages: Vec::new(),
         };

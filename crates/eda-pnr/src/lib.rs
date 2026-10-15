@@ -458,7 +458,22 @@ mod tests {
         )
         .unwrap()
         .netlist;
-        let placement = place(&nl).unwrap();
+        let mut placement = place(&nl).unwrap();
+        // Force at least two placement rows independently of the default row
+        // width: a 256-site default otherwise packs this small fixture into
+        // one row and produces horizontal-only routes.
+        placement.cell_pos[0] = Pos { row: 0, site: 0 };
+        let (mut row, mut site) = (1usize, 0usize);
+        for ci in 1..nl.cell_count() {
+            let width = placement.cell_width[ci].max(1);
+            if site + width > SITES_PER_ROW {
+                row += 1;
+                site = 0;
+            }
+            placement.cell_pos[ci] = Pos { row, site };
+            site += width;
+        }
+        placement.rows = row + 1;
         let mut routing = route(&nl, &placement).unwrap();
         assert!(!routing.via_locations.is_empty());
         assert_eq!(routing.vias, routing.via_locations.len());

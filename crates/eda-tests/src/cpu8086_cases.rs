@@ -27,6 +27,11 @@ fn sys_src() -> &'static str {
     SRC.get_or_init(|| format!("{PRIM}\n{RIPPLE}\n{ALU}\n{REGFILE}\n{CPU}\n{RAM}\n{SYS}\n"))
 }
 
+fn cpu_src() -> &'static str {
+    static SRC: OnceLock<String> = OnceLock::new();
+    SRC.get_or_init(|| format!("{PRIM}\n{RIPPLE}\n{ALU}\n{REGFILE}\n{CPU}\n{RAM}\n"))
+}
+
 fn alu_src() -> &'static str {
     static SRC: OnceLock<String> = OnceLock::new();
     SRC.get_or_init(|| format!("{PRIM}\n{RIPPLE}\n{ALU}\n{TB_ALU}\n"))
@@ -559,6 +564,38 @@ pub fn register(c: &mut CaseList) {
         expect_flag(&sim, "of", true)?; // 正 + 1 → 负
         expect_flag(&sim, "sf", true)?;
         expect_flag(&sim, "cf", false)?; // INC 不影响 CF
+        Ok(())
+    });
+
+    // ---------- 默认实现流程 ----------
+    c.add("cpu8086_default_flow_routes_and_proves", || {
+        let flow = eda_api::run_flow(cpu_src(), Some("cpu8086"))
+            .map_err(|e| format!("default cpu8086 flow failed: {e}"))?;
+        if !flow.equivalent {
+            return Err("default cpu8086 flow lost sequential equivalence".into());
+        }
+        if flow.routing.segments.is_empty() {
+            return Err("expected routed cpu8086 segments".into());
+        }
+        // Congestion would have returned an error above. Check DRC as the
+        // final physical legality gate.
+        if flow.drc.has_errors() {
+            return Err(format!(
+                "cpu8086 DRC errors: {:?}",
+                flow.drc
+                    .violations
+                    .into_iter()
+                    .filter(|v| v.severity == eda_pnr::DrcSeverity::Error)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if flow.stats.cells < 1000 || flow.netlist.net_count() < 1000 {
+            return Err(format!(
+                "unexpected small cpu8086 result: cells={} nets={}",
+                flow.stats.cells,
+                flow.netlist.net_count()
+            ));
+        }
         Ok(())
     });
 

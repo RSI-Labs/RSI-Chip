@@ -25,6 +25,24 @@ fn synth_cached(src: &'static str) -> &'static Netlist {
     })
 }
 
+fn placement_with_forced_layer_change(nl: &Netlist) -> Result<eda_pnr::Placement, String> {
+    let mut placement = eda_pnr::place(nl)?;
+    placement.cell_pos[0] = eda_pnr::Pos { row: 0, site: 0 };
+    let (mut row, mut site) = (1usize, 0usize);
+    for ci in 1..nl.cell_count() {
+        let width = placement.cell_width[ci].max(1);
+        if site + width > eda_pnr::SITES_PER_ROW {
+            row += 1;
+            site = 0;
+        }
+        placement.cell_pos[ci] = eda_pnr::Pos { row, site };
+        site += width;
+    }
+    placement.rows = row + 1;
+    eda_pnr::check_legal(nl, &placement)?;
+    Ok(placement)
+}
+
 fn congested_fixture() -> (Netlist, eda_pnr::Placement) {
     let mut nl = Netlist::new("congested_routes");
     let n0 = nl.add_net("n0");
@@ -362,7 +380,7 @@ pub fn register(c: &mut CaseList) {
                     if (rst) q <= 4'd0; else q <= q + 4'd1;
              endmodule",
         );
-        let p = eda_pnr::place(nl)?;
+        let p = placement_with_forced_layer_change(nl)?;
         let r = eda_pnr::route(nl, &p)?;
         eda_pnr::check_routing(&r)?;
         if r.via_locations.is_empty() || r.vias != r.via_locations.len() {
@@ -382,7 +400,7 @@ pub fn register(c: &mut CaseList) {
                     if (rst) q <= 4'd0; else q <= q + 4'd1;
              endmodule",
         );
-        let p = eda_pnr::place(nl)?;
+        let p = placement_with_forced_layer_change(nl)?;
         let mut r = eda_pnr::route(nl, &p)?;
         r.via_locations.pop();
         r.vias = r.via_locations.len();

@@ -438,7 +438,10 @@ set_power_switch_on_resistance sw_a 10.0
         });
         let placement = Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: vec![2],
             blockages: Vec::new(),
         };
@@ -663,7 +666,10 @@ set_power_switch_on_resistance sw1 10.0
         });
         let placement = Placement {
             rows: 3,
-            cell_pos: vec![eda_pnr::Pos { row: 1, site: 15 }],
+            cell_pos: vec![eda_pnr::Pos {
+                row: 1,
+                site: eda_pnr::SITES_PER_ROW / 2 - 1,
+            }],
             cell_width: vec![2],
             blockages: Vec::new(),
         };

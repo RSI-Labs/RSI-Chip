@@ -1144,6 +1144,40 @@ create_supply_port VSS -domain TOP
 
     // 分段签核：物理签核（模型相关/timing/DRC/物理库）在套件内常开；
     // LEC 作为独立交付项单独跟踪（见 verify/ 与 README）。
+    // 默认物理容量必须能覆盖完整 RV32I 核，而不依赖测试用 PDK 的
+    // tracks 2048 特例。
+    c.add("rv32i_default_physical_flow_routes_full_core", || {
+        let result = eda_api::implement_rtl_pnr(&signoff_source(), Some("rv32i_top"))
+            .map_err(|e| format!("default RV32I physical flow failed: {e}"))?;
+        if result.mapped_stats.cells < 20_000 || result.mapped_stats.seq < 2_000 {
+            return Err(format!(
+                "unexpected small RV32I netlist: cells={} seq={}",
+                result.mapped_stats.cells, result.mapped_stats.seq
+            ));
+        }
+        if result.routing.segments.is_empty() {
+            return Err("default RV32I routing produced no segments".into());
+        }
+        if !result.routing.congested_channels.is_empty() {
+            return Err(format!(
+                "default RV32I routing remained congested: {:?}",
+                result.routing.congested_channels
+            ));
+        }
+        if result.drc.has_errors() {
+            return Err(format!(
+                "default RV32I DRC errors: {:?}",
+                result
+                    .drc
+                    .violations
+                    .into_iter()
+                    .filter(|v| v.severity == eda_pnr::DrcSeverity::Error)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        Ok(())
+    });
+
     c.add("rv32i_pdk_physical_signoff_mmmc_pass", || {
         let manifest = r#"pdk rv32i-signoff-pdk
 version 1.0

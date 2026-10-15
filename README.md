@@ -113,7 +113,7 @@ samples the debug ports and reports pass/fail, RTL scan-chain DFT
 insertion with a full-chain audit, and an MMMC PDK signoff case (model
 correlation, per-corner implementation, timing, DRC, LEF/DEF/SDF
 physical databases, and full sequential-equivalence LEC) for the complete
-2051-flop netlist. The full `rv32i_pdk_signoff_mmmc_pass` gate is enabled
+2243-flop netlist. The full `rv32i_pdk_signoff_mmmc_pass` gate is enabled
 and PASSES. A staged physical signoff
 (`rv32i_pdk_physical_signoff_mmmc_pass`) runs in-suite and PASSES —
 model correlation, two-corner timing (worst 201.125 ns), zero DRC
@@ -122,8 +122,12 @@ can run physical closure independently when a manifest does not require
 LEC. The generated artifact lives at
 `rv32i/verify/signoff_report.txt` and covers physical signoff,
 power/IR, single- and multi-layer power meshes with EM, UPF
-power-domain IR (with per-domain multilayer meshes), and CTS. Power/IR and CTS stages run in-suite
-on RV32I as well: `rv32i_power_and_ir_analysis` drives full-chip
+power-domain IR (with per-domain multilayer meshes), and CTS.
+The `rv32i_default_physical_flow_routes_full_core` gate exercises the
+default 256-site-by-256-track physical grid without the signoff manifest's
+explicit 2048-track override, then checks routing, DRC, and sequential-count
+invariants. Power/IR and CTS stages also run in-suite on RV32I:
+`rv32i_power_and_ir_analysis` drives full-chip
 switching activity with a wide-vector activity format (the 512-bit
 program image is supplied directly as a sized Verilog literal `512'h...`
 on the top-level port; the power/IR pipeline now accepts arbitrary-width
