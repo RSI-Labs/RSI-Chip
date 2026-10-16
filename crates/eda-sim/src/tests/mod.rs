@@ -2,6 +2,7 @@
 
 mod aggregates;
 mod core;
+mod frontend_regressions;
 mod functions;
 mod properties;
 

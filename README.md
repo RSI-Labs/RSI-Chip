@@ -26,6 +26,11 @@ checked-in RV32I ELF and real-mode COM images can execute beyond the small
 directed SOC memories. These cores are compiled and simulated, and their
 release gates include RTL-to-mapped-netlist LEC. See `platform/README.md` for
 current scope and the remaining exhaustive-opcode acceptance gates.
+The release matrices now correlate both golden models against RTL for the
+RV32I base integer/data/control/CSR/trap classes and the broad i8086 ALU,
+ModRM, segment, shift/rotate, and unary groups. RV32I additionally runs 64
+deterministic randomized differential seeds, while i8086 runs 32 seeds mixing
+ALU, shift/rotate, unary, prefix, and sparse-memory load/store streams.
 
 ```sh
 cargo run -p eda-cpu-platform -- validate
@@ -37,7 +42,26 @@ cargo run -p eda-cpu-platform -- i8086 run platform/programs/high_memory.com --s
 cargo run -p eda-cpu-platform -- rv32i run platform/programs/rv32i_high_memory.elf --sv
 ```
 
-The data-driven regression target currently contains **15,101 unique named
+The optional `eda-slang` front-end adapter delegates full SystemVerilog
+validation, preprocessing, and AST serialization to
+[slang](https://github.com/MikePopoloski/slang). It accepts include paths and
+macro definitions, rejects malformed RTL with slang diagnostics, emits
+post-elaboration AST JSON, and can feed slang's single-unit preprocessed output
+to the bounded repository elaborator. Its conformance tests also validate the
+repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
+reference source with `UVM_NO_DPI`. This establishes a full-language validation
+path, while downstream execution remains explicit about constructs the bounded
+IR can represent.
+The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
+`compile_sources` for deterministic named multi-unit compilation with parser
+errors mapped back to their originating file and line.
+One-dimensional module unpacked arrays now support up to 4096 elements and a
+one-million-bit flat budget; runtime whole-element reads and writes lower to
+bounds-checked dynamic shift/mask operations instead of expanding one conditional
+per element. This makes natural 4 KiB byte arrays executable without the former
+512-byte array ceiling.
+
+The data-driven regression target currently contains **15,159 unique named
 cases**. It is not a collection of three or four broad assertions: every case
 has a distinct name and independently reports success or failure. Of those,
 `eda_tests::ams_cases` contributes exactly 3,110 analog/mixed-signal
@@ -87,6 +111,9 @@ static `uvm_factory` type-override table
 (`register`/`set_type_override`/`get_override`/`has_override`/
 `is_registered`, plus depth-four instance overrides that take priority and
 fall back after removal), the
+UVM-lite structural surface (`uvm_report_object`, `uvm_transaction`,
+`uvm_test`, `uvm_env`, `uvm_agent`, `uvm_monitor`, `uvm_scoreboard`, and
+analysis export/imp forwarding), the
 UVM-lite sequence flow (`uvm_sequence_item`, virtual-body `uvm_sequence`,
 queue-backed `uvm_sequencer`, `uvm_seq_item_port`, and `uvm_driver`),
 an analysis port with four explicit subscriber slots and fan-out writes,
@@ -113,7 +140,10 @@ back into its own object while former aliases retain the old one. A built-in vir
 with a `run_phase()` hook, an integrated objection lifecycle, component
 names, parent back-references, and four explicit child slots, giving
 testbenches the env/driver/monitor hierarchical structure used by UVM
-without requiring the full class library.
+without requiring the full class library. The built-in component executes the
+canonical common phase sequence — build, connect, end-of-elaboration,
+start-of-simulation, run, extract, check, report, and final — with virtual
+overrides at every hook.
 
 ## RV32I CPU (signoff vehicle)
 
@@ -422,7 +452,7 @@ SUITE_FILTER=ams_rc cargo test -p eda-tests --test suite
 | Area | Crates |
 |---|---|
 | Shared IR/logic/library/netlist | `eda-core`, `eda-ir` |
-| RTL frontend | `eda-hdl` |
+| RTL frontend | `eda-hdl`, `eda-slang` |
 | Digital simulation and waves | `eda-sim`, `eda-waveform` |
 | Analog/mixed-signal simulation | `eda-ams` |
 | Synthesis and netlist export | `eda-synth` |

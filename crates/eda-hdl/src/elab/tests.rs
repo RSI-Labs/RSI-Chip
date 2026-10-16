@@ -16,6 +16,47 @@ fn simple_assign_flattens() {
 }
 
 #[test]
+fn multiple_named_sources_compile_with_source_manager_mapping() {
+    let sources = [
+        HdlSource::new(
+            "child.sv",
+            "module child(input a, output y); assign y = ~a; endmodule\n",
+        ),
+        HdlSource::new(
+            "top.sv",
+            "module top(input x, output z);\nwire w;\nchild u1(.a(x), .y(w));\nchild u2(.a(w), .y(z));\nendmodule\n",
+        ),
+    ];
+    let manager = SourceManager::new(&sources);
+    assert_eq!(manager.locate(1), Some(("child.sv", 1)));
+    assert_eq!(manager.locate(3), Some(("top.sv", 1)));
+    assert_eq!(manager.locate(6), Some(("top.sv", 4)));
+
+    let design = compile_sources(&sources, Some("top")).expect("compile named sources");
+    assert_eq!(design.name, "top");
+    assert_eq!(design.instances_of_module("child").len(), 2);
+    // Two functional child assigns plus four flattened port connections.
+    assert_eq!(design.assigns.len(), 6);
+}
+
+#[test]
+fn syntax_errors_in_named_sources_report_the_original_file() {
+    let sources = [
+        HdlSource::new(
+            "first.sv",
+            "module first(output y); assign y = 1'b0; endmodule\n",
+        ),
+        HdlSource::new(
+            "broken.sv",
+            "module broken(output y);\nwire missing_semicolon\nassign y = 1'b0;\nendmodule\n",
+        ),
+    ];
+    let error =
+        compile_sources(&sources, Some("first")).expect_err("malformed source must be rejected");
+    assert!(error.starts_with("broken.sv:3: line 3:"), "{error}");
+}
+
+#[test]
 fn vectors_and_parts() {
     let d = compile_ok("module m(input [3:0] a, output [1:0] y); assign y = a[3:2]; endmodule");
     assert_eq!(d.n_nets, 6);
@@ -331,6 +372,69 @@ fn generate_for_loop_expands_assigns() {
 }
 
 #[test]
+fn generate_for_loop_accepts_declared_genvar_and_descending_iteration() {
+    let d = compile_ok(
+        "module m(input [2:0] a, output [2:0] y); \
+         genvar i; \
+         generate for (i = 2; i >= 0; i = i - 1) begin : bit_assign \
+         assign y[i] = a[i]; \
+         end endgenerate endmodule",
+    );
+    assert_eq!(d.assigns.len(), 3);
+}
+
+#[test]
+fn generate_for_loop_genvar_can_be_declared_inside_generate_region() {
+    let d = compile_ok(
+        "module m(input [1:0] a, output [1:0] y); \
+         generate genvar i; \
+         for (i = 0; i < 2; i = i + 1) begin : bit_assign \
+         assign y[i] = a[i]; \
+         end endgenerate endmodule",
+    );
+    assert_eq!(d.assigns.len(), 2);
+}
+
+#[test]
+fn false_generate_if_without_else_generates_no_items() {
+    let d = compile_ok(
+        "module m #(parameter ENABLE = 0) (input a, output y); \
+         wire generated; \
+         generate if (ENABLE) begin : enabled \
+         assign generated = 1'b1; \
+         end endgenerate \
+         assign generated = 1'b0; \
+         assign y = generated | a; \
+         endmodule",
+    );
+    assert_eq!(d.assigns.len(), 2);
+}
+
+#[test]
+fn generate_for_loop_reaches_the_final_iteration() {
+    let d = compile_ok(
+        "module m(output wire [0:0] y); \
+         generate for (genvar i = 0; i < 10001; i = i + 1) begin : iterations \
+         assign y = 1'b0; \
+         end endgenerate endmodule",
+    );
+    assert_eq!(d.assigns.len(), 10001);
+}
+
+#[test]
+fn generate_for_loop_reports_excessive_steps_instead_of_truncating() {
+    let error = compile(
+        "module m(output wire [0:0] y); \
+         generate for (genvar i = 0; i < 131073; i = i + 1) begin : iterations \
+         assign y = 1'b0; \
+         end endgenerate endmodule",
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("generate for-loop exceeds 131072 steps"));
+}
+
+#[test]
 fn generate_if_selects_parameterized_branch() {
     let invert = compile_ok(
         "module m #(parameter INVERT = 1) (input a, output y); generate if (INVERT) begin : inv assign y = ~a; end else begin : pass assign y = a; end endgenerate endmodule",
@@ -525,6 +629,25 @@ endmodule
 }
 
 #[test]
+fn modern_function_argument_lists_elaborate() {
+    let design = compile_ok(
+        r#"
+module top(input int a, b, output int sum);
+function automatic int add(int left, int right);
+add = left + right;
+endfunction
+assign sum = add(a, b);
+endmodule
+"#,
+    );
+    assert_eq!(design.ports.len(), 3);
+    assert!(matches!(
+        &design.assigns[0].e,
+        Expr::Bin { op: BinOp::Add, .. }
+    ));
+}
+
+#[test]
 fn package_functions_import_and_inline() {
     let d = compile_ok(
         r#"
@@ -663,7 +786,7 @@ endmodule
     let d = compile_ok(
         r#"
 module top(input s0, s1, [7:0] a, b, output [7:0] y);
-function logic [7:0] priority(input logic high, low,
+function logic [7:0] priority_select(input logic high, low,
 input logic [7:0] left, right);
 logic [7:0] result;
 if (high)
@@ -672,9 +795,9 @@ else if (low)
     result = right;
 else
     result = 8'd0;
-priority = result;
+priority_select = result;
 endfunction
-assign y = priority(s0, s1, a, b);
+assign y = priority_select(s0, s1, a, b);
 endmodule
 "#,
     );
@@ -1034,10 +1157,10 @@ fn function_unpacked_array_locals_update_and_read_elements() {
         r#"
 module top(input [7:0] a, b, output [7:0] y);
 function logic [7:0] sum4(input logic [7:0] left, right);
-logic [7:0] table [0:3];
+logic [7:0] memory [0:3];
 for (int i = 0; i < 4; i = i + 1)
-    table[i] = left + right + i;
-sum4 = table[0] + table[1] + table[2] + table[3];
+    memory[i] = left + right + i;
+sum4 = memory[0] + memory[1] + memory[2] + memory[3];
 endfunction
 assign y = sum4(a, b);
 endmodule
@@ -1050,9 +1173,9 @@ endmodule
         r#"
 module bad(input [7:0] a, output [7:0] y);
 function logic [7:0] f(input logic [7:0] value);
-logic [7:0] table [0:3];
-table[4] = value;
-f = table[4];
+logic [7:0] memory [0:3];
+memory[4] = value;
+f = memory[4];
 endfunction
 assign y = f(a);
 endmodule
@@ -1068,11 +1191,11 @@ fn function_multidimensional_unpacked_array_locals_select_elements() {
         r#"
 module top(input [7:0] a, b, output [7:0] y);
 function logic [7:0] sum4(input logic [7:0] left, right);
-logic [7:0] table [0:1][1:0];
+logic [7:0] memory [0:1][1:0];
 for (int i = 0; i < 2; i = i + 1)
     for (int j = 0; j < 2; j = j + 1)
-        table[i][j] = left + right + i * 2 + j;
-sum4 = table[0][0] + table[0][1] + table[1][0] + table[1][1];
+        memory[i][j] = left + right + i * 2 + j;
+sum4 = memory[0][0] + memory[0][1] + memory[1][0] + memory[1][1];
 endfunction
 assign y = sum4(a, b);
 endmodule
@@ -1085,9 +1208,9 @@ endmodule
         r#"
 module bad(input [7:0] a, output [7:0] y);
 function logic [7:0] f(input logic [7:0] value);
-logic [7:0] table [0:1][1:0];
-table[0] = value;
-f = table[0][1];
+logic [7:0] memory [0:1][1:0];
+memory[0] = value;
+f = memory[0][1];
 endfunction
 assign y = f(a);
 endmodule
@@ -1187,12 +1310,25 @@ endmodule
 }
 
 #[test]
-fn top_selection_prefers_tb() {
+fn top_selection_resolves_unique_uninstantiated_tb() {
     let d = compile_ok(
         "module dut(input a, output y); assign y = a; endmodule
          module tb; reg a; wire y; dut u1(a, y); initial begin #1 a = 0; end endmodule",
     );
     assert_eq!(d.name, "tb");
+}
+
+#[test]
+fn ambiguous_top_is_an_error() {
+    let error = compile(
+        "module first(output wire y); assign y = 1'b0; endmodule \
+         module second(output wire y); assign y = 1'b1; endmodule",
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("ambiguous top module"));
+    assert!(error.contains("first"));
+    assert!(error.contains("second"));
 }
 
 #[test]
@@ -1250,6 +1386,109 @@ fn unknown_instance_module_is_error() {
 }
 
 #[test]
+fn malformed_instance_bindings_are_rejected() {
+    let cases = [
+        (
+            "module child(input a, output y); assign y=a; endmodule \
+             module top(input a, output y); child u(.a(a), .missing(a), .y(y)); endmodule",
+            "port 'missing' does not exist in 'child'",
+        ),
+        (
+            "module child(input a, output y); assign y=a; endmodule \
+             module top(input a, output y); child u(.a(a), .a(a), .y(y)); endmodule",
+            "duplicate connection for port 'a'",
+        ),
+        (
+            "module child(input a, output y); assign y=a; endmodule \
+             module top(input a, output y); child u(a, y, a); endmodule",
+            "too many port connections",
+        ),
+        (
+            "module child(input a, b, output y); assign y=a&b; endmodule \
+             module top(input a, b, output y); child u(a, .b(b), .y(y)); endmodule",
+            "mixing ordered and named port connections",
+        ),
+        (
+            "module child #(parameter W=1, BAD=1) (input [W-1:0] a, output [W-1:0] y); assign y=a; endmodule \
+             module top(input a, output y); child #(.W(1), .MISSING(2)) u(a, y); endmodule",
+            "module 'child' has no parameter 'MISSING'",
+        ),
+        (
+            "module child #(parameter W=1, BAD=1) (input [W-1:0] a, output [W-1:0] y); assign y=a; endmodule \
+             module top(input a, output y); child #(.W(1), .W(2)) u(a, y); endmodule",
+            "duplicate parameter connection 'W'",
+        ),
+        (
+            "module child #(parameter W=1, BAD=1) (input [W-1:0] a, output [W-1:0] y); assign y=a; endmodule \
+             module top(input a, output y); child #(1, 2, 3) u(a, y); endmodule",
+            "too many parameter connections",
+        ),
+        (
+            "module child #(parameter W=1, BAD=1) (input [W-1:0] a, output [W-1:0] y); assign y=a; endmodule \
+             module top(input a, output y); child #(1, .BAD(2)) u(a, y); endmodule",
+            "unexpected token",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let error = compile(source, None).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "expected {error:?} to contain {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn automatic_top_respects_modules_nested_in_generate() {
+    let design = compile(
+        "module child_a(output y); assign y=1'b1; endmodule \
+         module child_b(output y); assign y=1'b0; endmodule \
+         module top #(parameter ENABLE=1) (output y); \
+           generate if (ENABLE) begin : selected child_a u(.y(y)); end \
+           else begin : unselected child_b u(.y(y)); end endgenerate \
+         endmodule",
+        None,
+    )
+    .unwrap();
+    assert_eq!(design.name, "top");
+    assert_eq!(design.hierarchy.len(), 2);
+}
+
+#[test]
+fn top_level_inout_is_rejected_explicitly() {
+    let error = compile("module top(inout wire pad); endmodule", None).unwrap_err();
+    assert_eq!(error, "top module 'top': inout port 'pad' is not supported");
+}
+
+#[test]
+fn duplicate_module_declarations_are_rejected() {
+    let cases = [
+        (
+            "module top(input a, input a); endmodule",
+            "duplicate port 'a'",
+        ),
+        (
+            "module top #(parameter W=1) (); parameter W=2; endmodule",
+            "duplicate parameter 'W'",
+        ),
+        (
+            "package pkg; parameter W=1; parameter W=2; endpackage \
+             module top(); endmodule",
+            "duplicate parameter 'W'",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let error = compile(source, None).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "expected {error:?} to contain {expected:?}"
+        );
+    }
+}
+
+#[test]
 fn monitor_flag_propagates() {
     let d = compile_ok("module tb; reg a; initial $monitor(\"a=%b\", a); endmodule");
     match &d.initials[0] {
@@ -1286,6 +1525,35 @@ fn delayed_runtime_continuous_lvalue_is_rejected() {
     )
     .unwrap_err();
     assert!(error.contains("delayed runtime indexed continuous-assignment lvalue is not supported"));
+}
+
+#[test]
+fn runtime_whole_unpacked_array_elements_compile_as_reads_and_writes() {
+    let d = compile_ok(
+        "module m(input clk, input [1:0] selector, input [7:0] din, \
+                  output reg [7:0] q); \
+         logic [7:0] memory [0:3]; \
+         initial begin \
+           memory[0] = 8'd10; memory[1] = 8'd20; \
+           memory[2] = 8'd30; memory[3] = 8'd40; \
+         end \
+         always @(posedge clk) begin \
+           q = memory[selector]; \
+           memory[selector] = din; \
+         end \
+         endmodule",
+    );
+    assert_eq!(d.initials.len(), 1);
+    assert_eq!(d.processes.len(), 1);
+
+    let continuous = compile_ok(
+        "module m(input [1:0] selector, input [7:0] din, output [7:0] q); \
+         logic [7:0] memory [0:3]; \
+         assign memory[selector] = din; \
+         assign q = memory[selector]; \
+         endmodule",
+    );
+    assert_eq!(continuous.processes.len(), 1);
 }
 
 #[test]

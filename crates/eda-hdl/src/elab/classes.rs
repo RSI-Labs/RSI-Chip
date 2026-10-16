@@ -20,7 +20,7 @@ virtual class uvm_object;
     get_id = this.m_id;
 endfunction
 endclass
-virtual class uvm_component extends uvm_object(0);
+virtual class uvm_component extends uvm_report_object(0);
   string name = "";
   int phase_state = 0;
   uvm_component parent;
@@ -39,16 +39,42 @@ virtual class uvm_component extends uvm_object(0);
   endfunction
   virtual function void connect_phase();
   endfunction
+  virtual function void end_of_elaboration_phase();
+  endfunction
+  virtual function void start_of_simulation_phase();
+  endfunction
   virtual function void run_phase();
+  endfunction
+  virtual function void extract_phase();
+  endfunction
+  virtual function void check_phase();
+  endfunction
+  virtual function void report_phase();
+  endfunction
+  virtual function void final_phase();
   endfunction
   function void run_phases();
     this.build_phase();
+    this.phase_state = 1;
     this.connect_phase();
+    this.phase_state = 2;
+    this.end_of_elaboration_phase();
+    this.phase_state = 3;
+    this.start_of_simulation_phase();
+    this.phase_state = 4;
     this.objection.raise(1);
     this.run_phase();
     this.objection.drop(1);
     this.objection.check_drained();
-    this.phase_state = 3;
+    this.phase_state = 5;
+    this.extract_phase();
+    this.phase_state = 6;
+    this.check_phase();
+    this.phase_state = 7;
+    this.report_phase();
+    this.phase_state = 8;
+    this.final_phase();
+    this.phase_state = 9;
   endfunction
   function void set_name(string n);
     this.name = n;
@@ -85,6 +111,88 @@ virtual class uvm_subscriber extends uvm_component;
   virtual function void write(int data);
   endfunction
 endclass
+virtual class uvm_report_object extends uvm_object;
+  int report_info_count = 0;
+  int report_warning_count = 0;
+  int report_error_count = 0;
+  int report_fatal_count = 0;
+  function new(int id = 0);
+    super.new(id);
+  endfunction
+  function int report_info(string id, string message, int verbosity = 0);
+    this.report_info_count = this.report_info_count + 1;
+    report_info = 1;
+  endfunction
+  function int report_warning(string id, string message, int verbosity = 0);
+    this.report_warning_count = this.report_warning_count + 1;
+    report_warning = 1;
+  endfunction
+  function int report_error(string id, string message, int verbosity = 0);
+    this.report_error_count = this.report_error_count + 1;
+    report_error = 1;
+  endfunction
+  function int report_fatal(string id, string message, int verbosity = 0);
+    this.report_fatal_count = this.report_fatal_count + 1;
+    report_fatal = 0;
+  endfunction
+endclass
+virtual class uvm_transaction extends uvm_object;
+  int transaction_id = 0;
+  function new(int id = 0, int transaction_id = 0);
+    super.new(id);
+    this.transaction_id = transaction_id;
+  endfunction
+  function int get_transaction_id();
+    get_transaction_id = this.transaction_id;
+  endfunction
+  function void set_transaction_id(int value);
+    this.transaction_id = value;
+  endfunction
+endclass
+virtual class uvm_test extends uvm_component;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
+virtual class uvm_env extends uvm_component;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
+virtual class uvm_agent extends uvm_component;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
+virtual class uvm_monitor extends uvm_component;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
+virtual class uvm_scoreboard extends uvm_component;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
+class uvm_analysis_export extends uvm_component;
+  uvm_subscriber subscriber;
+  int writes = 0;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+  function void connect(uvm_subscriber value);
+    this.subscriber = value;
+  endfunction
+  function void write(int data);
+    this.subscriber.write(data);
+    this.writes = this.writes + 1;
+  endfunction
+endclass
+class uvm_analysis_imp extends uvm_analysis_export;
+  function new(int id = 0, string name = "");
+    super.new(id, name);
+  endfunction
+endclass
 virtual class uvm_callback extends uvm_object;
   int event_sum = 0;
   int data_sum = 0;
@@ -93,7 +201,7 @@ virtual class uvm_callback extends uvm_object;
   function new(int id = 0);
     super.new(id);
   endfunction
-  virtual function void callback(int event, int data);
+  virtual function void callback(int event_id, int data);
   endfunction
 endclass
 class uvm_callback_pool extends uvm_object;
@@ -129,11 +237,11 @@ class uvm_callback_pool extends uvm_object;
     this.cb3 = cb;
     this.connects = 4;
   endfunction
-  function void call(int event, int data);
-    this.cb0.callback(event, data);
-    this.cb1.callback(event, data);
-    this.cb2.callback(event, data);
-    this.cb3.callback(event, data);
+  function void call(int event_id, int data);
+    this.cb0.callback(event_id, data);
+    this.cb1.callback(event_id, data);
+    this.cb2.callback(event_id, data);
+    this.cb3.callback(event_id, data);
     this.calls = this.calls + 1;
   endfunction
   function void enable0();
@@ -160,21 +268,21 @@ class uvm_callback_pool extends uvm_object;
   function void disable3();
     this.enabled3 = 0;
   endfunction
-  function void call_filtered(int event, int data);
+  function void call_filtered(int event_id, int data);
     if (this.enabled0)
-      this.cb0.callback(event, data);
+      this.cb0.callback(event_id, data);
     else
       this.skipped_callbacks = this.skipped_callbacks + 1;
     if (this.enabled1)
-      this.cb1.callback(event, data);
+      this.cb1.callback(event_id, data);
     else
       this.skipped_callbacks = this.skipped_callbacks + 1;
     if (this.enabled2)
-      this.cb2.callback(event, data);
+      this.cb2.callback(event_id, data);
     else
       this.skipped_callbacks = this.skipped_callbacks + 1;
     if (this.enabled3)
-      this.cb3.callback(event, data);
+      this.cb3.callback(event_id, data);
     else
       this.skipped_callbacks = this.skipped_callbacks + 1;
     this.filtered_calls = this.filtered_calls + 1;
@@ -369,19 +477,19 @@ class uvm_barrier extends uvm_object;
     this.count = 0;
     this.was_reached = 0;
   endfunction
-  function int wait(int n);
+  function int wait_for(int n);
     if (this.threshold > 0) begin
       this.count = this.count + n;
       this.waits = this.waits + 1;
       if (this.count >= this.threshold) begin
         this.count = this.threshold;
         this.was_reached = 1;
-        wait = 1;
+        wait_for = 1;
       end else begin
-        wait = 0;
+        wait_for = 0;
       end
     end else begin
-      wait = 0;
+      wait_for = 0;
     end
   endfunction
   function int reached();
@@ -1116,8 +1224,17 @@ endpackage
 
 pub(super) const BUILTIN_UVM_CLASS_NAMES: &[&str] = &[
     "uvm_object",
+    "uvm_report_object",
     "uvm_component",
     "uvm_subscriber",
+    "uvm_transaction",
+    "uvm_test",
+    "uvm_env",
+    "uvm_agent",
+    "uvm_monitor",
+    "uvm_scoreboard",
+    "uvm_analysis_export",
+    "uvm_analysis_imp",
     "uvm_callback",
     "uvm_callback_pool",
     "uvm_sequence_item",

@@ -321,14 +321,14 @@ pub(super) fn elab_structure(c: &mut CaseList) {
             Ok(())
         }
     });
-    c.add("elab_default_top_last", || {
-        let d = compile(
+    c.add("elab_ambiguous_top_is_rejected", || {
+        let error = compile(
             "module a(input x, output y); assign y = x; endmodule module b(input x, output y); assign y = x; endmodule",
             None,
         )
-        .map_err(|e| e.to_string())?;
-        if d.name.is_empty() {
-            Err("no top picked".into())
+        .expect_err("ambiguous roots must fail closed");
+        if !error.contains("ambiguous top module") {
+            Err(format!("unexpected error: {error}"))
         } else {
             Ok(())
         }

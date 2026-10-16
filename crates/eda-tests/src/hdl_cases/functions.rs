@@ -1659,13 +1659,13 @@ fn function_array_local_structure(c: &mut CaseList) {
                 if element > 0 {
                     sum_terms.push_str(" + ");
                 }
-                sum_terms.push_str(&format!("table[{element}]"));
+                sum_terms.push_str(&format!("lookup[{element}]"));
             }
             let body = match index % 4 {
                 0 | 2 => format!(
-                    "logic [{range}] table [{array_range}]; \
+                    "logic [{range}] lookup [{array_range}]; \
                      for (int i = 0; i < {length}; i = i + 1) \
-                     table[i] = left + right + i; \
+                     lookup[i] = left + right + i; \
                      compute = {sum_terms};",
                     range = range,
                     array_range = array_range,
@@ -1673,21 +1673,21 @@ fn function_array_local_structure(c: &mut CaseList) {
                     sum_terms = sum_terms
                 ),
                 1 => format!(
-                    "logic [{range}] table [0:2]; \
-                     table[0] = left; \
-                     table[1] = right; \
-                     table[2] = {width}'d{constant}; \
-                     if (selector) table[2] = left; \
-                     compute = table[0] + table[1] + table[2];",
+                    "logic [{range}] lookup [0:2]; \
+                     lookup[0] = left; \
+                     lookup[1] = right; \
+                     lookup[2] = {width}'d{constant}; \
+                     if (selector) lookup[2] = left; \
+                     compute = lookup[0] + lookup[1] + lookup[2];",
                     range = range,
                     width = width,
                     constant = constant
                 ),
                 _ => format!(
-                    "logic [{range}] table [{array_range}]; \
+                    "logic [{range}] lookup [{array_range}]; \
                      for (int i = 0; i < {length}; i = i + 1) \
-                     if (i == 0) table[i] = left; \
-                     else table[i] = right; \
+                     if (i == 0) lookup[i] = left; \
+                     else lookup[i] = right; \
                      compute = {sum_terms};",
                     range = range,
                     array_range = array_range,
@@ -1844,36 +1844,36 @@ fn multidim_function_array_local_structure(c: &mut CaseList) {
                 0 => storage_indexes
                     .iter()
                     .map(|(first, second)| {
-                        format!("table[{first}][{second}] = left ^ right;")
+                        format!("lookup[{first}][{second}] = left ^ right;")
                     })
                     .collect::<Vec<_>>()
                     .join(" "),
                 1 => format!(
                     "for (int i = 0; i < {first_length}; i = i + 1) \
                      for (int j = 0; j < {second_length}; j = j + 1) \
-                     table[i][j] = left + i * {second_length} + j;"
+                     lookup[i][j] = left + i * {second_length} + j;"
                 ),
                 2 => format!(
                     "for (int i = 0; i < {first_length}; i = i + 1) \
                      for (int j = 0; j < {second_length}; j = j + 1) \
-                     table[i][j] = right; \
-                     if (selector) table[{first_base}][{second_base}] = left & {width}'d{constant}; \
-                     else table[{first_base}][{second_base}] = left | {width}'d{constant};"
+                     lookup[i][j] = right; \
+                     if (selector) lookup[{first_base}][{second_base}] = left & {width}'d{constant}; \
+                     else lookup[{first_base}][{second_base}] = left | {width}'d{constant};"
                 ),
                 _ => format!(
                     "for (int i = 0; i < {first_length}; i = i + 1) \
                      for (int j = 0; j < {second_length}; j = j + 1) \
-                     if ((i + j) % 2 == 0) table[i][j] = left ^ {width}'d{constant}; \
-                     else table[i][j] = right + ((i * {second_length}) + j);"
+                     if ((i + j) % 2 == 0) lookup[i][j] = left ^ {width}'d{constant}; \
+                     else lookup[i][j] = right + ((i * {second_length}) + j);"
                 ),
             };
             let functions = format!(
                 "function logic [{total_range}] compute( \
                  input logic selector, \
                  input logic [{range}] left, right); \
-                 logic [{range}] table [{first_range}][{second_range}]; \
+                 logic [{range}] lookup [{first_range}][{second_range}]; \
                  {assignments} \
-                 compute = table; \
+                 compute = lookup; \
                  endfunction",
                 total_range = total_range,
                 range = range,

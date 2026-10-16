@@ -75,6 +75,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   localparam S_FAR_CALL_PUSH_IP = 5'd19;
   localparam S_DOS_PRINT = 5'd20;
   localparam S_DIVIDE = 5'd21;
+  localparam S_DIVIDE_INIT = 5'd22;
 
   localparam SZ_BYTE = 3'd0;
   localparam SZ_WORD = 3'd1;
@@ -119,7 +120,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     .first_byte(fetch_byte), .is_prefix(fetch_prefix),
     .is_segment_override(fetch_segment_override),
     .segment_index(fetch_segment_index), .segment_number(fetch_segment_number),
-    .repeat(fetch_repeat), .repeat_while_zero(fetch_repeat_equal), .lock(fetch_lock)
+    .repeat_active(fetch_repeat), .repeat_while_zero(fetch_repeat_equal), .lock(fetch_lock)
   );
 
   wire fetch_opcode_valid;
@@ -154,15 +155,17 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
 
   wire modrm_fetch_needs_immediate =
     (opcode_r == 8'h80 || opcode_r == 8'h82 || opcode_r == 8'h83 || opcode_r == 8'hc6) ||
+    (opcode_r == 8'hc0 || opcode_r == 8'hc1) ||
     (opcode_r == 8'hf6 && fetch_byte[5:3] <= 3'b001) ||
     (opcode_r == 8'hf7 && fetch_byte[5:3] <= 3'b001) ||
     opcode_r == 8'h81 || opcode_r == 8'hc7;
-
   wire modrm_memory;
   wire [1:0] modrm_segment;
   wire [15:0] modrm_offset;
   wire [2:0] modrm_register;
   wire [2:0] modrm_rm;
+  wire divide_will_be_signed =
+    opcode_r != 8'hd4 && modrm_register == 3'd7;
   i8086_modrm_decoder modrm_decode(
     .modrm(modrm_r), .displacement(displacement_r),
     .override_present(seg_override_present), .override_segment(seg_override),
@@ -269,26 +272,26 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   reg [15:0] shift_value;
   reg [15:0] shift_result;
   reg [15:0] shift_flags;
+  reg shift_carry;
+  reg shift_overflow;
   reg [15:0] bcd_result;
   reg [15:0] bcd_flags;
   reg [15:0] unary_result;
   reg [15:0] unary_flags;
   reg [31:0] mul_product;
-  reg [15:0] mul_flags;
-  reg signed [15:0] mul_signed_left;
-  reg signed [15:0] mul_signed_right;
+  wire [15:0] mul_flags;
+  reg mul_overflow;
   reg [31:0] divide_dividend;
-  reg [15:0] divide_divisor;
-  reg [15:0] divide_remainder;
-  reg [15:0] divide_quotient;
-  reg [3:0] divide_bits_left;
+  reg [31:0] divide_divisor;
+  reg [31:0] divide_remainder;
+  reg [31:0] divide_quotient;
+  reg [5:0] divide_bits_left;
   reg divide_byte;
   reg divide_signed;
   reg divide_dividend_negative;
   reg divide_divisor_negative;
   reg divide_start;
   reg divide_aam;
-  reg [15:0] aam_result;
   reg divide_dividend_msb;
   reg unary_result_sign;
   reg [16:0] rcl_input;
@@ -347,11 +350,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   end
 
   always @* begin
-    aam_result = (divide_quotient << 8) | divide_remainder;
-  end
-
-  always @* begin
-    divide_dividend_msb = divide_byte ? divide_dividend[7] : divide_dividend[15];
+    divide_dividend_msb = divide_aam ? divide_dividend[7] :
+                          divide_byte ? divide_dividend[15] : divide_dividend[31];
   end
 
   always @* begin
@@ -365,31 +365,24 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       far_call_segment = source_rdata;
   end
 
-  always @* begin
-    mul_flags = {
-      flags[15:12],
-      execute_width8 ? mul_product[23:16] != 8'b0
-                     : mul_product[31:16] != 16'b0,
-      flags[10:1],
-      execute_width8 ? mul_product[23:16] != 8'b0
-                     : mul_product[31:16] != 16'b0
-    };
-  end
+  assign mul_flags = {
+    flags[15:12],
+    mul_overflow,
+    flags[10:1],
+    mul_overflow
+  };
 
   always @* begin
     if (modrm_register == 3'd5 && !execute_width8)
-      mul_product = mul_signed_left * mul_signed_right;
+      mul_product = ({16'b0, ax} * {16'b0, rm_result_value}) -
+                    (ax[15] ? {rm_result_value, 16'b0} : 32'b0) -
+                    (rm_result_value[15] ? {ax, 16'b0} : 32'b0);
     else if (modrm_register == 3'd5)
       mul_product = {{16{al[7]}}, al} * {{16{rm_result_value[7]}}, rm_result_value[7:0]};
     else if (execute_width8)
       mul_product = {24'b0, al} * {24'b0, rm_result_value[7:0]};
     else
       mul_product = {16'b0, ax} * {16'b0, rm_result_value};
-  end
-
-  always @* begin
-    mul_signed_left = ax;
-    mul_signed_right = rm_result_value;
   end
 
   always @* begin
@@ -419,9 +412,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     end else if (modrm_register == 3'd3) begin
       unary_flags = {
         flags[15:12],
-        ((rm_result_value ^ 16'b0) &
-         (rm_result_value ^ unary_result) &
-         (execute_width8 ? 16'h0080 : 16'h8000)) != 0,
+        rm_result_value == (execute_width8 ? 16'h0080 : 16'h8000),
         flags[10:8], unary_result_sign,
         (unary_result & (execute_width8 ? 16'h00ff : 16'hffff)) == 0,
         flags[5:4],
@@ -489,7 +480,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         3'd2: operand_result = {8'b0, operand_a[7:0] + operand_b[7:0] + {7'b0, flags[0]}};
         3'd3: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0]};
         3'd4: operand_result = {8'b0, operand_a[7:0] & operand_b[7:0]};
-        3'd5: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0] - {7'b0, flags[0]}};
+        3'd5: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0]};
         3'd6: operand_result = {8'b0, operand_a[7:0] ^ operand_b[7:0]};
         default: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0]};
       endcase
@@ -500,7 +491,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         3'd2: operand_result = operand_a + operand_b + {15'b0, flags[0]};
         3'd3: operand_result = operand_a - operand_b;
         3'd4: operand_result = operand_a & operand_b;
-        3'd5: operand_result = operand_a - operand_b - {15'b0, flags[0]};
+        3'd5: operand_result = operand_a - operand_b;
         3'd6: operand_result = operand_a ^ operand_b;
         default: operand_result = operand_a - operand_b;
       endcase
@@ -550,20 +541,41 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
 
   always @* begin
     case (modrm_register)
-      3'd1: group_result = opcode_r == 8'h81 ? (rm_result_value | immediate_r) :
+      3'd1: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value | (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r)) :
                            {8'b0, rm_result_value[7:0] | immediate_r[7:0]};
-      3'd2: group_result = opcode_r == 8'h81
-                           ? (rm_result_value + immediate_r + {15'b0, flags[0]})
+      3'd2: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value + (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r) + {15'b0, flags[0]})
                            : {8'b0, rm_result_value[7:0] + immediate_r[7:0] + {7'b0, flags[0]}};
-      3'd3: group_result = opcode_r == 8'h81 ? (rm_result_value - immediate_r) :
+      3'd3: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value - (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r)) :
                            {8'b0, rm_result_value[7:0] - immediate_r[7:0]};
-      3'd4: group_result = opcode_r == 8'h81 ? (rm_result_value & immediate_r) :
+      3'd4: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value & (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r)) :
                            {8'b0, rm_result_value[7:0] & immediate_r[7:0]};
-      3'd5: group_result = opcode_r == 8'h81
-                           ? (rm_result_value - immediate_r - {15'b0, flags[0]})
-                           : {8'b0, rm_result_value[7:0] - immediate_r[7:0] - {7'b0, flags[0]}};
-      3'd6: group_result = opcode_r == 8'h81 ? (rm_result_value ^ immediate_r) :
+      3'd5: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value - (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r))
+                           : {8'b0, rm_result_value[7:0] - immediate_r[7:0]};
+      3'd6: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value ^ (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r)) :
                            {8'b0, rm_result_value[7:0] ^ immediate_r[7:0]};
+      3'd7: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
+                           ? (rm_result_value - (opcode_r == 8'h83
+                              ? {{8{immediate_r[7]}}, immediate_r[7:0]}
+                              : immediate_r)) :
+                           {8'b0, rm_result_value[7:0] - immediate_r[7:0]};
       default: group_result = opcode_r == 8'h81 ? (rm_result_value + immediate_r) :
                               opcode_r == 8'h83
                               ? (rm_result_value + {{8{immediate_r[7]}}, immediate_r[7:0]})
@@ -596,7 +608,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
                    opcode_r == 8'h83 ? {{8{immediate_r[7]}}, immediate_r[7:0]} :
                                        {8'b0, immediate_r[7:0]};
       alu_flag_result = group_result;
-      alu_flag_byte = opcode_r != 8'h81;
+      alu_flag_byte = execute_width8;
     end else if (opcode_r >= 8'h40 && opcode_r <= 8'h4f) begin
       alu_flag_operation = opcode_r[3] ? 3'd3 : 3'd0;
       alu_flag_a = register_word(opcode_r[2:0]);
@@ -641,7 +653,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   end
 
   always @* begin
-    shift_count = (opcode_r == 8'hd2 || opcode_r == 8'hd3) ? cx[4:0] : 5'd1;
+    shift_count = (opcode_r == 8'hd2 || opcode_r == 8'hd3) ? cx[4:0] :
+                  (opcode_r == 8'hc0 || opcode_r == 8'hc1) ? immediate_r[4:0] : 5'd1;
     shift_byte = opcode_r[0] == 1'b0;
     shift_value = rm_result_value;
   end
@@ -725,15 +738,28 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       endcase
   end
   always @* begin
-    rcl_input = {shift_value, flags[0]};
-    rcr_input = {flags[0], shift_value};
+    rcl_input = shift_byte
+      ? {8'b0, flags[0], shift_value[7:0]}
+      : {flags[0], shift_value};
+    rcr_input = shift_byte
+      ? {8'b0, flags[0], shift_value[7:0]}
+      : {flags[0], shift_value};
   end
 
   always @* begin
-    rcl_rotated = (rcl_input << through_carry_count) |
-                  (rcl_input >> (17 - through_carry_count));
-    rcr_rotated = (rcr_input >> through_carry_count) |
-                  (rcr_input << (17 - through_carry_count));
+    if (shift_byte) begin
+      rcl_rotated = {8'b0,
+        ((rcl_input[8:0] << through_carry_count) |
+         (rcl_input[8:0] >> (9 - through_carry_count)))};
+      rcr_rotated = {8'b0,
+        ((rcr_input[8:0] >> through_carry_count) |
+         (rcr_input[8:0] << (9 - through_carry_count)))};
+    end else begin
+      rcl_rotated = (rcl_input << through_carry_count) |
+                    (rcl_input >> (17 - through_carry_count));
+      rcr_rotated = (rcr_input >> through_carry_count) |
+                    (rcr_input << (17 - through_carry_count));
+    end
   end
 
   always @* begin
@@ -750,9 +776,9 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
                   (shift_value[7:0] << (8 - rotate_count)))}
         : ((shift_value >> rotate_count) | (shift_value << (16 - rotate_count)));
     else if (modrm_register == 3'd2)
-      shift_result = rcl_rotated[15:0];
+      shift_result = shift_byte ? {8'b0, rcl_rotated[7:0]} : rcl_rotated[15:0];
     else if (modrm_register == 3'd3)
-      shift_result = rcr_rotated[16:1];
+      shift_result = shift_byte ? {8'b0, rcr_rotated[7:0]} : rcr_rotated[15:0];
     else if (modrm_register == 3'd4 || modrm_register == 3'd6)
       shift_result = shift_byte
         ? {8'b0, shift_value[7:0] << shift_count}
@@ -783,61 +809,58 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   end
 
   always @* begin
-    if (shift_count == 5'd0)
-      shift_flags = flags;
+    if (shift_count != 5'd1)
+      shift_overflow = flags[11];
     else if (modrm_register == 3'd0)
-      shift_flags = {
-        flags[15:12], shift_result[0] != shift_result_sign, flags[10:8],
-        shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1], shift_result[0]
-      };
+      shift_overflow = shift_result[0] != shift_result_sign;
     else if (modrm_register == 3'd1)
-      shift_flags = {
-        flags[15:12], shift_result_sign != shift_result_next_sign, flags[10:8],
-        shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1],
-        shift_result_sign
-      };
+      shift_overflow = shift_result_sign != shift_result_next_sign;
     else if (modrm_register == 3'd2)
-      shift_flags = {
-        flags[15:12], rcl_rotated[16] != shift_result_sign, flags[10:8],
-        shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1], rcl_rotated[16]
-      };
+      shift_overflow = (shift_byte ? rcl_rotated[8] : rcl_rotated[16]) !=
+                       shift_result_sign;
     else if (modrm_register == 3'd3)
-      shift_flags = {
-        flags[15:12], shift_result_sign != shift_result_next_sign, flags[10:8],
-        shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1], rcr_rotated[0]
-      };
+      shift_overflow = shift_result_sign != shift_result_next_sign;
     else if (modrm_register == 3'd4 || modrm_register == 3'd6)
-      shift_flags = {
-        flags[15:12],
-        ((shift_value >> (shift_byte ? 8 - shift_count : 16 - shift_count)) & 16'b1) !=
-          shift_result_sign,
-        flags[10:8], shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1],
-        (shift_value >> (shift_byte ? 8 - shift_count : 16 - shift_count)) & 16'b1
-      };
+      shift_overflow = ((shift_value >> (shift_byte ? 8 - shift_count : 16 - shift_count)) & 16'b1) !=
+                       shift_result_sign;
     else if (modrm_register == 3'd5)
-      shift_flags = {
-        flags[15:12], shift_input_sign, flags[10:8], shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1],
-        (shift_value >> (shift_count - 5'd1)) & 16'b1
-      };
+      shift_overflow = shift_input_sign;
     else
-      shift_flags = {
-        flags[15:12], 1'b0, flags[10:8], shift_result_sign,
-        (shift_result & (shift_byte ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(shift_result), flags[1],
-        (shift_value >> (shift_count - 5'd1)) & 16'b1
-      };
+      shift_overflow = 1'b0;
+  end
+
+  always @* begin
+    if (modrm_register == 3'd0)
+      shift_carry = shift_result[0];
+    else if (modrm_register == 3'd1)
+      shift_carry = shift_result_sign;
+    else if (modrm_register == 3'd2)
+      shift_carry = shift_byte ? rcl_rotated[8] : rcl_rotated[16];
+    else if (modrm_register == 3'd3)
+      shift_carry = shift_byte ? rcr_rotated[8] : rcr_rotated[16];
+    else if (modrm_register == 3'd4 || modrm_register == 3'd6)
+      shift_carry = (shift_value >>
+        (shift_byte ? 8 - shift_count : 16 - shift_count)) & 16'b1;
+    else if (modrm_register == 3'd5)
+      shift_carry = (shift_value >> (shift_count - 5'd1)) & 16'b1;
+    else
+      shift_carry = (shift_count > (shift_byte ? 5'd8 : 5'd16)) ?
+                    shift_input_sign :
+                    ((shift_value >> (shift_count - 5'd1)) & 16'b1);
+  end
+
+  always @* begin
+    shift_flags = flags;
+    if (shift_count != 5'd0) begin
+      shift_flags[11] = shift_overflow;
+      if (modrm_register != 3'd2 && modrm_register != 3'd3) begin
+        shift_flags[7] = shift_result_sign;
+        shift_flags[6] = (shift_result &
+                          (shift_byte ? 16'h00ff : 16'hffff)) == 0;
+        shift_flags[2] = parity_even(shift_result);
+      end
+      shift_flags[0] = shift_carry;
+    end
   end
 
   always @* begin
@@ -934,6 +957,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     console_write_r = 1'b0;
     console_char_r = 8'b0;
     divide_start = 1'b0;
+    mul_overflow = execute_width8 ? mul_product > 32'h0000_00ff :
+                                  mul_product > 32'h0000_ffff;
 
     if (state == S_EXECUTE) begin
       // Defaults for a completed instruction.
@@ -1036,9 +1061,10 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             if (modrm_register != 3'd7) begin
               if (modrm_memory) begin
                 execute_mem_we = 1'b1;
-                execute_mem_width = opcode_r == 8'h81 ? SZ_WORD : SZ_BYTE;
+                execute_mem_width =
+                  (opcode_r == 8'h81 || opcode_r == 8'h83) ? SZ_WORD : SZ_BYTE;
                 execute_mem_wdata = group_result;
-              end else if (opcode_r == 8'h81) begin
+              end else if (opcode_r == 8'h81 || opcode_r == 8'h83) begin
                 case (modrm_rm)
                   3'd0: next_ax = group_result;
                   3'd1: next_cx = group_result;
@@ -1410,7 +1436,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
               endcase
             end
           end
-          8'hd0, 8'hd1, 8'hd2, 8'hd3: begin
+          8'hc0, 8'hc1, 8'hd0, 8'hd1, 8'hd2, 8'hd3: begin
             execute_mem_we = modrm_memory;
             execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
             execute_mem_wdata = shift_result;
@@ -1462,7 +1488,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
           8'hf6, 8'hf7: begin
             if (modrm_register == 3'd0 || modrm_register == 3'd1) begin
               next_flags = unary_flags;
-            end else if (modrm_register == 3'd2 || modrm_register == 3'd3) begin
+            end
+            if (modrm_register == 3'd2 || modrm_register == 3'd3) begin
               execute_mem_we = modrm_memory;
               execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
               execute_mem_wdata = unary_result;
@@ -1492,8 +1519,16 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
                   endcase
                 end
               end
-            end else begin
-              next_trap = 1'b1;
+            end
+            if (modrm_register == 3'd4 || modrm_register == 3'd5) begin
+              next_ax = mul_product[15:0];
+              if (!execute_width8)
+                next_dx = mul_product[31:16];
+              next_flags = mul_flags;
+            end
+            if (modrm_register >= 3'd6) begin
+              divide_start = 1'b1;
+              next_state = S_DIVIDE_INIT;
             end
           end
           8'hfe: begin
@@ -1768,10 +1803,18 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             next_flags = simple_flags;
           8'hf4: begin next_halted = 1'b1; next_state = S_HALTED; end
           default: begin next_trap = 1'b1; end
-        endcase
-      end
-    end
-  end
+                endcase
+              end
+            end else if (modrm_register == 3'd4 || modrm_register == 3'd5) begin
+              next_ax = mul_product[15:0];
+              if (!execute_width8)
+                next_dx = mul_product[31:16];
+              next_flags = mul_flags;
+            end else begin
+              divide_start = 1'b1;
+              next_state = S_DIVIDE;
+            end
+          end
 
   assign mem_addr =
     state == S_EXECUTE ? execute_mem_addr :
@@ -1895,13 +1938,15 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             state <= S_DISP8;
           else if (fetch_byte[7:6] == 2'b10)
             state <= S_DISP16_LOW;
+          else if (fetch_byte[7:6] == 2'b00 && fetch_byte[2:0] == 3'b110)
+            state <= S_DISP16_LOW;
           else if (modrm_fetch_needs_immediate)
             state <= S_IMM_LOW;
           else
             state <= S_EXECUTE;
         end
         S_DISP8: begin
-          displacement_r <= {{8{fetch_byte}}, fetch_byte};
+          displacement_r <= {{8{fetch_byte[7]}}, fetch_byte};
           ip <= ip + 16'd1;
           if (execute_imm_size != 2'b00)
             state <= S_IMM_LOW;
@@ -1975,32 +2020,41 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
           rep_while_not_equal <= next_rep_while_not_equal;
           if (divide_start) begin
             divide_aam <= opcode_r == 8'hd4;
-            divide_bits_left <= (opcode_r == 8'hd4 || execute_width8) ? 4'd8 : 4'd16;
-            divide_divisor <= opcode_r == 8'hd4
-                              ? {8'b0, immediate_r[7:0]}
-                              : rm_result_value;
-            divide_remainder <= 16'b0;
-            divide_quotient <= 16'b0;
+            if (opcode_r == 8'hd4)
+              divide_bits_left <= 6'd8;
+            else if (execute_width8)
+              divide_bits_left <= 6'd16;
+            else
+              divide_bits_left <= 6'd32;
+            divide_remainder <= 32'b0;
+            divide_quotient <= 32'b0;
             divide_byte <= opcode_r == 8'hd4 || execute_width8;
-            divide_signed <= opcode_r != 8'hd4 && modrm_register == 3'd7;
-            if (execute_width8) begin
-              divide_dividend <= {24'b0, al};
-              divide_dividend_negative <= divide_signed && al[7];
-              divide_divisor_negative <= divide_signed &&
+            divide_signed <= divide_will_be_signed;
+            if (opcode_r == 8'hd4 || execute_width8) begin
+              divide_dividend <= opcode_r == 8'hd4
+                ? {24'b0, al}
+                : divide_will_be_signed && ax[15]
+                ? 32'b0 - {16'b0, ax}
+                : {16'b0, ax};
+              divide_dividend_negative <= divide_will_be_signed && ax[15];
+              divide_divisor_negative <= divide_will_be_signed &&
                 (opcode_r == 8'hd4 ? immediate_r[7] : rm_result_value[7]);
-              if (divide_signed && al[7])
-                divide_dividend <= {24'b0, 8'b0 - al};
-              if (divide_signed && rm_result_value[7])
-                divide_divisor <= 16'b0 -
-                  (opcode_r == 8'hd4 ? {8'b0, immediate_r[7:0]} : rm_result_value);
+              if (opcode_r == 8'hd4)
+                divide_divisor <= {24'b0, immediate_r[7:0]};
+              else if (divide_will_be_signed && rm_result_value[7])
+                divide_divisor <= 32'b0 -
+                  {{24{rm_result_value[7]}}, rm_result_value[7:0]};
+              else
+                divide_divisor <= {24'b0, rm_result_value[7:0]};
             end else begin
-              divide_dividend <= {dx, ax};
-              divide_dividend_negative <= divide_signed && dx[15];
-              divide_divisor_negative <= divide_signed && rm_result_value[15];
-              if (divide_signed && dx[15])
-                divide_dividend <= 32'b0 - {dx, ax};
-              if (divide_signed && rm_result_value[15])
-                divide_divisor <= 16'b0 - rm_result_value;
+              divide_dividend <= divide_will_be_signed && dx[15]
+                ? 32'b0 - {dx, ax}
+                : {dx, ax};
+              divide_dividend_negative <= divide_will_be_signed && dx[15];
+              divide_divisor_negative <= divide_will_be_signed && rm_result_value[15];
+              divide_divisor <= divide_will_be_signed && rm_result_value[15]
+                ? 32'b0 - {{16{rm_result_value[15]}}, rm_result_value}
+                : {16'b0, rm_result_value};
             end
           end
         end
@@ -2053,51 +2107,53 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             dx <= dx + 16'd1;
         end
         S_DIVIDE: begin
-          if (divide_bits_left == 4'd0) begin
-            if (divide_divisor == 16'b0 ||
-                (divide_byte && divide_quotient[15:8] != 8'b0) ||
-                (divide_signed && divide_quotient[15] &&
-                 divide_quotient != 16'h8000)) begin
+          if (divide_bits_left == 6'd0) begin
+            if (divide_divisor == 32'b0 ||
+                (!divide_aam && divide_byte &&
+                 divide_quotient[15:8] != 8'b0) ||
+                (!divide_byte && divide_quotient[31:16] != 16'b0) ||
+                (divide_signed && divide_byte &&
+                 divide_quotient[15:7] != 9'b0 &&
+                 divide_quotient[15:7] != 9'h1ff) ||
+                (divide_signed && !divide_byte &&
+                 divide_quotient[31:15] != 17'b0 &&
+                 divide_quotient[31:15] != 17'h1ffff)) begin
               trap_r <= 1'b1;
             end else if (divide_aam) begin
-              ax <= aam_result;
+              ax <= {divide_quotient[7:0], divide_remainder[7:0]};
               flags[7] <= divide_remainder[7];
               flags[6] <= divide_remainder[7:0] == 8'b0;
               flags[2] <= parity_even(divide_remainder[7:0]);
             end else if (divide_byte) begin
               if (divide_signed && divide_dividend_negative != divide_divisor_negative)
-                ax <= {divide_remainder[7:0], 16'b0 - divide_quotient[7:0]};
+                ax <= {divide_remainder[7:0], 8'b0 - divide_quotient[7:0]};
               else
                 ax <= {divide_remainder[7:0], divide_quotient[7:0]};
-              if (opcode_r == 8'hd4) begin
-                flags[7] <= divide_remainder[7];
-                flags[6] <= divide_remainder[7:0] == 8'b0;
-                flags[2] <= parity_even(divide_remainder[7:0]);
-              end
             end else begin
               if (divide_signed && divide_dividend_negative != divide_divisor_negative)
-                ax <= 16'b0 - divide_quotient;
+                ax <= 16'b0 - divide_quotient[15:0];
               else
-                ax <= divide_quotient;
+                ax <= divide_quotient[15:0];
               if (divide_signed && divide_dividend_negative)
-                dx <= 16'b0 - divide_remainder;
+                dx <= 16'b0 - divide_remainder[15:0];
               else
-                dx <= divide_remainder;
+                dx <= divide_remainder[15:0];
             end
             state <= S_FETCH;
           end else begin
-            divide_bits_left <= divide_bits_left - 4'd1;
+            divide_bits_left <= divide_bits_left - 6'd1;
             divide_dividend <= divide_dividend << 1;
-            if ({divide_remainder[14:0], divide_dividend_msb} >= divide_divisor) begin
-              divide_remainder <= {divide_remainder[14:0], divide_dividend_msb} -
+            if ({divide_remainder[30:0], divide_dividend_msb} >= divide_divisor) begin
+              divide_remainder <= {divide_remainder[30:0], divide_dividend_msb} -
                                  divide_divisor;
-              divide_quotient <= {divide_quotient[14:0], 1'b1};
+              divide_quotient <= {divide_quotient[30:0], 1'b1};
             end else begin
-              divide_remainder <= {divide_remainder[14:0], divide_dividend_msb};
-              divide_quotient <= {divide_quotient[14:0], 1'b0};
+              divide_remainder <= {divide_remainder[30:0], divide_dividend_msb};
+              divide_quotient <= {divide_quotient[30:0], 1'b0};
             end
           end
         end
+        S_DIVIDE_INIT: state <= S_DIVIDE;
         S_HALTED: state <= S_HALTED;
         default: state <= S_FETCH;
       endcase

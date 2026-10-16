@@ -1,0 +1,210 @@
+# HDL frontend error and coverage audit
+
+Date: 2026-10-16  
+Repository state: branch `fix-digital`, commit `9827bcd`, with substantial uncommitted frontend/CPU-platform work present.  
+Scope: `crates/eda-hdl` and the `crates/eda-slang` integration boundary. Simulator behavior is discussed only where the frontend lowering causes the limitation.
+
+## Executive summary
+
+The serious frontend failures are structural, not isolated typos:
+
+1. The internal frontend is a hand-written, bounded Verilog/SystemVerilog subset. It is not an IEEE 1800 compiler and was never a replacement for a commercial frontend by itself.
+2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. Exact-width whole-element access is now shift/mask lowered, but array storage remains a flat packed vector, narrower/reversed/negative-index cases still have expansion paths, and there is no first-class sparse-memory object.
+3. The initial audit found malformed elaborations silently accepted, including unknown or duplicate named port/parameter connections and excess positional connections. The current worktree now rejects those cases; see the status column below.
+4. A representative slang-validated probe set contained 42 valid SystemVerilog constructs. The internal frontend accepted only 2 of them; 40 were rejected. This is expected for a bounded subset, but it quantifies how far the internal parser is from full-language coverage.
+5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON, but normal compilation still feeds slang-preprocessed text back into the bounded internal parser. There is no full slang-AST-to-repository-IR lowering.
+
+Current automated status at the time of this audit:
+
+| Gate | Result |
+|---|---|
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 84 passed after the P0 remediation below |
+| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 6 passed |
+| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 5 passed |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 143.27 s after P0 remediation |
+| `cargo clippy -p eda-hdl -p eda-slang --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` and `git diff --check` | Passed |
+
+Passing tests do not establish commercial frontend completeness. The tests are intentionally focused on the implemented subset.
+
+## Why the runtime-memory failure happened
+
+The internal elaborator represents an unpacked array as one packed flat net. For example, this valid design:
+
+```systemverilog
+module top(input clk, input [11:0] addr, input [7:0] din, output [7:0] q);
+  logic [7:0] mem [0:4095];
+  always @(posedge clk) mem[addr] <= din;
+  assign q = mem[addr];
+endmodule
+```
+
+reports `32797` flat bits through `eda info`: 32768 storage bits plus generated selector/control bits. The simulator state is a `Vec<LogicValue>`, so even unused memory elements consume state. The recent whole-element shift/mask lowering reduces expression-tree explosion but does not change this storage representation.
+
+Remaining scaling problems include:
+
+- one-dimensional arrays are capped at 4096 elements and 1 MiB of flattened bits;
+- multidimensional dimensions are capped at 256 elements per dimension;
+- module/interface arrays are capped at 4096 total elements;
+- narrower indexed slices of dynamically selected array elements still generate per-element alternatives;
+- reversed element declarations take bit-by-bit concatenation paths;
+- negative array-index bases disable the optimized physical-index path and fall back to expansion;
+- physical index expressions are lowered as 32-bit values;
+- there is no sparse-memory IR, memory hierarchy, lazy backfill, or independent memory subsystem.
+
+This is why the correct architectural fix is a first-class sparse memory object in IR and simulator, not another local transformation over a flat vector.
+
+## A. Confirmed correctness and diagnostic defects
+
+| ID | Severity | Area | Defect | Evidence / consequence | Required fix | Status |
+|---:|---|---|---|---|---|---|
+| HF-C01 | P0 | Lexer | Unterminated block comments are silently accepted. | `Lexer::skip_trivia` returns when EOF is reached without closing `/*`. slang rejects the same source; `eda info` accepts it after a complete module. | Return an unterminated-comment diagnostic with source span. | Fixed in current worktree |
+| HF-C02 | P0 | Top selection | Automatic top selection ignores instances nested in generate constructs. | A design with one true top and children instantiated only in `generate if` is reported as ambiguous because `pick_top` scans only direct `Item::Inst` nodes before generate expansion. | Resolve parameters and flatten generate constructs before choosing top, or construct the instantiation graph recursively. | Fixed in current worktree |
+| HF-C03 | P0 | Instance ports | Unknown named port connections are silently ignored. | `child u(.does_not_exist(x))` is accepted; slang reports that the port does not exist. | Validate every named connection against the child port table. | Fixed in current worktree |
+| HF-C04 | P0 | Instance ports | Duplicate named port connections are accepted. | Repeated `.a(...)` connections are accepted; `find_conn` returns the first match and never diagnoses the duplicate. | Reject duplicate connections and report both source locations. | Fixed in current worktree |
+| HF-C05 | P0 | Instance ports | Excess positional port connections are silently ignored. | A two-port child instantiated with three positional expressions is accepted; slang reports too many connections. | Enforce positional connection count and report missing/unconnected ports according to language rules. | Fixed in current worktree |
+| HF-C06 | P1 | Instance ports | Mixed named/positional connection matching is not robust. | `find_conn` tracks positional order only as tokens are encountered and does not model the child declaration index when named and positional connections are mixed. | Build and validate a complete connection map before lowering. | Fixed in current worktree |
+| HF-C07 | P0 | Parameter overrides | Unknown named parameter overrides are silently ignored. | `#(.DOES_NOT_EXIST(3))` is accepted; slang reports an undefined parameter override. | Validate names against declared child parameters. | Fixed in current worktree |
+| HF-C08 | P1 | Parameter overrides | Duplicate parameter overrides silently use the last value. | Overrides are inserted into a map without duplicate detection. | Reject duplicates and preserve declaration/override order diagnostics. | Fixed in current worktree |
+| HF-C09 | P1 | Parameter overrides | Excess positional parameter overrides are silently ignored. | More positional actuals than declared parameters are accepted. | Enforce declared parameter count and diagnostics. | Fixed in current worktree |
+| HF-C10 | P0 | Port directions | Top-level `inout` is coerced to `Dir::In`. | Only output is distinguished when top ports are emitted; child inout is separately rejected. The resulting design direction metadata is wrong. | Add a true bidirectional connection/strength model or reject inout consistently until supported. | Explicit rejection fixed; full inout remains open |
+| HF-C11 | P0 | Constants | Known constants wider than 64 bits cannot be elaborated and are mislabeled as X/Z. | `const_eval` first calls `LogicWord::to_u64`; that function returns `None` for every width above 64, so the error claims `constant contains x/z`. | Use an arbitrary-sized constant representation and context-correct width/signedness semantics. | Open |
+| HF-C12 | P1 | Constants | Constant arithmetic is `i64` with wrapping operations. | Parameter values have no arbitrary-precision representation and little type context. Overflow is not reported. | Use checked, typed, arbitrary-sized elaboration constants. | Open |
+| HF-C13 | P1 | Functions | Function/class-method return and formal signedness is discarded. | `FunctionDef` stores only ranges for returns/arguments; parser-detected signedness is not carried into the IR boundary. Formal casts and signed comparison contexts are therefore incomplete. | Preserve full source types through AST, inlining, and IR. | Open |
+| HF-C14 | P1 | Sensitivity | Mixed edge and level event expressions collapse to combinational sensitivity. | Any plain identifier in `@(a or posedge clk)` causes the entire list to become `Sens::Comb`; the edge list is discarded. | Represent all event kinds exactly and implement legal mixed-event scheduling semantics. | Open |
+| HF-C15 | P1 | Generate hierarchy | Generate block labels and generated-object hierarchy names are discarded. | `GenerateBlock::label` is not used as a hierarchical scope; an instance in `g` appears as `top.u`, not `top.g.u`. This breaks hierarchical references, waves, coverage, and physical naming. | Preserve generate scopes and standard generated-block naming, including unnamed blocks. | Open |
+| HF-C16 | P0 | Diagnostics | Elaboration diagnostics have no file, column, or original source span. | `SourceManager` remaps only parser errors. `compile_sources` elaboration failures still have no file mapping; parse remapping also retains the global concatenated line inside the message. | Attach spans to every AST/IR node and emit file:line:column diagnostics with notes. | Open |
+| HF-C17 | P1 | Strings | String lexical semantics are incomplete. | Backslash-newline is stored as a newline rather than continuing the literal; unknown escapes are accepted unchanged; non-ASCII bytes are reconstructed through `u8 as char`, corrupting UTF-8 contents. | Implement SystemVerilog string lexical rules on Unicode scalar/byte boundaries. | Open |
+| HF-C18 | P1 | Imports | Collisions between wildcard imports are silently overwritten. | `apply_import` iterates package tables and inserts into local maps without conflict reporting. | Detect ambiguous imported constants/types/functions and local/import collisions. | Open |
+| HF-C19 | P1 | Arrays | Negative array bases silently lose the optimized lowering path. | `runtime_array_physical_index` returns `None` if any dimension base is negative, after which exact-width access falls back to a per-element tree. This is a hidden performance cliff for valid indices such as `[-4:3]`. | Implement signed normalized physical indices or represent logical ranges directly. | Open |
+| HF-C20 | P0 | Dynamic arrays | Dynamic array storage is fixed at 256 elements while the size register is nine bits. | `new[size]` truncates size to nine bits, zeroes the fixed storage, and records values up to 511; access does not implement true allocation or complete `size()` semantics. | Reject >256 sizes immediately or, preferably, implement real dynamic storage. | Open |
+| HF-C21 | P1 | Lint/elaboration | The frontend does not diagnose multiple drivers, combinational loops, accidental latches, or incomplete `always_comb` behavior. | No such analysis exists at the frontend boundary. These are commercial-elaboration/lint prerequisites. | Add a driver/algebraic-cycle/latch analysis stage with waivers and source spans. | Open |
+| HF-C22 | P1 | Port checking | Width/truncation/extension and signedness mismatch diagnostics are incomplete. | Connections are lowered without a full port type/width contract. | Implement implicit port conversion rules and issue required warnings/errors. | Open |
+| HF-C23 | P1 | Assertions | Concurrent assertion coverage semantics merge overlapping attempts for some repetition forms. | The current implementation documents that goto attempts sharing a count bucket are merged; assertion/assumption behavior is preserved but distinct cover attempts are not. | Track individual attempts or define and validate a conservative cover model. | Open |
+
+## B. Language and semantic coverage gaps
+
+| ID | Severity | Area | Missing or incomplete capability |
+|---:|---|---|---|
+| HF-G01 | P0 | Preprocessor | No internal `include`, macro definition/expansion, conditional compilation, `` `define``/`` `undefine``, `` `ifdef`` family, or command-line define/include environment. The internal lexer rejects the backtick character. |
+| HF-G02 | P0 | Source model | No full source manager: no columns, ranges, include expansion maps, macro expansion maps, compilation-unit identity, or notes/carets. |
+| HF-G03 | P0 | Compilation model | No library/config resolution, `` `config``, `design`, `instance`, `liblist`, separate compilation-unit semantics, or source-order/package dependency management beyond a concatenated unit. |
+| HF-G04 | P0 | Types | No native `real`, `shortreal`, `realtime`, `time`, `chandle`, `event`, or complete `void` type system. |
+| HF-G05 | P0 | Aggregates | Only packed structs/unions. No unpacked structs, tagged unions, unpacked union layout, arbitrary aggregate assignment, or full assignment patterns. |
+| HF-G06 | P0 | Arrays | No complete dynamic arrays, queues, associative arrays, array query/manipulation methods, `inside`, `with`, sorting, reduction methods, or streaming concatenation. |
+| HF-G07 | P0 | Strings | Fixed 64-byte packed representation. Longer strings and dynamic string semantics are unsupported. |
+| HF-G08 | P0 | Parameters | No type parameters, parameter ranges/kinds, string/type parameter values, arbitrary-width constants, or complete localparam type syntax. Multiple `parameter` declaration groups in one module header are not accepted. |
+| HF-G09 | P0 | Expressions | No full context-determined/self-determined expression sizing and signedness algorithm. The AST has no general type layer. |
+| HF-G10 | P1 | Operators | Arithmetic left/right shifts, compound assignments, wildcard equality `==?`/`!=?`, set membership, `dist`, `matches`, and streaming operators are absent or partial. |
+| HF-G11 | P0 | Procedures | No top-level tasks, `return`, `break`, `continue`, `do...while`, `foreach`, `wait`, `wait_order`, `disable`, procedural labels, or complete event controls. |
+| HF-G12 | P0 | Concurrency | No `fork`/`join`, `join_any`, `join_none`, process control, interprocess communication, event triggers, semaphores, or mailboxes as general language features. |
+| HF-G13 | P0 | Timing | Delays are integer nanoseconds up to 1,000,000. No `timescale`, time units/precision, real delays, parameterized delays, intra-assignment delays, net delays, or full scheduling regions. |
+| HF-G14 | P0 | Procedural force | No `force`, `release`, `assign`/`deassign` procedural statements. |
+| HF-G15 | P0 | Hierarchy | No general hierarchical references/upwards references, cross-module references, `bind`, `defparam`, or preserve-generate hierarchy. |
+| HF-G16 | P0 | Module connectivity | No complete bidirectional/inout resolution, net strengths, tri-state resolution, user-defined nettypes, `interconnect`, or port connection type checking. |
+| HF-G17 | P1 | Gates/primitives | Basic AND/OR/XOR/BUF/NOT gates only. No gate delays/strengths, `bufif`/`notif`, MOS/CMOS switches, UDPs, or specify-path timing. |
+| HF-G18 | P1 | Specify | No `specify`, `specparam`, module path delays, pulse controls, timing checks, or SDF annotation at the frontend language level. |
+| HF-G19 | P0 | Functions | Functions are symbolically inlined. No runtime stack, general recursion, automatic/static lifetimes, side-effect ordering, task timing, ref arguments, or complete modern function signatures. |
+| HF-G20 | P1 | Interfaces | Static interface/modport subset only. No procedural rebinding, null virtual interfaces, virtual-interface arrays, interface classes, `implements`, or full modport procedure exports. |
+| HF-G21 | P0 | OOP | Class support is a bounded subset. No complete constructor/super rules, static/protected/local enforcement, package/class visibility, interfaces, nested classes, covergroups in classes, or general object lifetime. |
+| HF-G22 | P0 | Randomization | No constraint solver, `randomize`/`srandom`/`pre/post_randomize`, soft constraints, solve-before, distribution constraints, inheritance-aware randomization, or reproducible random state. |
+| HF-G23 | P0 | UVM | Built-in UVM-lite classes are not official UVM. Official Accellera UVM is elaborated by slang only; it is not lowered or executed. Factory/config/TLM/sequences/phases/callbacks/objections/reporting are all partial. |
+| HF-G24 | P0 | Assertions | SVA subset is bounded and mostly two-sequence. No complete sequences, local variables, recursion, unbounded repetition, first_match/throughout/within/intersect, multiclocking, clocking blocks, or full pass/fail actions. |
+| HF-G25 | P0 | Coverage | No SystemVerilog `covergroup`, coverpoints, crosses, bins, illegal/ignore bins, per-instance coverage, or coverage sampling semantics in the HDL frontend. |
+| HF-G26 | P0 | Elaboration lint | No `unique`/`priority` enforcement, full case-overlap analysis, full always kind checking, unused/conflicting name diagnostics, or elaboration-policy waivers. |
+| HF-G27 | P1 | System tasks/functions | Only a selected display/format/control subset. No complete file I/O, math/random conversion, assertion control, PLI/VPI/DPI tasks, or vendor-task policy. |
+| HF-G28 | P0 | Memory architecture | No first-class sparse memories, memory macros, byte enables, banked memories, hierarchical memories, lazy initialization, or independent memory netlist mapping. |
+| HF-G29 | P1 | Literal limits | Packed literals/types are capped at 4096 bits; string literals at 64 bytes. Valid larger constructs are rejected rather than represented. |
+| HF-G30 | P1 | Elaboration bounds | Generate loops stop at 131072 steps, function loops at 256 iterations, class composition at eight levels, hierarchy at 64 levels. These are safety caps, not language semantics. |
+| HF-G31 | P0 | slang integration | No full slang elaborated AST to repository IR lowering. `compile_files` validates with slang, preprocesses to one text unit, then invokes the bounded internal parser. |
+| HF-G32 | P1 | slang diagnostics | slang diagnostics are passthrough strings. No structured severities, spans, artifact capture, filtering, or mapping from preprocessed output back to original source. |
+| HF-G33 | P1 | slang lifecycle | No runtime-pinned version check, timeout, cache, incremental compilation unit, or AST schema contract. Any compatible-looking `SLANG_BIN` path is accepted. |
+
+## C. Representative full-language probe results
+
+The following probe set was first accepted by local slang 12.0.0; the unchanged sources were then passed to the internal `eda info` path. Forty of the forty-two slang-valid probes were rejected. This is not an exhaustive IEEE 1800 matrix, but it shows that current passing tests are subset tests.
+
+| Probe | Internal result |
+|---|---|
+| ANSI top with `inout` | Now explicitly rejected until bidirectional semantics are implemented (HF-C10). |
+| Concatenated/sliced named port actual | Accepted. |
+| Parameter type parameter | Rejected: `expected identifier, found Ident("type")`. |
+| Typed `localparam logic` | Rejected before elaboration. |
+| Enum `.next()` | Rejected as an unsupported dynamic-array method. |
+| Unpacked struct | Rejected: only packed structs/unions supported. |
+| Tagged union | Rejected. |
+| Dynamic array | Rejected at `[]`. |
+| Queue | Rejected at `[$]`. |
+| Associative array | Rejected. |
+| 70-byte string | Rejected by 64-byte string limit. |
+| `real` | Rejected. |
+| `time` | Rejected. |
+| `automatic` function with modern argument list | Rejected: classic `input` argument syntax expected. |
+| `let` declaration | Rejected. |
+| Task | Rejected. |
+| Function with `return` | Rejected. |
+| `foreach` | Rejected. |
+| `break`/`continue` | Rejected. |
+| `do...while` | Rejected. |
+| `wait` | Rejected. |
+| `fork`/`join` | Rejected. |
+| `` `timescale`` directive | Rejected at the backtick. |
+| `force`/`release` | Rejected. |
+| `alias` | Rejected. |
+| `tran` switch | Rejected. |
+| `specify` path | Rejected. |
+| Hierarchical reference | Rejected: undeclared identifier. |
+| `always_latch` | Rejected. |
+| `priority case` | Rejected. |
+| `case ... inside` | Rejected. |
+| Assignment pattern | Rejected. |
+| Streaming concatenation | Rejected. |
+| Array assignment pattern | Rejected. |
+| `with` clause | Rejected. |
+| Randomization constraint | Rejected. |
+| `covergroup` | Rejected. |
+| Multiclock assertion | Rejected. |
+| Package `export` | Rejected. |
+| `program` block | Rejected. |
+| `checker` block | Rejected. |
+| `config` declaration | Rejected. |
+
+## D. Highest-priority corrective plan
+
+### P0 correctness stopgaps
+
+1. Add malformed-instance matrices for unknown, duplicate, missing, mixed, and excess port/parameter connections; reject all of them.
+2. Fix unterminated block comments and string lexical handling.
+3. Choose automatic top after generate elaboration or through a recursive instantiation graph.
+4. Preserve top `inout` direction or reject it until bidirectional semantics exist.
+5. Replace `i64` elaboration constants with typed arbitrary-sized constants.
+6. Attach source spans to parser and elaboration errors; remap all `compile_sources` failures.
+7. Preserve function formal/return signedness and full types.
+8. Add a negative-index and slice-scaling regression so the optimized path cannot silently degrade.
+
+### P0 architecture
+
+1. Define a sparse-memory IR object with logical dimensions, element width, initialization policy, byte/part enables, bank/interface metadata, and simulator/runtime mapping.
+2. Stop lowering general dynamic array accesses through per-element expansion. Keep expansion only for tiny explicitly requested constants.
+3. Lower slang's elaborated AST/compilation model into repository IR rather than preprocessing source and reparsing it with the bounded parser.
+4. Introduce a typed frontend IR before flattening so signedness, widths, lifetimes, aggregate shape, and source identity survive elaboration.
+5. Make frontend diagnostics structured (`file`, `line`, `column`, `end`, `severity`, `code`, `notes`) rather than strings.
+
+### Validation requirements
+
+- Add a slang-conformance corpus that is valid under slang and deliberately unsupported in the internal frontend; expected results must be explicit, not accidental parse errors.
+- Add malformed-source diagnostics for every accepted-by-mistake case in section A.
+- Add array scaling tests at 1, 256, 4096, >4096, negative bases, multidimensional forms, partial-width slices, and out-of-range X indices.
+- Add expression width/signedness differential matrices, including >64-bit constants.
+- Keep official UVM elaboration separate from any claim that UVM runs.
+- Add source-location golden tests for parser and elaborator errors.
+- Add compile-time and runtime memory budgets to CI so a flat-array regression cannot merge unnoticed.
+
+## Acceptance criteria for calling the frontend signoff-grade
+
+- Full slang or equivalent standard frontend is the parser/type/elaboration authority.
+- No valid input is silently transformed into a different hierarchy, direction, type, width, or driver structure.
+- Every unsupported construct has a precise, source-located diagnostic.
+- Arrays and memories do not require dense allocation for sparse designs.
+- Parser, type checker, elaborator, linter, and simulator use one typed source-span-carrying representation.
+- Official UVM execution, if claimed, is validated against a documented behavioral reference, not merely slang elaboration.

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/eda-core",
     "crates/eda-hdl",
+    "crates/eda-slang",
   "crates/eda-sim",
   "crates/eda-ams",
   "crates/eda-schematic",

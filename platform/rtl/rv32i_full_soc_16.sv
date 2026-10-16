@@ -22,6 +22,7 @@ module rv32i_full_soc_16(clk, rst, prog, halted, trap, trap_cause, dbg_pc,
   reg [31:0] mem8, mem9, mem10, mem11, mem12, mem13, mem14, mem15;
   reg [31:0] imem_word;
   reg [31:0] dmem_word;
+  reg [31:0] merged_word;
 
   rv32i_full_core core(
     .clk(clk), .rst(rst), .init_pc(32'b0), .imem_rdata(imem_word), .dmem_rdata(dmem_word),
@@ -117,7 +118,6 @@ module rv32i_full_soc_16(clk, rst, prog, halted, trap, trap_cause, dbg_pc,
       endcase
     end
   end
-  reg [31:0] merged_word;
   always @* begin
     case (dmem_width)
       3'b000: merged_word = dmem_addr[1:0] == 2'd0 ? {dmem_word[31:8], dmem_wdata[7:0]} : dmem_addr[1:0] == 2'd1 ? {dmem_word[31:16], dmem_wdata[7:0], dmem_word[7:0]} : dmem_addr[1:0] == 2'd2 ? {dmem_word[31:24], dmem_wdata[7:0], dmem_word[15:0]} : {dmem_wdata[7:0], dmem_word[23:0]};

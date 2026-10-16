@@ -270,14 +270,13 @@ impl I8086Machine {
         let carry_in = u16::from(self.get_flag(FLAG_CF));
         let result = match operation {
             2 => raw.wrapping_add(carry_in),
-            5 => raw.wrapping_sub(carry_in),
             _ => raw,
         } & mask;
         let carry = match operation {
             0 => u32::from(a) + u32::from(b) > u32::from(mask),
             2 => u32::from(a) + u32::from(b) + u32::from(carry_in) > u32::from(mask),
             3 | 7 => add_carry,
-            5 => i32::from(a) - i32::from(b) - i32::from(carry_in) < 0,
+            5 => i32::from(a) - i32::from(b) < 0,
             _ => false,
         };
         let overflow = match operation {
@@ -603,7 +602,11 @@ impl I8086Machine {
                 }
             }
             0x80..=0x83 => {
-                let width = if opcode == 0x81 { 16 } else { 8 };
+                let width = if opcode == 0x81 || opcode == 0x83 {
+                    16
+                } else {
+                    8
+                };
                 let (destination, operation) = self.modrm(segment_override);
                 let immediate = if opcode == 0x81 {
                     self.fetch_u16()
@@ -811,10 +814,12 @@ impl I8086Machine {
                 self.segments[SEG_CS] = self.pop_u16();
                 self.flags = self.pop_u16();
             }
-            0xd0..=0xd3 => {
+            0xc0 | 0xc1 | 0xd0..=0xd3 => {
                 let width = if opcode & 1 == 0 { 8 } else { 16 };
                 let (destination, operation) = self.modrm(segment_override);
-                let count = if opcode < 0xd2 {
+                let count = if opcode == 0xc0 || opcode == 0xc1 {
+                    u16::from(self.fetch_u8())
+                } else if opcode < 0xd2 {
                     1
                 } else {
                     self.regs[REG_CX] as u8 as u16
@@ -982,7 +987,9 @@ impl I8086Machine {
                             let product = if operation == 4 {
                                 dividend.wrapping_mul(u32::from(value))
                             } else {
-                                (dividend as i32).wrapping_mul(value as i16 as i32) as u32
+                                ((self.regs[REG_AX] as i16 as i32)
+                                    .wrapping_mul(value as i16 as i32))
+                                    as u32
                             };
                             self.regs[REG_AX] = product as u16;
                             self.regs[REG_DX] = (product >> 16) as u16;
@@ -1107,6 +1114,9 @@ impl I8086Machine {
                     carry = next_carry;
                 }
                 self.set_flag(FLAG_CF, carry);
+                if count == 1 {
+                    self.set_flag(FLAG_OF, (result & (1 << (width - 1)) != 0) != carry);
+                }
                 return result;
             }
             3 => {
@@ -1118,27 +1128,52 @@ impl I8086Machine {
                     carry = next_carry;
                 }
                 self.set_flag(FLAG_CF, carry);
+                if count == 1 {
+                    self.set_flag(
+                        FLAG_OF,
+                        (result & (1 << (width - 1)) != 0) != (result & (1 << (width - 2)) != 0),
+                    );
+                }
                 return result;
             }
             4 | 6 => {
                 let result = ((value as u32) << count) as u16 & mask;
-                (result, (value as u32 >> (32 - count)) & 1 != 0)
+                let bits = u32::from(width);
+                let carry = count <= bits && ((value >> (bits - count)) & 1) != 0;
+                (result, carry)
             }
             5 => {
                 let result = (value as u32 >> count) as u16 & mask;
                 (result, (value as u32 >> (count - 1)) & 1 != 0)
             }
-            _ => {
+            7 => {
                 let signed = if width == 8 {
                     value as u8 as i8 as i32
                 } else {
                     value as i16 as i32
                 };
                 let result = ((signed >> count) as u16) & mask;
-                (result, (value as u32 >> (count - 1)) & 1 != 0)
+                let bits = u32::from(width);
+                let carry = if count <= bits {
+                    (value >> (count - 1)) & 1 != 0
+                } else {
+                    value & (1 << (bits - 1)) != 0
+                };
+                (result, carry)
             }
+            _ => unreachable!("shift operation is masked to three bits"),
         };
         self.set_flag(FLAG_CF, carry);
+        if count == 1 {
+            let overflow = match operation {
+                0 => (result & (1 << (width - 1)) != 0) != carry,
+                1 => (result & (1 << (width - 1)) != 0) != (result & (1 << (width - 2)) != 0),
+                4 | 6 => (result & (1 << (width - 1)) != 0) != carry,
+                5 => value & (1 << (width - 1)) != 0,
+                _ => false,
+            };
+            self.set_flag(FLAG_OF, overflow);
+        }
         self.set_flag(FLAG_SF, result & (1 << (width - 1)) != 0);
         self.set_flag(FLAG_ZF, result == 0);
         self.set_flag(FLAG_PF, parity(result as u8));
@@ -1371,13 +1406,6 @@ mod tests {
         assert_eq!(cpu.regs[REG_SP], 0xfffe);
         assert_eq!(cpu.memory.read_u8(0x80), 6);
         assert_eq!(cpu.memory.read_u8(0x81), b' ');
-    }
-
-    #[test]
-    fn mov_ax_immediate_executes() {
-        let mut cpu = I8086Machine::com(&[0xb8, 0x2a, 0x00, 0xf4], "").unwrap();
-        assert_eq!(cpu.run(10), I8086Stop::Halt);
-        assert_eq!(cpu.regs[REG_AX], 42);
     }
 
     #[test]

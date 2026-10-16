@@ -114,6 +114,7 @@ impl<'a> Elaborator<'a> {
                 ))
             }
         };
+        validate_instance_bindings(sub, inst_name, overrides, conns)?;
         // Child parameter defaults, then overrides.
         let mut child_params: HashMap<String, i64> = HashMap::new();
         let mut declared_order: Vec<String> = Vec::new();
@@ -494,4 +495,112 @@ impl<'a> Elaborator<'a> {
         }
         Ok(())
     }
+}
+
+fn validate_instance_bindings(
+    child: &ast::Module,
+    instance: &str,
+    overrides: &[(Option<String>, ast::Expr)],
+    connections: &[ast::Conn],
+) -> Result<(), String> {
+    let mut declared_parameters = std::collections::HashSet::new();
+    let mut declared_parameter_order = Vec::new();
+    for item in &child.items {
+        if let ast::Item::Params(parameters) = item {
+            for (name, _) in parameters {
+                if !declared_parameters.insert(name.clone()) {
+                    return Err(format!(
+                        "module '{}': duplicate parameter '{}'",
+                        child.name, name
+                    ));
+                }
+                declared_parameter_order.push(name.clone());
+            }
+        }
+    }
+
+    let mut named_parameters = std::collections::HashSet::new();
+    let mut positional_parameters = 0_usize;
+    for (name, _) in overrides {
+        match name {
+            Some(parameter) => {
+                if !declared_parameters.contains(parameter) {
+                    return Err(format!(
+                        "instance '{}': module '{}' has no parameter '{}'",
+                        instance, child.name, parameter
+                    ));
+                }
+                if !named_parameters.insert(parameter.clone()) {
+                    return Err(format!(
+                        "instance '{}': duplicate parameter connection '{}'",
+                        instance, parameter
+                    ));
+                }
+            }
+            None => positional_parameters += 1,
+        }
+    }
+    if positional_parameters != 0 && !named_parameters.is_empty() {
+        return Err(format!(
+            "instance '{}': mixing ordered and named parameter connections is not allowed",
+            instance
+        ));
+    }
+    if positional_parameters > declared_parameter_order.len() {
+        return Err(format!(
+            "instance '{}': too many parameter connections given for '{}' ({} given, {} expected)",
+            instance,
+            child.name,
+            positional_parameters,
+            declared_parameter_order.len()
+        ));
+    }
+
+    let mut declared_ports = std::collections::HashSet::new();
+    let mut port_count = 0_usize;
+    for item in &child.items {
+        if let ast::Item::Port { names, .. } = item {
+            for name in names {
+                if declared_ports.insert(name.clone()) {
+                    port_count += 1;
+                }
+            }
+        }
+    }
+
+    let mut named_ports = std::collections::HashSet::new();
+    let mut positional_ports = 0_usize;
+    for connection in connections {
+        match connection {
+            ast::Conn::Named(name, _) => {
+                if !declared_ports.contains(name) {
+                    return Err(format!(
+                        "instance '{}': port '{}' does not exist in '{}'",
+                        instance, name, child.name
+                    ));
+                }
+                if !named_ports.insert(name.clone()) {
+                    return Err(format!(
+                        "instance '{}': duplicate connection for port '{}'",
+                        instance, name
+                    ));
+                }
+            }
+            ast::Conn::Pos(_) => positional_ports += 1,
+        }
+    }
+    if positional_ports != 0 && !named_ports.is_empty() {
+        return Err(format!(
+            "instance '{}': mixing ordered and named port connections is not allowed",
+            instance
+        ));
+    }
+    if positional_ports > port_count {
+        return Err(format!(
+            "instance '{}': too many port connections given for '{}' ({} given, {} expected)",
+            instance, child.name, positional_ports, port_count
+        ));
+    }
+
+    Ok(())
 }

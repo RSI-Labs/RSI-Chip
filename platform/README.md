@@ -68,6 +68,47 @@ ELF code image and subword load/store tests. The i8086 core executes immediate
 ALU, ModRM memory, MUL/DIV, AAM with arbitrary non-zero base, rotate, NOT, far
 call/return, REP MOVSB, hardware interrupt/IRET, and DOS INT 21h Hello World
 programs through its SystemVerilog SOC.
+The deterministic differential matrix additionally compares all primary byte and
+word ALU rows plus every `/0` through `/7` operation in the `0x81` and
+sign-extended `0x83` immediate groups against the Rust golden model. It checks
+the final register and FLAGS state. This matrix exposed and now regression-guards
+the word semantics of `0x83 /r, imm8`.
+The ModRM matrix sweeps `mod=00/01/10/11` across every rm encoding, including
+direct disp16, signed disp8, disp16, and register forms. It exposed and now
+guards two additional RTL decode bugs: missing fetch of direct-address disp16
+and an incorrectly replicated sign-extended disp8 value.
+The segment matrix loads through default DS plus explicit ES/SS/DS overrides
+after installing distinct non-zero segment registers.
+The shift/rotate matrices compare every legal `/0` through `/5` and `/7`
+operation for byte and word forms using both CL-relative and immediate counts.
+An exhaustive immediate-count matrix repeats every operation for masked counts
+0 through 31. These tests exposed and now guard zero-count flag preservation,
+RCL/RCR rotate-through-carry extraction, SHL/SAL carry exhaustion beyond the
+operand width, and SAR sign carry once the shifted value has saturated.
+They also regression-guard missing `0xC0/0xC1` support in both models and
+preserve OF for multi-bit shifts while defining it for count-one forms.
+The unary matrices compare byte and word `F6/F7` `/0` through `/7`, including
+TEST, NOT, NEG, MUL, IMUL, DIV, and IDIV. They exposed and fixed missing RTL
+MUL/DIV dispatch, byte NEG OF, byte IDIV signed-dividend/divisor handling,
+word IMUL's incorrect use of the full DX:AX dividend, word IDIV magnitude
+extension, and RCL/RCR rotate-through-carry width/flag preservation.
+The i8086 randomized differential fuzz executes 32 deterministic seeds with
+mixed primary ALU, immediate ALU, immediate and CL-controlled shift/rotate,
+safe unary, prefixed ModRM load/store, and memory-comparison streams. Every
+seed checks all architectural registers, IP, FLAGS, halt/trap state, and a
+768-byte sparse-memory window. It exposed and fixed incoming-carry leakage
+into both register and immediate SUB, incorrect wide-shift carry semantics,
+and zero-count flag updates.
+The RV32I matrices compare every base integer OP/OP-IMM operation, every
+load/store width, LUI/AUIPC, every legal branch predicate, JAL/JALR, CSR
+read/write/set/clear, ECALL-to-MTVEC dispatch, MEPC advancement, and MRET
+return. They exposed and fixed SRAI immediate funct7 decoding in the golden
+model, signed SLT result generation in RTL, and RTL EBREAK handling when MTVEC
+points to a non-zero handler.
+The randomized differential fuzz executes 64 deterministic seeds with mixed OP,
+OP-IMM, aligned load/store, and branch streams. It exposed and fixed signed
+SLTI comparison against a negative immediate. Every seed compares all
+architectural registers, EBREAK state, and a 256-byte data window.
 
 ## Commands
 
@@ -104,11 +145,16 @@ retained.
 ## Remaining acceptance gates
 
 1. Correlate the 8086 golden model and SystemVerilog core against every legal
-   8088/8086 opcode, ModRM form, prefix, and exception combination. Directed
-   tests cover representative classes, but full-row exhaustive coverage remains
-   incomplete.
-3. Add randomized instruction/concurrency traces and compare final architectural
-   state against independent references.
+   8088/8086 opcode, ModRM form, prefix, and exception combination. The current
+   differential matrix covers the primary ALU rows, two immediate groups, all
+   four ModRM address modes, explicit segment overrides, and byte/word
+   variable/immediate shift-rotate and unary groups, while RV32I covers all
+   base integer, data, control, CSR, and trap classes plus 64 randomized
+   seeds. Full-row exhaustive, broader randomized, and concurrent coverage
+   remains incomplete.
+3. Expand the current 32-seed randomized i8086 stream to unsafe DIV/IDIV,
+   control flow, string operations, exceptions, and concurrent/multithreaded
+   traces beyond the current deterministic RV32I instruction fuzz.
 4. Add independently written implementation/golden RTL pairs beyond the current
    RTL-versus-mapped-netlist LEC, with identical sequential-state naming and
    proof equivalence.

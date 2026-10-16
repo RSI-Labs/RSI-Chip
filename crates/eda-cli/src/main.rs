@@ -1,7 +1,7 @@
 //! # eda — command-line interface
 //!
 //! Usage: `eda <command> <file.v> [--top <module>]`
-//! Commands: info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
+//! Commands: info | slang-info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
 //! Library: `--lib <file.lib>` imports a Liberty subset.
 //! Activity: `--vcd <file.vcd>` drives `eda power` and `eda assert`.
 //! Properties: `--sva <file.sva>` drives `eda assert`.
@@ -128,12 +128,47 @@ fn main() -> ExitCode {
     }
     if args.len() < 3 {
         eprintln!(
-            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|synth|equiv|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>]"
+            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|slang-info|synth|equiv|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>]"
         );
         return ExitCode::from(2);
     }
     let cmd = args[1].clone();
     let file = args[2].clone();
+    if cmd == "slang-info" {
+        let top = args
+            .iter()
+            .position(|argument| argument == "--top")
+            .and_then(|index| args.get(index + 1))
+            .cloned();
+        return match eda_slang::SlangFrontend::discover() {
+            Ok(frontend) => match frontend.compile_files(
+                &[std::path::PathBuf::from(&file)],
+                top.as_deref(),
+                &eda_slang::PreprocessOptions::default(),
+            ) {
+                Ok(design) => {
+                    println!("module {}", design.name);
+                    println!("  nets: {} (flat bits)", design.n_nets);
+                    println!("  ports: {}", design.ports.len());
+                    println!(
+                        "  assigns: {}, processes: {}, initials: {}",
+                        design.assigns.len(),
+                        design.processes.len(),
+                        design.initials.len()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let mut top: Option<String> = None;
     let mut sdc_path: Option<String> = None;
     let mut mmsc_path: Option<String> = None;

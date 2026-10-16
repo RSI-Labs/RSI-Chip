@@ -220,10 +220,10 @@ impl Rv32iMachine {
             0x13 => {
                 let immediate = immediate_i(instruction);
                 let shamt = immediate & 0x1f;
-                let value = match (funct3, instruction >> 26) {
+                let value = match (funct3, instruction >> 25) {
                     (0, _) => a.wrapping_add(immediate),
                     (1, 0) => {
-                        if instruction >> 27 != 0 {
+                        if instruction >> 25 != 0 {
                             self.take_trap(instruction);
                             return self.finish_trap();
                         }

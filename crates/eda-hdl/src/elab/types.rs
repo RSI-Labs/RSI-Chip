@@ -382,6 +382,12 @@ pub(super) fn resolve_packages(packages: &[ast::Package]) -> Result<PackageTable
         }
         let mut values = HashMap::new();
         for (name, expression) in &package.params {
+            if values.contains_key(name) {
+                return Err(format!(
+                    "package '{}': duplicate parameter '{}'",
+                    package.name, name
+                ));
+            }
             let value = package_const_eval(expression, &out, &package.name, &values)?;
             values.insert(name.clone(), value);
         }
@@ -399,6 +405,12 @@ pub(super) fn resolve_packages(packages: &[ast::Package]) -> Result<PackageTable
                 ast::TypeDef::Struct(definition) => &definition.name,
                 ast::TypeDef::Union(definition) => &definition.name,
             };
+            if types.contains_key(type_name) {
+                return Err(format!(
+                    "package '{}': duplicate type '{}'",
+                    package.name, type_name
+                ));
+            }
             types.insert(type_name.clone(), resolved);
         }
         for definition in &package.functions {

@@ -1,12 +1,12 @@
 // 64-byte simulation memory attached to the full i8086 core.
-module i8086_full_soc_64(clk, rst, init_ip, program, halted, trap, retired,
+module i8086_full_soc_64(clk, rst, init_ip, program_image, halted, trap, retired,
                          console_write, console_char,
                          ax, cx, dx, bx,
                          sp, bp, si, di, ip, flags);
   input clk;
   input rst;
   input [15:0] init_ip;
-  input [511:0] program;
+  input [511:0] program_image;
   output halted;
   output trap;
   output [63:0] retired;
@@ -130,22 +130,22 @@ module i8086_full_soc_64(clk, rst, init_ip, program, halted, trap, retired,
 
   always @(posedge clk) begin
     if (rst) begin
-      b0 <= program[7:0]; b1 <= program[15:8]; b2 <= program[23:16]; b3 <= program[31:24];
-      b4 <= program[39:32]; b5 <= program[47:40]; b6 <= program[55:48]; b7 <= program[63:56];
-      b8 <= program[71:64]; b9 <= program[79:72]; b10 <= program[87:80]; b11 <= program[95:88];
-      b12 <= program[103:96]; b13 <= program[111:104]; b14 <= program[119:112]; b15 <= program[127:120];
-      b16 <= program[135:128]; b17 <= program[143:136]; b18 <= program[151:144]; b19 <= program[159:152];
-      b20 <= program[167:160]; b21 <= program[175:168]; b22 <= program[183:176]; b23 <= program[191:184];
-      b24 <= program[199:192]; b25 <= program[207:200]; b26 <= program[215:208]; b27 <= program[223:216];
-      b28 <= program[231:224]; b29 <= program[239:232]; b30 <= program[247:240]; b31 <= program[255:248];
-      b32 <= program[263:256]; b33 <= program[271:264]; b34 <= program[279:272]; b35 <= program[287:280];
-      b36 <= program[295:288]; b37 <= program[303:296]; b38 <= program[311:304]; b39 <= program[319:312];
-      b40 <= program[327:320]; b41 <= program[335:328]; b42 <= program[343:336]; b43 <= program[351:344];
-      b44 <= program[359:352]; b45 <= program[367:360]; b46 <= program[375:368]; b47 <= program[383:376];
-      b48 <= program[391:384]; b49 <= program[399:392]; b50 <= program[407:400]; b51 <= program[415:408];
-      b52 <= program[423:416]; b53 <= program[431:424]; b54 <= program[439:432]; b55 <= program[447:440];
-      b56 <= program[455:448]; b57 <= program[463:456]; b58 <= program[471:464]; b59 <= program[479:472];
-      b60 <= program[487:480]; b61 <= program[495:488]; b62 <= program[503:496]; b63 <= program[511:504];
+      b0 <= program_image[7:0]; b1 <= program_image[15:8]; b2 <= program_image[23:16]; b3 <= program_image[31:24];
+      b4 <= program_image[39:32]; b5 <= program_image[47:40]; b6 <= program_image[55:48]; b7 <= program_image[63:56];
+      b8 <= program_image[71:64]; b9 <= program_image[79:72]; b10 <= program_image[87:80]; b11 <= program_image[95:88];
+      b12 <= program_image[103:96]; b13 <= program_image[111:104]; b14 <= program_image[119:112]; b15 <= program_image[127:120];
+      b16 <= program_image[135:128]; b17 <= program_image[143:136]; b18 <= program_image[151:144]; b19 <= program_image[159:152];
+      b20 <= program_image[167:160]; b21 <= program_image[175:168]; b22 <= program_image[183:176]; b23 <= program_image[191:184];
+      b24 <= program_image[199:192]; b25 <= program_image[207:200]; b26 <= program_image[215:208]; b27 <= program_image[223:216];
+      b28 <= program_image[231:224]; b29 <= program_image[239:232]; b30 <= program_image[247:240]; b31 <= program_image[255:248];
+      b32 <= program_image[263:256]; b33 <= program_image[271:264]; b34 <= program_image[279:272]; b35 <= program_image[287:280];
+      b36 <= program_image[295:288]; b37 <= program_image[303:296]; b38 <= program_image[311:304]; b39 <= program_image[319:312];
+      b40 <= program_image[327:320]; b41 <= program_image[335:328]; b42 <= program_image[343:336]; b43 <= program_image[351:344];
+      b44 <= program_image[359:352]; b45 <= program_image[367:360]; b46 <= program_image[375:368]; b47 <= program_image[383:376];
+      b48 <= program_image[391:384]; b49 <= program_image[399:392]; b50 <= program_image[407:400]; b51 <= program_image[415:408];
+      b52 <= program_image[423:416]; b53 <= program_image[431:424]; b54 <= program_image[439:432]; b55 <= program_image[447:440];
+      b56 <= program_image[455:448]; b57 <= program_image[463:456]; b58 <= program_image[471:464]; b59 <= program_image[479:472];
+      b60 <= program_image[487:480]; b61 <= program_image[495:488]; b62 <= program_image[503:496]; b63 <= program_image[511:504];
     end else if (mem_we) begin
       if (mem_width == 3'd1) begin
         case (mem_addr[5:0])

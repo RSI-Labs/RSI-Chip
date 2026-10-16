@@ -1072,8 +1072,9 @@ assignments/selects work exactly as they do for module nets and an instance can
 connect the complete array port to a parent vector of the same total width with
 named or positional connections. Module instance-array expansion uses the same
 total width, so each expanded child can receive/drive its row-major slice of a
-wider parent vector. The existing 4096-bit/element limits and row-major layout
-apply. One hundred generated cases cover one-dimensional and
+wider parent vector. Module arrays follow the current 4096-element/one-million-bit
+flat budget and row-major layout (small inline-function arrays retain the older
+tighter elaboration bound). One hundred generated cases cover one-dimensional and
 two-dimensional ports, widths 1..8, ascending/descending dimensions, add/XOR/
 AND/OR element transforms, both connection styles, child hierarchy widths, and
 simulation readback. Dynamic array ports and arbitrary aggregate port assignment
@@ -1750,6 +1751,19 @@ and voltage data, worst power/drop/EM scenario and mode labels, finite versus
 unbounded EM lifetime, findings, per-scenario UPF reports, the physical timing
 report, stimulus kind/sample count, and mapped statistics. Direct RPC and
 async jobs share cancellation.
+
+### Follow-up: i8086 randomized sparse-memory differential validation
+
+The i8086 differential matrix now includes 32 deterministic randomized seeds
+combining primary ALU operations, immediate groups, immediate and CL-controlled
+shift/rotates, safe unary operations, segment prefixes, and ModRM loads/stores.
+Each seed compares all architectural registers, IP, FLAGS, halt/trap state, and
+a 768-byte sparse-memory window against the independent Rust golden model. The
+new stream exposed and fixed incoming-carry leakage into register and immediate
+SUB, zero-count shift flag mutation, byte/word RCL and RCR result/carry
+extraction, SHL/SAL carry exhaustion past operand width, and SAR sign carry
+after saturation. An exhaustive immediate shift/rotate matrix additionally
+sweeps every operation at masked counts 0 through 31.
 
 ## Remaining high-priority gaps
 

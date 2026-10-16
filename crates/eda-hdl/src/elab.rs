@@ -34,6 +34,113 @@ pub fn compile(source: &str, top: Option<&str>) -> Result<Design, String> {
     elaborate(&file, top)
 }
 
+/// A named compilation unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HdlSource {
+    pub name: String,
+    pub source: String,
+}
+
+impl HdlSource {
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SourceLineRange {
+    name: String,
+    first_line: usize,
+    last_line: usize,
+}
+
+/// Maps lines in a deterministic concatenation back to their source files.
+///
+/// This is the first source-manager boundary for the internal frontend. The
+/// full slang frontend remains responsible for include/macro expansion and its
+/// original-file diagnostics; this manager at least prevents multi-unit
+/// syntax errors from reporting only an anonymous concatenated line number.
+#[derive(Clone, Debug)]
+pub struct SourceManager {
+    sources: Vec<HdlSource>,
+    combined: String,
+    ranges: Vec<SourceLineRange>,
+}
+
+impl SourceManager {
+    pub fn new(sources: &[HdlSource]) -> Self {
+        let mut lines = Vec::<&str>::new();
+        let mut ranges = Vec::new();
+        for source in sources {
+            if !lines.is_empty() {
+                // Keep a deterministic blank separator that belongs to no file.
+                lines.push("");
+            }
+            let first_line = lines.len() + 1;
+            let source_lines: Vec<_> = source.source.lines().collect();
+            let line_count = source_lines.len().max(1);
+            lines.extend(source_lines);
+            ranges.push(SourceLineRange {
+                name: source.name.clone(),
+                first_line,
+                last_line: first_line + line_count - 1,
+            });
+        }
+        Self {
+            sources: sources.to_vec(),
+            combined: lines.join("\n"),
+            ranges,
+        }
+    }
+
+    pub fn sources(&self) -> &[HdlSource] {
+        &self.sources
+    }
+
+    pub fn combined(&self) -> &str {
+        &self.combined
+    }
+
+    pub fn locate(&self, line: usize) -> Option<(&str, usize)> {
+        self.ranges
+            .iter()
+            .find(|range| line >= range.first_line && line <= range.last_line)
+            .map(|range| (range.name.as_str(), line - range.first_line + 1))
+    }
+}
+
+/// Parse and elaborate multiple named compilation units.
+pub fn compile_sources(sources: &[HdlSource], top: Option<&str>) -> Result<Design, String> {
+    let manager = SourceManager::new(sources);
+    let file =
+        parser::parse(manager.combined()).map_err(|error| remap_parse_error(&error, &manager))?;
+    elaborate(&file, top)
+}
+
+fn remap_parse_error(error: &str, manager: &SourceManager) -> String {
+    let Some(line_marker) = error.find("line ") else {
+        return error.to_string();
+    };
+    let digits_start = line_marker + "line ".len();
+    let digits_end = error[digits_start..]
+        .find(|character: char| !character.is_ascii_digit())
+        .map(|offset| digits_start + offset)
+        .unwrap_or(error.len());
+    let Ok(line) = error[digits_start..digits_end].parse::<usize>() else {
+        return error.to_string();
+    };
+    match manager.locate(line) {
+        Some((file, file_line)) => {
+            let error = error.replacen(&format!("line {line}"), &format!("line {file_line}"), 1);
+            format!("{file}:{file_line}: {error}")
+        }
+        None => error.to_string(),
+    }
+}
+
 pub fn elaborate(file: &ast::SourceFile, top: Option<&str>) -> Result<Design, String> {
     let mut mods: HashMap<String, &ast::Module> = HashMap::new();
     for m in &file.modules {
@@ -72,11 +179,7 @@ pub fn elaborate(file: &ast::SourceFile, top: Option<&str>) -> Result<Design, St
 fn pick_top(file: &ast::SourceFile) -> Result<String, String> {
     let mut instantiated = std::collections::HashSet::new();
     for m in &file.modules {
-        for it in &m.items {
-            if let ast::Item::Inst { module, .. } = it {
-                instantiated.insert(module.clone());
-            }
-        }
+        collect_module_references(&m.items, &mut instantiated);
     }
     let cands: Vec<&ast::Module> = file
         .modules
@@ -86,12 +189,62 @@ fn pick_top(file: &ast::SourceFile) -> Result<String, String> {
     match cands.len() {
         0 => Err("no top module: every module is instantiated".into()),
         1 => Ok(cands[0].name.clone()),
-        _ => cands
-            .iter()
-            .find(|m| m.name.contains("tb") || m.name.contains("top"))
-            .map(|m| m.name.clone())
-            .or_else(|| cands.last().map(|m| m.name.clone()))
-            .ok_or_else(|| "no top module".into()),
+        _ => Err(format!(
+            "ambiguous top module: {}; specify the top explicitly",
+            cands
+                .iter()
+                .map(|module| module.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn collect_module_references(
+    items: &[ast::Item],
+    references: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            ast::Item::Inst { module, .. } => {
+                references.insert(module.clone());
+            }
+            ast::Item::Generate(constructs) => {
+                for construct in constructs {
+                    collect_generate_module_references(construct, references);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_generate_module_references(
+    construct: &ast::GenerateConstruct,
+    references: &mut std::collections::HashSet<String>,
+) {
+    match construct {
+        ast::GenerateConstruct::Genvar(_) => {}
+        ast::GenerateConstruct::Block(block) => collect_module_references(&block.items, references),
+        ast::GenerateConstruct::Case { arms, default, .. } => {
+            for arm in arms {
+                collect_module_references(&arm.body.items, references);
+            }
+            if let Some(block) = default {
+                collect_module_references(&block.items, references);
+            }
+        }
+        ast::GenerateConstruct::If {
+            then, otherwise, ..
+        } => {
+            collect_module_references(&then.items, references);
+            if let Some(block) = otherwise {
+                collect_module_references(&block.items, references);
+            }
+        }
+        ast::GenerateConstruct::For { body, .. } => {
+            collect_module_references(&body.items, references);
+        }
     }
 }
 
@@ -204,6 +357,7 @@ fn flatten_generate_items(
     let mut out = Vec::new();
     for item in items {
         match item {
+            ast::Item::Genvar(_) => {}
             ast::Item::Generate(constructs) => {
                 for construct in constructs {
                     flatten_generate_construct(construct, params, module_name, packages, &mut out)?;
@@ -223,6 +377,7 @@ fn flatten_generate_construct(
     out: &mut Vec<ast::Item>,
 ) -> Result<(), String> {
     match construct {
+        ast::GenerateConstruct::Genvar(_) => {}
         ast::GenerateConstruct::Block(block) => {
             let expanded = flatten_generate_items(&block.items, params, module_name, packages)?;
             out.extend(expanded);
@@ -263,9 +418,11 @@ fn flatten_generate_construct(
             let selected = if const_eval_packages(cond, params, module_name, packages)? != 0 {
                 then
             } else {
-                otherwise
-                    .as_ref()
-                    .ok_or_else(|| "generate if has no else branch".to_string())?
+                match otherwise.as_ref() {
+                    Some(branch) => branch,
+                    // A false generate-if without an else generates no items.
+                    None => return Ok(()),
+                }
             };
             let expanded = flatten_generate_items(&selected.items, params, module_name, packages)?;
             out.extend(expanded);
@@ -279,7 +436,16 @@ fn flatten_generate_construct(
         } => {
             let mut value = const_eval_packages(start, params, module_name, packages)?;
             let mut loop_params = params.clone();
-            for _ in 0..10_000 {
+            const MAX_GENERATE_STEPS: u64 = 131_072;
+            let mut steps = 0_u64;
+            loop {
+                steps += 1;
+                if steps > MAX_GENERATE_STEPS {
+                    return Err(format!(
+                        "module '{}': generate for-loop exceeds {MAX_GENERATE_STEPS} steps",
+                        module_name
+                    ));
+                }
                 loop_params.insert(var.clone(), value);
                 if const_eval_packages(cond, &loop_params, module_name, packages)? == 0 {
                     break;
@@ -293,7 +459,7 @@ fn flatten_generate_construct(
                     flatten_generate_items(&replaced, &loop_params, module_name, packages)?;
                 out.extend(expanded);
                 let next = const_eval_packages(step, &loop_params, module_name, packages)?;
-                if next <= value {
+                if next == value {
                     return Err(format!(
                         "module '{}': generate for-loop does not advance '{var}'",
                         module_name

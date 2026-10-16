@@ -7,13 +7,13 @@ fn function_multidimensional_unpacked_array_local_updates_and_reads() {
     let mut sim = sim_for(
         "module top(input logic [7:0] a, b, output logic [31:0] y); \
              function logic [31:0] combine(input logic [7:0] left, right); \
-                 logic [7:0] table [1:0][2:3]; \
-                 table[1][3] = left + right; \
-                 table[1][2] = left ^ right; \
-                 table[0][3] = left & right; \
-                 table[0][2] = left | right; \
-                 combine = {table[1][3], table[1][2], \
-                            table[0][3], table[0][2]}; \
+                 logic [7:0] memory [1:0][2:3]; \
+                 memory[1][3] = left + right; \
+                 memory[1][2] = left ^ right; \
+                 memory[0][3] = left & right; \
+                 memory[0][2] = left | right; \
+                 combine = {memory[1][3], memory[1][2], \
+                            memory[0][3], memory[0][2]}; \
              endfunction \
              assign y = combine(a, b); \
          endmodule",
@@ -32,18 +32,18 @@ fn function_unpacked_array_elements_support_indexed_part_selects() {
                       output logic [7:0] updated); \
              function logic [3:0] pick(input logic [1:0] element_selector, \
                                        input logic [3:0] selector); \
-                 logic [7:0] table [0:2]; \
-                 table[0] = 8'h5a; \
-                 table[1] = 8'ha5; \
-                 table[2] = 8'h3c; \
-                 pick = table[element_selector][selector +: 4]; \
+                 logic [7:0] memory [0:2]; \
+                 memory[0] = 8'h5a; \
+                 memory[1] = 8'ha5; \
+                 memory[2] = 8'h3c; \
+                 pick = memory[element_selector][selector +: 4]; \
              endfunction \
              function logic [7:0] update(input logic [3:0] selector, \
                                          input logic [3:0] value); \
-                 logic [7:0] table [0:1]; \
-                 table[0] = 8'h5a; \
-                 table[0][selector -: 4] = value ^ 4'd3; \
-                 update = table[0]; \
+                 logic [7:0] memory [0:1]; \
+                 memory[0] = 8'h5a; \
+                 memory[0][selector -: 4] = value ^ 4'd3; \
+                 update = memory[0]; \
              endfunction \
              assign selected = pick(element_selector, selector); \
              assign dynamic = pick(element_selector, selector); \
@@ -286,10 +286,10 @@ fn function_multidimensional_array_whole_local_layout() {
     let mut sim = sim_for(
         "module top(input logic dummy, output logic [7:0] y); \
              function logic [7:0] whole(input logic unused); \
-                 logic [1:0] table [0:1][0:1]; \
-                 table[0][0] = 0; table[0][1] = 1; \
-                 table[1][0] = 2; table[1][1] = 3; \
-                 whole = table; \
+                 logic [1:0] memory [0:1][0:1]; \
+                 memory[0][0] = 0; memory[0][1] = 1; \
+                 memory[1][0] = 2; memory[1][1] = 3; \
+                 whole = memory; \
              endfunction \
              assign y = whole(dummy); \
          endmodule",

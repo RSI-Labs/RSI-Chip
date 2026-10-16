@@ -84,7 +84,7 @@ impl<'a> Lexer<'a> {
         c
     }
 
-    fn skip_trivia(&mut self) {
+    fn skip_trivia(&mut self) -> Result<(), String> {
         loop {
             match self.peek() {
                 b' ' | b'\t' | b'\r' | b'\n' => {
@@ -96,11 +96,12 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'/' if self.peek_at(1) == b'*' => {
+                    let comment_line = self.line;
                     self.bump();
                     self.bump();
                     loop {
                         if self.pos >= self.src.len() {
-                            return;
+                            return Err(format!("line {comment_line}: unterminated block comment"));
                         }
                         if self.peek() == b'*' && self.peek_at(1) == b'/' {
                             self.bump();
@@ -110,13 +111,13 @@ impl<'a> Lexer<'a> {
                         self.bump();
                     }
                 }
-                _ => return,
+                _ => return Ok(()),
             }
         }
     }
 
     fn next_token(&mut self) -> Result<Token, String> {
-        self.skip_trivia();
+        self.skip_trivia()?;
         let line = self.line;
         if self.pos >= self.src.len() {
             return Ok(Token {
@@ -488,5 +489,14 @@ mod tests {
         assert!(Lexer::tokenize("4'q10").is_err());
         assert!(Lexer::tokenize("\"open").is_err());
         assert!(Lexer::tokenize("`").is_err());
+    }
+
+    #[test]
+    fn unterminated_block_comment_is_rejected() {
+        let error = Lexer::tokenize("a /* open").unwrap_err();
+        assert_eq!(error, "line 1: unterminated block comment");
+
+        let error = Lexer::tokenize("a\nb /* open").unwrap_err();
+        assert_eq!(error, "line 2: unterminated block comment");
     }
 }

@@ -315,6 +315,20 @@ impl<'a> Elaborator<'a> {
             .iter()
             .map(|index| self.elab_expr(index, env))
             .collect::<Result<Vec<_>, _>>()?;
+        if width == element_width
+            && ascending
+            && array.element_msb >= array.element_lsb
+            && self.const_eval(start, env.params, env.module_name).ok() == Some(0)
+        {
+            if let Some(selected) = self.runtime_whole_array_element_expr(
+                entry.base,
+                entry.width,
+                array,
+                &runtime_indexes,
+            ) {
+                return Ok(selected);
+            }
+        }
         let mut selected_element = ExprIR::Const(LogicWord::xes(element_width));
         let mut any_index_valid = ExprIR::Const(LogicWord::from_u64(1, 0));
         for physical_element in 0..array.length {
@@ -433,6 +447,115 @@ impl<'a> Elaborator<'a> {
             c: Box::new(any_index_valid),
             t: Box::new(packed_result),
             f: Box::new(ExprIR::Const(LogicWord::xes(width))),
+        })
+    }
+
+    fn runtime_array_physical_index(
+        &self,
+        array: &NetArray,
+        runtime_indexes: &[ExprIR],
+    ) -> Option<(ExprIR, ExprIR)> {
+        if array
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.base < 0 || dimension.base > i64::from(u32::MAX))
+        {
+            return None;
+        }
+
+        let mut physical_index = ExprIR::Const(LogicWord::zero(32));
+        let mut all_in_range = ExprIR::Const(LogicWord::from_u64(1, 1));
+        let mut stride = array.length;
+        for (dimension, runtime_index) in array.dimensions.iter().zip(runtime_indexes) {
+            stride /= dimension.length;
+            let base = dimension.base;
+            let last = base + dimension.step * (dimension.length as i64 - 1);
+            let lower = base.min(last);
+            let upper = base.max(last);
+            let lower_bound = ExprIR::Bin {
+                op: BinOp::Ge,
+                a: Box::new(runtime_index.clone()),
+                b: Box::new(ExprIR::Const(LogicWord::from_u64(32, lower.unsigned_abs()))),
+            };
+            let upper_bound = ExprIR::Bin {
+                op: BinOp::Le,
+                a: Box::new(runtime_index.clone()),
+                b: Box::new(ExprIR::Const(LogicWord::from_u64(32, upper.unsigned_abs()))),
+            };
+            all_in_range = ExprIR::Bin {
+                op: BinOp::LogAnd,
+                a: Box::new(all_in_range),
+                b: Box::new(ExprIR::Bin {
+                    op: BinOp::LogAnd,
+                    a: Box::new(lower_bound),
+                    b: Box::new(upper_bound),
+                }),
+            };
+            let normalized = if base <= last {
+                ExprIR::Bin {
+                    op: BinOp::Sub,
+                    a: Box::new(runtime_index.clone()),
+                    b: Box::new(ExprIR::Const(LogicWord::from_u64(32, base.unsigned_abs()))),
+                }
+            } else {
+                ExprIR::Bin {
+                    op: BinOp::Sub,
+                    a: Box::new(ExprIR::Const(LogicWord::from_u64(32, base.unsigned_abs()))),
+                    b: Box::new(runtime_index.clone()),
+                }
+            };
+            physical_index = ExprIR::Bin {
+                op: BinOp::Add,
+                a: Box::new(physical_index),
+                b: Box::new(ExprIR::Bin {
+                    op: BinOp::Mul,
+                    a: Box::new(normalized),
+                    b: Box::new(ExprIR::Const(LogicWord::from_u64(32, stride as u64))),
+                }),
+            };
+        }
+        Some((physical_index, all_in_range))
+    }
+
+    fn runtime_whole_array_element_expr(
+        &self,
+        net: usize,
+        total_width: usize,
+        array: &NetArray,
+        runtime_indexes: &[ExprIR],
+    ) -> Option<ExprIR> {
+        let (physical_index, in_range) =
+            self.runtime_array_physical_index(array, runtime_indexes)?;
+        let bit_offset = ExprIR::Bin {
+            op: BinOp::Mul,
+            a: Box::new(physical_index),
+            b: Box::new(ExprIR::Const(LogicWord::from_u64(
+                32,
+                array.element_width as u64,
+            ))),
+        };
+        let shifted = ExprIR::Bin {
+            op: BinOp::Shr,
+            a: Box::new(ExprIR::Ref {
+                net,
+                decl_width: total_width,
+                range: Range::Span {
+                    msb: total_width - 1,
+                    lsb: 0,
+                },
+                signed: false,
+            }),
+            b: Box::new(bit_offset),
+        };
+        let selected = ExprIR::Bin {
+            op: BinOp::And,
+            a: Box::new(shifted),
+            b: Box::new(ExprIR::Const(low_mask(total_width, array.element_width))),
+        };
+        Some(ExprIR::Cond {
+            c: Box::new(in_range),
+            t: Box::new(selected),
+            f: Box::new(ExprIR::Const(LogicWord::xes(array.element_width))),
         })
     }
 
@@ -634,6 +757,26 @@ impl<'a> Elaborator<'a> {
             .iter()
             .map(|index| self.elab_expr(index, env))
             .collect::<Result<Vec<_>, _>>()?;
+        let selected_width =
+            usize::try_from(self.const_eval(width, env.params, env.module_name)?)
+                .map_err(|_| "indexed part-select width is out of range".to_string())?;
+        if selected_width == array.element_width
+            && ascending
+            && array.element_msb >= array.element_lsb
+            && self.const_eval(start, env.params, env.module_name).ok() == Some(0)
+        {
+            let value = self.elab_expr(value, env)?;
+            if let Some(statement) = self.runtime_whole_array_element_statement(
+                entry.base,
+                entry.width,
+                array,
+                &runtime_indexes,
+                value,
+                nonblocking,
+            ) {
+                return Ok(statement);
+            }
+        }
 
         let mut result = None;
         for physical_element in 0..array.length {
@@ -674,6 +817,88 @@ impl<'a> Elaborator<'a> {
             });
         }
         result.ok_or_else(|| format!("array '{name}' has no elements"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn runtime_whole_array_element_statement(
+        &self,
+        net: usize,
+        total_width: usize,
+        array: &NetArray,
+        runtime_indexes: &[ExprIR],
+        value: ExprIR,
+        nonblocking: bool,
+    ) -> Option<StmtIR> {
+        let (physical_index, in_range) =
+            self.runtime_array_physical_index(array, runtime_indexes)?;
+        let element_width = array.element_width;
+        let value = Self::resize_indexed_value(value, element_width);
+        let wide_value = Self::resize_indexed_value(value, total_width);
+        let bit_offset = ExprIR::Bin {
+            op: BinOp::Mul,
+            a: Box::new(physical_index),
+            b: Box::new(ExprIR::Const(LogicWord::from_u64(32, element_width as u64))),
+        };
+        let shifted_value = ExprIR::Bin {
+            op: BinOp::Or,
+            a: Box::new(ExprIR::Bin {
+                op: BinOp::Shl,
+                a: Box::new(wide_value),
+                b: Box::new(bit_offset.clone()),
+            }),
+            b: Box::new(ExprIR::Const(LogicWord::zero(total_width))),
+        };
+        let selected_mask = ExprIR::Bin {
+            op: BinOp::Shl,
+            a: Box::new(ExprIR::Const(low_mask(total_width, element_width))),
+            b: Box::new(bit_offset),
+        };
+        let clear_mask = ExprIR::Un {
+            op: UnOp::Not,
+            a: Box::new(selected_mask),
+        };
+        let old_value = ExprIR::Ref {
+            net,
+            decl_width: total_width,
+            range: Range::Span {
+                msb: total_width - 1,
+                lsb: 0,
+            },
+            signed: false,
+        };
+        let merged = ExprIR::Bin {
+            op: BinOp::Or,
+            a: Box::new(ExprIR::Bin {
+                op: BinOp::And,
+                a: Box::new(old_value.clone()),
+                b: Box::new(clear_mask),
+            }),
+            b: Box::new(shifted_value),
+        };
+        let value = ExprIR::Cond {
+            c: Box::new(in_range),
+            t: Box::new(merged),
+            f: Box::new(old_value),
+        };
+        let lvalue = LValue {
+            net,
+            decl_width: total_width,
+            range: Range::Span {
+                msb: total_width - 1,
+                lsb: 0,
+            },
+        };
+        Some(if nonblocking {
+            StmtIR::NBl {
+                lv: lvalue,
+                e: value,
+            }
+        } else {
+            StmtIR::Bl {
+                lv: lvalue,
+                e: value,
+            }
+        })
     }
 
     pub(super) fn dynamic_indexed_part_expr(
@@ -1243,6 +1468,13 @@ impl<'a> Elaborator<'a> {
         object_name: &str,
         object_kind: &str,
     ) -> Result<Option<NetArray>, String> {
+        const MAX_UNPACKED_ARRAY_ELEMENTS: usize = 4096;
+        const MAX_UNPACKED_ARRAY_BITS: usize = 1 << 20;
+        let maximum_dimension = if array_ranges.len() == 1 {
+            MAX_UNPACKED_ARRAY_ELEMENTS
+        } else {
+            256
+        };
         if array_ranges.len() == 1 && array_ranges[0].is_none() {
             element_width
                 .checked_mul(256)
@@ -1278,14 +1510,14 @@ impl<'a> Elaborator<'a> {
             let last = self.const_eval(right, params, module_name)?;
             let step = if base <= last { 1 } else { -1 };
             let dimension_length = (base - last).unsigned_abs() as usize + 1;
-            if dimension_length == 0 || dimension_length > 256 {
+            if dimension_length == 0 || dimension_length > maximum_dimension {
                 return Err(format!(
                     "module '{module_name}': unpacked {object_kind} '{object_name}' has invalid dimensions"
                 ));
             }
             length = length
                 .checked_mul(dimension_length)
-                .filter(|total| *total <= 4096)
+                .filter(|total| *total <= MAX_UNPACKED_ARRAY_ELEMENTS)
                 .ok_or_else(|| {
                     format!(
                         "module '{module_name}': unpacked {object_kind} '{object_name}' exceeds the element limit"
@@ -1302,7 +1534,7 @@ impl<'a> Elaborator<'a> {
         }
         element_width
             .checked_mul(length)
-            .filter(|total| *total <= 4096)
+            .filter(|total| *total <= MAX_UNPACKED_ARRAY_BITS)
             .ok_or_else(|| {
                 format!(
                     "module '{module_name}': unpacked {object_kind} '{object_name}' exceeds the packed-width limit"
@@ -1415,5 +1647,13 @@ impl<'a> Elaborator<'a> {
                 lsb: offset,
             },
         ))
+    }
+}
+
+fn low_mask(total_width: usize, selected_width: usize) -> LogicWord {
+    LogicWord {
+        bits: (0..total_width)
+            .map(|bit| LogicValue::bit(bit < selected_width))
+            .collect(),
     }
 }

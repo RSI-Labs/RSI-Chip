@@ -389,11 +389,11 @@ pub(super) fn function_unpacked_indexed_select_structure(c: &mut CaseList) {
                 let update_definition = format!(
                     "function logic [{slice_range}] update( \
                  input logic [3:0] selector, input logic [{slice_range}] value); \
-                 logic [{element_range}] table {array_declaration}; \
-                 table{array_index} = {element_width}'d{physical_initial}; \
-                 table{array_index}[selector {direction}: {slice_width}] = \
+                 logic [{element_range}] lookup {array_declaration}; \
+                 lookup{array_index} = {element_width}'d{physical_initial}; \
+                 lookup{array_index}[selector {direction}: {slice_width}] = \
                  value {operator} {slice_width}'d{constant}; \
-                 update = table{array_index}[selector {direction}: {slice_width}]; \
+                 update = lookup{array_index}[selector {direction}: {slice_width}]; \
                  endfunction",
                     slice_range = slice_range,
                     element_range = element_range,
@@ -409,11 +409,11 @@ pub(super) fn function_unpacked_indexed_select_structure(c: &mut CaseList) {
                 let preserve_definition = format!(
                     "function logic [{element_range}] preserve( \
                  input logic [3:0] selector, input logic [{slice_range}] value); \
-                 logic [{element_range}] table {array_declaration}; \
-                 table{array_index} = {element_width}'d{physical_initial}; \
-                 table{array_index}[selector {direction}: {slice_width}] = \
+                 logic [{element_range}] lookup {array_declaration}; \
+                 lookup{array_index} = {element_width}'d{physical_initial}; \
+                 lookup{array_index}[selector {direction}: {slice_width}] = \
                  value {operator} {slice_width}'d{constant}; \
-                 preserve = table{array_index}; \
+                 preserve = lookup{array_index}; \
                  endfunction",
                     element_range = element_range,
                     slice_range = slice_range,
@@ -612,11 +612,11 @@ pub(super) fn function_runtime_array_indexed_select_structure(c: &mut CaseList) 
                         };
                         if multidimensional {
                             format!(
-                                "table[{first_init}][{second_init}] = \
+                                "lookup[{first_init}][{second_init}] = \
                                  {element_width}'d{value};"
                             )
                         } else {
-                            format!("table[{first_init}] = {element_width}'d{value};")
+                            format!("lookup[{first_init}] = {element_width}'d{value};")
                         }
                     })
                     .collect::<Vec<_>>()
@@ -625,9 +625,9 @@ pub(super) fn function_runtime_array_indexed_select_structure(c: &mut CaseList) 
                     "function logic [{slice_range}] pick( \
                      input logic [3:0] packed_selector, {ports} \
                      input logic unused); \
-                     logic [{element_range}] table {declaration}; \
+                     logic [{element_range}] lookup {declaration}; \
                      {initializers} \
-                     pick = table{indexes}[packed_selector {direction}: {slice_width}]; \
+                     pick = lookup{indexes}[packed_selector {direction}: {slice_width}]; \
                      endfunction",
                     slice_range = slice_range,
                     ports = ports,
@@ -849,10 +849,10 @@ pub(super) fn function_runtime_array_indexed_assignment_structure(c: &mut CaseLi
                         };
                         if multidimensional {
                             format!(
-                                "table[{first_init}][{second_init}] = {element_width}'d{value};"
+                                "lookup[{first_init}][{second_init}] = {element_width}'d{value};"
                             )
                         } else {
-                            format!("table[{first_init}] = {element_width}'d{value};")
+                            format!("lookup[{first_init}] = {element_width}'d{value};")
                         }
                     })
                     .collect::<Vec<_>>()
@@ -877,9 +877,9 @@ pub(super) fn function_runtime_array_indexed_assignment_structure(c: &mut CaseLi
                             element % 2
                         };
                         if multidimensional {
-                            format!("table[{first}][{second}]")
+                            format!("lookup[{first}][{second}]")
                         } else {
-                            format!("table[{first}]")
+                            format!("lookup[{first}]")
                         }
                     })
                     .collect::<Vec<_>>()
@@ -887,9 +887,9 @@ pub(super) fn function_runtime_array_indexed_assignment_structure(c: &mut CaseLi
                 let function_definition = format!(
                     "function logic [{total_range}] update({ports}, \
                      input logic [{slice_range}] value); \
-                     logic [{element_range}] table {declaration}; \
+                     logic [{element_range}] lookup {declaration}; \
                      {initializers} \
-                     table{indexes}[packed_selector {direction}: {slice_width}] = \
+                     lookup{indexes}[packed_selector {direction}: {slice_width}] = \
                      value {operator} {slice_width}'d{constant}; \
                      update = {{{return_elements}}}; \
                      endfunction",

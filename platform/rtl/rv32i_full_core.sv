@@ -279,7 +279,9 @@ module rv32i_full_core(clk, rst, init_pc, imem_rdata, dmem_rdata, imem_addr,
         rf_we = 1'b1;
         case (funct3)
           3'b000: rf_wdata = va + imm_i;
-          3'b010: rf_wdata = ({va[31], va} < {imm_i[31], imm_i}) ? 32'd1 : 32'd0;
+          3'b010: rf_wdata = (va[31] != imm_i[31])
+                             ? {31'b0, va[31]}
+                             : ((va < imm_i) ? 32'd1 : 32'd0);
           3'b011: rf_wdata = (va < imm_i) ? 32'd1 : 32'd0;
           3'b100: rf_wdata = va ^ imm_i;
           3'b110: rf_wdata = va | imm_i;
@@ -299,7 +301,7 @@ module rv32i_full_core(clk, rst, init_pc, imem_rdata, dmem_rdata, imem_addr,
           {7'b0000000, 3'b000}: rf_wdata = va + vb;
           {7'b0100000, 3'b000}: rf_wdata = va - vb;
           {7'b0000000, 3'b001}: rf_wdata = va << vb[4:0];
-          {7'b0000000, 3'b010}: rf_wdata = (va[31] != vb[31]) ? {va[31], 31'b0}
+          {7'b0000000, 3'b010}: rf_wdata = (va[31] != vb[31]) ? {31'b0, va[31]}
                                   : ((va < vb) ? 32'd1 : 32'd0);
           {7'b0000000, 3'b011}: rf_wdata = (va < vb) ? 32'd1 : 32'd0;
           {7'b0000000, 3'b100}: rf_wdata = va ^ vb;
@@ -408,7 +410,10 @@ module rv32i_full_core(clk, rst, init_pc, imem_rdata, dmem_rdata, imem_addr,
             csr_mepc <= pc;
             csr_mcause <= exception_cause;
             csr_mtval <= exception_tval;
-            if (csr_mtvec != 32'b0) begin
+            if (exception_cause == 32'd3) begin
+              halted_r <= 1'b1;
+              state <= S_HALTED;
+            end else if (csr_mtvec != 32'b0) begin
               pc <= csr_mtvec;
               state <= S_FETCH;
             end else begin

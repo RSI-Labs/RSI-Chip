@@ -59,7 +59,15 @@ impl I8086SvRunner {
     }
 
     pub fn run_memory(&self, initial_memory: SparseMemory) -> Result<I8086SvResult, String> {
-        execute_i8086(&self.design, initial_memory)
+        self.run_memory_with_budget(initial_memory, SIMULATION_TIME_BUDGET)
+    }
+
+    pub fn run_memory_with_budget(
+        &self,
+        initial_memory: SparseMemory,
+        simulation_time_budget: u64,
+    ) -> Result<I8086SvResult, String> {
+        execute_i8086(&self.design, initial_memory, simulation_time_budget)
     }
 }
 
@@ -71,6 +79,8 @@ pub struct Rv32iSvResult {
     pub pc: u32,
     pub a0: u32,
     pub instructions: u64,
+    pub regs: [u32; 32],
+    pub memory: SparseMemory,
 }
 
 pub fn run_i8086_com(program: &[u8]) -> Result<I8086SvResult, String> {
@@ -86,12 +96,16 @@ pub fn run_i8086_com(program: &[u8]) -> Result<I8086SvResult, String> {
     I8086SvRunner::new()?.run_memory(memory)
 }
 
-fn execute_i8086(design: &Design, mut memory: SparseMemory) -> Result<I8086SvResult, String> {
+fn execute_i8086(
+    design: &Design,
+    mut memory: SparseMemory,
+    simulation_time_budget: u64,
+) -> Result<I8086SvResult, String> {
     let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
     simulator.set_input("io_rdata", &LogicWord::from_u64(16, 0))?;
 
     let mut output = Vec::new();
-    for time in 0..SIMULATION_TIME_BUDGET {
+    for time in 0..simulation_time_budget {
         let clock = output_bool(&simulator, "clock")?;
         let mem_address = bus_u64(&simulator, "mem_addr")? as u32;
         let source_address = bus_u64(&simulator, "source_addr")? as u32;
@@ -160,14 +174,45 @@ fn supply_i8086_reads(simulator: &mut Simulator<'_>, memory: &SparseMemory) -> R
     )
 }
 
+/// A compiled RV32I RTL runtime that can execute many sparse-memory cases
+/// without repeating HDL elaboration.
+pub struct Rv32iSvRunner {
+    design: Design,
+}
+
+impl Rv32iSvRunner {
+    pub fn new() -> Result<Self, String> {
+        let source = format!("{RV_CORE}\n{RV_TB}");
+        let design =
+            eda_hdl::compile(&source, Some("rv32i_full_runtime_tb")).map_err(|e| e.to_string())?;
+        Ok(Self { design })
+    }
+
+    pub fn run_memory(
+        &self,
+        entry: u32,
+        initial_memory: SparseMemory,
+    ) -> Result<Rv32iSvResult, String> {
+        execute_rv32i(&self.design, entry, initial_memory)
+    }
+}
+
 pub fn run_rv32i_elf(bytes: &[u8]) -> Result<Rv32iSvResult, String> {
-    let mut golden = crate::rv32i::Rv32iMachine::load_elf(bytes, &[])
+    let golden = crate::rv32i::Rv32iMachine::load_elf(bytes, &[])
         .map_err(|error| format!("invalid RV32I ELF: {error}"))?;
     let entry = golden.pc;
     let source = format!("{RV_CORE}\n{RV_TB}");
     let design =
         eda_hdl::compile(&source, Some("rv32i_full_runtime_tb")).map_err(|e| e.to_string())?;
-    let mut simulator = Simulator::new(&design).map_err(|e| e.to_string())?;
+    execute_rv32i(&design, entry, golden.memory)
+}
+
+fn execute_rv32i(
+    design: &Design,
+    entry: u32,
+    mut memory: SparseMemory,
+) -> Result<Rv32iSvResult, String> {
+    let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
     simulator.set_input("init_pc", &LogicWord::from_u64(32, u64::from(entry)))?;
 
     for time in 0..SIMULATION_TIME_BUDGET {
@@ -176,16 +221,13 @@ pub fn run_rv32i_elf(bytes: &[u8]) -> Result<Rv32iSvResult, String> {
         let data_address = bus_u64(&simulator, "dmem_addr")? as u32;
         simulator.set_input(
             "imem_rdata",
-            &LogicWord::from_u64(
-                32,
-                u64::from(golden.memory.read_le_u32(instruction_address)),
-            ),
+            &LogicWord::from_u64(32, u64::from(memory.read_le_u32(instruction_address))),
         )?;
         simulator.set_input(
             "dmem_rdata",
             &LogicWord::from_u64(
                 32,
-                u64::from(golden.memory.read_le_u32(data_address & 0xffff_fffc)),
+                u64::from(memory.read_le_u32(data_address & 0xffff_fffc)),
             ),
         )?;
 
@@ -199,14 +241,20 @@ pub fn run_rv32i_elf(bytes: &[u8]) -> Result<Rv32iSvResult, String> {
         if clock_now && !clock {
             if pending_write {
                 match write_width {
-                    0 => golden.memory.write_u8(write_address, write_value as u8),
-                    1 => golden
-                        .memory
-                        .write_le_u16(write_address, write_value as u16),
-                    _ => golden.memory.write_le_u32(write_address, write_value),
+                    0 => memory.write_u8(write_address, write_value as u8),
+                    1 => memory.write_le_u16(write_address, write_value as u16),
+                    _ => memory.write_le_u32(write_address, write_value),
                 }
             }
             if output_bool(&simulator, "halted")? {
+                let mut regs = [0_u32; 32];
+                for (index, register) in regs.iter_mut().enumerate().skip(1) {
+                    *register = simulator
+                        .read(&format!("core.x{index}"))
+                        .and_then(|word| word.to_u64())
+                        .map(|value| value as u32)
+                        .ok_or_else(|| format!("missing RTL register x{index}"))?;
+                }
                 return Ok(Rv32iSvResult {
                     halted: true,
                     trap: output_bool(&simulator, "trap")?,
@@ -217,6 +265,8 @@ pub fn run_rv32i_elf(bytes: &[u8]) -> Result<Rv32iSvResult, String> {
                         .read("core.cycle_count")
                         .and_then(|word| word.to_u64())
                         .ok_or("missing RV32I cycle count")?,
+                    regs,
+                    memory,
                 });
             }
         }

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 eda-core = { path = "../eda-core" }
+eda-slang = { path = "../eda-slang" }
 eda-api = { path = "../eda-api" }
 eda-daemon = { path = "../eda-daemon" }
 eda-ams = { path = "../eda-ams" }

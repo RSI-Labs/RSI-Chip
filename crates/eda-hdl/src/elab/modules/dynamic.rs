@@ -65,6 +65,20 @@ impl<'a> Elaborator<'a> {
         env: &Env,
     ) -> Result<StmtIR, String> {
         let (entry, array) = self.dynamic_array_entry(name, env)?;
+        let constant_size = self
+            .const_eval(size, env.params, env.module_name)
+            .map_err(|_| {
+                format!(
+                    "module '{}': dynamic array '{}' requires a constant size in this bounded subset",
+                    env.module_name, name
+                )
+            })?;
+        if !(0..=256).contains(&constant_size) {
+            return Err(format!(
+                "module '{}': dynamic array '{}' size must be between 0 and 256 in this bounded subset, got {}",
+                env.module_name, name, constant_size
+            ));
+        }
         let mut size_value = self.elab_expr(size, env)?;
         size_value = if size_value.width() < 9 {
             ExprIR::Concat(vec![

@@ -80,74 +80,259 @@ mod items;
 mod statements;
 mod utility;
 
+// Keywords are aligned with slang's IEEE 1800-2023 keyword tables. The
+// context-sensitive class expressions `new`, `null`, `this`, and `super` are
+// intentionally lexed as identifiers here and recognized by their syntactic
+// position until the lexer gains distinct keyword token kinds.
+const SYSTEMVERILOG_RESERVED: &[&str] = &[
+    "accept_on",
+    "alias",
+    "always",
+    "always_comb",
+    "always_ff",
+    "always_latch",
+    "and",
+    "assert",
+    "assign",
+    "assume",
+    "automatic",
+    "before",
+    "begin",
+    "bind",
+    "bins",
+    "binsof",
+    "bit",
+    "break",
+    "buf",
+    "bufif0",
+    "bufif1",
+    "byte",
+    "case",
+    "casex",
+    "casez",
+    "cell",
+    "chandle",
+    "checker",
+    "class",
+    "clocking",
+    "cmos",
+    "config",
+    "const",
+    "constraint",
+    "context",
+    "continue",
+    "cover",
+    "covergroup",
+    "coverpoint",
+    "cross",
+    "deassign",
+    "default",
+    "defparam",
+    "design",
+    "disable",
+    "dist",
+    "do",
+    "edge",
+    "else",
+    "end",
+    "endcase",
+    "endchecker",
+    "endclass",
+    "endclocking",
+    "endconfig",
+    "endfunction",
+    "endgenerate",
+    "endgroup",
+    "endinterface",
+    "endmodule",
+    "endpackage",
+    "endprimitive",
+    "endprogram",
+    "endproperty",
+    "endsequence",
+    "endspecify",
+    "endtable",
+    "endtask",
+    "enum",
+    "event",
+    "eventually",
+    "expect",
+    "export",
+    "extends",
+    "extern",
+    "final",
+    "first_match",
+    "for",
+    "force",
+    "foreach",
+    "forever",
+    "fork",
+    "forkjoin",
+    "function",
+    "generate",
+    "genvar",
+    "global",
+    "highz0",
+    "highz1",
+    "if",
+    "iff",
+    "ifnone",
+    "ignore_bins",
+    "illegal_bins",
+    "implements",
+    "implies",
+    "import",
+    "incdir",
+    "include",
+    "initial",
+    "inout",
+    "input",
+    "inside",
+    "instance",
+    "int",
+    "integer",
+    "interconnect",
+    "interface",
+    "intersect",
+    "join",
+    "join_any",
+    "join_none",
+    "large",
+    "let",
+    "liblist",
+    "library",
+    "local",
+    "localparam",
+    "logic",
+    "longint",
+    "macromodule",
+    "matches",
+    "medium",
+    "modport",
+    "module",
+    "nand",
+    "negedge",
+    "nettype",
+    "nexttime",
+    "nmos",
+    "nor",
+    "noshowcancelled",
+    "not",
+    "notif0",
+    "notif1",
+    "or",
+    "output",
+    "package",
+    "packed",
+    "parameter",
+    "pmos",
+    "posedge",
+    "primitive",
+    "priority",
+    "program",
+    "property",
+    "protected",
+    "pull0",
+    "pull1",
+    "pulldown",
+    "pullup",
+    "pulsestyle_ondetect",
+    "pulsestyle_onevent",
+    "pure",
+    "rand",
+    "randc",
+    "randcase",
+    "randsequence",
+    "rcmos",
+    "real",
+    "realtime",
+    "ref",
+    "reg",
+    "reject_on",
+    "release",
+    "repeat",
+    "restrict",
+    "return",
+    "rnmos",
+    "rpmos",
+    "rtran",
+    "rtranif0",
+    "rtranif1",
+    "s_always",
+    "s_eventually",
+    "s_nexttime",
+    "s_until",
+    "s_until_with",
+    "scalared",
+    "sequence",
+    "shortint",
+    "shortreal",
+    "showcancelled",
+    "signed",
+    "small",
+    "soft",
+    "solve",
+    "specify",
+    "specparam",
+    "static",
+    "string",
+    "strong",
+    "strong0",
+    "strong1",
+    "struct",
+    "supply0",
+    "supply1",
+    "sync_accept_on",
+    "sync_reject_on",
+    "table",
+    "tagged",
+    "task",
+    "throughout",
+    "time",
+    "timeprecision",
+    "timeunit",
+    "tran",
+    "tranif0",
+    "tranif1",
+    "tri",
+    "tri0",
+    "tri1",
+    "triand",
+    "trior",
+    "trireg",
+    "type",
+    "typedef",
+    "union",
+    "unique",
+    "unique0",
+    "unsigned",
+    "until",
+    "until_with",
+    "untyped",
+    "use",
+    "uwire",
+    "var",
+    "vectored",
+    "virtual",
+    "void",
+    "wait",
+    "wait_order",
+    "wand",
+    "weak",
+    "weak0",
+    "weak1",
+    "while",
+    "wildcard",
+    "wire",
+    "with",
+    "within",
+    "wor",
+    "xnor",
+    "xor",
+];
+
 fn is_reserved(s: &str) -> bool {
-    matches!(
-        s,
-        "module"
-            | "endmodule"
-            | "interface"
-            | "endinterface"
-            | "virtual"
-            | "modport"
-            | "assert"
-            | "property"
-            | "disable"
-            | "iff"
-            | "package"
-            | "endpackage"
-            | "import"
-            | "typedef"
-            | "enum"
-            | "union"
-            | "function"
-            | "endfunction"
-            | "automatic"
-            | "input"
-            | "output"
-            | "inout"
-            | "wire"
-            | "reg"
-            | "tri"
-            | "logic"
-            | "bit"
-            | "byte"
-            | "shortint"
-            | "int"
-            | "longint"
-            | "integer"
-            | "signed"
-            | "unsigned"
-            | "parameter"
-            | "localparam"
-            | "generate"
-            | "endgenerate"
-            | "genvar"
-            | "assign"
-            | "always"
-            | "initial"
-            | "begin"
-            | "end"
-            | "if"
-            | "else"
-            | "case"
-            | "casez"
-            | "casex"
-            | "endcase"
-            | "default"
-            | "posedge"
-            | "negedge"
-            | "or"
-            | "forever"
-            | "and"
-            | "nand"
-            | "nor"
-            | "xor"
-            | "xnor"
-            | "buf"
-            | "not"
-            | "always_comb"
-            | "always_ff"
-    )
+    SYSTEMVERILOG_RESERVED.contains(&s)
 }
 
 fn default_range(width: usize) -> PackedRange {

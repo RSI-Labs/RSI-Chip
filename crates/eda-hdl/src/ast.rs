@@ -111,6 +111,8 @@ pub enum Item {
     Function(FunctionDef),
     /// One or more `import pkg::*;` / `import pkg::name;` specifications.
     Imports(Vec<Import>),
+    /// One or more loop-generate control variables.
+    Genvar(Vec<String>),
     /// Verilog-2001 generate region. Constructs are expanded after module
     /// parameter resolution but before port/net declaration.
     Generate(Vec<GenerateConstruct>),
@@ -275,6 +277,8 @@ pub struct GenerateBlock {
 
 #[derive(Clone, Debug)]
 pub enum GenerateConstruct {
+    /// A declaration inside a generate region; it controls a later loop.
+    Genvar(Vec<String>),
     Block(GenerateBlock),
     Case {
         selector: Expr,

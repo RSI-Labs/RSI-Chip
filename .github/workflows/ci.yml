@@ -20,3 +20,28 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+
+  slang-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clone slang
+        run: |
+          git clone https://github.com/MikePopoloski/slang slang
+          git -C slang checkout 54c19b53a4cc1beb875c4529409d9314ba675b76
+      - name: Build slang
+        run: |
+          cmake -S slang -B slang-build -DCMAKE_BUILD_TYPE=Release
+          cmake --build slang-build --target slang_driver -j2
+      - name: Clone official UVM
+        run: |
+          git clone https://github.com/accellera-official/uvm-core uvm-core
+          git -C uvm-core checkout 78c06547a2a0a29b3dc9dcafae62b75b2ff61544
+      - name: Slang frontend tests
+        env:
+          SLANG_BIN: ${{ github.workspace }}/slang-build/bin/slang
+          UVM_HOME: ${{ github.workspace }}/uvm-core
+        run: cargo test -p eda-slang --all-targets -- --nocapture

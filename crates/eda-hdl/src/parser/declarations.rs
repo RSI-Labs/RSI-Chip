@@ -134,6 +134,12 @@ impl Parser {
                     if !self.eat_punct(",") {
                         break;
                     }
+                    if self.at_kw("parameter") || self.at_kw("localparam") {
+                        break;
+                    }
+                }
+                if self.at_kw("parameter") || self.at_kw("localparam") {
+                    continue;
                 }
                 if !self.eat_punct(",") {
                     break;
@@ -422,7 +428,7 @@ impl Parser {
         let mut arg_defaults = Vec::new();
         if !self.at_punct(")") {
             loop {
-                self.expect_kw("input")?;
+                let _ = self.eat_kw("input");
                 let arg_type = self.parse_net_type();
                 // Classic Verilog `input [msb:lsb] name` has no type keyword.
                 let mut range = if let Some(arg_info) = arg_type {
@@ -446,16 +452,17 @@ impl Parser {
                     if !self.eat_punct(",") {
                         break;
                     }
-                    if self.at_kw("input") {
+                    if self.at_kw("input") || self.at_net_type() {
                         break;
                     }
                     if self.at_punct("[") {
                         range = self.parse_opt_range()?;
                     }
                 }
-                if !self.eat_punct(",") && !self.at_kw("input") {
-                    break;
+                if self.at_kw("input") || self.at_net_type() {
+                    continue;
                 }
+                break;
             }
         }
         self.expect_punct(")")?;

@@ -214,6 +214,19 @@ impl<'a> Elaborator<'a> {
             }
             ast::Expr::Select(n, idx) => {
                 let entry = env.net(n)?;
+                if entry.array.is_some()
+                    && self.const_eval(idx, env.params, env.module_name).is_err()
+                {
+                    let element_width = entry
+                        .array
+                        .as_ref()
+                        .map(|array| array.element_width)
+                        .ok_or_else(|| format!("'{n}' is not an unpacked array"))?;
+                    let indexes = vec![idx.as_ref().clone()];
+                    let start = constant_expr(0);
+                    let width = constant_expr(element_width as i64);
+                    return self.array_element_indexed_expr(n, &indexes, &start, &width, true, env);
+                }
                 let i = self.const_eval(idx, env.params, env.module_name)?;
                 let off = if entry.array.is_some() {
                     entry.array_offset(&[i])?
@@ -240,6 +253,19 @@ impl<'a> Elaborator<'a> {
                     unreachable!("pattern was already checked");
                 };
                 let entry = env.net(n)?;
+                if indexes
+                    .iter()
+                    .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
+                {
+                    let element_width = entry
+                        .array
+                        .as_ref()
+                        .map(|array| array.element_width)
+                        .ok_or_else(|| format!("'{n}' is not an unpacked array"))?;
+                    let start = constant_expr(0);
+                    let width = constant_expr(element_width as i64);
+                    return self.array_element_indexed_expr(n, indexes, &start, &width, true, env);
+                }
                 let mut resolved = Vec::with_capacity(indexes.len());
                 for index in indexes {
                     resolved.push(self.const_eval(index, env.params, env.module_name)?);

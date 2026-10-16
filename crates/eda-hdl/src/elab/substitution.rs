@@ -15,6 +15,7 @@ pub(super) fn substitute_generate_var(item: &ast::Item, var: &str, value: i64) -
                 .collect(),
         ),
         ast::Item::Imports(_) => item.clone(),
+        ast::Item::Genvar(_) => item.clone(),
         ast::Item::TypeDef(_) => item.clone(),
         ast::Item::ClassDef(_) => item.clone(),
         ast::Item::Function(_) => item.clone(),
@@ -237,6 +238,7 @@ pub(super) fn subst_generate_construct(
     value: i64,
 ) -> ast::GenerateConstruct {
     match construct {
+        ast::GenerateConstruct::Genvar(names) => ast::GenerateConstruct::Genvar(names.clone()),
         ast::GenerateConstruct::Block(block) => {
             ast::GenerateConstruct::Block(subst_generate_block(block, var, value))
         }

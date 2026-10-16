@@ -13,6 +13,14 @@ fn simple_module() {
 }
 
 #[test]
+fn systemverilog_keywords_cannot_be_used_as_identifiers() {
+    assert!(parse("module repeat(output y); assign y = 1'b0; endmodule").is_err());
+    assert!(parse("module m(output program); assign program = 1'b0; endmodule").is_err());
+    assert!(parse("module m(output table); assign table = 1'b0; endmodule").is_err());
+    assert!(parse("module m(output priority); assign priority = 1'b0; endmodule").is_err());
+}
+
+#[test]
 fn non_ansi_ports() {
     let f = parse_ok("module m(a, b, y); input a, b; output y; assign y = a & b; endmodule");
     assert_eq!(f.modules[0].items.len(), 4);
@@ -136,6 +144,41 @@ fn instance_with_params() {
             assert!(matches!(conns[2], Conn::Named(_, None)));
         }
         other => panic!("expected inst, got {:?}", other),
+    }
+}
+
+#[test]
+fn module_header_allows_multiple_parameter_groups() {
+    let file = parse_ok(
+        "module m #(parameter WIDTH = 4, parameter SIGNED = 0) (input [WIDTH-1:0] a, output y); assign y = a[0]; endmodule",
+    );
+    match &file.modules[0].items[0] {
+        Item::Params(parameters) => assert_eq!(
+            parameters
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["WIDTH", "SIGNED"]
+        ),
+        other => panic!("expected parameters, got {:?}", other),
+    }
+}
+
+#[test]
+fn modern_function_argument_lists_are_parsed() {
+    let file = parse_ok(
+        "module m; function automatic int add(int left, int right); add = left + right; endfunction endmodule",
+    );
+    match &file.modules[0].items[0] {
+        Item::Function(function) => assert_eq!(
+            function
+                .args
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["left", "right"]
+        ),
+        other => panic!("expected function, got {:?}", other),
     }
 }
 

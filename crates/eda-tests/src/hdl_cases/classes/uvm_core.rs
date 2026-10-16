@@ -6,6 +6,7 @@ use eda_sim::Simulator;
 pub(super) fn register(c: &mut CaseList) {
     uvm_component_cases(c);
     uvm_channel_cases(c);
+    uvm_structure_cases(c);
 }
 fn uvm_component_cases(c: &mut CaseList) {
     // 1. phase 钩子按 build→connect→run 顺序经虚分派执行。
@@ -34,7 +35,7 @@ module top(output int y1, y2);
     base = t;                 // 基类句柄观察派生 override
     base.run_phases();
     y1 = t.trace;             // 123
-    y2 = base.phase_state;    // 3（run_phases 完成）
+    y2 = base.phase_state;    // 9（all common phases complete）
   end
 endmodule
 "#;
@@ -42,7 +43,61 @@ endmodule
         let mut sim = Simulator::new(&design)?;
         sim.run_until(0)?;
         expect_net(&sim, "y1", 123, "phase order 1-2-3")?;
-        expect_net(&sim, "y2", 3, "phase_state completion")?;
+        expect_net(&sim, "y2", 9, "phase_state completion")?;
+        Ok(())
+    });
+
+    // 1a. IEEE UVM common component phases execute in their canonical order.
+    c.add("uvm_component_common_phase_order", || {
+        let source = r#"
+class phased_component extends uvm_component;
+  int trace = 0;
+  function new(int id);
+    super.new(id);
+  endfunction
+  virtual function void build_phase();
+    this.trace = this.trace * 10 + 1;
+  endfunction
+  virtual function void connect_phase();
+    this.trace = this.trace * 10 + 2;
+  endfunction
+  virtual function void end_of_elaboration_phase();
+    this.trace = this.trace * 10 + 3;
+  endfunction
+  virtual function void start_of_simulation_phase();
+    this.trace = this.trace * 10 + 4;
+  endfunction
+  virtual function void run_phase();
+    this.trace = this.trace * 10 + 5;
+  endfunction
+  virtual function void extract_phase();
+    this.trace = this.trace * 10 + 6;
+  endfunction
+  virtual function void check_phase();
+    this.trace = this.trace * 10 + 7;
+  endfunction
+  virtual function void report_phase();
+    this.trace = this.trace * 10 + 8;
+  endfunction
+  virtual function void final_phase();
+    this.trace = this.trace * 10 + 9;
+  endfunction
+endclass
+module top(output int y1, y2);
+  phased_component component;
+  initial begin
+    component = new(9);
+    component.run_phases();
+    y1 = component.trace;
+    y2 = component.phase_state;
+  end
+endmodule
+"#;
+        let design = compile(source, Some("top")).map_err(|e| e.to_string())?;
+        let mut sim = Simulator::new(&design)?;
+        sim.run_until(0)?;
+        expect_net(&sim, "y1", 123_456_789, "common phase order")?;
+        expect_net(&sim, "y2", 9, "all common phases complete")?;
         Ok(())
     });
 
@@ -125,9 +180,9 @@ module top(output int y1, y2, y3, y4, y5, y6, y7, y8, y9);
     y4 = (e.a.parent == e);        // parent 引用
     y5 = (e.child1 == e.b);        // child slot 引用
     y6 = e.b.hits;                  // 11
-    y7 = e.a.phase_state;           // 3
+    y7 = e.a.phase_state;           // 9
     y8 = (e.a.parent == e);
-    y9 = e.b.phase_state;           // 3
+    y9 = e.b.phase_state;           // 9
   end
 endmodule
 "#;
@@ -140,9 +195,9 @@ endmodule
         expect_net(&sim, "y4", 1, "parent identity")?;
         expect_net(&sim, "y5", 1, "child slot identity")?;
         expect_net(&sim, "y6", 11, "second child phases")?;
-        expect_net(&sim, "y7", 3, "first child phase completion")?;
+        expect_net(&sim, "y7", 9, "first child phase completion")?;
         expect_net(&sim, "y8", 1, "parent identity after phases")?;
-        expect_net(&sim, "y9", 3, "second child phase completion")?;
+        expect_net(&sim, "y9", 9, "second child phase completion")?;
         Ok(())
     });
 
@@ -188,7 +243,89 @@ endmodule
         sim.run_until(0)?;
         expect_net(&sim, "y1", 11, "nested agent a1 build+run")?;
         expect_net(&sim, "y2", 11, "nested agent a2 build+run")?;
-        expect_net(&sim, "y3", 3, "env phases complete")?;
+        expect_net(&sim, "y3", 9, "env phases complete")?;
+        Ok(())
+    });
+}
+
+fn uvm_structure_cases(c: &mut CaseList) {
+    c.add("uvm_core_structural_class_surface", || {
+        let source = r#"
+class smoke_test extends uvm_test;
+  int ran = 0;
+  function new(int id, string name);
+    super.new(id, name);
+  endfunction
+  virtual function void run_phase();
+    this.report_info("smoke", "run phase", 0);
+    this.ran = 1;
+  endfunction
+endclass
+class value_subscriber extends uvm_subscriber;
+  int observed_value = 0;
+  function new(int id);
+    super.new(id);
+  endfunction
+  virtual function void write(int data);
+    this.observed_value = data;
+    this.observed = this.observed + 1;
+  endfunction
+endclass
+class smoke_env extends uvm_env;
+  uvm_analysis_export analysis_export;
+  value_subscriber subscriber;
+  function new(int id, string name);
+    super.new(id, name);
+    this.analysis_export = new(id + 1, name);
+    this.subscriber = new(id + 2);
+    this.analysis_export.connect(this.subscriber);
+  endfunction
+endclass
+class smoke_transaction extends uvm_transaction;
+  function new(int id, int transaction_id);
+    super.new(id, transaction_id);
+  endfunction
+endclass
+module top(output int y1, y2, y3, y4, y5, y6, y7, y8);
+  smoke_test test;
+  smoke_env environment;
+  smoke_transaction transaction;
+  uvm_agent agent;
+  uvm_monitor monitor;
+  uvm_scoreboard scoreboard;
+  initial begin
+    test = new(1, "smoke_test");
+    test.run_phases();
+    environment = new(2, "smoke_env");
+    environment.analysis_export.write(7);
+    transaction = new(3, 41);
+    agent = new(4, "agent");
+    monitor = new(5, "monitor");
+    scoreboard = new(6, "scoreboard");
+    agent.run_phases();
+
+    y1 = test.ran;
+    y2 = test.report_info_count;
+    y3 = test.phase_state;
+    y4 = transaction.get_transaction_id();
+    y5 = environment.subscriber.observed_value;
+    y6 = environment.analysis_export.writes;
+    y7 = environment.subscriber.observed;
+    y8 = agent.phase_state;
+  end
+endmodule
+"#;
+        let design = compile(source, Some("top")).map_err(|e| e.to_string())?;
+        let mut sim = Simulator::new(&design)?;
+        sim.run_until(0)?;
+        expect_net(&sim, "y1", 1, "uvm_test virtual run phase")?;
+        expect_net(&sim, "y2", 1, "uvm_report_object info counter")?;
+        expect_net(&sim, "y3", 9, "uvm_test phase completion")?;
+        expect_net(&sim, "y4", 41, "uvm_transaction id")?;
+        expect_net(&sim, "y5", 7, "analysis export forwards write")?;
+        expect_net(&sim, "y6", 1, "analysis export write count")?;
+        expect_net(&sim, "y7", 1, "analysis subscriber observation count")?;
+        expect_net(&sim, "y8", 9, "structural component phase completion")?;
         Ok(())
     });
 }
@@ -218,7 +355,7 @@ class collector extends uvm_subscriber;
     this.observed = this.observed + 1;
   endfunction
 endclass
-class checker extends uvm_subscriber;
+class checker_component extends uvm_subscriber;
   int max = 0;
   function new(int id);
     super.new(id);
@@ -231,7 +368,7 @@ endclass
 class env extends uvm_component;
   monitor mon;
   collector col;
-  checker chk;
+  checker_component chk;
   function new(int id);
     super.new(id);
     this.mon = new(id * 100 + 1);
@@ -276,8 +413,8 @@ class tracer extends uvm_callback;
   function new(int id);
     super.new(id);
   endfunction
-  virtual function void callback(int event, int data);
-    this.event_sum = this.event_sum + event;
+  virtual function void callback(int event_code, int data);
+    this.event_sum = this.event_sum + event_code;
     this.data_sum = this.data_sum + data;
     this.hits = this.hits + 1;
   endfunction
@@ -286,8 +423,8 @@ class scale extends uvm_callback;
   function new(int id);
     super.new(id);
   endfunction
-  virtual function void callback(int event, int data);
-    this.scaled = this.scaled + event * data;
+  virtual function void callback(int event_code, int data);
+    this.scaled = this.scaled + event_code * data;
   endfunction
 endclass
 module top(output int y1, y2, y3, y4, y5, y6);
@@ -337,8 +474,8 @@ class tracer extends uvm_callback;
   function new(int id);
     super.new(id);
   endfunction
-  virtual function void callback(int event, int data);
-    this.event_sum = this.event_sum + event;
+  virtual function void callback(int event_code, int data);
+    this.event_sum = this.event_sum + event_code;
     this.data_sum = this.data_sum + data;
     this.hits = this.hits + 1;
   endfunction
@@ -347,8 +484,8 @@ class scale extends uvm_callback;
   function new(int id);
     super.new(id);
   endfunction
-  virtual function void callback(int event, int data);
-    this.scaled = this.scaled + event * data;
+  virtual function void callback(int event_code, int data);
+    this.scaled = this.scaled + event_code * data;
   endfunction
 endclass
 module top(output int y1, y2, y3, y4, y5, y6, y7, y8, y9);
@@ -446,9 +583,9 @@ module top(output int y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12);
     ev.reset();
 
     barrier = new(10, 3);
-    y7 = barrier.wait(1);  // 0
-    y8 = barrier.wait(1);  // 0
-    y9 = barrier.wait(1);  // 1：到达阈值
+    y7 = barrier.wait_for(1);  // 0
+    y8 = barrier.wait_for(1);  // 0
+    y9 = barrier.wait_for(1);  // 1：到达阈值
     y10 = barrier.count;   // 3
     y11 = barrier.reached(); // 1
   end

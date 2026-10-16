@@ -54,9 +54,16 @@ impl<'a> Elaborator<'a> {
                 }
             }
         }
+        let mut declared_parameter_names = std::collections::HashSet::new();
         for item in &module.items {
             if let ast::Item::Params(list) = item {
                 for (name, value) in list {
+                    if !declared_parameter_names.insert(name.clone()) {
+                        return Err(format!(
+                            "module '{}': duplicate parameter '{}'",
+                            module.name, name
+                        ));
+                    }
                     if parent_params.contains_key(name) {
                         continue;
                     }
@@ -126,12 +133,29 @@ impl<'a> Elaborator<'a> {
                 } = item
                 {
                     for n in names {
+                        if port_dirs.contains_key(n) {
+                            return Err(format!(
+                                "module '{}': duplicate port '{}'",
+                                module.name, n
+                            ));
+                        }
                         port_dirs.insert(n.clone(), *dir);
                         if seen.insert(n.clone()) {
                             port_order.push(n.clone());
                         }
                     }
                 }
+            }
+        }
+        if root_instance {
+            if let Some(name) = port_order
+                .iter()
+                .find(|name| port_dirs.get(*name) == Some(&ast::DirSrc::InOut))
+            {
+                return Err(format!(
+                    "top module '{}': inout port '{}' is not supported",
+                    module.name, name
+                ));
             }
         }
 
@@ -470,6 +494,81 @@ impl<'a> Elaborator<'a> {
                     }
                 }
                 ast::Item::Assign { delay, lv, e } => {
+                    if let ast::Expr::Select(name, index) = lv {
+                        if env
+                            .net(name)
+                            .map(|entry| entry.array.is_some())
+                            .unwrap_or(false)
+                            && self.const_eval(index, env.params, env.module_name).is_err()
+                        {
+                            if *delay != 0 {
+                                return Err(
+                                    "delayed runtime indexed continuous-assignment lvalue is not supported"
+                                        .to_string(),
+                                );
+                            }
+                            let element_width = env
+                                .net(name)?
+                                .array
+                                .as_ref()
+                                .map(|array| array.element_width)
+                                .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                            let body = self.elab_stmt(
+                                &ast::Stmt::BL {
+                                    lv: ast::Expr::ArrayIndexedPart {
+                                        name: name.clone(),
+                                        indexes: vec![index.as_ref().clone()],
+                                        start: Box::new(constant_expr(0)),
+                                        width: Box::new(constant_expr(element_width as i64)),
+                                        ascending: true,
+                                    },
+                                    e: e.clone(),
+                                },
+                                &env,
+                            )?;
+                            self.design.processes.push(Process {
+                                sens: SensIR::Comb,
+                                body,
+                            });
+                            continue;
+                        }
+                    }
+                    if let ast::Expr::ArraySelect(name, indexes) = lv {
+                        if indexes.iter().any(|index| {
+                            self.const_eval(index, env.params, env.module_name).is_err()
+                        }) {
+                            if *delay != 0 {
+                                return Err(
+                                    "delayed runtime indexed continuous-assignment lvalue is not supported"
+                                        .to_string(),
+                                );
+                            }
+                            let element_width = env
+                                .net(name)?
+                                .array
+                                .as_ref()
+                                .map(|array| array.element_width)
+                                .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                            let body = self.elab_stmt(
+                                &ast::Stmt::BL {
+                                    lv: ast::Expr::ArrayIndexedPart {
+                                        name: name.clone(),
+                                        indexes: indexes.clone(),
+                                        start: Box::new(constant_expr(0)),
+                                        width: Box::new(constant_expr(element_width as i64)),
+                                        ascending: true,
+                                    },
+                                    e: e.clone(),
+                                },
+                                &env,
+                            )?;
+                            self.design.processes.push(Process {
+                                sens: SensIR::Comb,
+                                body,
+                            });
+                            continue;
+                        }
+                    }
                     if let ast::Expr::ArrayIndexedPart {
                         name,
                         indexes,

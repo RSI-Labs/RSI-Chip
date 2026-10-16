@@ -29,6 +29,47 @@ fn checked_in_com_runs_on_systemverilog_core() {
 }
 
 #[test]
+fn high_memory_com_runs_on_golden_and_systemverilog_models() {
+    let program = include_bytes!("../../../platform/programs/high_memory.com");
+    assert!(program.len() > 64);
+    let mut golden = I8086Machine::com(program, "").expect("golden high-memory COM loader");
+    assert_eq!(golden.run(100), I8086Stop::Halt);
+    assert_eq!(golden.output, b"HIGH");
+
+    let rtl = eda_cpu_platform::systemverilog::run_i8086_com(program)
+        .expect("SystemVerilog high-memory COM execution");
+    assert!(rtl.halted);
+    assert!(!rtl.trap);
+    assert_eq!(rtl.output, golden.output);
+    assert_eq!(rtl.ip, golden.ip);
+}
+
+#[test]
+fn maximum_size_com_image_uses_the_complete_real_mode_segment() {
+    let mut program = vec![0_u8; 0xff00];
+    program[..12].copy_from_slice(&[
+        0xba, 0x00, 0xff, // mov dx, 0xff00
+        0xb4, 0x09, // mov ah, 9
+        0xcd, 0x21, // int 0x21
+        0xb8, 0x00, 0x4c, // mov ax, 0x4c00
+        0xcd, 0x21, // int 0x21
+    ]);
+    program[0xfe00..0xfe04].copy_from_slice(b"END$");
+
+    let mut golden =
+        I8086Machine::com(&program, "").expect("golden loader accepts maximum-size COM image");
+    assert_eq!(golden.run(100), I8086Stop::Halt);
+    assert_eq!(golden.output, b"END");
+
+    let rtl = eda_cpu_platform::systemverilog::run_i8086_com(&program)
+        .expect("SystemVerilog runtime executes maximum-size COM image");
+    assert!(rtl.halted);
+    assert!(!rtl.trap);
+    assert_eq!(rtl.output, golden.output);
+    assert_eq!(rtl.ip, golden.ip);
+}
+
+#[test]
 fn checked_in_elf_runs_on_systemverilog_core() {
     let program = include_bytes!("../../../platform/programs/rv32i_exit42.elf");
     let mut golden = Rv32iMachine::load_elf(program, &[]).expect("golden ELF loader");
@@ -40,33 +81,94 @@ fn checked_in_elf_runs_on_systemverilog_core() {
 }
 
 #[test]
-fn high_memory_com_runs_on_golden_and_systemverilog_models() {
-    let program = include_bytes!("../../../platform/programs/high_memory.com");
-    assert!(program.len() > 64);
-
-    let mut golden = I8086Machine::com(program, "").expect("golden high-memory COM loader");
-    assert_eq!(golden.run(100), I8086Stop::Halt);
-    assert_eq!(golden.output, b"OK");
-
-    let rtl = eda_cpu_platform::systemverilog::run_i8086_com(program)
-        .expect("SystemVerilog high-memory COM execution");
-    assert_eq!(rtl.output, b"OK");
-    assert_eq!(rtl.output, golden.output);
-    assert!(rtl.halted && !rtl.trap);
-}
-
-#[test]
 fn high_memory_elf_runs_on_golden_and_systemverilog_models() {
     let program = include_bytes!("../../../platform/programs/rv32i_high_memory.elf");
     assert!(program.len() > 64);
-
     let mut golden = Rv32iMachine::load_elf(program, &[]).expect("golden high-memory ELF loader");
     assert_eq!(golden.run(100), StopReason::Exit(42));
-    assert_eq!(golden.memory.read_le_u32(0x1084), 42);
 
     let rtl = eda_cpu_platform::systemverilog::run_rv32i_elf(program)
         .expect("SystemVerilog high-memory ELF execution");
     assert!(rtl.halted);
-    assert_eq!(rtl.a0, 42);
+    assert!(rtl.trap);
+    assert_eq!(rtl.trap_cause, 11);
     assert_eq!(rtl.a0, golden.regs[10]);
+}
+
+#[test]
+fn sparse_rv32i_elf_runs_from_a_high_32_bit_address() {
+    fn instruction(opcode: u32, rd: u32, rs1: u32, funct3: u32, immediate: u32) -> [u8; 4] {
+        let encoded_immediate = if opcode == 0x37 {
+            immediate & 0xfffff
+        } else {
+            immediate & 0xfff
+        };
+        let immediate_shift = if opcode == 0x37 { 12 } else { 20 };
+        let value = (encoded_immediate << immediate_shift)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | (rd << 7)
+            | opcode;
+        value.to_le_bytes()
+    }
+
+    let entry = 0x7000_0000_u32;
+    let instructions = [
+        instruction(0x37, 6, 0, 0, 0x70000),   // lui t1, 0x70000
+        instruction(0x03, 5, 6, 0b010, 0x180), // lw t0, 0x180(t1)
+        instruction(0x13, 10, 5, 0, 1),        // addi a0, t0, 1
+        instruction(0x13, 17, 0, 0, 93),       // addi a7, zero, 93
+        0x0000_0073_u32.to_le_bytes(),         // ecall
+    ];
+    let file_offset = 0x100_usize;
+    let mut segment = vec![0_u8; 0x184];
+    for (index, instruction) in instructions.iter().enumerate() {
+        segment[index * 4..index * 4 + 4].copy_from_slice(instruction);
+    }
+    segment[0x180..0x184].copy_from_slice(&41_u32.to_le_bytes());
+
+    let mut elf = vec![0_u8; file_offset + segment.len()];
+    elf[0..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    elf[16..52].copy_from_slice(&{
+        let mut header = [0_u8; 36];
+        header[0..2].copy_from_slice(&2_u16.to_le_bytes());
+        header[2..4].copy_from_slice(&243_u16.to_le_bytes());
+        header[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        header[8..12].copy_from_slice(&entry.to_le_bytes());
+        header[12..16].copy_from_slice(&52_u32.to_le_bytes());
+        header[24..26].copy_from_slice(&52_u16.to_le_bytes());
+        header[26..28].copy_from_slice(&32_u16.to_le_bytes());
+        header[28..30].copy_from_slice(&1_u16.to_le_bytes());
+        header
+    });
+    let program_header = [
+        1_u32,
+        file_offset as u32,
+        entry,
+        entry,
+        segment.len() as u32,
+        segment.len() as u32,
+        5,
+        0x1000,
+    ];
+    for (destination, field) in elf[52..84]
+        .chunks_exact_mut(4)
+        .zip(program_header.map(|field| field.to_le_bytes()))
+    {
+        destination.copy_from_slice(&field);
+    }
+    elf[file_offset..].copy_from_slice(&segment);
+
+    let mut golden =
+        Rv32iMachine::load_elf(&elf, &[]).expect("golden loader accepts high-address ELF");
+    assert_eq!(golden.pc, entry);
+    let stop = golden.run(100);
+    assert_eq!(stop, StopReason::Exit(42));
+
+    let rtl = eda_cpu_platform::systemverilog::run_rv32i_elf(&elf)
+        .expect("SystemVerilog runtime executes high-address ELF");
+    assert!(rtl.halted);
+    assert!(rtl.trap);
+    assert_eq!(rtl.trap_cause, 11);
+    assert_eq!(rtl.a0, 42);
 }

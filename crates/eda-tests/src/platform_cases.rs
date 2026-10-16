@@ -337,7 +337,7 @@ pub fn register(c: &mut CaseList) {
             let design =
                 eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
             let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-            sim.set_input("program", &byte_program_image(&program))?;
+            sim.set_input("program_image", &byte_program_image(&program))?;
             sim.run_until(30)?;
             let ax = sim
                 .read_port("ax")
@@ -371,7 +371,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(35)?;
         let ax = sim
             .read_port("ax")
@@ -419,7 +419,7 @@ pub fn register(c: &mut CaseList) {
             let design =
                 eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
             let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-            sim.set_input("program", &byte_program_image(&program))?;
+            sim.set_input("program_image", &byte_program_image(&program))?;
             sim.run_until(80)?;
             for (port, expected) in [
                 ("ax", golden.regs[eda_cpu_platform::i8086::REG_AX]),
@@ -467,7 +467,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&image))?;
+        sim.set_input("program_image", &byte_program_image(&image))?;
         sim.run_until(100)?;
         let ax = sim
             .read_port("ax")
@@ -497,7 +497,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(60)?;
         let ax = sim
             .read_port("ax")
@@ -551,7 +551,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(120)?;
         let ax = sim
             .read_port("ax")
@@ -602,7 +602,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         let mut output = Vec::new();
         let mut previous_clock = false;
         for time in 1..100_u64 {
@@ -654,7 +654,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(120)?;
         let ax = sim
             .read_port("ax")
@@ -690,7 +690,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(80)?;
         let ax = sim
             .read_port("ax")
@@ -733,7 +733,7 @@ pub fn register(c: &mut CaseList) {
         let design =
             eda_hdl::compile(&source, Some("i8086_full_tb_64")).map_err(|e| e.to_string())?;
         let mut sim = Simulator::new(&design).map_err(|e| e.to_string())?;
-        sim.set_input("program", &byte_program_image(&program))?;
+        sim.set_input("program_image", &byte_program_image(&program))?;
         sim.run_until(120)?;
         let bx = sim
             .read_port("bx")

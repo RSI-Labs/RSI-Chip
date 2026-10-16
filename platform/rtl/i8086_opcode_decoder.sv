@@ -83,7 +83,7 @@ module i8086_opcode_decoder(opcode, modrm, valid, opcode_class, width8,
       begin
         class_r = CLASS_IMM_ALU;
         has_modrm_r = 1'b1;
-        width8_r = opcode != 8'h81;
+        width8_r = opcode == 8'h80 || opcode == 8'h82;
         immediate_size_r = opcode == 8'h81 ? 2'b10 : 2'b01;
       end
     else if (opcode >= 8'h84 && opcode <= 8'h8b)
@@ -121,6 +121,13 @@ module i8086_opcode_decoder(opcode, modrm, valid, opcode_class, width8,
         class_r = CLASS_MOVE_IMMEDIATE;
         width8_r = opcode <= 8'hb7;
         immediate_size_r = opcode <= 8'hb7 ? 2'b01 : 2'b10;
+      end
+    else if (opcode == 8'hc0 || opcode == 8'hc1)
+      begin
+        class_r = CLASS_SHIFT_ROTATE;
+        has_modrm_r = 1'b1;
+        width8_r = opcode == 8'hc0;
+        immediate_size_r = 2'b01;
       end
     else if (opcode == 8'hc2 || opcode == 8'hc3 || opcode == 8'hca ||
              opcode == 8'hcb || opcode == 8'hc4 || opcode == 8'hc5 ||

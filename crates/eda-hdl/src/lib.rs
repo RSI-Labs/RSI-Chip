@@ -9,4 +9,5 @@ pub mod lexer;
 pub mod parser;
 
 pub use elab::{compile, elaborate};
+pub use elab::{compile_sources, HdlSource, SourceManager};
 pub use parser::parse;

@@ -1,10 +1,10 @@
 // Self-clocking simulation harness for the 64-byte i8086 SOC.
-module i8086_full_tb_64(program, halted, trap, retired,
+module i8086_full_tb_64(program_image, halted, trap, retired,
                         console_write, console_char,
                         clock,
                         ax, cx, dx, bx, sp, bp,
                         si, di, ip, flags);
-  input [511:0] program;
+  input [511:0] program_image;
   output halted;
   output trap;
   output [63:0] retired;
@@ -41,7 +41,7 @@ module i8086_full_tb_64(program, halted, trap, retired,
   end
 
   i8086_full_soc_64 dut(
-    .clk(clk), .rst(rst), .init_ip(INIT_IP), .program(program), .halted(halted), .trap(trap),
+    .clk(clk), .rst(rst), .init_ip(INIT_IP), .program_image(program_image), .halted(halted), .trap(trap),
     .retired(retired), .console_write(console_write), .console_char(console_char),
     .ax(ax), .cx(cx), .dx(dx), .bx(bx), .sp(sp), .bp(bp),
     .si(si), .di(di), .ip(ip), .flags(flags)

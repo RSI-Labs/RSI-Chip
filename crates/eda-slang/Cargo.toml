@@ -1,0 +1,12 @@
+[package]
+name = "eda-slang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-hdl = { path = "../eda-hdl" }
+
+[dev-dependencies]
+eda-sim = { path = "../eda-sim" }

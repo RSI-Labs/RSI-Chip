@@ -542,6 +542,122 @@ impl<'a> Elaborator<'a> {
             return self.dynamic_array_method(object, method, arguments, env);
         }
         if let ast::Stmt::BL {
+            lv: ast::Expr::Select(name, index),
+            e,
+        } = s
+        {
+            if env
+                .net(name)
+                .map(|entry| entry.array.is_some())
+                .unwrap_or(false)
+                && self.const_eval(index, env.params, env.module_name).is_err()
+            {
+                let element_width = env
+                    .net(name)?
+                    .array
+                    .as_ref()
+                    .map(|array| array.element_width)
+                    .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                let transformed = ast::Stmt::BL {
+                    lv: ast::Expr::ArrayIndexedPart {
+                        name: name.clone(),
+                        indexes: vec![index.as_ref().clone()],
+                        start: Box::new(constant_expr(0)),
+                        width: Box::new(constant_expr(element_width as i64)),
+                        ascending: true,
+                    },
+                    e: e.clone(),
+                };
+                return self.elab_stmt(&transformed, env);
+            }
+        }
+        if let ast::Stmt::NBL {
+            lv: ast::Expr::Select(name, index),
+            e,
+        } = s
+        {
+            if env
+                .net(name)
+                .map(|entry| entry.array.is_some())
+                .unwrap_or(false)
+                && self.const_eval(index, env.params, env.module_name).is_err()
+            {
+                let element_width = env
+                    .net(name)?
+                    .array
+                    .as_ref()
+                    .map(|array| array.element_width)
+                    .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                let transformed = ast::Stmt::NBL {
+                    lv: ast::Expr::ArrayIndexedPart {
+                        name: name.clone(),
+                        indexes: vec![index.as_ref().clone()],
+                        start: Box::new(constant_expr(0)),
+                        width: Box::new(constant_expr(element_width as i64)),
+                        ascending: true,
+                    },
+                    e: e.clone(),
+                };
+                return self.elab_stmt(&transformed, env);
+            }
+        }
+        if let ast::Stmt::BL {
+            lv: ast::Expr::ArraySelect(name, indexes),
+            e,
+        } = s
+        {
+            if indexes
+                .iter()
+                .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
+            {
+                let element_width = env
+                    .net(name)?
+                    .array
+                    .as_ref()
+                    .map(|array| array.element_width)
+                    .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                let transformed = ast::Stmt::BL {
+                    lv: ast::Expr::ArrayIndexedPart {
+                        name: name.clone(),
+                        indexes: indexes.clone(),
+                        start: Box::new(constant_expr(0)),
+                        width: Box::new(constant_expr(element_width as i64)),
+                        ascending: true,
+                    },
+                    e: e.clone(),
+                };
+                return self.elab_stmt(&transformed, env);
+            }
+        }
+        if let ast::Stmt::NBL {
+            lv: ast::Expr::ArraySelect(name, indexes),
+            e,
+        } = s
+        {
+            if indexes
+                .iter()
+                .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
+            {
+                let element_width = env
+                    .net(name)?
+                    .array
+                    .as_ref()
+                    .map(|array| array.element_width)
+                    .ok_or_else(|| format!("'{name}' is not an unpacked array"))?;
+                let transformed = ast::Stmt::NBL {
+                    lv: ast::Expr::ArrayIndexedPart {
+                        name: name.clone(),
+                        indexes: indexes.clone(),
+                        start: Box::new(constant_expr(0)),
+                        width: Box::new(constant_expr(element_width as i64)),
+                        ascending: true,
+                    },
+                    e: e.clone(),
+                };
+                return self.elab_stmt(&transformed, env);
+            }
+        }
+        if let ast::Stmt::BL {
             lv:
                 ast::Expr::ArrayIndexedPart {
                     name,

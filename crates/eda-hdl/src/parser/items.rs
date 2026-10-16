@@ -455,6 +455,10 @@ impl Parser {
                 let imports = self.parse_import()?;
                 Ok(Item::Imports(imports))
             }
+            Tok::Ident(s) if s == "genvar" => {
+                let names = self.parse_genvar_declaration()?;
+                Ok(Item::Genvar(names))
+            }
             Tok::Ident(s) if s == "typedef" => {
                 let _ = s;
                 self.parse_typedef()
@@ -628,7 +632,10 @@ impl Parser {
             if self.at_eof() {
                 return Err("generate region is missing 'endgenerate'".into());
             }
-            if self.eat_kw("case") {
+            if self.at_kw("genvar") {
+                let names = self.parse_genvar_declaration()?;
+                out.push(GenerateConstruct::Genvar(names));
+            } else if self.eat_kw("case") {
                 self.expect_punct("(")?;
                 let selector = self.parse_expr()?;
                 self.expect_punct(")")?;
@@ -703,6 +710,19 @@ impl Parser {
             }
         }
         Ok(out)
+    }
+
+    fn parse_genvar_declaration(&mut self) -> Result<Vec<String>, String> {
+        self.expect_kw("genvar")?;
+        let mut names = Vec::new();
+        loop {
+            names.push(self.ident()?);
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct(";")?;
+        Ok(names)
     }
 
     pub(super) fn parse_generate_block(&mut self) -> Result<GenerateBlock, String> {
