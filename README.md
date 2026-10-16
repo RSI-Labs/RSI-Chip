@@ -13,6 +13,30 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## CPU program platform
+
+`crates/eda-cpu-platform` contains an executable-centric ISA validation
+platform. It loads ELF32 RV32I images plus DOS `.COM` and MZ `.EXE` i8086
+images, executes them through independent golden models, captures output and
+exit status, and exposes directed validation cases. `platform/rtl` contains
+the full multicycle RV32I core, a broad multicycle i8086 core, directed
+simulation SOCs, and the i8086 prefix/opcode/ModRM decoder contracts. The
+`--sv` runners attach the external RTL memory buses to sparse host memory, so
+checked-in RV32I ELF and real-mode COM images can execute beyond the small
+directed SOC memories. These cores are compiled and simulated, and their
+release gates include RTL-to-mapped-netlist LEC. See `platform/README.md` for
+current scope and the remaining exhaustive-opcode acceptance gates.
+
+```sh
+cargo run -p eda-cpu-platform -- validate
+cargo run -p eda-cpu-platform -- i8086 run platform/programs/hello.com
+cargo run -p eda-cpu-platform -- i8086 run platform/programs/hello.com --sv
+cargo run -p eda-cpu-platform -- rv32i run platform/programs/rv32i_exit42.elf
+cargo run -p eda-cpu-platform -- rv32i run platform/programs/rv32i_exit42.elf --sv
+cargo run -p eda-cpu-platform -- i8086 run platform/programs/high_memory.com --sv
+cargo run -p eda-cpu-platform -- rv32i run platform/programs/rv32i_high_memory.elf --sv
+```
+
 The data-driven regression target currently contains **15,101 unique named
 cases**. It is not a collection of three or four broad assertions: every case
 has a distinct name and independently reports success or failure. Of those,

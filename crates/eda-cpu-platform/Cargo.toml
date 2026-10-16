@@ -1,0 +1,14 @@
+[package]
+name = "eda-cpu-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eda-core = { path = "../eda-core" }
+eda-hdl = { path = "../eda-hdl" }
+eda-sim = { path = "../eda-sim" }
+
+[[bin]]
+name = "cpu-platform"
+path = "src/main.rs"

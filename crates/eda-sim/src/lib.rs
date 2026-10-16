@@ -63,6 +63,7 @@ pub struct Simulator<'d> {
     vcd_changes: HashSet<usize>,
     event_count: u64,
     has_zero_delay_feedback: bool,
+    zero_delay_feedback_nets: Vec<String>,
     cancellation: FlowCancellation,
 }
 
@@ -85,6 +86,18 @@ impl<'d> Simulator<'d> {
         for init in &design.initials {
             collect_monitors(init, &mut mons);
         }
+        let zero_delay_feedback_nets = design
+            .processes
+            .iter()
+            .filter(|process| matches!(process.sens, Sens::Comb))
+            .flat_map(|process| {
+                let mut reads = HashSet::new();
+                let mut writes = HashSet::new();
+                collect_stmt_access(&process.body, &mut reads, &mut writes);
+                reads.intersection(&writes).copied().collect::<Vec<_>>()
+            })
+            .map(|net| design.net_name(net))
+            .collect::<Vec<_>>();
         let mut sim = Simulator {
             design,
             vals: vec![LogicValue::X; n],
@@ -110,10 +123,8 @@ impl<'d> Simulator<'d> {
             vcd: None,
             vcd_changes: HashSet::new(),
             event_count: 0,
-            has_zero_delay_feedback: design
-                .processes
-                .iter()
-                .any(|p| matches!(p.sens, Sens::Comb) && stmt_has_zero_delay_feedback(&p.body)),
+            has_zero_delay_feedback: !zero_delay_feedback_nets.is_empty(),
+            zero_delay_feedback_nets,
             cancellation: FlowCancellation::new(),
         };
         for init in &design.initials {
@@ -263,6 +274,12 @@ impl<'d> Simulator<'d> {
 
     pub fn take_property_covers(&mut self) -> BTreeMap<String, u64> {
         std::mem::take(&mut self.property_covers)
+    }
+
+    /// Names of nets conservatively detected as same-process combinational
+    /// read/write feedback. Empty when no such process exists.
+    pub fn zero_delay_feedback_nets(&self) -> &[String] {
+        &self.zero_delay_feedback_nets
     }
 
     /// Run until absolute time `t` (ns), `$finish`, or quiescence.
@@ -1215,17 +1232,6 @@ fn stmt_nets(s: &Stmt) -> Vec<usize> {
     let mut out = Vec::new();
     walk_stmt(s, &mut out);
     out
-}
-
-/// Conservative zero-delay feedback detector for `always @(*)`: does the
-/// process both read and assign the same net without an intervening positive
-/// delay? Catching this statically avoids burning the scheduler budget on a
-/// guaranteed oscillation.
-fn stmt_has_zero_delay_feedback(s: &Stmt) -> bool {
-    let mut reads = HashSet::new();
-    let mut writes = HashSet::new();
-    collect_stmt_access(s, &mut reads, &mut writes);
-    reads.intersection(&writes).next().is_some()
 }
 
 fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSet<usize>) {

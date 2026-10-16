@@ -22,6 +22,7 @@ pub mod library_cases;
 pub mod logic_cases;
 pub mod lvs_cases;
 pub mod netlist_cases;
+pub mod platform_cases;
 pub mod pnr_cases;
 pub mod power_cases;
 pub mod rv32i_cases;
@@ -135,5 +136,6 @@ pub fn all_cases() -> CaseList {
     cts_cases::register(&mut all);
     ir_cases::register(&mut all);
     layout_cases::register(&mut all);
+    platform_cases::register(&mut all);
     all
 }

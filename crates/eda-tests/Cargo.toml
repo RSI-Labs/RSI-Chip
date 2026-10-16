@@ -27,3 +27,4 @@ eda-coverage = { path = "../eda-coverage" }
 eda-cdc = { path = "../eda-cdc" }
 eda-ir = { path = "../eda-ir" }
 eda-api = { path = "../eda-api" }
+eda-cpu-platform = { path = "../eda-cpu-platform" }

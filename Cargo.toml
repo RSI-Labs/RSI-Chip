@@ -24,9 +24,10 @@ members = [
     "crates/eda-ir",
     "crates/eda-coverage",
     "crates/eda-cdc",
-  "crates/eda-api",
-  "crates/eda-daemon",
-  "crates/eda-cli",
+    "crates/eda-api",
+    "crates/eda-daemon",
+    "crates/eda-cli",
+    "crates/eda-cpu-platform",
     "crates/eda-tests",
 ]
 
