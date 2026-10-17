@@ -169,6 +169,9 @@ impl SlangAstLowerer {
                     .get("expr")
                     .ok_or_else(|| "expression statement has no expression".to_string())?;
                 if string_field(expression, "kind").as_deref() == Some("Call") {
+                    if let Some(statement) = self.lower_task_call(expression)? {
+                        return Ok(statement);
+                    }
                     return self.lower_memory_file_call(expression, statement);
                 }
                 if string_field(expression, "kind").as_deref() != Some("Assignment") {

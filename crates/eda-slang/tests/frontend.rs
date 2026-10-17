@@ -3523,6 +3523,83 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_tasks_with_output_arguments() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-output");
+    let source_path = root.join("task_output.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_output(
+  input int a,
+  output int y,
+  output int z
+);
+  task automatic add_one(input int x, output int result);
+    result = x + 1;
+  endtask
+
+  always_comb begin
+    add_one(a, y);
+    add_one(41, z);
+  end
+endmodule
+"#,
+    )
+    .expect("write task-output source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_output"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task with output argument");
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create task simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(32, 7))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(8));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(42));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_recursive_tasks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-recursive-task");
+    let source_path = root.join("recursive_task.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module recursive_task(output int y);
+  task automatic loop(input int x, output int result);
+    if (x == 0) result = 1;
+    else loop(x - 1, result);
+  endtask
+
+  always_comb loop(2, y);
+endmodule
+"#,
+    )
+    .expect("write recursive-task source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("recursive_task"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unbounded recursive task inlining must be rejected");
+    assert!(error.contains("recursive task"), "{error}");
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_excessive_function_loops() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -112,6 +112,117 @@ impl SlangAstLowerer {
         result
     }
 
+    pub(super) fn lower_task_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        let task_name = subroutine
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .to_string();
+        let Some(definition) = self.subroutines.get(&task_name) else {
+            return Ok(None);
+        };
+        if string_field(definition, "subroutineKind").as_deref() != Some("Task") {
+            return Ok(None);
+        }
+
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("task call '{task_name}' has no arguments"))?;
+        let formals = definition
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("task '{task_name}' has no formal arguments"))?;
+        if arguments.len() != formals.len() {
+            return Err(format!(
+                "task '{}' expects {} arguments, found {}",
+                task_name,
+                formals.len(),
+                arguments.len()
+            ));
+        }
+
+        let mut environment = std::collections::BTreeMap::new();
+        for (formal, actual) in formals.iter().zip(arguments) {
+            let formal_name = formal
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("task '{task_name}' has an unnamed argument"))?;
+            let direction = string_field(formal, "direction").unwrap_or_default();
+            match direction.as_str() {
+                "In" => {
+                    let formal_type = formal.get("type").cloned().ok_or_else(|| {
+                        format!("task argument '{formal_name}' has no elaborated type")
+                    })?;
+                    environment.insert(
+                        formal_name.to_string(),
+                        json!({
+                            "kind": "Conversion",
+                            "type": formal_type,
+                            "operand": actual,
+                        }),
+                    );
+                }
+                "Out" | "InOut" | "Ref" => {
+                    if string_field(actual, "kind").as_deref() != Some("Assignment") {
+                        return Err(format!(
+                            "task '{task_name}' argument '{formal_name}' must be connected to an assignable target"
+                        ));
+                    }
+                    let target = actual
+                        .get("left")
+                        .ok_or_else(|| format!("task argument '{formal_name}' has no target"))?;
+                    let formal_type = formal.get("type").cloned().unwrap_or_default();
+                    let target_type = target.get("type").cloned().unwrap_or_default();
+                    if formal_type != target_type {
+                        return Err(format!(
+                            "task '{task_name}' argument '{formal_name}' type {formal_type} does not match target type {target_type}"
+                        ));
+                    }
+                    if direction != "InOut"
+                        && task_value_reads_formal(
+                            definition
+                                .get("body")
+                                .ok_or_else(|| format!("task '{task_name}' has no body"))?,
+                            formal_name,
+                        )
+                    {
+                        return Err(format!(
+                            "direct task inlining does not support reading output '{formal_name}'"
+                        ));
+                    }
+                    environment.insert(formal_name.to_string(), target.clone());
+                }
+                other => {
+                    return Err(format!(
+                        "direct task inlining does not support argument direction '{other}'"
+                    ));
+                }
+            }
+        }
+
+        let body = definition
+            .get("body")
+            .ok_or_else(|| format!("task '{task_name}' has no body"))?;
+        let body = substitute_named_values(body, &environment);
+        {
+            let mut stack = self.inline_stack.borrow_mut();
+            if stack.iter().any(|name| name == &task_name) {
+                return Err(format!("recursive task '{task_name}' is not supported"));
+            }
+            stack.push(task_name.clone());
+        }
+        let result = self.lower_statement(&body);
+        self.inline_stack.borrow_mut().pop();
+        result.map(Some)
+    }
+
     fn lower_enum_next_prev(
         &self,
         value: &Value,
@@ -527,6 +638,50 @@ fn substitute_named_values(
             .collect::<Vec<_>>()
             .into(),
         scalar => scalar.clone(),
+    }
+}
+
+fn task_value_reads_formal(value: &Value, formal_name: &str) -> bool {
+    match value {
+        Value::Object(fields) => {
+            if string_field(value, "kind").as_deref() == Some("Assignment") {
+                if let Some(right) = value.get("right") {
+                    if json_contains_named_value(right, formal_name) {
+                        return true;
+                    }
+                }
+                return fields
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "left" && key.as_str() != "right")
+                    .any(|(_, nested)| task_value_reads_formal(nested, formal_name));
+            }
+            fields
+                .values()
+                .any(|nested| task_value_reads_formal(nested, formal_name))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|nested| task_value_reads_formal(nested, formal_name)),
+        _ => false,
+    }
+}
+
+fn json_contains_named_value(value: &Value, name: &str) -> bool {
+    match value {
+        Value::Object(fields) => {
+            if string_field(value, "kind").as_deref() == Some("NamedValue")
+                && expression_symbol(value).as_deref() == Some(name)
+            {
+                return true;
+            }
+            fields
+                .values()
+                .any(|nested| json_contains_named_value(nested, name))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|nested| json_contains_named_value(nested, name)),
+        _ => false,
     }
 }
 
