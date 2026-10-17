@@ -5,7 +5,7 @@ use super::hierarchy::full_range;
 use super::SlangAstLowerer;
 use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
-    slang_constant_u64, string_field,
+    slang_constant_u64, string_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
 use eda_core::logic::LogicWord;
@@ -123,6 +123,14 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn lower_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        self.lower_statement_inner(statement)
+            .map_err(|error| with_source_span(statement, error))
+    }
+
+    fn lower_statement_inner(
         &self,
         statement: &serde_json::Value,
     ) -> Result<eda_core::ir::Stmt, String> {

@@ -1,7 +1,7 @@
 //! Direct lowering from slang's post-elaboration AST JSON into the repository IR.
 
 use crate::ast_util::{
-    bool_field, normalize_detailed_types, normalize_instance_bodies, string_field,
+    bool_field, normalize_detailed_types, normalize_instance_bodies, string_field, with_source_span,
 };
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
@@ -158,28 +158,48 @@ impl SlangAstLowerer {
     fn lower_members(&mut self, members: &[serde_json::Value]) -> Result<(), String> {
         for member in members {
             match string_field(member, "kind").as_deref() {
-                Some("Subroutine") => self.collect_subroutine(member)?,
-                Some("TypeAlias") => self.collect_type_alias(member)?,
-                Some("EnumType") => self.collect_enum_type(member)?,
+                Some("Subroutine") => self
+                    .collect_subroutine(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("TypeAlias") => self
+                    .collect_type_alias(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("EnumType") => self
+                    .collect_enum_type(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 _ => {}
             }
         }
         for member in members {
             let kind = string_field(member, "kind").unwrap_or_default();
             match kind.as_str() {
-                "Port" => self.lower_port(member)?,
-                "Net" | "Variable" => self.lower_declaration(member)?,
-                "Parameter" => self.lower_parameter(member)?,
-                "ContinuousAssign" => self.lower_continuous_assignment(member)?,
-                "ProceduralBlock" => self.lower_procedural_block(member)?,
-                "Instance" => self.lower_instance(member)?,
+                "Port" => self
+                    .lower_port(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "Net" | "Variable" => self
+                    .lower_declaration(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "Parameter" => self
+                    .lower_parameter(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "ContinuousAssign" => self
+                    .lower_continuous_assignment(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "ProceduralBlock" => self
+                    .lower_procedural_block(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "Instance" => self
+                    .lower_instance(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 "Subroutine" => {}
                 "TypeAlias" => {}
                 "EnumType" => {}
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}
-                "GenerateBlockArray" => self.lower_generate_array(member)?,
+                "GenerateBlockArray" => self
+                    .lower_generate_array(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 generate_kind if generate_kind.starts_with("GenerateBlock") => {
                     if bool_field(member, "isUninstantiated") {
                         continue;
@@ -211,11 +231,12 @@ impl SlangAstLowerer {
                     {
                         self.generate_path.pop();
                     }
-                    result?;
+                    result.map_err(|error| with_source_span(member, error))?;
                 }
                 _ => {
-                    return Err(format!(
-                        "direct slang-AST lowering does not support member kind '{kind}'"
+                    return Err(with_source_span(
+                        member,
+                        format!("direct slang-AST lowering does not support member kind '{kind}'"),
                     ))
                 }
             }
@@ -262,7 +283,7 @@ impl SlangAstLowerer {
             self.type_enums = outer_type_enums;
             self.enum_constants = outer_enum_constants;
             self.generate_path.pop();
-            result?;
+            result.map_err(|error| with_source_span(member, error))?;
         }
         Ok(())
     }

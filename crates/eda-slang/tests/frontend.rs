@@ -4090,6 +4090,41 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_reports_expression_source_spans() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-source-span");
+    let source_path = root.join("spanned.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module spanned(
+  input logic [3:0] a,
+  output logic [3:0] y
+);
+  assign y = $countones(a);
+endmodule
+"#,
+    )
+    .expect("write source-span source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("spanned"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported direct expression must include its source span");
+    assert!(
+        error.contains("unknown direct-lowering function"),
+        "{error}"
+    );
+    assert!(error.contains("[slang at "), "{error}");
+    assert!(error.contains("spanned.sv:6:14"), "{error}");
+}
+
+#[test]
 fn slang_ast_json_contains_elaborated_module_symbols() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

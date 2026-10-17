@@ -180,6 +180,19 @@ pub(super) fn source_span(value: &Value) -> Option<SlangSourceSpan> {
     })
 }
 
+pub(super) fn with_source_span(value: &Value, error: String) -> String {
+    if error.contains(" [slang at ") {
+        return error;
+    }
+    let Some(span) = source_span(value) else {
+        return error;
+    };
+    format!(
+        "{error} [slang at {}:{}:{}-{}:{}]",
+        span.file, span.start_line, span.start_column, span.end_line, span.end_column
+    )
+}
+
 pub(super) fn parameter_summary(member: &Value) -> Result<SlangParameterSummary, String> {
     let name = string_field(member, "name")
         .filter(|name| !name.is_empty())

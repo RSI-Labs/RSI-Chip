@@ -2,7 +2,7 @@
 
 use crate::ast_util::{
     constant_json_word, expression_symbol, integer_literal_word, named_constant_word, string_field,
-    usize_field,
+    usize_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
@@ -113,6 +113,14 @@ impl super::SlangAstLowerer {
         &self,
         value: &serde_json::Value,
     ) -> Result<eda_core::ir::LValue, String> {
+        self.lower_lvalue_inner(value)
+            .map_err(|error| with_source_span(value, error))
+    }
+
+    fn lower_lvalue_inner(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::LValue, String> {
         match string_field(value, "kind").as_deref() {
             Some("NamedValue") => {
                 let name = expression_symbol(value)
@@ -176,6 +184,14 @@ impl super::SlangAstLowerer {
     }
 
     pub(super) fn lower_expression(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        self.lower_expression_inner(value)
+            .map_err(|error| with_source_span(value, error))
+    }
+
+    fn lower_expression_inner(
         &self,
         value: &serde_json::Value,
     ) -> Result<eda_core::ir::Expr, String> {
