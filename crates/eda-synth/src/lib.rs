@@ -219,7 +219,9 @@ struct Synth<'a> {
     nl: Netlist,
     flat2net: Vec<NetId>,
     rom_contents: HashMap<usize, RomContents>,
+    ram_state: HashMap<usize, Vec<Vec<NetId>>>,
     lowered_memories: HashSet<usize>,
+    skipped_processes: HashSet<usize>,
     sym: HashMap<usize, Vec<NetId>>,
     written: HashSet<usize>,
     warnings: Vec<String>,
@@ -333,6 +335,14 @@ fn physical_to_logical(memory: &eda_core::ir::MemoryDecl, physical_index: u64) -
     Some(indexes)
 }
 
+#[derive(Clone)]
+struct DistributedRamWrite {
+    memory: usize,
+    condition: Option<Expr>,
+    indexes: Vec<Expr>,
+    value: Expr,
+}
+
 impl<'a> Synth<'a> {
     fn new(design: &'a Design) -> Result<Self, String> {
         let mut nl = Netlist::new(design.name.clone());
@@ -361,7 +371,9 @@ impl<'a> Synth<'a> {
             nl,
             flat2net,
             rom_contents: rom_contents_from_design(design),
+            ram_state: HashMap::new(),
             lowered_memories: HashSet::new(),
+            skipped_processes: HashSet::new(),
             sym: HashMap::new(),
             written: HashSet::new(),
             warnings: Vec::new(),
@@ -372,13 +384,17 @@ impl<'a> Synth<'a> {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        self.lower_distributed_ram_processes()?;
         for a in &self.design.assigns {
             self.reset_sym();
             let w = a.lv.range.width();
             let v = self.blast(&a.e, w)?;
             self.hook_assign(&a.lv, &v)?;
         }
-        for p in &self.design.processes {
+        for (process_index, p) in self.design.processes.iter().enumerate() {
+            if self.skipped_processes.contains(&process_index) {
+                continue;
+            }
             self.reset_sym();
             match &p.sens {
                 Sens::Comb => {
@@ -469,6 +485,120 @@ impl<'a> Synth<'a> {
                 self.add_cell("hook", CellKind::Buf, vec![src], dst);
             }
         }
+        Ok(())
+    }
+
+    fn lower_distributed_ram_processes(&mut self) -> Result<(), String> {
+        for process_index in 0..self.design.processes.len() {
+            let process = self.design.processes[process_index].clone();
+            let (clock, posedge) = match &process.sens {
+                Sens::Posedge(net) => (*net, true),
+                Sens::Negedge(net) => (*net, false),
+                _ => continue,
+            };
+            let Some(write) = self.distributed_ram_write(&process.body) else {
+                continue;
+            };
+            if !self.is_distributed_ram(write.memory) {
+                continue;
+            }
+            if self.ram_state.contains_key(&write.memory) {
+                return Err(format!(
+                    "memory '{}' has multiple clocked write processes, which distributed-RAM lowering does not support",
+                    self.design.memories[write.memory].name
+                ));
+            }
+            self.lower_distributed_ram_process(clock, posedge, write)?;
+            self.skipped_processes.insert(process_index);
+        }
+        Ok(())
+    }
+
+    fn distributed_ram_write(&self, statement: &Stmt) -> Option<DistributedRamWrite> {
+        match statement {
+            Stmt::Block(statements) if statements.len() == 1 => {
+                self.distributed_ram_write(&statements[0])
+            }
+            Stmt::MemoryBl {
+                memory, indexes, e, ..
+            }
+            | Stmt::MemoryNBl {
+                memory, indexes, e, ..
+            } => Some(DistributedRamWrite {
+                memory: *memory,
+                condition: None,
+                indexes: indexes.clone(),
+                value: (*e).clone(),
+            }),
+            Stmt::If { c, t, f: None, .. } => {
+                let write = self.distributed_ram_write(t)?;
+                write.condition.as_ref().map(|_| None).unwrap_or_else(|| {
+                    Some(DistributedRamWrite {
+                        condition: Some((*c).clone()),
+                        ..write
+                    })
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn is_distributed_ram(&self, memory_index: usize) -> bool {
+        let Some(memory) = self.design.memories.get(memory_index) else {
+            return false;
+        };
+        memory.kind == MemoryKind::Ram
+            && macro_candidate(
+                memory.template,
+                u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0),
+            ) == MemoryMacroCandidate::DistributedRam
+    }
+
+    fn lower_distributed_ram_process(
+        &mut self,
+        clock_flat: usize,
+        posedge: bool,
+        write: DistributedRamWrite,
+    ) -> Result<(), String> {
+        let memory = self.design.memories[write.memory].clone();
+        let clock = self.flat2net_of(clock_flat)?;
+        let state = (0..memory.flat_length)
+            .map(|_| {
+                (0..memory.element_width)
+                    .map(|_| self.new_tmp("ram_q"))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.ram_state.insert(write.memory, state);
+
+        self.reset_sym();
+        let condition = match &write.condition {
+            Some(condition) => Some(self.blast(condition, 1)?[0]),
+            None => None,
+        };
+        let value = self.blast(&write.value, memory.element_width)?;
+        let old_state = self
+            .ram_state
+            .get(&write.memory)
+            .cloned()
+            .unwrap_or_default();
+        let mut next_state = Vec::with_capacity(memory.flat_length as usize);
+        for (physical_index, old_bits) in old_state.iter().enumerate() {
+            let physical_index = physical_index as u64;
+            let mut select = self.memory_address_select(&memory, physical_index, &write.indexes)?;
+            if let Some(condition) = condition {
+                select = self.combine(CellKind::And, select, condition);
+            }
+            let mut updated = Vec::with_capacity(memory.element_width);
+            for (bit, old) in old_bits.iter().enumerate() {
+                let next = self.mux(select, value[bit], *old);
+                self.add_cell("dxff", CellKind::Dff { posedge }, vec![clock, next], *old);
+                updated.push(*old);
+            }
+            next_state.push(updated);
+        }
+        self.ram_state.insert(write.memory, next_state);
+        self.lowered_memories.insert(write.memory);
         Ok(())
     }
 
@@ -730,14 +860,33 @@ impl<'a> Synth<'a> {
             .get(memory_index)
             .ok_or_else(|| format!("memory read refers to missing memory {memory_index}"))?
             .clone();
-        if memory.kind != MemoryKind::Rom {
-            return Err(format!(
-                "memory '{}' is a RAM and requires a writable macro model",
-                memory.name
-            ));
-        }
         let total_bits =
             u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
+        if memory.kind == MemoryKind::Ram {
+            if macro_candidate(memory.template, total_bits) != MemoryMacroCandidate::DistributedRam
+            {
+                return Err(format!(
+                    "memory '{}' requires a writable block macro, which is not implemented",
+                    memory.name
+                ));
+            }
+            let Some(state) = self.ram_state.get(&memory_index).cloned() else {
+                return Err(format!(
+                    "memory '{}' has no lowered distributed-RAM state",
+                    memory.name
+                ));
+            };
+            let mut output = (0..memory.element_width)
+                .map(|_| self.const_net(LogicValue::X))
+                .collect::<Vec<_>>();
+            for (physical_index, value) in state.iter().enumerate() {
+                let select = self.memory_address_select(&memory, physical_index as u64, indexes)?;
+                for (bit, new_value) in output.iter_mut().zip(value.iter()) {
+                    *bit = self.mux(select, *new_value, *bit);
+                }
+            }
+            return Ok(output);
+        }
         if macro_candidate(memory.template, total_bits) != MemoryMacroCandidate::DistributedRom {
             return Err(format!(
                 "memory '{}' requires block macro synthesis, which is not implemented",
@@ -763,25 +912,7 @@ impl<'a> Synth<'a> {
         for physical_index in 0..memory.flat_length {
             let logical = physical_to_logical(&memory, physical_index)
                 .ok_or_else(|| format!("memory '{}' has invalid banking geometry", memory.name))?;
-            let mut select = None;
-            for (index, logical_index) in indexes.iter().zip(logical.iter()) {
-                let width = index.width().max(1);
-                let target = Expr::Const(LogicWord::from_u64(width, *logical_index as u64));
-                let equal = self.blast_bin(BinOp::Eq, index, &target)?;
-                let Some(equal) = equal.first() else {
-                    return Err(format!(
-                        "memory '{}' address comparison produced no select bit",
-                        memory.name
-                    ));
-                };
-                select = Some(match select {
-                    Some(previous) => self.combine(CellKind::And, previous, *equal),
-                    None => *equal,
-                });
-            }
-            let Some(select) = select else {
-                return Err(format!("memory '{}' read has no index", memory.name));
-            };
+            let select = self.memory_address_select(&memory, physical_index, indexes)?;
             let value = contents
                 .get(&logical)
                 .cloned()
@@ -792,6 +923,33 @@ impl<'a> Synth<'a> {
             }
         }
         Ok(output)
+    }
+
+    fn memory_address_select(
+        &mut self,
+        memory: &eda_core::ir::MemoryDecl,
+        physical_index: u64,
+        indexes: &[Expr],
+    ) -> Result<NetId, String> {
+        let logical = physical_to_logical(memory, physical_index)
+            .ok_or_else(|| format!("memory '{}' has invalid banking geometry", memory.name))?;
+        let mut select = None;
+        for (index, logical_index) in indexes.iter().zip(logical.iter()) {
+            let width = index.width().max(1);
+            let target = Expr::Const(LogicWord::from_u64(width, *logical_index as u64));
+            let equal = self.blast_bin(BinOp::Eq, index, &target)?;
+            let Some(equal) = equal.first() else {
+                return Err(format!(
+                    "memory '{}' address comparison produced no select bit",
+                    memory.name
+                ));
+            };
+            select = Some(match select {
+                Some(previous) => self.combine(CellKind::And, previous, *equal),
+                None => *equal,
+            });
+        }
+        select.ok_or_else(|| format!("memory '{}' read has no index", memory.name))
     }
 
     fn decl_of_flat(&self, flat: usize) -> Result<&eda_core::ir::NetDecl, String> {
@@ -1682,6 +1840,94 @@ endmodule
                 rtl_sim.read("q").unwrap(),
                 gate_sim.read("q").unwrap(),
                 "address {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn distributed_ram_synthesizes_and_matches_direct_ast_semantics() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let source_path = std::env::temp_dir().join(format!(
+            "eda-synth-distributed-ram-{}-{}.sv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &source_path,
+            r#"
+module distributed_ram(
+  input logic clk,
+  input logic write,
+  input logic [1:0] address,
+  input logic [7:0] din,
+  output logic [7:0] q
+);
+  logic [7:0] memory [0:3];
+  always @(posedge clk) if (write) memory[address] <= din;
+  assign q = memory[address];
+endmodule
+"#,
+        )
+        .expect("write distributed RAM source");
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("distributed_ram"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("directly lower distributed RAM");
+        let result = synthesize(&rtl, &SynthOptions::default())
+            .expect("lower distributed RAM to registers and multiplexers");
+        assert_eq!(result.memory_plans.len(), 1);
+        assert_eq!(
+            result.memory_plans[0].candidate,
+            MemoryMacroCandidate::DistributedRam
+        );
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no synthesis lowering")));
+        assert_eq!(result.netlist.stats().seq, 32);
+
+        let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+        let mut rtl_sim = Simulator::new(&rtl).unwrap();
+        let mut gate_sim = Simulator::new(&gate).unwrap();
+        for sim in [&mut rtl_sim, &mut gate_sim] {
+            sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+            sim.set_input("write", &LogicWord::from_u64(1, 1)).unwrap();
+        }
+        for (address, value) in [(0_u64, 0x12), (1, 0x34), (2, 0x56), (3, 0x78)] {
+            for sim in [&mut rtl_sim, &mut gate_sim] {
+                sim.set_input("address", &LogicWord::from_u64(2, address))
+                    .unwrap();
+                sim.set_input("din", &LogicWord::from_u64(8, value))
+                    .unwrap();
+                sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+                sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+            }
+            assert_eq!(
+                rtl_sim.read("q").unwrap(),
+                gate_sim.read("q").unwrap(),
+                "write address {address}"
+            );
+        }
+        for sim in [&mut rtl_sim, &mut gate_sim] {
+            sim.set_input("write", &LogicWord::from_u64(1, 0)).unwrap();
+        }
+        for address in 0..4_u64 {
+            for sim in [&mut rtl_sim, &mut gate_sim] {
+                sim.set_input("address", &LogicWord::from_u64(2, address))
+                    .unwrap();
+            }
+            assert_eq!(
+                rtl_sim.read("q").unwrap(),
+                gate_sim.read("q").unwrap(),
+                "read address {address}"
             );
         }
     }
