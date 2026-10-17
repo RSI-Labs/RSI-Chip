@@ -725,6 +725,115 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_uses_multidimensional_sparse_memory() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory2d");
+    let source_path = root.join("memory2d.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory2d(
+  input logic clk,
+  input logic [1:0] x,
+  input logic [2:0] y,
+  input logic [7:0] wdata,
+  output logic [7:0] q,
+  output logic [3:0] p
+);
+  logic [7:0] mem [0:1][2:3];
+  initial begin
+    mem[0][2] = 8'h12;
+    mem[1][3] = 8'h34;
+  end
+  always_comb q = mem[x][y];
+  assign p = mem[x][y][3:0];
+  always @(posedge clk) mem[x][y] <= wdata;
+endmodule
+"#,
+    )
+    .expect("write multidimensional sparse-memory source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory2d"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional sparse memory");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("memory2d"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower multidimensional memory through the bounded path");
+    assert_eq!(direct.memories.len(), 1);
+    assert_eq!(direct.memories[0].dimensions.len(), 2);
+    assert_eq!(direct.memories[0].flat_length, 4);
+    assert_eq!(direct.n_nets, 27);
+
+    let mut direct_simulator = Simulator::new(&direct).expect("create direct 2D simulator");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize direct clock");
+    direct_simulator
+        .set_input("x", &LogicWord::from_u64(2, 0))
+        .expect("set first direct index");
+    direct_simulator
+        .set_input("y", &LogicWord::from_u64(3, 2))
+        .expect("set second direct index");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x12));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0x2));
+    direct_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .expect("set direct 2D write data");
+    direct_simulator
+        .set_input("x", &LogicWord::from_u64(2, 1))
+        .expect("update first direct index");
+    direct_simulator
+        .set_input("y", &LogicWord::from_u64(3, 3))
+        .expect("update second direct index");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0x4));
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create direct 2D posedge");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0xa));
+
+    let mut reference_simulator = Simulator::new(&reference).expect("create bounded 2D simulator");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize bounded clock");
+    reference_simulator
+        .set_input("x", &LogicWord::from_u64(2, 0))
+        .expect("set first bounded index");
+    reference_simulator
+        .set_input("y", &LogicWord::from_u64(3, 2))
+        .expect("set second bounded index");
+    assert_eq!(reference_simulator.read("q").unwrap().to_u64(), Some(0x12));
+    assert_eq!(reference_simulator.read("p").unwrap().to_u64(), Some(0x2));
+    reference_simulator
+        .set_input("x", &LogicWord::from_u64(2, 1))
+        .expect("update first bounded index");
+    reference_simulator
+        .set_input("y", &LogicWord::from_u64(3, 3))
+        .expect("update second bounded index");
+    assert_eq!(reference_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(reference_simulator.read("p").unwrap().to_u64(), Some(0x4));
+    reference_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .expect("set bounded 2D write data");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create bounded 2D posedge");
+    assert_eq!(reference_simulator.read("q").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(reference_simulator.read("p").unwrap().to_u64(), Some(0xa));
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

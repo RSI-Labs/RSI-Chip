@@ -1304,21 +1304,31 @@ impl SlangAstLowerer {
         let selected = value
             .get("value")
             .ok_or_else(|| "element select has no value".to_string())?;
-        if string_field(selected, "kind").as_deref() != Some("NamedValue") {
-            return Ok(None);
-        }
-        let name = expression_symbol(selected)
-            .ok_or_else(|| "memory element select has no symbol".to_string())?;
-        let Some(symbol) = self.symbols.get(&name) else {
-            return Ok(None);
-        };
-        let Some(memory) = symbol.memory else {
-            return Ok(None);
-        };
         let selector = value
             .get("selector")
             .ok_or_else(|| "memory element select has no selector".to_string())?;
-        Ok(Some((memory, vec![self.lower_expression(selector)?])))
+        let selector = self.lower_expression(selector)?;
+        match string_field(selected, "kind").as_deref() {
+            Some("NamedValue") => {
+                let name = expression_symbol(selected)
+                    .ok_or_else(|| "memory element select has no symbol".to_string())?;
+                let Some(symbol) = self.symbols.get(&name) else {
+                    return Ok(None);
+                };
+                let Some(memory) = symbol.memory else {
+                    return Ok(None);
+                };
+                Ok(Some((memory, vec![selector])))
+            }
+            Some("ElementSelect") => {
+                let Some((memory, mut indexes)) = self.memory_element_select(selected)? else {
+                    return Ok(None);
+                };
+                indexes.push(selector);
+                Ok(Some((memory, indexes)))
+            }
+            _ => Ok(None),
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -1481,25 +1491,38 @@ fn memory_type(type_name: &str) -> Option<AstMemoryType> {
     let separator = type_name.find('$')?;
     let element_type = type_name[..separator].trim();
     let dimension_type = type_name[separator + 1..].trim();
-    if dimension_type.contains('$') {
-        return None;
-    }
     let element_width = simple_type_width(element_type)?;
     let (element_msb, element_lsb) =
         parse_type_range(element_type).unwrap_or((element_width as i64 - 1, 0));
     if (element_msb - element_lsb).unsigned_abs() as usize + 1 != element_width {
         return None;
     }
-    let (base, last) = parse_type_range(dimension_type)?;
-    let step = if base <= last { 1 } else { -1 };
-    let length = usize::try_from((base as i128 - last as i128).unsigned_abs() + 1).ok()?;
+    let mut dimensions = Vec::new();
+    let mut remaining = dimension_type;
+    while !remaining.is_empty() {
+        remaining = remaining.trim_start();
+        if !remaining.starts_with('[') {
+            return None;
+        }
+        let end = remaining.find(']')?;
+        let (base, last) = parse_type_range(&remaining[..=end])?;
+        let step = if base <= last { 1 } else { -1 };
+        let length = usize::try_from((base as i128 - last as i128).unsigned_abs() + 1).ok()?;
+        dimensions.push(eda_core::ir::MemoryDimension { base, step, length });
+        remaining = &remaining[end + 1..];
+    }
+    if dimensions.is_empty() {
+        return None;
+    }
     let mut flat_length = 1_u64;
-    flat_length = flat_length.checked_mul(u64::try_from(length).ok()?)?;
+    for dimension in &dimensions {
+        flat_length = flat_length.checked_mul(u64::try_from(dimension.length).ok()?)?;
+    }
     Some(AstMemoryType {
         element_width,
         element_msb,
         element_lsb,
-        dimensions: vec![eda_core::ir::MemoryDimension { base, step, length }],
+        dimensions,
         flat_length,
         signed: simple_type_signed(element_type)?,
     })
