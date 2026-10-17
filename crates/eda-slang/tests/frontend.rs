@@ -2797,7 +2797,9 @@ module functions(
   output int initial_sum,
   output int selected,
   output int assigned,
-  output int loop_sum
+  output int loop_sum,
+  output int while_sum,
+  output int repeat_sum
 );
   function automatic int add(int x, int y);
     int result;
@@ -2828,6 +2830,22 @@ module functions(
     return result;
   endfunction
 
+  function automatic int while_four();
+    int result = 0;
+    int i = 0;
+    while (i < 4) begin
+      result = result + i;
+      i = i + 1;
+    end
+    return result;
+  endfunction
+
+  function automatic int repeat_four();
+    int result = 0;
+    repeat (4) result = result + 1;
+    return result;
+  endfunction
+
   assign sum = add(a, b);
   assign constant = add(2, 3);
   assign nested = twice(b);
@@ -2835,6 +2853,8 @@ module functions(
   assign selected = pick(a, b);
   assign assigned = cond_assign(a, b);
   assign loop_sum = sum_four();
+  assign while_sum = while_four();
+  assign repeat_sum = repeat_four();
 endmodule
 "#,
     )
@@ -2847,7 +2867,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower function calls");
-    assert_eq!(design.assigns.len(), 6);
+    assert_eq!(design.assigns.len(), 8);
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create function simulator");
@@ -2867,6 +2887,8 @@ endmodule
     );
     assert_eq!(simulator.read("assigned").unwrap().to_u64(), Some(4));
     assert_eq!(simulator.read("loop_sum").unwrap().to_u64(), Some(6));
+    assert_eq!(simulator.read("while_sum").unwrap().to_u64(), Some(6));
+    assert_eq!(simulator.read("repeat_sum").unwrap().to_u64(), Some(4));
 
     simulator
         .set_input("a", &LogicWord::from_u64(8, 5))
@@ -2937,6 +2959,58 @@ endmodule
         )
         .expect_err("excessive function-loop inlining must be bounded");
     assert!(error.contains("256-iteration"), "{error}");
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_excessive_while_and_repeat_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let cases = [
+        (
+            "while",
+            r#"
+module m(output int y);
+  function automatic int sum();
+    int result = 0;
+    int i = 0;
+    while (i < 257) begin
+      result = result + 1;
+      i = i + 1;
+    end
+    return result;
+  endfunction
+  assign y = sum();
+endmodule
+"#,
+        ),
+        (
+            "repeat",
+            r#"
+module m(output int y);
+  function automatic int sum();
+    int result = 0;
+    repeat (257) result = result + 1;
+    return result;
+  endfunction
+  assign y = sum();
+endmodule
+"#,
+        ),
+    ];
+    for (name, source) in cases {
+        let root = temporary_directory("direct-ast-excessive-function-loop");
+        let source_path = root.join(format!("{name}.sv"));
+        std::fs::write(&source_path, source).expect("write excessive-loop source");
+        let error = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("m"),
+                &PreprocessOptions::default(),
+            )
+            .expect_err("function-loop inlining must stay bounded");
+        assert!(error.contains("256-iteration"), "{name}: {error}");
+    }
 }
 
 #[test]

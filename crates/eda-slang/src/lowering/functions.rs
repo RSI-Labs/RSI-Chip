@@ -249,6 +249,53 @@ impl SlangAstLowerer {
                 }
                 Err("function for-loop exceeds the 256-iteration inlining limit".into())
             }
+            Some("WhileLoop") => {
+                const MAX_INLINE_FUNCTION_LOOP_STEPS: usize = 256;
+                let condition = value
+                    .get("cond")
+                    .ok_or_else(|| "function while-loop has no condition".to_string())?;
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "function while-loop has no body".to_string())?;
+                for _ in 0..=MAX_INLINE_FUNCTION_LOOP_STEPS {
+                    let condition = substitute_named_values(condition, environment);
+                    let condition_value = constant_ast_i64(&condition).map_err(|_| {
+                        "function while-loop condition must be an inline integer constant"
+                    })?;
+                    if condition_value == 0 {
+                        return Ok(None);
+                    }
+                    if let Some(result) = self.inline_function_statement(body, environment)? {
+                        return Ok(Some(result));
+                    }
+                }
+                Err("function while-loop exceeds the 256-iteration inlining limit".into())
+            }
+            Some("RepeatLoop") => {
+                const MAX_INLINE_FUNCTION_LOOP_STEPS: usize = 256;
+                let count = value
+                    .get("count")
+                    .ok_or_else(|| "function repeat-loop has no count".to_string())?;
+                let count = substitute_named_values(count, environment);
+                let count = constant_ast_i64(&count)
+                    .map_err(|_| "function repeat-loop count must be an inline integer constant")?;
+                let count = usize::try_from(count)
+                    .map_err(|_| "function repeat-loop count is negative".to_string())?;
+                if count > MAX_INLINE_FUNCTION_LOOP_STEPS {
+                    return Err(
+                        "function repeat-loop exceeds the 256-iteration inlining limit".into(),
+                    );
+                }
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "function repeat-loop has no body".to_string())?;
+                for _ in 0..count {
+                    if let Some(result) = self.inline_function_statement(body, environment)? {
+                        return Ok(Some(result));
+                    }
+                }
+                Ok(None)
+            }
             Some(kind) => Err(format!(
                 "direct function inlining does not support statement kind '{kind}'"
             )),
