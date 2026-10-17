@@ -56,6 +56,114 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_compiles_and_simulates_simple_modules() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast");
+    let source_path = root.join("simple.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module simple #(parameter SHIFT = 1)(
+  input logic [3:0] a,
+  input logic [3:0] b,
+  output logic [3:0] sum,
+  output logic [3:0] mask,
+  output logic [3:0] shifted,
+  output logic [3:0] inverted,
+  output logic selected,
+  output logic [7:0] concatenated,
+  output logic [2:0] sliced,
+  output logic [7:0] literal
+);
+  logic [3:0] initialized = 4'h3;
+  assign sum = a + b;
+  assign mask = a & b;
+  assign shifted = a << SHIFT;
+  assign inverted = ~a;
+  assign selected = a[0] ? b[0] : a[1];
+  assign concatenated = {a, b};
+  assign sliced = a[3:1];
+  assign literal = 8'hA5;
+endmodule
+"#,
+    )
+    .expect("write direct-lowering source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("simple"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower slang AST");
+    let preprocessed_reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("simple"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower the same module through the preprocessed path");
+    assert_eq!(design.name, "simple");
+    assert_eq!(design.n_nets, 48);
+    assert_eq!(design.assigns.len(), 9);
+    assert_eq!(preprocessed_reference.name, design.name);
+    assert_eq!(preprocessed_reference.n_nets, design.n_nets);
+    assert_eq!(preprocessed_reference.assigns.len(), design.assigns.len());
+    assert_eq!(
+        format!("{:?}", preprocessed_reference.ports),
+        format!("{:?}", design.ports)
+    );
+    assert_eq!(
+        format!("{:?}", preprocessed_reference.net_decls),
+        format!("{:?}", design.net_decls)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create direct-AST simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0b1101))
+        .expect("set a");
+    simulator
+        .set_input("b", &LogicWord::from_u64(4, 0b0101))
+        .expect("set b");
+    let output = |name: &str| {
+        simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("{name} was unknown"))
+    };
+    assert_eq!(output("sum"), 0b0010);
+    assert_eq!(output("mask"), 0b0101);
+    assert_eq!(output("shifted"), 0b1010);
+    assert_eq!(output("inverted"), 0b0010);
+    assert_eq!(output("selected"), 1);
+    assert_eq!(output("concatenated"), 0b11010101);
+    assert_eq!(output("sliced"), 0b110);
+    assert_eq!(output("literal"), 0xa5);
+    assert_eq!(output("initialized"), 3);
+
+    let unsupported_path = root.join("unsupported.sv");
+    std::fs::write(
+        &unsupported_path,
+        "module unsupported(output logic y); initial y = 1'b1; endmodule\n",
+    )
+    .expect("write unsupported source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&unsupported_path),
+            Some("unsupported"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("direct path must reject unsupported constructs");
+    assert!(
+        error.contains("does not yet support top member kind 'ProceduralBlock'"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -65,16 +173,23 @@ fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     std::fs::write(
         &source_path,
         r#"
-module child(input logic a, output logic y);
+module child #(parameter CHILD_WIDTH = 1)
+    (input logic a, output logic y);
   assign y = ~a;
 endmodule
 
 module top #(parameter WIDTH = 4)
-    (input logic [WIDTH-1:0] a, output logic [WIDTH-1:0] y);
+    (input logic [WIDTH-1:0] a, output logic [WIDTH-1:0] y,
+     output logic [7:0] lit);
   logic [7:0] wide;
-  child u(.a(a[0]), .y(y[0]));
+  logic held;
+  logic [WIDTH-1:0] sum;
+  child #(.CHILD_WIDTH(1)) u(.a(a[0]), .y(y[0]));
+  initial held = a[0];
   assign y[3:1] = a[3:1];
   assign wide = {a, a};
+  assign sum = a + a;
+  assign lit = 8'hA5;
 endmodule
 "#,
     )
@@ -95,13 +210,32 @@ endmodule
         .expect("parse slang AST summary");
 
     assert_eq!(summary.top_name, "top");
+    for (key, expected_line) in [
+        ("top", 7),
+        ("parameter:WIDTH", 7),
+        ("port:a", 8),
+        ("declaration:wide", 10),
+        ("instance:u", 13),
+        ("procedural:0", 14),
+        ("continuous:wide:1", 16),
+        ("continuous:sum:2", 17),
+        ("continuous:lit:3", 18),
+    ] {
+        let span = summary
+            .source_spans
+            .get(key)
+            .unwrap_or_else(|| panic!("missing source span {key}"));
+        assert!(span.file.ends_with("top.sv"), "{key} file: {}", span.file);
+        assert_eq!(span.start_line, expected_line, "{key}");
+        assert!(span.start_column > 0, "{key}");
+    }
     assert_eq!(
         summary
             .ports
             .iter()
             .map(|port| (port.name.as_str(), port.direction.as_str()))
             .collect::<Vec<_>>(),
-        vec![("a", "In"), ("y", "Out")]
+        vec![("a", "In"), ("y", "Out"), ("lit", "Out")]
     );
     assert!(summary.declarations.iter().any(|declaration| {
         declaration.name == "wide"
@@ -129,9 +263,122 @@ endmodule
         summary
             .continuous_targets
             .iter()
-            .map(|target| (target.name.as_str(), target.source.as_str()))
+            .map(|target| {
+                (
+                    target.name.as_str(),
+                    target.source.as_str(),
+                    target.rhs.kind.as_str(),
+                    target.rhs.operator.as_str(),
+                )
+            })
             .collect::<Vec<_>>(),
-        vec![("y", "ContinuousAssign"), ("wide", "ContinuousAssign")]
+        vec![
+            ("y", "ContinuousAssign", "RangeSelect", ""),
+            ("wide", "ContinuousAssign", "Concatenation", ""),
+            ("sum", "ContinuousAssign", "BinaryOp", "Add"),
+            ("lit", "ContinuousAssign", "Conversion", ""),
+        ]
+    );
+    let sum_rhs = &summary
+        .continuous_targets
+        .iter()
+        .find(|target| target.name == "sum")
+        .expect("sum assignment summary")
+        .rhs;
+    assert_eq!(sum_rhs.operator, "Add");
+    assert_eq!(sum_rhs.type_width, Some(4));
+    assert_eq!(sum_rhs.type_signed, Some(false));
+    assert_eq!(
+        sum_rhs
+            .operands
+            .iter()
+            .map(|operand| (operand.kind.as_str(), operand.symbol.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("NamedValue", Some("a")), ("NamedValue", Some("a"))]
+    );
+    let child_instance = summary
+        .instances
+        .iter()
+        .find(|instance| instance.instance_name == "u")
+        .expect("child instance parameter summary");
+    assert_eq!(
+        child_instance
+            .parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter.name.as_str(),
+                    parameter.value.as_str(),
+                    parameter.is_local,
+                    parameter.is_port,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![("CHILD_WIDTH", "1", false, true)]
+    );
+    let wide_rhs = &summary
+        .continuous_targets
+        .iter()
+        .find(|target| target.name == "wide")
+        .expect("wide assignment summary")
+        .rhs;
+    assert_eq!(
+        wide_rhs
+            .operands
+            .iter()
+            .map(|operand| operand.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["NamedValue", "NamedValue"]
+    );
+    let literal_rhs = &summary
+        .continuous_targets
+        .iter()
+        .find(|target| target.name == "lit")
+        .expect("literal assignment summary")
+        .rhs;
+    assert_eq!(literal_rhs.type_width, Some(8));
+    assert_eq!(literal_rhs.type_signed, Some(false));
+    assert_eq!(literal_rhs.operands.len(), 1);
+    assert_eq!(
+        literal_rhs
+            .operands
+            .first()
+            .and_then(|operand| operand.literal.as_deref()),
+        Some("8:10100101")
+    );
+    assert_eq!(
+        summary
+            .procedural_blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.procedure_kind.clone(),
+                    block.assignment_targets.clone(),
+                    block
+                        .assignments
+                        .iter()
+                        .map(|assignment| {
+                            (
+                                assignment.target_names.clone(),
+                                assignment.rhs.kind.clone(),
+                                assignment.rhs.operator.clone(),
+                                assignment.nonblocking,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(
+            "Initial".to_string(),
+            vec!["held".to_string()],
+            vec![(
+                vec!["held".to_string()],
+                "ElementSelect".to_string(),
+                String::new(),
+                false
+            )]
+        )]
     );
     assert_eq!(
         summary
@@ -191,11 +438,135 @@ endmodule
         .push(eda_slang::SlangContinuousTarget {
             name: "wide".into(),
             source: "ContinuousAssign".into(),
+            rhs: eda_slang::SlangExpressionSummary {
+                kind: "BinaryOp".into(),
+                operator: "Add".into(),
+                type_width: None,
+                type_signed: None,
+                symbol: None,
+                literal: None,
+                operands: Vec::new(),
+            },
         });
     assert!(dropped_continuous
         .validate_against_design(&design)
         .unwrap_err()
-        .contains("dropped continuous assignments for 'wide'"));
+        .contains("continuous assignment shape for 'wide' does not match slang"));
+
+    let mut changed_operand_shape = summary.clone();
+    let sum_rhs = changed_operand_shape
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+        .expect("sum assignment summary")
+        .rhs
+        .operands
+        .first_mut()
+        .expect("sum binary operand");
+    sum_rhs.kind = "BinaryOp".into();
+    sum_rhs.operator = "Add".into();
+    sum_rhs.symbol = None;
+    assert!(changed_operand_shape
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("continuous assignment shape for 'sum' does not match slang"));
+
+    let mut changed_operand_symbol = summary.clone();
+    let operand = changed_operand_symbol
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+        .expect("sum assignment summary")
+        .rhs
+        .operands
+        .first_mut()
+        .expect("sum binary operand");
+    operand.symbol = Some("wrong".into());
+    assert!(changed_operand_symbol
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("continuous assignment shape for 'sum' does not match slang"));
+
+    let mut changed_operand_width = changed_operand_symbol;
+    let operand = changed_operand_width
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+        .expect("sum assignment summary")
+        .rhs
+        .operands
+        .first_mut()
+        .expect("sum binary operand");
+    operand.type_width = Some(3);
+    assert!(changed_operand_width
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("continuous assignment shape for 'sum' does not match slang"));
+
+    let mut changed_operand_signedness = changed_operand_width;
+    let operand = changed_operand_signedness
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+        .expect("sum assignment summary")
+        .rhs
+        .operands
+        .first_mut()
+        .expect("sum binary operand");
+    operand.type_width = Some(4);
+    operand.type_signed = Some(true);
+    assert!(changed_operand_signedness
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("continuous assignment shape for 'sum' does not match slang"));
+
+    let mut dropped_procedural = summary.clone();
+    dropped_procedural
+        .procedural_blocks
+        .push(eda_slang::SlangProceduralBlockSummary {
+            procedure_kind: "Initial".into(),
+            assignment_targets: vec!["held".into()],
+            assignments: Vec::new(),
+        });
+    assert!(dropped_procedural
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("dropped initial blocks"));
+
+    let mut changed_procedural_rhs = summary.clone();
+    let assignment = changed_procedural_rhs
+        .procedural_blocks
+        .iter_mut()
+        .find(|block| block.procedure_kind == "Initial")
+        .expect("initial block summary")
+        .assignments
+        .first_mut()
+        .expect("initial assignment summary");
+    assignment.rhs.kind = "BinaryOp".into();
+    assignment.rhs.operator = "Add".into();
+    assert!(changed_procedural_rhs
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("procedural assignment shape for 'held' does not match slang"));
+
+    let mut changed_literal = summary.clone();
+    let literal_rhs = changed_literal
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "lit")
+        .expect("literal assignment summary")
+        .rhs
+        .operands
+        .first_mut()
+        .expect("integer literal under conversion")
+        .literal
+        .as_mut()
+        .expect("slang literal fingerprint");
+    *literal_rhs = "8:10100100".into();
+    assert!(changed_literal
+        .validate_against_design(&design)
+        .unwrap_err()
+        .contains("continuous assignment shape for 'lit' does not match slang"));
 
     let mut dropped_instance = summary;
     dropped_instance.instances.pop();

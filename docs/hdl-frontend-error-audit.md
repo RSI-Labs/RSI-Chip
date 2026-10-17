@@ -1,7 +1,8 @@
 # HDL frontend error and coverage audit
 
-Date: 2026-10-16  
-Repository state: branch `fix-digital`, commit `0e836e9`, with frontend/sparse-memory follow-up work in progress.
+Date: 2026-10-17
+
+Repository state: branch `fix-digital` after the sparse-memory and slang direct-AST follow-up work.
 Scope: `crates/eda-hdl` and the `crates/eda-slang` integration boundary. Simulator behavior is discussed only where the frontend lowering causes the limitation.
 
 ## Executive summary
@@ -12,7 +13,8 @@ The serious frontend failures are structural, not isolated typos:
 2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. The current IR now has first-class `MemoryDecl` objects plus sparse whole-element and indexed part-select read/write operations. Large one-dimensional module arrays use sparse storage and retain only a one-bit flat placeholder; small arrays, multidimensional arrays, and input/output aggregate ports retain their legacy bounded representation, while a direct large `inout` memory port can share a parent sparse-memory object.
 3. The initial audit found malformed elaborations silently accepted, including unknown or duplicate named port/parameter connections and excess positional connections. The current worktree now rejects those cases; see the status column below.
 4. A representative slang-validated probe set contained 42 valid SystemVerilog constructs. The internal frontend accepted only 2 of them; 40 were rejected. This is expected for a bounded subset, but it quantifies how far the internal parser is from full-language coverage.
-5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON. Normal compilation still feeds slang-preprocessed text into the bounded parser, but a new `SlangAstSummary` now checks the lowered top name, ordered ports/directions, simple declaration widths, parameter metadata, continuous-assignment targets, and direct/generated instances against slang after compilation. Full slang-AST-to-repository-IR lowering remains absent.
+5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON. Normal compilation still feeds slang-preprocessed text into the bounded parser, but a new `SlangAstSummary` now records slang source spans and per-instance post-elaboration parameter values and checks the lowered top name, ordered ports/directions, simple declaration widths, top parameter metadata, continuous/procedural assignment targets, recursive RHS operand shapes/order/symbol identity, sized integer literal values, simple width/signedness, and direct/generated instances against slang after compilation. `compile_files_via_ast` now directly lowers a deliberately small module subset (including parameter-constant leaves) from slang's elaborated AST, simulates it, and rejects unsupported constructs explicitly. Full slang-AST-to-repository-IR lowering remains absent.
+6. Concurrent `compile_source` calls previously generated temporary filenames from only process ID plus nanosecond time and could collide during parallel tests. The adapter now adds a process-local atomic counter; the new default-parallel frontend suite exercises the fix.
 
 Current automated status at the time of this audit:
 
@@ -22,9 +24,9 @@ Current automated status at the time of this audit:
 | `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 82 passed, including sparse blocking/NBA/runtime-index/part-select/port-alias/out-of-range tests |
 | `cargo test -p eda-sim frontend_regressions -- --nocapture` | 12 passed |
-| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 7 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 144.33 s after P0/sparse-memory/port remediation |
-| `cargo clippy -p eda-hdl -p eda-slang --all-targets -- -D warnings` | Passed |
+| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 8 passed |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 142.82 s after the direct-AST follow-up |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
 Passing tests do not establish commercial frontend completeness. The tests are intentionally focused on the implemented subset.
@@ -118,7 +120,7 @@ This closes the original dense-storage blocker for whole-element and indexed par
 | HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, and indexed part-select IR plus simulator storage now exist for large one-dimensional module memories. Memory macros, typed byte enables, banks, hierarchical memories, initialization files, sparse-memory synthesis, general input/output aggregate ports, and VCD visualization remain. |
 | HF-G29 | P1 | Literal limits | Packed literals/types are capped at 4096 bits; string literals at 64 bytes. Valid larger constructs are rejected rather than represented. |
 | HF-G30 | P1 | Elaboration bounds | Generate loops stop at 131072 steps, function loops at 256 iterations, class composition at eight levels, hierarchy at 64 levels. These are safety caps, not language semantics. |
-| HF-G31 | P0 | slang integration | No full slang elaborated AST to repository IR lowering. `compile_files` validates with slang, serializes an include/macro-aware AST summary, preprocesses to one text unit, invokes the bounded parser, then checks top/ports/direct instances against slang. |
+| HF-G31 | P0 | slang integration | Full slang elaborated AST to repository IR lowering remains absent. The normal `compile_files` path validates with slang, serializes an include/macro-aware structural summary, preprocesses to one text unit, invokes the bounded parser, and compares the result with slang. A new explicit `compile_files_via_ast` path directly lowers a small ports/nets/continuous-expression/parameter-constant subset without preprocessed reparsing; unsupported constructs fail closed. |
 | HF-G32 | P1 | slang diagnostics | slang diagnostics are passthrough strings. No structured severities, spans, artifact capture, filtering, or mapping from preprocessed output back to original source. |
 | HF-G33 | P1 | slang lifecycle | No runtime-pinned version check, timeout, cache, incremental compilation unit, or AST schema contract. Any compatible-looking `SLANG_BIN` path is accepted. |
 
@@ -188,7 +190,7 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 
 1. Extend the new sparse-memory IR with initialization policy, typed byte enables, bank/interface metadata, general port contracts, memory macros, synthesis mapping, and waveform visibility.
 2. Stop lowering general dynamic array accesses through per-element expansion. Keep expansion only for tiny explicitly requested constants.
-3. Lower slang's elaborated AST/compilation model into repository IR rather than preprocessing source and reparsing it with the bounded parser.
+3. Expand the direct slang elaborated-AST lowering path until preprocessing and reparsing are no longer needed for representable constructs.
 4. Introduce a typed frontend IR before flattening so signedness, widths, lifetimes, aggregate shape, and source identity survive elaboration.
 5. Make frontend diagnostics structured (`file`, `line`, `column`, `end`, `severity`, `code`, `notes`) rather than strings.
 

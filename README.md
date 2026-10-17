@@ -47,13 +47,20 @@ validation, preprocessing, and AST serialization to
 [slang](https://github.com/MikePopoloski/slang). It accepts include paths and
 macro definitions, rejects malformed RTL with slang diagnostics, emits
 post-elaboration AST JSON, and can feed slang's single-unit preprocessed output
-to the bounded repository elaborator. After bounded lowering, it compares the
-result's top name, ordered port inventory/directions, simple declaration widths, parameter metadata, continuous-assignment targets, and direct and generated-instance
-inventory against the slang AST. Its conformance tests also validate the
-repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
+to the bounded repository elaborator. After bounded lowering, it records slang
+source spans and authoritative per-instance post-elaboration parameter values,
+then compares the result's top name, ordered port inventory/directions, simple
+declaration widths, top parameter metadata, continuous/procedural assignment
+targets, recursive RHS operand shapes/order/symbol identity, sized
+integer-literal values, simple type width/signedness, and direct/generated
+instance inventory against the slang AST. `compile_files_via_ast`
+additionally lowers a simple module subset with elaborated parameter-constant leaves
+directly from slang's elaborated AST—without preprocessing and reparsing—and
+reports unsupported constructs explicitly. Its conformance tests also validate
+the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
 reference source with `UVM_NO_DPI`. This establishes a full-language validation
-path, while downstream execution remains explicit about constructs the bounded
-IR can represent.
+path and the first direct-AST lowering path, while downstream execution remains
+explicit about constructs the bounded IR can represent.
 The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
 `compile_sources` for deterministic named multi-unit compilation with parser
 errors mapped back to their originating file and line.
