@@ -1,7 +1,8 @@
 //! Expression operator and constant helpers for direct slang lowering.
 
 use crate::ast_util::{
-    expression_symbol, integer_literal_word, named_constant_word, string_field, usize_field,
+    constant_json_word, expression_symbol, integer_literal_word, named_constant_word, string_field,
+    usize_field,
 };
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
@@ -21,7 +22,7 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
         Some("Power") => Ok(eda_core::ir::BinOp::Pow),
         Some("BinaryAnd") => Ok(eda_core::ir::BinOp::And),
         Some("BinaryOr") => Ok(eda_core::ir::BinOp::Or),
-        Some("BitwiseXor") => Ok(eda_core::ir::BinOp::Xor),
+        Some("BinaryXor") => Ok(eda_core::ir::BinOp::Xor),
         Some("LogicalShiftLeft") => Ok(eda_core::ir::BinOp::Shl),
         Some("LogicalShiftRight") => Ok(eda_core::ir::BinOp::Shr),
         Some("ArithmeticShiftLeft") => Ok(eda_core::ir::BinOp::Shl),
@@ -71,6 +72,8 @@ pub(super) fn continuous_assignment_delay(member: &Value) -> Result<u64, String>
 
 pub(super) fn constant_index(value: &serde_json::Value) -> Result<usize, String> {
     integer_literal_word(value)
+        .or_else(|| named_constant_word(value))
+        .or_else(|| constant_json_word(value))
         .and_then(|word| word.to_u64())
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| "direct lowering requires an integer constant index".to_string())
@@ -79,6 +82,7 @@ pub(super) fn constant_index(value: &serde_json::Value) -> Result<usize, String>
 pub(super) fn constant_i64(value: &serde_json::Value) -> Result<i64, String> {
     let word = integer_literal_word(value)
         .or_else(|| named_constant_word(value))
+        .or_else(|| constant_json_word(value))
         .ok_or_else(|| "direct lowering requires an integer constant index".to_string())?;
     if word.width() == 0 {
         return Err("integer constant index has zero width".to_string());
@@ -297,6 +301,22 @@ impl super::SlangAstLowerer {
                     }
                     return Ok(equality);
                 }
+                if string_field(value, "op").as_deref() == Some("BinaryXnor") {
+                    let left = value
+                        .get("left")
+                        .ok_or_else(|| "binary expression has no left operand".to_string())?;
+                    let right = value
+                        .get("right")
+                        .ok_or_else(|| "binary expression has no right operand".to_string())?;
+                    return Ok(Expr::Un {
+                        op: UnOp::Not,
+                        a: Box::new(Expr::Bin {
+                            op: eda_core::ir::BinOp::Xor,
+                            a: Box::new(self.lower_expression(left)?),
+                            b: Box::new(self.lower_expression(right)?),
+                        }),
+                    });
+                }
                 if matches!(
                     string_field(value, "op").as_deref(),
                     Some("LogicalImplication" | "LogicalEquivalence")
@@ -440,6 +460,29 @@ impl super::SlangAstLowerer {
                 }
                 if let Some(selected) = self.lower_packed_element_select(value)? {
                     return Ok(selected);
+                }
+                if let Some(selected) = value.get("value") {
+                    if string_field(selected, "kind").as_deref() == Some("NamedValue")
+                        && self.direct_packed_symbol(selected)?.is_none()
+                    {
+                        let selector = value
+                            .get("selector")
+                            .ok_or_else(|| "element select has no selector".to_string())?;
+                        let index = constant_i64(selector)?;
+                        let base = self.lower_expression(selected)?;
+                        if index < 0 || index >= base.width() as i64 {
+                            return Err(format!(
+                                "constant expression select index {index} is out of range for width {}",
+                                base.width()
+                            ));
+                        }
+                        let index = index as usize;
+                        return Ok(Expr::Index {
+                            e: Box::new(base),
+                            msb: index,
+                            lsb: index,
+                        });
+                    }
                 }
                 let (base, index) = self.lower_constant_select(value)?;
                 Ok(Expr::Index {

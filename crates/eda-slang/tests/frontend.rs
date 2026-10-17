@@ -2049,6 +2049,47 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_accepts_generate_for_assignments() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-generate-for");
+    let source_path = root.join("generate_for.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module generate_for(
+  input logic a,
+  output logic [3:0] forward,
+  output logic [3:0] reverse
+);
+  for (genvar i = 0; i < 4; i = i + 1) begin : iteration
+    assign forward[i] = a ^ i[0];
+    assign reverse[3 - i] = a ^ i[1];
+  end
+endmodule
+"#,
+    )
+    .expect("write generate-for source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("generate_for"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower generated assignments");
+    assert_eq!(design.assigns.len(), 8);
+
+    let mut simulator = Simulator::new(&design).expect("create generate simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("forward").unwrap().to_u64(), Some(0b0101));
+    assert_eq!(simulator.read("reverse").unwrap().to_u64(), Some(0b1100));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_continuous_assignment_delay() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

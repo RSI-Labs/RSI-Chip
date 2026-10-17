@@ -124,6 +124,9 @@ impl SlangAstLowerer {
                 "ContinuousAssign" => self.lower_continuous_assignment(member)?,
                 "ProceduralBlock" => self.lower_procedural_block(member)?,
                 "Instance" => self.lower_instance(member)?,
+                // slang has already elaborated the loop; its per-iteration
+                // GenerateBlock members carry the materialized localparam.
+                "Genvar" => {}
                 generate_kind if generate_kind.starts_with("GenerateBlock") => {
                     if bool_field(member, "isUninstantiated") {
                         continue;
