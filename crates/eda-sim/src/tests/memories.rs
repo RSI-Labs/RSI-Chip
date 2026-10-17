@@ -39,6 +39,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
             }],
             flat_length: 4,
         }],
+        memory_connections: Vec::new(),
         n_nets: 8,
         ports: vec![PortDecl {
             name: "q".into(),

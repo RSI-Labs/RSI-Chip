@@ -347,6 +347,7 @@ impl<'a> Elaborator<'a> {
                     }
                 }
                 ast::Item::Port {
+                    dir,
                     range,
                     array_ranges,
                     type_name,
@@ -390,7 +391,10 @@ impl<'a> Elaborator<'a> {
                             }
                             if let Some(resolved) = array.as_ref() {
                                 let total_width = resolved.element_width * resolved.length;
-                                if total_width > 1 << 20 {
+                                let sparse_inout = *dir == ast::DirSrc::InOut
+                                    && resolved.dimensions.len() == 1
+                                    && total_width > 4096;
+                                if total_width > 1 << 20 && !sparse_inout {
                                     return Err(format!(
                                         "module '{}': unpacked array port '{}' exceeds the 1 MiB flat budget; sparse memory ports are not supported yet",
                                         module.name, n
@@ -398,9 +402,22 @@ impl<'a> Elaborator<'a> {
                                 }
                             }
                             self.apply_element_range(&mut array, range, &params, &module.name)?;
+                            let memory = array.as_ref().and_then(|resolved| {
+                                let total_width = resolved.element_width * resolved.length;
+                                (*dir == ast::DirSrc::InOut
+                                    && resolved.dimensions.len() == 1
+                                    && total_width > 4096)
+                                    .then(|| self.declare_memory(n, prefix, resolved))
+                            });
                             let declaration_range = if array.is_some() {
-                                let length = array.as_ref().map_or(1, |resolved| resolved.length);
-                                Self::flat_array_range(element_width * length)
+                                match memory {
+                                    Some(_) => None,
+                                    None => {
+                                        let length =
+                                            array.as_ref().map_or(1, |resolved| resolved.length);
+                                        Self::flat_array_range(element_width * length)
+                                    }
+                                }
                             } else {
                                 range.clone()
                             };
@@ -415,7 +432,7 @@ impl<'a> Elaborator<'a> {
                                 type_name.as_deref(),
                             )?;
                             e.array = array;
-                            e.memory = None;
+                            e.memory = memory;
                             nets.insert(n.clone(), e);
                         } else if !array_ranges.is_empty() {
                             return Err(format!(

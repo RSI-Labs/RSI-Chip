@@ -150,6 +150,7 @@ fn main() -> ExitCode {
                     println!("module {}", design.name);
                     println!("  nets: {} (flat bits)", design.n_nets);
                     println!("  memories: {}", design.memories.len());
+                    println!("  memory connections: {}", design.memory_connections.len());
                     println!("  ports: {}", design.ports.len());
                     println!(
                         "  assigns: {}, processes: {}, initials: {}",

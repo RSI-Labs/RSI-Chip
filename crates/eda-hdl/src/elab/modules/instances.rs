@@ -427,8 +427,57 @@ impl<'a> Elaborator<'a> {
             })
             .collect();
 
+        // First-class sparse `inout` unpacked-array ports share the parent
+        // memory object instead of flattening every element into port nets.
+        let mut connected_memory_ports = std::collections::HashSet::new();
+        for (i, (pname, pdir)) in sub_ports.iter().enumerate() {
+            if *pdir != ast::DirSrc::InOut {
+                continue;
+            }
+            let Some(ast::Expr::Ident(parent_name)) = find_conn(conns, pname, i) else {
+                continue;
+            };
+            let full_child_name = format!("{child_prefix}{pname}");
+            let Some(child_memory) = self
+                .design
+                .memories
+                .iter()
+                .position(|memory| memory.name == full_child_name)
+            else {
+                continue;
+            };
+            let parent_entry = env.net(parent_name)?;
+            let Some(parent_memory) = parent_entry.memory else {
+                return Err(format!(
+                    "instance '{}': inout memory port '{}' must connect to a sparse memory object",
+                    inst_name, pname
+                ));
+            };
+            let child = &self.design.memories[child_memory];
+            let parent = &self.design.memories[parent_memory];
+            if child.element_width != parent.element_width
+                || child.element_msb != parent.element_msb
+                || child.element_lsb != parent.element_lsb
+                || child.dimensions != parent.dimensions
+                || child.flat_length != parent.flat_length
+            {
+                return Err(format!(
+                    "instance '{}': memory port '{}' shape does not match parent memory '{}'",
+                    inst_name, pname, parent_name
+                ));
+            }
+            self.design.memory_connections.push(MemoryConnection {
+                child: child_memory,
+                parent: parent_memory,
+            });
+            connected_memory_ports.insert(pname.clone());
+        }
+
         // Connect ports.
         for (i, (pname, pdir)) in sub_ports.iter().enumerate() {
+            if connected_memory_ports.contains(pname) {
+                continue;
+            }
             let (base, pwidth) = match port_nets.get(pname) {
                 Some(v) => *v,
                 None => continue,

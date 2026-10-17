@@ -1502,6 +1502,21 @@ fn huge_sparse_memory_port_is_rejected_until_memory_ports_exist() {
 }
 
 #[test]
+fn sparse_memory_port_shape_mismatch_is_rejected() {
+    let error = compile(
+        "module child(inout [7:0] memory [0:4095]); endmodule \
+         module top; logic [7:0] memory [0:4094]; \
+         child u(.memory(memory)); endmodule",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("memory port 'memory' shape does not match parent memory"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn monitor_flag_propagates() {
     let d = compile_ok("module tb; reg a; initial $monitor(\"a=%b\", a); endmodule");
     match &d.initials[0] {

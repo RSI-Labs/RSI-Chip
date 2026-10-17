@@ -9,21 +9,21 @@ Scope: `crates/eda-hdl` and the `crates/eda-slang` integration boundary. Simulat
 The serious frontend failures are structural, not isolated typos:
 
 1. The internal frontend is a hand-written, bounded Verilog/SystemVerilog subset. It is not an IEEE 1800 compiler and was never a replacement for a commercial frontend by itself.
-2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. The current IR now has first-class `MemoryDecl` objects plus sparse whole-element and indexed part-select read/write operations. Large one-dimensional module arrays use sparse storage and retain only a one-bit flat placeholder; small arrays, multidimensional arrays, and ports retain their legacy bounded representation.
+2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. The current IR now has first-class `MemoryDecl` objects plus sparse whole-element and indexed part-select read/write operations. Large one-dimensional module arrays use sparse storage and retain only a one-bit flat placeholder; small arrays, multidimensional arrays, and input/output aggregate ports retain their legacy bounded representation, while a direct large `inout` memory port can share a parent sparse-memory object.
 3. The initial audit found malformed elaborations silently accepted, including unknown or duplicate named port/parameter connections and excess positional connections. The current worktree now rejects those cases; see the status column below.
 4. A representative slang-validated probe set contained 42 valid SystemVerilog constructs. The internal frontend accepted only 2 of them; 40 were rejected. This is expected for a bounded subset, but it quantifies how far the internal parser is from full-language coverage.
-5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON, but normal compilation still feeds slang-preprocessed text back into the bounded internal parser. There is no full slang-AST-to-repository-IR lowering.
+5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON. Normal compilation still feeds slang-preprocessed text into the bounded parser, but a new `SlangAstSummary` now checks the lowered top name, ordered ports/directions, simple declaration widths, parameter metadata, continuous-assignment targets, and direct/generated instances against slang after compilation. Full slang-AST-to-repository-IR lowering remains absent.
 
 Current automated status at the time of this audit:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p eda-hdl --all-targets -- --nocapture` | 85 passed after the P0/sparse-memory remediation below |
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 86 passed after the P0/sparse-memory remediation below |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
-| `cargo test -p eda-sim --all-targets -- --nocapture` | 81 passed, including sparse blocking/NBA/runtime-index/part-select/out-of-range tests |
-| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 11 passed |
-| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 5 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 151.55 s after P0/sparse-memory remediation |
+| `cargo test -p eda-sim --all-targets -- --nocapture` | 82 passed, including sparse blocking/NBA/runtime-index/part-select/port-alias/out-of-range tests |
+| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 12 passed |
+| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 7 passed |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 144.33 s after P0/sparse-memory/port remediation |
 | `cargo clippy -p eda-hdl -p eda-slang --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
@@ -49,7 +49,7 @@ Remaining memory limitations:
 
 - indexed part-select reads and writes work on large sparse memories, including runtime starts, reversed packed elements, continuous lvalues, and disjoint NBA-field merging;
 - sparse-memory reads/writes are not synthesizable to RAM macros yet;
-- memory ports, typed byte enables/write-mask metadata, banks, initialization files, and memory macros are not yet first-class;
+- direct large `inout` memory ports share a parent sparse-memory object, but input/output aggregate-port contracts, typed byte enables/write-mask metadata, banks, initialization files, and memory macros are not yet first-class;
 - multidimensional and small compatibility arrays still use flat representation;
 - VCD memory visualization is not yet implemented;
 - the sparse element cap is currently 16,777,216 elements, not unbounded host memory.
@@ -115,10 +115,10 @@ This closes the original dense-storage blocker for whole-element and indexed par
 | HF-G25 | P0 | Coverage | No SystemVerilog `covergroup`, coverpoints, crosses, bins, illegal/ignore bins, per-instance coverage, or coverage sampling semantics in the HDL frontend. |
 | HF-G26 | P0 | Elaboration lint | No `unique`/`priority` enforcement, full case-overlap analysis, full always kind checking, unused/conflicting name diagnostics, or elaboration-policy waivers. |
 | HF-G27 | P1 | System tasks/functions | Only a selected display/format/control subset. No complete file I/O, math/random conversion, assertion control, PLI/VPI/DPI tasks, or vendor-task policy. |
-| HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, and indexed part-select IR plus simulator storage now exist for large one-dimensional module memories. Memory macros, typed byte enables, banks, hierarchical memories, initialization files, sparse-memory synthesis, ports, and VCD visualization remain. |
+| HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, and indexed part-select IR plus simulator storage now exist for large one-dimensional module memories. Memory macros, typed byte enables, banks, hierarchical memories, initialization files, sparse-memory synthesis, general input/output aggregate ports, and VCD visualization remain. |
 | HF-G29 | P1 | Literal limits | Packed literals/types are capped at 4096 bits; string literals at 64 bytes. Valid larger constructs are rejected rather than represented. |
 | HF-G30 | P1 | Elaboration bounds | Generate loops stop at 131072 steps, function loops at 256 iterations, class composition at eight levels, hierarchy at 64 levels. These are safety caps, not language semantics. |
-| HF-G31 | P0 | slang integration | No full slang elaborated AST to repository IR lowering. `compile_files` validates with slang, preprocesses to one text unit, then invokes the bounded internal parser. |
+| HF-G31 | P0 | slang integration | No full slang elaborated AST to repository IR lowering. `compile_files` validates with slang, serializes an include/macro-aware AST summary, preprocesses to one text unit, invokes the bounded parser, then checks top/ports/direct instances against slang. |
 | HF-G32 | P1 | slang diagnostics | slang diagnostics are passthrough strings. No structured severities, spans, artifact capture, filtering, or mapping from preprocessed output back to original source. |
 | HF-G33 | P1 | slang lifecycle | No runtime-pinned version check, timeout, cache, incremental compilation unit, or AST schema contract. Any compatible-looking `SLANG_BIN` path is accepted. |
 
@@ -186,7 +186,7 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 
 ### P0 architecture
 
-1. Extend the new sparse-memory IR with initialization policy, typed byte enables, bank/interface metadata, ports, memory macros, synthesis mapping, and waveform visibility.
+1. Extend the new sparse-memory IR with initialization policy, typed byte enables, bank/interface metadata, general port contracts, memory macros, synthesis mapping, and waveform visibility.
 2. Stop lowering general dynamic array accesses through per-element expansion. Keep expansion only for tiny explicitly requested constants.
 3. Lower slang's elaborated AST/compilation model into repository IR rather than preprocessing source and reparsing it with the bounded parser.
 4. Introduce a typed frontend IR before flattening so signedness, widths, lifetimes, aggregate shape, and source identity survive elaboration.
@@ -207,6 +207,6 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 - Full slang or equivalent standard frontend is the parser/type/elaboration authority.
 - No valid input is silently transformed into a different hierarchy, direction, type, width, or driver structure.
 - Every unsupported construct has a precise, source-located diagnostic.
-- Whole-element one-dimensional sparse memories do not require dense allocation; extend this guarantee to memory ports, typed byte enables, banks, and aggregates.
+- Whole-element one-dimensional sparse memories do not require dense allocation; extend the direct `inout` shared-memory-port guarantee to general input/output port contracts, typed byte enables, banks, and aggregates.
 - Parser, type checker, elaborator, linter, and simulator use one typed source-span-carrying representation.
 - Official UVM execution, if claimed, is validated against a documented behavioral reference, not merely slang elaboration.

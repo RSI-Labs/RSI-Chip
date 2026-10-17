@@ -1752,11 +1752,15 @@ unbounded EM lifetime, findings, per-scenario UPF reports, the physical timing
 report, stimulus kind/sample count, and mapped statistics. Direct RPC and
 async jobs share cancellation.
 
+### Follow-up: slang AST structural authority check
+
+The `eda-slang` adapter now parses slang's include/macro-aware elaborated AST JSON into a shallow `SlangAstSummary`. Compilation still uses the bounded repository elaborator for downstream IR, but after lowering it compares the slang top name, ordered port names/directions, simple declaration widths, parameter metadata, continuous-assignment targets, and direct and generated instance inventory against the resulting `Design`. A dropped top port, declaration, or continuous assignment; direction, simple-width, parameter-duplicate, top-name, or hierarchy mismatch now fails closed instead of being silently accepted. This is a structural equivalence guard, not yet statement-level or expression-level slang-AST lowering.
+
 ### Follow-up: first-class sparse RTL memory IR
 
 The elaborated IR now models unpacked memories as first-class `MemoryDecl` objects with element width, ascending/descending logical dimensions, and physical-index metadata. The simulator stores their elements sparsely and executes whole-element reads, blocking writes, and non-blocking writes through explicit memory operations. Logical-index bounds are enforced: out-of-range reads return X and out-of-range writes are no-ops. Memory changes wake continuous readers and combinational processes.
 
-Large one-dimensional module memories (more than 4096 flattened bits) no longer allocate one flat bit per element. They retain a one-bit flat placeholder and use sparse storage. The 4 KiB runtime regression fell from 32,797 flat bits to 30, and a new 1 MiB-by-8 regression uses 38 flat bits while storing only initialized or touched elements. Indexed part-select reads and writes support runtime starts, reversed packed elements, continuous-lvalue preservation, and disjoint NBA-field merging. Sparse-memory synthesis/macros, typed byte enables, memory ports, banks, initialization files, and waveform visibility remain future work.
+Large one-dimensional module memories (more than 4096 flattened bits) no longer allocate one flat bit per element. They retain a one-bit flat placeholder and use sparse storage. The 4 KiB runtime regression fell from 32,797 flat bits to 30, and a new 1 MiB-by-8 regression uses 38 flat bits while storing only initialized or touched elements. Indexed part-select reads and writes support runtime starts, reversed packed elements, continuous-lvalue preservation, and disjoint NBA-field merging. A direct large `inout` unpacked-array port can share a parent sparse-memory object across hierarchy, with shape checking and both parent/child readers observing the same storage. Sparse-memory synthesis/macros, typed byte enables, general input/output aggregate ports, banks, initialization files, and waveform visibility remain future work.
 
 ### Follow-up: i8086 randomized sparse-memory differential validation
 

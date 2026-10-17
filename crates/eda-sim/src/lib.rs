@@ -69,6 +69,7 @@ pub struct Simulator<'d> {
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
+    memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
     memory_readers: Vec<Vec<usize>>,
     memory_assign_fanin: Vec<Vec<usize>>,
@@ -106,12 +107,37 @@ impl<'d> Simulator<'d> {
             }
             memory_elements.push(HashMap::new());
         }
+        let mut memory_aliases = vec![0_usize; design.memories.len()];
+        for (index, alias) in memory_aliases.iter_mut().enumerate() {
+            *alias = index;
+        }
+        for connection in &design.memory_connections {
+            if connection.child >= memory_aliases.len() || connection.parent >= memory_aliases.len()
+            {
+                return Err("memory connection refers to a missing memory object".into());
+            }
+            memory_aliases[connection.child] = connection.parent;
+        }
+        // Parent memories are elaborated before child instances, but resolve
+        // chains explicitly so nested aliases remain well-formed.
+        for index in 0..memory_aliases.len() {
+            let mut target = memory_aliases[index];
+            let mut steps = 0;
+            while target != memory_aliases[target] {
+                target = memory_aliases[target];
+                steps += 1;
+                if steps > memory_aliases.len() {
+                    return Err("memory alias cycle detected".into());
+                }
+            }
+            memory_aliases[index] = target;
+        }
         let mut memory_readers: Vec<Vec<usize>> = vec![Vec::new(); design.memories.len()];
         let mut memory_assign_fanin: Vec<Vec<usize>> = vec![Vec::new(); design.memories.len()];
         for (ai, assign) in design.assigns.iter().enumerate() {
             for memory in expr_memories(&assign.e) {
                 if memory < design.memories.len() {
-                    memory_assign_fanin[memory].push(ai);
+                    memory_assign_fanin[memory_aliases[memory]].push(ai);
                 }
             }
         }
@@ -120,7 +146,7 @@ impl<'d> Simulator<'d> {
             if matches!(p.sens, Sens::Comb) {
                 for memory in stmt_memories(&p.body) {
                     if memory < design.memories.len() {
-                        memory_readers[memory].push(pi);
+                        memory_readers[memory_aliases[memory]].push(pi);
                     }
                 }
             }
@@ -150,6 +176,7 @@ impl<'d> Simulator<'d> {
             nba: Vec::new(),
             busy_procs: HashSet::new(),
             memory_elements,
+            memory_aliases,
             memory_nba: Vec::new(),
             memory_readers,
             memory_assign_fanin,
@@ -754,6 +781,10 @@ impl<'d> Simulator<'d> {
         Ok(())
     }
 
+    fn canonical_memory(&self, memory: usize) -> usize {
+        self.memory_aliases.get(memory).copied().unwrap_or(memory)
+    }
+
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
         let mut work = c.work;
         while let Some(s) = work.pop() {
@@ -809,15 +840,17 @@ impl<'d> Simulator<'d> {
                         continue;
                     };
                     let value = self.eval(e);
-                    self.apply_memory_update(*memory, index, value)?;
+                    let memory = self.canonical_memory(*memory);
+                    self.apply_memory_update(memory, index, value)?;
                 }
                 Stmt::MemoryNBl { memory, indexes, e } => {
                     let Some(index) = self.memory_index(*memory, indexes) else {
                         continue;
                     };
                     let value = self.eval(e);
+                    let memory = self.canonical_memory(*memory);
                     self.memory_nba.push(MemoryNbaUpdate::Whole {
-                        memory: *memory,
+                        memory,
                         index,
                         value,
                     });
@@ -836,7 +869,8 @@ impl<'d> Simulator<'d> {
                         continue;
                     };
                     let value = self.eval(e);
-                    self.apply_memory_part_update(*memory, index, low_offset, *width, value)?;
+                    let memory = self.canonical_memory(*memory);
+                    self.apply_memory_part_update(memory, index, low_offset, *width, value)?;
                 }
                 Stmt::MemoryNBlPart {
                     memory,
@@ -852,8 +886,9 @@ impl<'d> Simulator<'d> {
                         continue;
                     };
                     let value = self.eval(e);
+                    let memory = self.canonical_memory(*memory);
                     self.memory_nba.push(MemoryNbaUpdate::Part {
-                        memory: *memory,
+                        memory,
                         index,
                         low_offset,
                         width: *width,
@@ -1310,7 +1345,7 @@ impl<'d> Simulator<'d> {
             } => match self.memory_index(*memory, indexes) {
                 Some(index) => self
                     .memory_elements
-                    .get(*memory)
+                    .get(self.canonical_memory(*memory))
                     .and_then(|elements| elements.get(&index))
                     .cloned()
                     .unwrap_or_else(|| LogicWord::xes(*width)),
@@ -1326,7 +1361,7 @@ impl<'d> Simulator<'d> {
                 Some((index, low_offset)) => {
                     let element = self
                         .memory_elements
-                        .get(*memory)
+                        .get(self.canonical_memory(*memory))
                         .and_then(|elements| elements.get(&index))
                         .cloned()
                         .unwrap_or_else(|| {

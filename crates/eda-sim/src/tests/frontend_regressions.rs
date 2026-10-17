@@ -254,6 +254,42 @@ endmodule
 }
 
 #[test]
+fn sparse_inout_memory_port_shares_parent_memory_object() {
+    let mut sim = sim_for(
+        r#"
+module child(inout [7:0] memory [0:4095], input clk,
+              input [11:0] address, input [7:0] din, output [7:0] q);
+  always @(posedge clk) memory[address] <= din;
+  assign q = memory[address];
+endmodule
+
+module top(input clk, input [11:0] address, input [7:0] din,
+           output [7:0] child_q, parent_q);
+  logic [7:0] memory [0:4095];
+  initial memory[5] = 8'h3C;
+  child u(.memory(memory), .clk(clk), .address(address),
+          .din(din), .q(child_q));
+  assign parent_q = memory[address];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.memories.len(), 2);
+    assert_eq!(sim.design.memory_connections.len(), 1);
+    assert_eq!(sim.design.n_nets, 68);
+
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("address", &LogicWord::from_u64(12, 5))
+        .unwrap();
+    assert_eq!(sim.read("child_q").unwrap().to_u64(), Some(0x3C));
+    assert_eq!(sim.read("parent_q").unwrap().to_u64(), Some(0x3C));
+
+    sim.set_input("din", &LogicWord::from_u64(8, 0xA7)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("child_q").unwrap().to_u64(), Some(0xA7));
+    assert_eq!(sim.read("parent_q").unwrap().to_u64(), Some(0xA7));
+}
+
+#[test]
 fn runtime_whole_unpacked_array_element_supports_continuous_assignment() {
     let mut sim = sim_for(
         "module m(input [1:0] selector, input [7:0] din, output [7:0] q); \

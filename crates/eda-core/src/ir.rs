@@ -73,6 +73,14 @@ pub struct MemoryDecl {
     pub flat_length: u64,
 }
 
+/// Aliases a child instance's memory object to the parent memory supplied on
+/// an `inout` unpacked-array port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryConnection {
+    pub child: usize,
+    pub parent: usize,
+}
+
 impl MemoryDecl {
     pub fn physical_index(&self, indexes: &[i64]) -> Option<u64> {
         if indexes.len() != self.dimensions.len() {
@@ -495,6 +503,7 @@ pub struct Design {
     pub name: String,
     pub net_decls: Vec<NetDecl>,
     pub memories: Vec<MemoryDecl>,
+    pub memory_connections: Vec<MemoryConnection>,
     pub n_nets: usize,
     pub ports: Vec<PortDecl>,
     pub assigns: Vec<Assign>,

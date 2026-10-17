@@ -47,7 +47,9 @@ validation, preprocessing, and AST serialization to
 [slang](https://github.com/MikePopoloski/slang). It accepts include paths and
 macro definitions, rejects malformed RTL with slang diagnostics, emits
 post-elaboration AST JSON, and can feed slang's single-unit preprocessed output
-to the bounded repository elaborator. Its conformance tests also validate the
+to the bounded repository elaborator. After bounded lowering, it compares the
+result's top name, ordered port inventory/directions, simple declaration widths, parameter metadata, continuous-assignment targets, and direct and generated-instance
+inventory against the slang AST. Its conformance tests also validate the
 repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
 reference source with `UVM_NO_DPI`. This establishes a full-language validation
 path, while downstream execution remains explicit about constructs the bounded
@@ -61,7 +63,8 @@ explicit read, blocking-write, and NBA-write operations; a natural 4 KiB byte
 array uses 30 flat bits rather than 32,797, and the sparse-memory regression
 extends to 1 MiB-by-8. Small compatibility arrays retain bounded flat storage. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
-elements, continuous lvalue preservation, and disjoint NBA-field merging.
+elements, continuous lvalue preservation, disjoint NBA-field merging, and
+direct large `inout` memory-port sharing through the hierarchy.
 
 The data-driven regression target currently contains **15,159 unique named
 cases**. It is not a collection of three or four broad assertions: every case

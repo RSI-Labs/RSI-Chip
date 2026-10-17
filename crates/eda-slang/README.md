@@ -8,11 +8,17 @@ frontend. It uses slang for:
 2. complete SystemVerilog parsing, type checking, and elaboration;
 3. post-elaboration AST JSON export;
 4. production of a single preprocessed compilation unit for the repository's
-   bounded downstream IR elaborator.
+   bounded downstream IR elaborator;
+5. post-lowering comparison of slang's top-module, port, simple declaration-width, parameter, continuous-target, and direct/generated-instance
+   inventory against the resulting repository `Design`.
 
 The adapter deliberately reports slang diagnostics instead of silently
 bypassing them. If the downstream elaborator cannot represent a construct, that
 failure remains visible after slang has accepted the source.
+`compile_files` now also parses the same include/macro-aware elaborated AST and
+rejects a bounded result whose top name, ordered port inventory/directions, or
+direct instance inventory disagrees with slang. This is structural validation,
+not yet full AST-to-IR lowering.
 
 ## Installing the external frontend
 
