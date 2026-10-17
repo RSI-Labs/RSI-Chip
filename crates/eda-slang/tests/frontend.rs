@@ -2499,6 +2499,158 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_streaming_concatenation() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-streaming");
+    let source_path = root.join("streaming.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module streaming(
+  input logic [7:0] a,
+  input logic [3:0] b,
+  output logic [7:0] reverse_bits,
+  output logic [7:0] forward_bits,
+  output logic [7:0] reverse_nibbles,
+  output logic [7:0] reverse_pairs,
+  output logic [11:0] multi_bits,
+  output logic [11:0] multi_nibbles
+);
+  assign reverse_bits = {<<{a}};
+  assign forward_bits = {>>{a}};
+  assign reverse_nibbles = {<<4{a}};
+  assign reverse_pairs = {<<2{a}};
+  assign multi_bits = {<<{a, b}};
+  assign multi_nibbles = {<<4{a, b}};
+endmodule
+"#,
+    )
+    .expect("write streaming-concatenation source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("streaming"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower streaming concatenation");
+    assert_eq!(design.assigns.len(), 6);
+
+    let mut simulator = Simulator::new(&design).expect("create streaming simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 0xb2))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(4, 0x2))
+        .unwrap();
+    assert_eq!(simulator.read("reverse_bits").unwrap().to_u64(), Some(0x4d));
+    assert_eq!(simulator.read("forward_bits").unwrap().to_u64(), Some(0xb2));
+    assert_eq!(
+        simulator.read("reverse_nibbles").unwrap().to_u64(),
+        Some(0x2b)
+    );
+    assert_eq!(
+        simulator.read("reverse_pairs").unwrap().to_u64(),
+        Some(0x8e)
+    );
+    // The stream operands form one bitstream in source order before the
+    // streaming operator reorders it. Thus `{a, b}` is 12'b1011_0010_0010.
+    assert_eq!(simulator.read("multi_bits").unwrap().to_u64(), Some(0x44d));
+    assert_eq!(
+        simulator.read("multi_nibbles").unwrap().to_u64(),
+        Some(0x22b)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_ascending_indexed_packed_selects() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-ascending-indexed");
+    let source_path = root.join("ascending_indexed.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module ascending_indexed(
+  input logic [0:7] a,
+  input logic [2:0] start,
+  output logic [3:0] up,
+  output logic [3:0] down
+);
+  assign up = a[start +: 4];
+  assign down = a[start -: 4];
+endmodule
+"#,
+    )
+    .expect("write ascending indexed-select source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("ascending_indexed"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower ascending indexed selects");
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create ascending simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 0xa5))
+        .unwrap();
+    simulator
+        .set_input("start", &LogicWord::from_u64(3, 0))
+        .unwrap();
+    assert_eq!(simulator.read("up").unwrap().to_u64(), Some(0xa));
+    assert_eq!(simulator.read("down").unwrap().to_hex_str(), "x");
+
+    simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .unwrap();
+    assert_eq!(simulator.read("up").unwrap().to_u64(), Some(0x5));
+    assert_eq!(simulator.read("down").unwrap().to_u64(), Some(0x4));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unimplemented_case_and_priority_semantics() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let cases = [
+        (
+            "casex",
+            "module m(input logic [3:0] a, output logic y); always_comb casex (a) 4'b1x0x: y = 1'b1; default: y = 1'b0; endcase endmodule",
+        ),
+        (
+            "unique_case",
+            "module m(input logic [1:0] a, output logic y); always_comb unique case (a) 2'b00: y = 1'b1; default: y = 1'b0; endcase endmodule",
+        ),
+        (
+            "priority_if",
+            "module m(input logic [1:0] a, output logic y); always_comb priority if (a[0]) y = 1'b1; else y = 1'b0; endmodule",
+        ),
+    ];
+    for (name, source) in cases {
+        let root = temporary_directory("direct-ast-case-semantics");
+        let source_path = root.join(format!("{name}.sv"));
+        std::fs::write(&source_path, source).expect("write case-semantics source");
+        let error = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("m"),
+                &PreprocessOptions::default(),
+            )
+            .expect_err("unimplemented case/priority semantics must not silently lower");
+        assert!(
+            error.contains("case semantics") || error.contains("conditional semantics"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_indexed_packed_part_selects() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

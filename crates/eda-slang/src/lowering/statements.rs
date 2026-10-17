@@ -173,6 +173,12 @@ impl SlangAstLowerer {
             }
             "Assignment" => self.lower_assignment(statement),
             "Conditional" => {
+                if string_field(statement, "check").as_deref() != Some("None") {
+                    let check = string_field(statement, "check").unwrap_or_default();
+                    return Err(format!(
+                        "direct slang-AST lowering does not support {check} conditional semantics"
+                    ));
+                }
                 let conditions = statement
                     .get("conditions")
                     .and_then(Value::as_array)
@@ -202,6 +208,18 @@ impl SlangAstLowerer {
                 })
             }
             "Case" => {
+                let condition = string_field(statement, "condition").unwrap_or_default();
+                if condition != "Normal" {
+                    return Err(format!(
+                        "direct slang-AST lowering does not support {condition} case semantics"
+                    ));
+                }
+                let check = string_field(statement, "check").unwrap_or_default();
+                if check != "None" {
+                    return Err(format!(
+                        "direct slang-AST lowering does not support {check} case semantics"
+                    ));
+                }
                 let expression = statement
                     .get("expr")
                     .ok_or_else(|| "case statement has no expression".to_string())?;

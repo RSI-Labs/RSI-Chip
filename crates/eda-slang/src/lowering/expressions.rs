@@ -1,6 +1,8 @@
 //! Expression operator and constant helpers for direct slang lowering.
 
-use crate::ast_util::{expression_symbol, integer_literal_word, named_constant_word, string_field};
+use crate::ast_util::{
+    expression_symbol, integer_literal_word, named_constant_word, string_field, usize_field,
+};
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::logic::{LogicValue, LogicWord};
@@ -194,6 +196,13 @@ impl super::SlangAstLowerer {
                 let operand = value
                     .get("operand")
                     .ok_or_else(|| "conversion has no operand".to_string())?;
+                if string_field(operand, "kind").as_deref() == Some("Streaming") {
+                    let target_type = string_field(value, "type").unwrap_or_default();
+                    let target_width = simple_type_width(&target_type).ok_or_else(|| {
+                        format!("streaming conversion has unresolved target type '{target_type}'")
+                    })?;
+                    return self.lower_streaming(operand, target_width);
+                }
                 let target_type = string_field(value, "type").unwrap_or_default();
                 let operand_type = string_field(operand, "type").unwrap_or_default();
                 let target = (
@@ -308,6 +317,9 @@ impl super::SlangAstLowerer {
                     times,
                     e: Box::new(self.lower_expression(concat)?),
                 })
+            }
+            "Streaming" => {
+                Err("streaming expressions require a sized conversion context".to_string())
             }
             "Inside" => self.lower_inside(value),
             "ConditionalOp" => {
@@ -446,6 +458,12 @@ impl super::SlangAstLowerer {
         let Some(symbol) = self.direct_packed_symbol(selected)? else {
             return Ok(None);
         };
+        let Some((declaration_msb, declaration_lsb)) = symbol.bounds else {
+            return Err(
+                "multi-packed indexed range selects require dimension-aware lowering and are not supported yet"
+                    .to_string(),
+            );
+        };
         let start_value = value
             .get("left")
             .ok_or_else(|| "indexed packed select has no start".to_string())?;
@@ -459,21 +477,28 @@ impl super::SlangAstLowerer {
                 symbol.width
             ));
         }
+        let width_i64 = i64::try_from(width)
+            .map_err(|_| format!("indexed packed select width {width} is outside i64 bounds"))?;
 
         let start = self.lower_expression(start_value)?;
         let start_width = start.width().max(1);
         let mut selected_expression = Expr::Const(LogicWord::xes(width));
+        let lower = declaration_msb.min(declaration_lsb);
+        let upper = declaration_msb.max(declaration_lsb);
         let starts = if selection_kind == "IndexedUp" {
-            0..=symbol.width - width
+            lower..=upper + 1 - width_i64
         } else {
-            width - 1..=symbol.width - 1
+            lower + width_i64 - 1..=upper
         };
-        for physical_start in starts {
-            let (msb, lsb) = if selection_kind == "IndexedUp" {
-                (physical_start + width - 1, physical_start)
+        for logical_start in starts {
+            let (low_logical, high_logical) = if selection_kind == "IndexedUp" {
+                (logical_start, logical_start + width_i64 - 1)
             } else {
-                (physical_start, physical_start + 1 - width)
+                (logical_start - width_i64 + 1, logical_start)
             };
+            let first = self.declared_bit_index(&symbol, low_logical)?;
+            let second = self.declared_bit_index(&symbol, high_logical)?;
+            let (msb, lsb) = (first.max(second), first.min(second));
             let candidate = Expr::Index {
                 e: Box::new(self.lower_expression(selected)?),
                 msb,
@@ -481,7 +506,7 @@ impl super::SlangAstLowerer {
             };
             if constant_i64(start_value).is_ok() {
                 let constant_start = constant_i64(start_value)?;
-                if constant_start == physical_start as i64 {
+                if constant_start == logical_start {
                     return Ok(Some(candidate));
                 }
                 continue;
@@ -491,7 +516,7 @@ impl super::SlangAstLowerer {
                 a: Box::new(start.clone()),
                 b: Box::new(Expr::Const(LogicWord::from_u64(
                     start_width,
-                    physical_start as u64,
+                    logical_start as u64,
                 ))),
             };
             selected_expression = Expr::Cond {
@@ -504,6 +529,65 @@ impl super::SlangAstLowerer {
             return Err("constant indexed packed select start is out of range".to_string());
         }
         Ok(Some(selected_expression))
+    }
+
+    pub(super) fn lower_streaming(
+        &self,
+        value: &serde_json::Value,
+        target_width: usize,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        if string_field(value, "kind").as_deref() != Some("Streaming") {
+            return Err("streaming lowering requires a Streaming expression".to_string());
+        }
+        let streams = value
+            .get("streams")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "streaming expression has no stream operands".to_string())?;
+        if streams.is_empty() {
+            return Err("streaming expression has an empty stream list".to_string());
+        }
+        let mut parts = Vec::with_capacity(streams.len());
+        for stream in streams {
+            let operand = stream
+                .get("operand")
+                .ok_or_else(|| "stream operand has no expression".to_string())?;
+            parts.push(self.lower_expression(operand)?);
+        }
+        let source_width: usize = parts.iter().map(Expr::width).sum();
+        if source_width != target_width {
+            return Err(format!(
+                "streaming source width {source_width} does not match target width {target_width}"
+            ));
+        }
+        let source = if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Expr::Concat(parts)
+        };
+
+        let slice_size = usize_field(value, "sliceSize").unwrap_or(1);
+        if slice_size == 0 {
+            // `{>>{...}}` streams blocks left-to-right without reordering.
+            return Ok(source);
+        }
+        if slice_size > source_width || !source_width.is_multiple_of(slice_size) {
+            return Err(format!(
+                "streaming slice size {slice_size} does not evenly divide source width {source_width}"
+            ));
+        }
+        let blocks = source_width / slice_size;
+        let mut reversed_blocks = Vec::with_capacity(blocks);
+        for block in 0..blocks {
+            let lsb = block * slice_size;
+            reversed_blocks.push(Expr::Index {
+                e: Box::new(source.clone()),
+                msb: lsb + slice_size - 1,
+                lsb,
+            });
+        }
+        Ok(Expr::Concat(reversed_blocks))
     }
 
     pub(super) fn lower_wildcard_equality(
