@@ -585,6 +585,32 @@ impl<'a> Elaborator<'a> {
                             continue;
                         }
                     }
+                    if let ast::Expr::ArrayPart {
+                        name,
+                        indexes,
+                        msb,
+                        lsb,
+                    } = lv
+                    {
+                        if *delay != 0 {
+                            return Err("delayed sparse-memory continuous lvalue is not supported"
+                                .to_string());
+                        }
+                        let normalized =
+                            self.normalize_array_part(name, indexes, msb, lsb, &env)?;
+                        let body = self.elab_stmt(
+                            &ast::Stmt::BL {
+                                lv: normalized,
+                                e: e.clone(),
+                            },
+                            &env,
+                        )?;
+                        self.design.processes.push(Process {
+                            sens: SensIR::Comb,
+                            body,
+                        });
+                        continue;
+                    }
                     if let ast::Expr::Select(name, index) = lv {
                         if env
                             .net(name)

@@ -366,6 +366,25 @@ pub(super) fn subst_expr(expr: &ast::Expr, var: &str, value: i64) -> ast::Expr {
                 ascending: *ascending,
             }
         }
+        ast::Expr::ArrayPart {
+            name,
+            indexes,
+            msb,
+            lsb,
+        } => {
+            if name == var {
+                return subst_expr(&ast::Expr::Ident(name.clone()), var, value);
+            }
+            ast::Expr::ArrayPart {
+                name: name.clone(),
+                indexes: indexes
+                    .iter()
+                    .map(|index| subst_expr(index, var, value))
+                    .collect(),
+                msb: Box::new(subst_expr(msb, var, value)),
+                lsb: Box::new(subst_expr(lsb, var, value)),
+            }
+        }
         ast::Expr::Part(name, msb, lsb) => {
             if name == var {
                 return subst_expr(&ast::Expr::Ident(name.clone()), var, value);
@@ -694,6 +713,20 @@ pub(super) fn substitute_function_arguments(
             start: Box::new(substitute_function_arguments(start, arguments)),
             width: Box::new(substitute_function_arguments(width, arguments)),
             ascending: *ascending,
+        },
+        ast::Expr::ArrayPart {
+            name,
+            indexes,
+            msb,
+            lsb,
+        } => ast::Expr::ArrayPart {
+            name: name.clone(),
+            indexes: indexes
+                .iter()
+                .map(|index| substitute_function_arguments(index, arguments))
+                .collect(),
+            msb: Box::new(substitute_function_arguments(msb, arguments)),
+            lsb: Box::new(substitute_function_arguments(lsb, arguments)),
         },
         ast::Expr::Part(name, msb, lsb) => ast::Expr::Part(
             name.clone(),

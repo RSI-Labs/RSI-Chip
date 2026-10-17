@@ -1084,6 +1084,23 @@ impl<'a> Elaborator<'a> {
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             ),
+            ast::Expr::ArrayPart {
+                name,
+                indexes,
+                msb,
+                lsb,
+            } => {
+                let indexes = indexes
+                    .iter()
+                    .map(|index| {
+                        self.resolve_aggregate_references(index, values, aggregate_types, env)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let msb = self.resolve_aggregate_references(msb, values, aggregate_types, env)?;
+                let lsb = self.resolve_aggregate_references(lsb, values, aggregate_types, env)?;
+                let normalized = self.normalize_array_part(name, &indexes, &msb, &lsb, env)?;
+                self.resolve_aggregate_references(&normalized, values, aggregate_types, env)?
+            }
             ast::Expr::ArrayIndexedPart {
                 name,
                 indexes,
@@ -1670,6 +1687,20 @@ impl<'a> Elaborator<'a> {
                 start: Box::new(self.inline_nested_function_calls(start, env, call_stack)?),
                 width: Box::new(self.inline_nested_function_calls(width, env, call_stack)?),
                 ascending: *ascending,
+            },
+            ast::Expr::ArrayPart {
+                name,
+                indexes,
+                msb,
+                lsb,
+            } => ast::Expr::ArrayPart {
+                name: name.clone(),
+                indexes: indexes
+                    .iter()
+                    .map(|index| self.inline_nested_function_calls(index, env, call_stack))
+                    .collect::<Result<Vec<_>, _>>()?,
+                msb: Box::new(self.inline_nested_function_calls(msb, env, call_stack)?),
+                lsb: Box::new(self.inline_nested_function_calls(lsb, env, call_stack)?),
             },
             ast::Expr::Part(name, msb, lsb) => ast::Expr::Part(
                 name.clone(),

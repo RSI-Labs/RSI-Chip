@@ -99,6 +99,38 @@ fn indexed_part_selects() {
 }
 
 #[test]
+fn unpacked_array_element_simple_range_selects() {
+    let source = r#"
+module m(input [1:0] i, output [3:0] y);
+  logic [7:0] mem [0:3];
+  assign y = mem[i][3:0];
+endmodule
+"#;
+    let file = parse_ok(source);
+    let assignment = file.modules[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Assign { e, .. } => Some(e),
+            _ => None,
+        })
+        .expect("range assignment");
+    let Expr::ArrayPart {
+        name,
+        indexes,
+        msb,
+        lsb,
+    } = assignment
+    else {
+        panic!("expected array-element range select, got {assignment:?}");
+    };
+    assert_eq!(name, "mem");
+    assert_eq!(indexes.len(), 1);
+    assert!(matches!(&**msb, Expr::Num { word, .. } if word.to_u64() == Some(3)));
+    assert!(matches!(&**lsb, Expr::Num { word, .. } if word.to_u64() == Some(0)));
+}
+
+#[test]
 fn conditional_and_concat() {
     let f = parse_ok("module m(s,a,b,y); assign y = s ? {a, b[3:0]} : 4'b0; endmodule");
     if let Item::Assign { e, .. } = &f.modules[0].items[4] {

@@ -15,18 +15,19 @@ The serious frontend failures are structural, not isolated typos:
 4. A representative slang-validated probe set contained 42 valid SystemVerilog constructs. The internal frontend accepted only 2 of them; 40 were rejected. This is expected for a bounded subset, but it quantifies how far the internal parser is from full-language coverage.
 5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON. Normal compilation still feeds slang-preprocessed text into the bounded parser, but a new `SlangAstSummary` now records slang source spans and per-instance post-elaboration parameter values and checks the lowered top name, ordered ports/directions, simple declaration widths, top parameter metadata, continuous/procedural assignment targets, recursive RHS operand shapes/order/symbol identity, sized integer literal values, simple width/signedness, and direct/generated instances against slang after compilation. `compile_files_via_ast` now directly lowers a deliberately small module subset (including parameter-constant leaves, procedural assignments, if/case control flow, single-edge sensitivity, recursive hierarchy, generated members, and one-dimensional sparse-memory whole-element operations, part-select reads, and indexed part writes) from slang's elaborated AST, simulates it, and rejects unsupported constructs explicitly. Full slang-AST-to-repository-IR lowering remains absent.
 6. Concurrent `compile_source` calls previously generated temporary filenames from only process ID plus nanosecond time and could collide during parallel tests. The adapter now adds a process-local atomic counter; the new default-parallel frontend suite exercises the fix.
-7. The first AST-summary implementation recursively collected every named symbol under an assignment LHS, so `mem[addr]` incorrectly reported both `mem` and `addr` as assignment targets. Target extraction now follows only the selected base value. Legacy small-array procedural assignments still use bounded per-element expansion; their slang comparison preserves assignment-count checking without pretending that the expanded expression tree has source-level shape equivalence.
+7. The bounded parser now preserves and lowers `mem[i][msb:lsb]`; both direct slang-AST and preprocessed bounded paths pass a behavioral differential test.
+8. The first AST-summary implementation recursively collected every named symbol under an assignment LHS, so `mem[addr]` incorrectly reported both `mem` and `addr` as assignment targets. Target extraction now follows only the selected base value. Legacy small-array procedural assignments still use bounded per-element expansion; their slang comparison preserves assignment-count checking without pretending that the expanded expression tree has source-level shape equivalence.
 
 Current automated status at the time of this audit:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p eda-hdl --all-targets -- --nocapture` | 86 passed after the P0/sparse-memory remediation below |
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 87 passed after array-element range-select remediation |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
-| `cargo test -p eda-sim --all-targets -- --nocapture` | 82 passed, including sparse blocking/NBA/runtime-index/part-select/port-alias/out-of-range tests |
-| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 13 passed |
-| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 13 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 130.31 s after the direct-AST follow-up |
+| `cargo test -p eda-sim --all-targets -- --nocapture` | 83 passed, including consecutive sparse whole/part-write tests |
+| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 14 passed |
+| `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 14 passed |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 139.57 s after the direct-AST follow-up |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
@@ -86,7 +87,7 @@ This closes the original dense-storage blocker for whole-element and indexed par
 | HF-C21 | P1 | Lint/elaboration | The frontend does not diagnose multiple drivers, combinational loops, accidental latches, or incomplete `always_comb` behavior. | No such analysis exists at the frontend boundary. These are commercial-elaboration/lint prerequisites. | Add a driver/algebraic-cycle/latch analysis stage with waivers and source spans. | Open |
 | HF-C22 | P1 | Port checking | Width/truncation/extension and signedness mismatch diagnostics are incomplete. | Connections are lowered without a full port type/width contract. | Implement implicit port conversion rules and issue required warnings/errors. | Open |
 | HF-C23 | P1 | Assertions | Concurrent assertion coverage semantics merge overlapping attempts for some repetition forms. | The current implementation documents that goto attempts sharing a count bucket are merged; assertion/assumption behavior is preserved but distinct cover attempts are not. | Track individual attempts or define and validate a conservative cover model. | Open |
-| HF-C24 | P1 | Arrays/parser | The internal parser rejects a simple range select of an unpacked-array element, such as `mem[i][msb:lsb]`. | slang accepts the syntax and the direct `compile_files_via_ast` path lowers it, but the preprocessed bounded parser reports `expected ']', found ':'`. The parser AST has indexed array-element part selects but no simple-range equivalent. | Add an array-element range-select AST node and lower it to `MemoryReadPart`/`MemoryBlPart`. | Open in bounded path; direct read lowering exists |
+| HF-C24 | P1 | Arrays/parser | The internal parser rejected a simple range select of an unpacked-array element, such as `mem[i][msb:lsb]`. | slang accepted the syntax while the bounded parser reported `expected ']', found ':'`; there was no array-element range AST node. | Add an array-element range-select AST node and lower it to indexed `MemoryReadPart`/`MemoryBlPart` semantics. | Fixed in current worktree |
 
 ## B. Language and semantic coverage gaps
 

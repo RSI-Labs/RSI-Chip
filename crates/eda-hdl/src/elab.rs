@@ -961,6 +961,20 @@ fn resolve_package_expressions(
             width: Box::new(resolve_package_expressions(width, packages)?),
             ascending: *ascending,
         },
+        ast::Expr::ArrayPart {
+            name,
+            indexes,
+            msb,
+            lsb,
+        } => ast::Expr::ArrayPart {
+            name: name.clone(),
+            indexes: indexes
+                .iter()
+                .map(|index| resolve_package_expressions(index, packages))
+                .collect::<Result<Vec<_>, _>>()?,
+            msb: Box::new(resolve_package_expressions(msb, packages)?),
+            lsb: Box::new(resolve_package_expressions(lsb, packages)?),
+        },
         ast::Expr::Part(name, msb, lsb) => ast::Expr::Part(
             name.clone(),
             Box::new(resolve_package_expressions(msb, packages)?),

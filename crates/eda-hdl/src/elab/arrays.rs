@@ -169,6 +169,35 @@ impl<'a> Elaborator<'a> {
         Ok((entry.clone(), offset, array.element_width))
     }
 
+    pub(super) fn normalize_array_part(
+        &self,
+        name: &str,
+        indexes: &[ast::Expr],
+        msb: &ast::Expr,
+        lsb: &ast::Expr,
+        env: &Env<'_>,
+    ) -> Result<ast::Expr, String> {
+        let msb = self.const_eval(msb, env.params, env.module_name)?;
+        let lsb = self.const_eval(lsb, env.params, env.module_name)?;
+        if msb >= lsb {
+            Ok(ast::Expr::ArrayIndexedPart {
+                name: name.to_string(),
+                indexes: indexes.to_vec(),
+                start: Box::new(constant_expr(lsb)),
+                width: Box::new(constant_expr(msb - lsb + 1)),
+                ascending: true,
+            })
+        } else {
+            Ok(ast::Expr::ArrayIndexedPart {
+                name: name.to_string(),
+                indexes: indexes.to_vec(),
+                start: Box::new(constant_expr(msb)),
+                width: Box::new(constant_expr(lsb - msb + 1)),
+                ascending: false,
+            })
+        }
+    }
+
     pub(super) fn array_element_indexed_expr(
         &self,
         name: &str,

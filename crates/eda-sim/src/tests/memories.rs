@@ -77,6 +77,31 @@ fn sparse_memory_blocking_write_updates_continuous_reader() {
 }
 
 #[test]
+fn sparse_memory_part_write_following_whole_write_updates_reader() {
+    let mut design = sparse_memory_design(false);
+    design.initials = vec![Stmt::Block(vec![
+        Stmt::MemoryBl {
+            memory: 0,
+            indexes: vec![Expr::Const(LogicWord::from_u64(8, 5))],
+            e: Expr::Const(LogicWord::from_u64(8, 0x9c)),
+        },
+        Stmt::MemoryBlPart {
+            memory: 0,
+            indexes: vec![Expr::Const(LogicWord::from_u64(8, 5))],
+            start: Box::new(Expr::Const(LogicWord::from_u64(32, 1))),
+            width: 2,
+            ascending: true,
+            e: Expr::Const(LogicWord::from_u64(2, 0b01)),
+        },
+    ])];
+    let mut simulator = Simulator::new(&design).unwrap();
+    simulator.run_until(0).unwrap();
+    let value = simulator.read("q").unwrap();
+    assert_eq!(value.to_u64(), Some(154));
+    assert!(value.to_bin_str().ends_with("1010"));
+}
+
+#[test]
 fn sparse_memory_nonblocking_write_commits_after_active_region() {
     let design = sparse_memory_design(true);
     let mut simulator = Simulator::new(&design).unwrap();

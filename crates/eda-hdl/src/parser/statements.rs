@@ -664,6 +664,17 @@ impl Parser {
                                     ascending,
                                 });
                             }
+                            if self.eat_punct(":") {
+                                let msb = next;
+                                let lsb = self.parse_expr()?;
+                                self.expect_punct("]")?;
+                                return Ok(Expr::ArrayPart {
+                                    name,
+                                    indexes: indices,
+                                    msb: Box::new(msb),
+                                    lsb: Box::new(lsb),
+                                });
+                            }
                             self.expect_punct("]")?;
                             indices.push(next);
                         }

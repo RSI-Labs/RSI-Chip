@@ -674,6 +674,57 @@ endmodule
 }
 
 #[test]
+fn slang_and_bounded_paths_lower_array_element_simple_ranges() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("array-simple-range");
+    let source_path = root.join("simple-range.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module simple_range(input logic [1:0] addr, output logic [3:0] y);
+  logic [7:0] mem [0:0];
+  initial begin
+    mem[0] = 8'h9c;
+    mem[0][2:1] = 2'b01;
+  end
+  assign y = mem[addr][3:0];
+endmodule
+"#,
+    )
+    .expect("write array-element simple-range source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("simple_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower array-element simple range");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("simple_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower array-element simple range through bounded path");
+    assert_eq!(direct.memories.len(), 1);
+
+    let mut direct_simulator = Simulator::new(&direct).expect("create direct simulator");
+    direct_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 0))
+        .expect("set direct address");
+    assert_eq!(direct_simulator.read("y").unwrap().to_u64(), Some(0b1010));
+
+    let mut bounded_simulator = Simulator::new(&bounded).expect("create bounded simulator");
+    bounded_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 0))
+        .expect("set bounded address");
+    assert_eq!(bounded_simulator.read("y").unwrap().to_u64(), Some(0b1010));
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

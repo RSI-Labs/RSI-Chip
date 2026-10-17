@@ -300,6 +300,15 @@ impl<'a> Elaborator<'a> {
                 width,
                 ascending,
             } => self.array_element_indexed_expr(name, indexes, start, width, *ascending, env)?,
+            ast::Expr::ArrayPart {
+                name,
+                indexes,
+                msb,
+                lsb,
+            } => {
+                let normalized = self.normalize_array_part(name, indexes, msb, lsb, env)?;
+                self.elab_expr(&normalized, env)?
+            }
             ast::Expr::Member(object, field) => {
                 let (net, decl_width, range) = self.member_reference(env, object, field, false)?;
                 ExprIR::Ref {

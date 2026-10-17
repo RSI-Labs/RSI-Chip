@@ -695,6 +695,24 @@ impl<'a> Elaborator<'a> {
                 name, indexes, start, width, *ascending, e, false, env,
             );
         }
+        if let ast::Stmt::BL {
+            lv:
+                ast::Expr::ArrayPart {
+                    name,
+                    indexes,
+                    msb,
+                    lsb,
+                },
+            e,
+        } = s
+        {
+            let normalized = self.normalize_array_part(name, indexes, msb, lsb, env)?;
+            let transformed = ast::Stmt::BL {
+                lv: normalized,
+                e: e.clone(),
+            };
+            return self.elab_stmt(&transformed, env);
+        }
         if let ast::Stmt::NBL {
             lv:
                 ast::Expr::ArrayIndexedPart {
@@ -710,6 +728,24 @@ impl<'a> Elaborator<'a> {
             return self.array_element_indexed_statement(
                 name, indexes, start, width, *ascending, e, true, env,
             );
+        }
+        if let ast::Stmt::NBL {
+            lv:
+                ast::Expr::ArrayPart {
+                    name,
+                    indexes,
+                    msb,
+                    lsb,
+                },
+            e,
+        } = s
+        {
+            let normalized = self.normalize_array_part(name, indexes, msb, lsb, env)?;
+            let transformed = ast::Stmt::NBL {
+                lv: normalized,
+                e: e.clone(),
+            };
+            return self.elab_stmt(&transformed, env);
         }
         if let ast::Stmt::BL {
             lv:

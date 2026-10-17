@@ -418,6 +418,14 @@ pub enum Expr {
         width: Box<Expr>,
         ascending: bool,
     },
+    /// Simple range select of an unpacked-array element, such as
+    /// `memory[i][msb:lsb]`.
+    ArrayPart {
+        name: String,
+        indexes: Vec<Expr>,
+        msb: Box<Expr>,
+        lsb: Box<Expr>,
+    },
     /// SystemVerilog indexed part-select `name[start +: width]` or
     /// `name[start -: width]`.
     IndexedPart {
