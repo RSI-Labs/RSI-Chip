@@ -3611,6 +3611,84 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_task_local_conditionals() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-local-conditionals");
+    let source_path = root.join("task_local_conditionals.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_local_conditionals(
+  input logic select,
+  input int a,
+  input int b,
+  output int selected,
+  output int maybe_incremented
+);
+  task automatic pick(
+    input logic use_a,
+    input int a_value,
+    input int b_value,
+    output int result
+  );
+    int value = 0;
+    if (use_a) value = a_value;
+    else value = b_value;
+    result = value + 1;
+  endtask
+
+  task automatic increment_if(
+    input logic enable,
+    input int value,
+    output int result
+  );
+    int accumulated = 7;
+    if (enable) accumulated = value;
+    result = accumulated;
+  endtask
+
+  always_comb begin
+    pick(select, a, b, selected);
+    increment_if(select, a, maybe_incremented);
+  end
+endmodule
+"#,
+    )
+    .expect("write task-local conditional source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_local_conditionals"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task-local conditionals");
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create task-local conditional simulator");
+    for (select, a, b, selected, maybe_incremented) in
+        [(false, 11, 22, 23, 7), (true, 11, 22, 12, 11)]
+    {
+        simulator
+            .set_input("select", &LogicWord::from_u64(1, select as u64))
+            .unwrap();
+        simulator
+            .set_input("a", &LogicWord::from_u64(32, a))
+            .unwrap();
+        simulator
+            .set_input("b", &LogicWord::from_u64(32, b))
+            .unwrap();
+        assert_eq!(simulator.read("selected").unwrap().to_u64(), Some(selected));
+        assert_eq!(
+            simulator.read("maybe_incremented").unwrap().to_u64(),
+            Some(maybe_incremented)
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_recursive_tasks() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -339,6 +339,58 @@ impl SlangAstLowerer {
                 }
                 Ok(Some(assignment))
             }
+            Some("Conditional") => {
+                if string_field(value, "check").as_deref() != Some("None") {
+                    return Err(
+                        "direct task inlining does not support unique/priority conditionals".into(),
+                    );
+                }
+                let conditions = value
+                    .get("conditions")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "task conditional has no conditions".to_string())?;
+                if conditions.len() != 1 {
+                    return Err("direct task inlining supports one task condition".into());
+                }
+                let condition = conditions
+                    .first()
+                    .and_then(|condition| condition.get("expr"))
+                    .ok_or_else(|| "task conditional has no expression".to_string())?;
+                let condition = substitute_named_values(condition, environment);
+                let true_statement = value
+                    .get("ifTrue")
+                    .ok_or_else(|| "task conditional has no true branch".to_string())?;
+                let mut true_environment = environment.clone();
+                let true_body =
+                    self.inline_task_body(true_statement, &mut true_environment, locals)?;
+                let mut false_environment = environment.clone();
+                let false_body = match value.get("ifFalse") {
+                    Some(statement) => {
+                        self.inline_task_body(statement, &mut false_environment, locals)?
+                    }
+                    None => None,
+                };
+                merge_conditional_environment(
+                    environment,
+                    true_environment,
+                    false_environment,
+                    condition.clone(),
+                )?;
+                if true_body.is_none() && false_body.is_none() {
+                    return Ok(None);
+                }
+                let empty_block = json!({
+                    "kind": "Block",
+                    "blockKind": "Sequential",
+                });
+                Ok(Some(json!({
+                    "kind": "Conditional",
+                    "conditions": [{"expr": condition}],
+                    "check": "None",
+                    "ifTrue": true_body.unwrap_or_else(|| empty_block.clone()),
+                    "ifFalse": false_body.unwrap_or(empty_block),
+                })))
+            }
             Some(kind) => {
                 if task_contains_local_assignment(value, locals) {
                     return Err(format!(
