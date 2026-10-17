@@ -111,6 +111,8 @@ pub struct SlangExpressionSummary {
     /// expressions slang represented as `IntegerLiteral`. Other literal forms
     /// remain unresolved until typed lowering preserves their exact type.
     pub literal: Option<String>,
+    /// Elaborated replication count for slang `Replication` nodes.
+    pub repeat_count: Option<usize>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 

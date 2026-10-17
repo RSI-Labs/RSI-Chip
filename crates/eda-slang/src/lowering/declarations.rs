@@ -49,7 +49,7 @@ impl SlangAstLowerer {
             ));
         }
         self.lower_memory_declaration(member, name)?;
-        let symbol = self.symbols[name];
+        let symbol = self.symbols[name].clone();
         // Child PortDecl uses In only as internal connection metadata. The
         // actual storage contract is represented by MemoryConnection.
         self.design.ports.push(eda_core::ir::PortDecl {
@@ -134,6 +134,7 @@ impl SlangAstLowerer {
                 width: memory.element_width,
                 signed: memory.signed,
                 bounds: Some((memory.element_msb, memory.element_lsb)),
+                dimensions: Vec::new(),
                 memory: Some(memory_index),
             },
         );
@@ -154,7 +155,7 @@ impl SlangAstLowerer {
         kind: &str,
     ) -> Result<AstLoweredSymbol, String> {
         if self.symbols.contains_key(name) {
-            let existing = self.symbols[name];
+            let existing = self.symbols[name].clone();
             let type_name = string_field(member, "type").unwrap_or_default();
             let shape = simple_type_shape(&type_name)
                 .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
@@ -190,6 +191,7 @@ impl SlangAstLowerer {
             width: shape.width,
             signed,
             bounds: shape.bounds,
+            dimensions: shape.dimensions,
             memory: None,
         };
         self.design.n_nets += shape.width;
@@ -200,7 +202,7 @@ impl SlangAstLowerer {
             is_signed: signed,
             base,
         });
-        self.symbols.insert(name.to_string(), symbol);
+        self.symbols.insert(name.to_string(), symbol.clone());
         Ok(symbol)
     }
 

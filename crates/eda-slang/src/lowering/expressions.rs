@@ -1,7 +1,9 @@
 //! Expression operator and constant helpers for direct slang lowering.
 
 use crate::ast_util::{expression_symbol, integer_literal_word, named_constant_word, string_field};
+use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
+use eda_core::logic::LogicWord;
 use serde_json::Value;
 
 use super::hierarchy::full_range;
@@ -19,6 +21,8 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
         Some("BitwiseXor") => Ok(eda_core::ir::BinOp::Xor),
         Some("LogicalShiftLeft") => Ok(eda_core::ir::BinOp::Shl),
         Some("LogicalShiftRight") => Ok(eda_core::ir::BinOp::Shr),
+        Some("ArithmeticShiftLeft") => Ok(eda_core::ir::BinOp::Shl),
+        Some("ArithmeticShiftRight") => Ok(eda_core::ir::BinOp::Shr),
         Some("LogicalAnd") => Ok(eda_core::ir::BinOp::LogAnd),
         Some("LogicalOr") => Ok(eda_core::ir::BinOp::LogOr),
         Some("Equality") => Ok(eda_core::ir::BinOp::Eq),
@@ -262,6 +266,20 @@ impl super::SlangAstLowerer {
                 }
                 Ok(Expr::Concat(parts))
             }
+            "Replication" => {
+                let count = value
+                    .get("count")
+                    .ok_or_else(|| "replication has no count".to_string())?;
+                let concat = value
+                    .get("concat")
+                    .ok_or_else(|| "replication has no concatenated value".to_string())?;
+                let times = usize::try_from(constant_i64(count)?)
+                    .map_err(|_| "replication count is out of range".to_string())?;
+                Ok(Expr::Repeat {
+                    times,
+                    e: Box::new(self.lower_expression(concat)?),
+                })
+            }
             "ConditionalOp" => {
                 let conditions = value
                     .get("conditions")
@@ -305,6 +323,9 @@ impl super::SlangAstLowerer {
                         signed,
                     });
                 }
+                if let Some(selected) = self.lower_packed_element_select(value)? {
+                    return Ok(selected);
+                }
                 let (base, index) = self.lower_constant_select(value)?;
                 Ok(Expr::Index {
                     e: Box::new(base),
@@ -337,6 +358,147 @@ impl super::SlangAstLowerer {
         }
     }
 
+    pub(super) fn lower_packed_element_select(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+            return Ok(None);
+        }
+        let mut selectors = Vec::new();
+        let mut selected = value;
+        while string_field(selected, "kind").as_deref() == Some("ElementSelect") {
+            selectors.push(
+                selected
+                    .get("selector")
+                    .cloned()
+                    .ok_or_else(|| "packed select has no selector".to_string())?,
+            );
+            selected = selected
+                .get("value")
+                .ok_or_else(|| "packed select has no selected value".to_string())?;
+        }
+        let Some(symbol) = self.direct_packed_symbol(selected)? else {
+            return Ok(None);
+        };
+        selectors.reverse();
+        if selectors.is_empty() || selectors.len() > symbol.dimensions.len() {
+            return Err(format!(
+                "packed select rank {} exceeds the declaration's {} packed dimensions",
+                selectors.len(),
+                symbol.dimensions.len()
+            ));
+        }
+        let base = self.lower_expression(selected)?;
+        self.select_packed_dimension(&symbol, &selectors, 0, base)
+            .map(Some)
+    }
+
+    fn select_packed_dimension(
+        &self,
+        symbol: &AstLoweredSymbol,
+        selectors: &[serde_json::Value],
+        level: usize,
+        base: eda_core::ir::Expr,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let Some(dimension) = symbol.dimensions.get(level) else {
+            return Err("packed select has too many dimensions".to_string());
+        };
+        let selector = &selectors[level];
+        let selector_width = string_field(selector, "type")
+            .and_then(|type_name| simple_type_width(&type_name))
+            .unwrap_or(32)
+            .max(1);
+        let lower = dimension.msb.min(dimension.lsb);
+        let upper = dimension.msb.max(dimension.lsb);
+        let mut constant_index = None;
+        if integer_literal_word(selector).is_some() || string_field(selector, "constant").is_some()
+        {
+            let index = constant_i64(selector)?;
+            if index < lower || index > upper {
+                return Err(format!("packed select index {index} is out of range"));
+            }
+            constant_index = Some(index);
+        }
+
+        let lowered_selector = self.lower_expression(selector)?;
+        let mut selected = Expr::Const(LogicWord::xes(dimension.element_width));
+        for logical_index in lower..=upper {
+            let candidate = self.packed_dimension_candidate(
+                dimension,
+                logical_index,
+                level,
+                symbol,
+                selectors,
+                base.clone(),
+            )?;
+            if constant_index == Some(logical_index) {
+                return Ok(candidate);
+            }
+            if constant_index.is_some() {
+                continue;
+            }
+            let condition = Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(lowered_selector.clone()),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    selector_width,
+                    logical_index as u64,
+                ))),
+            };
+            selected = Expr::Cond {
+                c: Box::new(condition),
+                t: Box::new(candidate),
+                f: Box::new(selected),
+            };
+        }
+        if constant_index.is_some() {
+            return Err("constant packed select did not match a declared index".to_string());
+        }
+        Ok(selected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn packed_dimension_candidate(
+        &self,
+        dimension: &AstPackedDimension,
+        logical_index: i64,
+        level: usize,
+        symbol: &AstLoweredSymbol,
+        selectors: &[serde_json::Value],
+        base: eda_core::ir::Expr,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let coordinate = if dimension.msb >= dimension.lsb {
+            logical_index - dimension.lsb
+        } else {
+            dimension.lsb - logical_index
+        };
+        let coordinate = usize::try_from(coordinate)
+            .ok()
+            .filter(|coordinate| *coordinate < dimension.length)
+            .ok_or_else(|| {
+                format!(
+                    "packed select maps to an invalid physical coordinate: index {logical_index}, dimension [{}:{}]",
+                    dimension.msb,
+                    dimension.lsb
+                )
+            })?;
+        let width = dimension.element_width;
+        let start = coordinate * width;
+        let candidate = eda_core::ir::Expr::Index {
+            e: Box::new(base),
+            msb: start + width - 1,
+            lsb: start,
+        };
+        if level + 1 == selectors.len() {
+            Ok(candidate)
+        } else {
+            self.select_packed_dimension(symbol, selectors, level + 1, candidate)
+        }
+    }
+
     pub(super) fn lower_constant_select(
         &self,
         value: &serde_json::Value,
@@ -350,7 +512,7 @@ impl super::SlangAstLowerer {
         let symbol = self
             .direct_packed_symbol(selected)?
             .ok_or_else(|| "direct packed selects require a named declaration".to_string())?;
-        let index = self.declared_bit_index(symbol, constant_i64(selector)?)?;
+        let index = self.declared_bit_index(&symbol, constant_i64(selector)?)?;
         let base = self.lower_expression(selected)?;
         Ok((base, index))
     }
@@ -364,12 +526,12 @@ impl super::SlangAstLowerer {
         }
         let name = expression_symbol(value)
             .ok_or_else(|| "packed select has no declaration symbol".to_string())?;
-        Ok(self.symbols.get(&name).copied())
+        Ok(self.symbols.get(&name).cloned())
     }
 
     pub(super) fn declared_bit_index(
         &self,
-        symbol: AstLoweredSymbol,
+        symbol: &AstLoweredSymbol,
         index: i64,
     ) -> Result<usize, String> {
         let Some((msb, lsb)) = symbol.bounds else {
@@ -515,7 +677,7 @@ impl super::SlangAstLowerer {
         let symbol = self
             .direct_packed_symbol(selected)?
             .ok_or_else(|| "direct packed selects require a named declaration".to_string())?;
-        let index = self.declared_bit_index(symbol, constant_i64(selector)?)?;
+        let index = self.declared_bit_index(&symbol, constant_i64(selector)?)?;
         Ok((self.lower_lvalue(selected)?, index))
     }
 
@@ -567,8 +729,8 @@ impl super::SlangAstLowerer {
                 "packed range select [{left}:{right}] is invalid for declaration [{declaration_msb}:{declaration_lsb}]"
             ));
         }
-        let mapped_left = self.declared_bit_index(symbol, left)?;
-        let mapped_right = self.declared_bit_index(symbol, right)?;
+        let mapped_left = self.declared_bit_index(&symbol, left)?;
+        let mapped_right = self.declared_bit_index(&symbol, right)?;
         Ok((mapped_left.max(mapped_right), mapped_left.min(mapped_right)))
     }
 

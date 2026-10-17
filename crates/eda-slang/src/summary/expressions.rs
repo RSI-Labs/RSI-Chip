@@ -1,8 +1,8 @@
 //! Expression summaries, fingerprints, and IR-shape comparison helpers.
 
 use crate::ast_util::{
-    bool_field, expression_symbol, expression_target_names, instance_parameters, literal_word,
-    string_field,
+    bool_field, expression_symbol, expression_target_names, instance_parameters,
+    integer_literal_word, literal_word, named_constant_word, string_field,
 };
 use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
@@ -30,6 +30,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         type_signed,
         symbol: expression_symbol(value),
         literal,
+        repeat_count: repeat_count(value),
         operands: expression_operands(value),
     }
 }
@@ -42,6 +43,7 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         type_signed: None,
         symbol: None,
         literal: None,
+        repeat_count: None,
         operands: Vec::new(),
     }
 }
@@ -85,6 +87,11 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
                 operands.extend(values.iter().map(expression_summary));
             }
         }
+        "Replication" => {
+            if let Some(concat) = value.get("concat") {
+                operands.push(expression_summary(concat));
+            }
+        }
         "ConditionalOp" => {
             if let Some(conditions) = value.get("conditions").and_then(Value::as_array) {
                 operands.extend(
@@ -103,6 +110,14 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
         _ => {}
     }
     operands
+}
+
+fn repeat_count(value: &Value) -> Option<usize> {
+    let count = value.get("count")?;
+    integer_literal_word(count)
+        .or_else(|| named_constant_word(count))
+        .and_then(|word| word.to_u64())
+        .and_then(|count| usize::try_from(count).ok())
 }
 
 pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummary> {
@@ -157,6 +172,8 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("BinaryOp", "BinaryAnd") => Some("And"),
         ("BinaryOp", "BinaryOr") => Some("Or"),
         ("BinaryOp", "BitwiseXor") => Some("Xor"),
+        ("BinaryOp", "LogicalShiftLeft" | "ArithmeticShiftLeft") => Some("Shl"),
+        ("BinaryOp", "LogicalShiftRight" | "ArithmeticShiftRight") => Some("Shr"),
         ("BinaryOp", "LogicalAnd") => Some("LogAnd"),
         ("BinaryOp", "LogicalOr") => Some("LogOr"),
         ("BinaryOp", "Equality") => Some("Eq"),
@@ -209,6 +226,13 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         let operand_fingerprint =
             slang_expression_fingerprint_with_parameters(operand, parameters)?;
         return Some(format!("Not:1:u[Reduction:1:u[{operand_fingerprint}]]"));
+    }
+    if expression.kind == "Replication" {
+        let count = expression.repeat_count?;
+        let operand = expression.operands.first()?;
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters)?;
+        return Some(format!("Repeat:{count}:u[{operand_fingerprint}]"));
     }
     if expression.kind == "Conversion" {
         let operand = expression.operands.first()?;
@@ -407,6 +431,9 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             word.width(),
             word.to_bin_str()
         );
+    }
+    if let Expr::Repeat { times, e } = expression {
+        return format!("Repeat:{times}:u[{}]", design_expr_fingerprint(design, e));
     }
     let operands: Vec<String> = match expression {
         Expr::Const(_) | Expr::Ref { .. } | Expr::MemoryRead { .. } => Vec::new(),

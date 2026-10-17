@@ -3,9 +3,20 @@
 use eda_core::ir::MemoryDimension;
 
 #[derive(Clone, Copy)]
+pub(super) struct AstPackedDimension {
+    pub msb: i64,
+    pub lsb: i64,
+    pub length: usize,
+    /// Width remaining after this outer dimension, including all inner packed
+    /// dimensions. Selecting one element of this dimension has this width.
+    pub element_width: usize,
+}
+
+#[derive(Clone)]
 pub(super) struct AstTypeShape {
     pub width: usize,
     pub bounds: Option<(i64, i64)>,
+    pub dimensions: Vec<AstPackedDimension>,
 }
 
 pub(super) struct AstMemoryType {
@@ -18,8 +29,14 @@ pub(super) struct AstMemoryType {
 }
 
 pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
-    simple_type_width(type_name)
-        .map(|_| type_name.split_whitespace().any(|token| token == "signed"))
+    simple_type_width(type_name).map(|_| {
+        type_name
+            .split('[')
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|token| token == "signed")
+    })
 }
 
 fn parse_type_range(text: &str) -> Option<(i64, i64)> {
@@ -100,18 +117,31 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
         }
     };
     let ranges = explicit_type_ranges(type_name)?;
-    let mut width: usize = element_width;
-    for (left, right) in &ranges {
+    let mut dimensions = Vec::<AstPackedDimension>::new();
+    let mut suffix_width: usize = element_width;
+    for (left, right) in ranges.iter().rev() {
         let range_width =
             usize::try_from(((*left as i128) - (*right as i128)).unsigned_abs() + 1).ok()?;
-        width = width.checked_mul(range_width)?;
+        dimensions.push(AstPackedDimension {
+            msb: *left,
+            lsb: *right,
+            length: range_width,
+            element_width: suffix_width,
+        });
+        suffix_width = suffix_width.checked_mul(range_width)?;
     }
+    dimensions.reverse();
+    let width = suffix_width;
     let bounds = match ranges.as_slice() {
         [] => Some((width as i64 - 1, 0)),
         [only] => Some(*only),
         _ => None,
     };
-    Some(AstTypeShape { width, bounds })
+    Some(AstTypeShape {
+        width,
+        bounds,
+        dimensions,
+    })
 }
 
 fn explicit_type_ranges(type_name: &str) -> Option<Vec<(i64, i64)>> {

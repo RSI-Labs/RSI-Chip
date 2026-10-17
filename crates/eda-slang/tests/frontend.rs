@@ -1809,6 +1809,7 @@ endmodule
                 type_signed: None,
                 symbol: None,
                 literal: None,
+                repeat_count: None,
                 operands: Vec::new(),
             },
         });
@@ -2166,24 +2167,188 @@ endmodule
         r#"
 module multi_packed_select(
   input logic [3:0][7:0] a,
-  output logic [7:0] y
+  input logic [1:0] selector,
+  output logic [7:0] y,
+  output logic [7:0] dynamic_y,
+  output logic nested_bit
 );
   assign y = a[3];
+  assign dynamic_y = a[selector];
+  assign nested_bit = a[3][7];
 endmodule
 "#,
     )
     .expect("write multi-packed select source");
-    let error = slang
+    let selected = slang
         .compile_files_via_ast(
             std::slice::from_ref(&selected_path),
             Some("multi_packed_select"),
             &PreprocessOptions::default(),
         )
-        .expect_err("multi-packed dimension selects must not be flattened to one bit");
-    assert!(
-        error.contains("multi-packed selects require dimension-aware lowering"),
-        "unexpected error: {error}"
-    );
+        .expect("lower constant, dynamic, and nested packed selects");
+
+    let mut simulator = Simulator::new(&selected).expect("create packed-select simulator");
+    for selector in 0..4_u64 {
+        simulator
+            .set_input("a", &LogicWord::from_u64(32, 0xB234_5678))
+            .unwrap();
+        simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0xB2));
+        let expected = match selector {
+            0 => 0x78,
+            1 => 0x56,
+            2 => 0x34,
+            _ => 0xB2,
+        };
+        assert_eq!(
+            simulator.read("dynamic_y").unwrap().to_u64(),
+            Some(expected)
+        );
+        assert_eq!(simulator.read("nested_bit").unwrap().to_u64(), Some(1));
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_replication() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-replication");
+    let source_path = root.join("replication.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module replication(input logic [3:0] a, output logic [15:0] y);
+  assign y = {4{a}};
+endmodule
+"#,
+    )
+    .expect("write replication source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("replication"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower replication");
+    assert_eq!(design.assigns.len(), 1);
+    assert_eq!(design.assigns[0].e.width(), 16);
+
+    let mut simulator = Simulator::new(&design).expect("create replication simulator");
+    for value in [0x3_u64, 0x5, 0xa, 0xf] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(4, value))
+            .unwrap();
+        let expected = 0x1111_u64 * value;
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(expected));
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_packed_select() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-packed");
+    let source_path = root.join("dynamic_packed.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_packed(
+  input logic [7:0] a,
+  input logic [2:0] selector,
+  output logic y
+);
+  assign y = a[selector];
+endmodule
+"#,
+    )
+    .expect("write dynamic packed-select source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_packed"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower dynamic packed select");
+    assert_eq!(design.assigns.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic packed simulator");
+    for (selector, expected) in [(0_u64, 1_u64), (1, 0), (6, 0), (7, 1)] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(8, 0x81))
+            .unwrap();
+        simulator
+            .set_input("selector", &LogicWord::from_u64(3, selector))
+            .unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(expected));
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_arithmetic_shifts() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-arithmetic-shift");
+    let source_path = root.join("arithmetic_shift.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module arithmetic_shift(
+  input logic signed [7:0] a,
+  input logic [2:0] n,
+  output logic signed [7:0] left,
+  output logic signed [7:0] right
+);
+  assign left = a <<< n;
+  assign right = a >>> n;
+endmodule
+"#,
+    )
+    .expect("write arithmetic-shift source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("arithmetic_shift"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower arithmetic shifts");
+    assert_eq!(design.assigns.len(), 2);
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "a" && declaration.is_signed));
+
+    let mut simulator = Simulator::new(&design).expect("create shift simulator");
+    for (shift, expected_left, expected_right) in [
+        (0_u64, 0xf8_u64, 0xf8_u64),
+        (1, 0xf0, 0xfc),
+        (2, 0xe0, 0xfe),
+        (7, 0x00, 0xff),
+    ] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(8, 0xf8))
+            .unwrap();
+        simulator
+            .set_input("n", &LogicWord::from_u64(3, shift))
+            .unwrap();
+        assert_eq!(
+            simulator.read("left").unwrap().to_u64(),
+            Some(expected_left),
+            "shift left {shift}"
+        );
+        assert_eq!(
+            simulator.read("right").unwrap().to_u64(),
+            Some(expected_right),
+            "shift right {shift}"
+        );
+    }
 }
 
 #[test]

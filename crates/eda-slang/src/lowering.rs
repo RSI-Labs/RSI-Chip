@@ -34,15 +34,15 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     Ok(root.clone())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AstLoweredSymbol {
     base: usize,
     width: usize,
     signed: bool,
-    /// Declared index bounds for a simple packed vector. `None` means the
-    /// declaration has multiple packed dimensions and cannot be selected with
-    /// the current one-level lowering.
+    /// Declared bounds for a simple packed vector and all packed dimensions
+    /// used to map logical selects onto canonical physical bits.
     bounds: Option<(i64, i64)>,
+    dimensions: Vec<crate::types::AstPackedDimension>,
     memory: Option<usize>,
 }
 

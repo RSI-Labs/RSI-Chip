@@ -389,7 +389,7 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn push_assignment(&mut self, name: String, rhs: eda_core::ir::Expr) {
-        let symbol = self.symbols[&name];
+        let symbol = self.symbols[&name].clone();
         self.design.assigns.push(eda_core::ir::Assign {
             lv: eda_core::ir::LValue {
                 net: symbol.base,
