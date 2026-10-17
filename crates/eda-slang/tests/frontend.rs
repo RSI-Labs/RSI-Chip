@@ -2614,6 +2614,254 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_integral_conversions() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-conversions");
+    let source_path = root.join("conversions.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module conversions(
+  input byte signed source,
+  input logic [15:0] wide,
+  output logic [15:0] widen,
+  output logic [3:0] truncate,
+  output logic [15:0] unsigned_same,
+  output logic signed [15:0] signed_widen,
+  output logic signed_lt_zero,
+  output logic unsigned_lt_zero
+);
+  assign widen = 16'(source);
+  assign truncate = 4'(wide);
+  assign unsigned_same = unsigned'(source);
+  assign signed_widen = signed'(16'(source));
+  assign signed_lt_zero = signed_widen < 16'sd0;
+  assign unsigned_lt_zero = widen < 16'd0;
+endmodule
+"#,
+    )
+    .expect("write integral-conversion source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("conversions"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower integral conversions");
+    let signed_output = design
+        .net_decls
+        .iter()
+        .find(|declaration| declaration.name == "signed_widen")
+        .expect("signed conversion output");
+    assert!(signed_output.is_signed);
+
+    let mut simulator = Simulator::new(&design).expect("create conversion simulator");
+    simulator
+        .set_input("source", &LogicWord::from_u64(8, 0xfb))
+        .unwrap();
+    simulator
+        .set_input("wide", &LogicWord::from_u64(16, 0xabcd))
+        .unwrap();
+
+    assert_eq!(simulator.read("widen").unwrap().to_u64(), Some(0xfffb));
+    assert_eq!(simulator.read("truncate").unwrap().to_u64(), Some(0xd));
+    assert_eq!(
+        simulator.read("unsigned_same").unwrap().to_u64(),
+        Some(0x00fb)
+    );
+    assert_eq!(simulator.read("signed_widen").unwrap().to_hex_str(), "fffb");
+    assert_eq!(simulator.read("signed_lt_zero").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("unsigned_lt_zero").unwrap().to_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_case_equality() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-case-equality");
+    let source_path = root.join("case_equality.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module case_equality(
+  input logic [3:0] a,
+  input logic [3:0] b,
+  output logic equal,
+  output logic unequal
+);
+  assign equal = a === b;
+  assign unequal = a !== b;
+endmodule
+"#,
+    )
+    .expect("write case-equality source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("case_equality"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower case equality");
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create case-equality simulator");
+    simulator
+        .set_input("a", &LogicWord::parse(4, "'b1x0z").expect("a with X/Z"))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::parse(4, "'b1x0z").expect("matching X/Z"))
+        .unwrap();
+    assert_eq!(simulator.read("equal").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("unequal").unwrap().to_u64(), Some(0));
+
+    simulator
+        .set_input(
+            "b",
+            &LogicWord::parse(4, "'b1x00").expect("different Z bit"),
+        )
+        .unwrap();
+    assert_eq!(simulator.read("equal").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("unequal").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_unary_operators() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-unary-operators");
+    let source_path = root.join("unary_operators.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module unary_operators(
+  input int signed value,
+  input logic [3:0] bits,
+  output int signed plus,
+  output int signed minus,
+  output logic reduction_and,
+  output logic reduction_nand,
+  output logic reduction_or,
+  output logic reduction_nor,
+  output logic reduction_xor,
+  output logic reduction_xnor
+);
+  assign plus = +value;
+  assign minus = -value;
+  assign reduction_and = &bits;
+  assign reduction_nand = ~&bits;
+  assign reduction_or = |bits;
+  assign reduction_nor = ~|bits;
+  assign reduction_xor = ^bits;
+  assign reduction_xnor = ~^bits;
+endmodule
+"#,
+    )
+    .expect("write unary-operator source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("unary_operators"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower unary operators");
+    assert_eq!(design.assigns.len(), 8);
+
+    let mut simulator = Simulator::new(&design).expect("create unary simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(32, 5))
+        .unwrap();
+    simulator
+        .set_input("bits", &LogicWord::from_u64(4, 0b0011))
+        .unwrap();
+    assert_eq!(simulator.read("plus").unwrap().to_u64(), Some(5));
+    assert_eq!(simulator.read("minus").unwrap().to_hex_str(), "fffffffb");
+    assert_eq!(simulator.read("reduction_and").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("reduction_nand").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("reduction_or").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("reduction_nor").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("reduction_xor").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("reduction_xnor").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_logical_implication_and_equivalence() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-logical-composition");
+    let source_path = root.join("logical_composition.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module logical_composition(
+  input logic a,
+  input logic b,
+  output logic imply_00,
+  output logic imply_01,
+  output logic imply_10,
+  output logic imply_11,
+  output logic equiv_00,
+  output logic equiv_01,
+  output logic equiv_10,
+  output logic equiv_11
+);
+  assign imply_00 = a -> b;
+  assign imply_01 = a -> b;
+  assign imply_10 = a -> b;
+  assign imply_11 = a -> b;
+  assign equiv_00 = a <-> b;
+  assign equiv_01 = a <-> b;
+  assign equiv_10 = a <-> b;
+  assign equiv_11 = a <-> b;
+endmodule
+"#,
+    )
+    .expect("write logical-composition source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("logical_composition"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower logical composition");
+    assert_eq!(design.assigns.len(), 8);
+
+    let mut simulator = Simulator::new(&design).expect("create logical simulator");
+    for (a, b, label) in [
+        (false, false, "00"),
+        (false, true, "01"),
+        (true, false, "10"),
+        (true, true, "11"),
+    ] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(1, a as u64))
+            .unwrap();
+        simulator
+            .set_input("b", &LogicWord::from_u64(1, b as u64))
+            .unwrap();
+        assert_eq!(
+            simulator.read(&format!("imply_{label}")).unwrap().to_u64(),
+            Some((!a || b) as u64)
+        );
+        assert_eq!(
+            simulator.read(&format!("equiv_{label}")).unwrap().to_u64(),
+            Some((a == b) as u64)
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unimplemented_case_and_priority_semantics() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

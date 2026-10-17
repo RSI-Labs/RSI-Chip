@@ -30,6 +30,8 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
         Some("LogicalOr") => Ok(eda_core::ir::BinOp::LogOr),
         Some("Equality") => Ok(eda_core::ir::BinOp::Eq),
         Some("Inequality") => Ok(eda_core::ir::BinOp::Ne),
+        Some("CaseEquality") => Ok(eda_core::ir::BinOp::CaseEq),
+        Some("CaseInequality") => Ok(eda_core::ir::BinOp::CaseNe),
         Some("LessThan") => Ok(eda_core::ir::BinOp::Lt),
         Some("LessThanEqual") => Ok(eda_core::ir::BinOp::Le),
         Some("GreaterThan") => Ok(eda_core::ir::BinOp::Gt),
@@ -190,7 +192,17 @@ impl super::SlangAstLowerer {
             "IntegerLiteral" => {
                 let word = integer_literal_word(value)
                     .ok_or_else(|| "invalid slang integer literal".to_string())?;
-                Ok(Expr::Const(word))
+                let signed = string_field(value, "type")
+                    .and_then(|type_name| simple_type_signed(&type_name))
+                    .unwrap_or(false);
+                if signed {
+                    Ok(Expr::Signed {
+                        e: Box::new(Expr::Const(word)),
+                        signed,
+                    })
+                } else {
+                    Ok(Expr::Const(word))
+                }
             }
             "Conversion" => {
                 let operand = value
@@ -203,53 +215,73 @@ impl super::SlangAstLowerer {
                     })?;
                     return self.lower_streaming(operand, target_width);
                 }
-                let target_type = string_field(value, "type").unwrap_or_default();
-                let operand_type = string_field(operand, "type").unwrap_or_default();
-                let target = (
-                    simple_type_width(&target_type),
-                    simple_type_signed(&target_type),
-                );
-                let source = (
-                    simple_type_width(&operand_type),
-                    simple_type_signed(&operand_type),
-                );
-                if target != source {
-                    return Err(format!(
-                        "direct slang-AST lowering does not support conversion '{target_type}' from '{operand_type}'"
-                    ));
-                }
-                self.lower_expression(operand)
+                self.lower_integral_conversion(value)
             }
             "UnaryOp" => {
-                let op = match string_field(value, "op").as_deref() {
-                    Some("BitwiseNot") => UnOp::Not,
-                    Some("LogicalNot") => UnOp::Not,
-                    Some("BitwiseAnd") => UnOp::AndR,
-                    Some("BitwiseOr") => UnOp::OrR,
-                    Some("BitwiseXor") => UnOp::XorR,
-                    Some(op) => {
-                        return Err(format!(
-                            "direct slang-AST lowering does not support unary operator '{op}'"
-                        ))
-                    }
-                    None => return Err("unary expression has no operator".into()),
-                };
                 let operand = value
                     .get("operand")
                     .ok_or_else(|| "unary expression has no operand".to_string())?;
-                if string_field(value, "op").as_deref() == Some("LogicalNot") {
-                    return Ok(Expr::Un {
+                match string_field(value, "op").as_deref() {
+                    Some("LogicalNot") => Ok(Expr::Un {
                         op: UnOp::Not,
                         a: Box::new(Expr::Un {
                             op: UnOp::OrR,
                             a: Box::new(self.lower_expression(operand)?),
                         }),
-                    });
+                    }),
+                    Some("BitwiseNot" | "BitwiseAnd" | "BitwiseOr" | "BitwiseXor") => {
+                        let op = match string_field(value, "op").as_deref() {
+                            Some("BitwiseAnd") => UnOp::AndR,
+                            Some("BitwiseOr") => UnOp::OrR,
+                            Some("BitwiseXor") => UnOp::XorR,
+                            _ => UnOp::Not,
+                        };
+                        Ok(Expr::Un {
+                            op,
+                            a: Box::new(self.lower_expression(operand)?),
+                        })
+                    }
+                    Some("BitwiseNand" | "BitwiseNor" | "BitwiseXnor") => {
+                        let reduction = match string_field(value, "op").as_deref() {
+                            Some("BitwiseNand") => UnOp::AndR,
+                            Some("BitwiseNor") => UnOp::OrR,
+                            _ => UnOp::XorR,
+                        };
+                        Ok(Expr::Un {
+                            op: UnOp::Not,
+                            a: Box::new(Expr::Un {
+                                op: reduction,
+                                a: Box::new(self.lower_expression(operand)?),
+                            }),
+                        })
+                    }
+                    Some("Plus") => self.lower_expression(operand),
+                    Some("Minus") => {
+                        let expression = self.lower_expression(operand)?;
+                        let type_name = string_field(value, "type").unwrap_or_default();
+                        let width = simple_type_width(&type_name)
+                            .unwrap_or(expression.width())
+                            .max(1);
+                        let zero = Expr::Const(LogicWord::zero(width));
+                        let zero = if simple_type_signed(&type_name).unwrap_or(false) {
+                            Expr::Signed {
+                                e: Box::new(zero),
+                                signed: true,
+                            }
+                        } else {
+                            zero
+                        };
+                        Ok(Expr::Bin {
+                            op: eda_core::ir::BinOp::Sub,
+                            a: Box::new(zero),
+                            b: Box::new(expression),
+                        })
+                    }
+                    Some(op) => Err(format!(
+                        "direct slang-AST lowering does not support unary operator '{op}'"
+                    )),
+                    None => Err("unary expression has no operator".into()),
                 }
-                Ok(Expr::Un {
-                    op,
-                    a: Box::new(self.lower_expression(operand)?),
-                })
             }
             "BinaryOp" => {
                 if matches!(
@@ -264,6 +296,47 @@ impl super::SlangAstLowerer {
                         });
                     }
                     return Ok(equality);
+                }
+                if matches!(
+                    string_field(value, "op").as_deref(),
+                    Some("LogicalImplication" | "LogicalEquivalence")
+                ) {
+                    let left = value
+                        .get("left")
+                        .ok_or_else(|| "logical expression has no left operand".to_string())?;
+                    let right = value
+                        .get("right")
+                        .ok_or_else(|| "logical expression has no right operand".to_string())?;
+                    let left = self.lower_expression(left)?;
+                    let right = self.lower_expression(right)?;
+                    let not_left = Expr::Un {
+                        op: UnOp::Not,
+                        a: Box::new(left.clone()),
+                    };
+                    if string_field(value, "op").as_deref() == Some("LogicalImplication") {
+                        return Ok(Expr::Bin {
+                            op: eda_core::ir::BinOp::LogOr,
+                            a: Box::new(not_left),
+                            b: Box::new(right.clone()),
+                        });
+                    }
+                    let not_right = Expr::Un {
+                        op: UnOp::Not,
+                        a: Box::new(right.clone()),
+                    };
+                    return Ok(Expr::Bin {
+                        op: eda_core::ir::BinOp::LogAnd,
+                        a: Box::new(Expr::Bin {
+                            op: eda_core::ir::BinOp::LogOr,
+                            a: Box::new(not_left),
+                            b: Box::new(right.clone()),
+                        }),
+                        b: Box::new(Expr::Bin {
+                            op: eda_core::ir::BinOp::LogOr,
+                            a: Box::new(not_right),
+                            b: Box::new(left),
+                        }),
+                    });
                 }
                 if string_field(value, "op").as_deref() == Some("Power") {
                     let too_wide = ["left", "right"].iter().any(|field| {
@@ -588,6 +661,79 @@ impl super::SlangAstLowerer {
             });
         }
         Ok(Expr::Concat(reversed_blocks))
+    }
+
+    pub(super) fn lower_integral_conversion(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        let operand = value
+            .get("operand")
+            .ok_or_else(|| "conversion has no operand".to_string())?;
+        let target_type = string_field(value, "type").unwrap_or_default();
+        let source_type = string_field(operand, "type").unwrap_or_default();
+        let (target_width, target_signed) = match (
+            simple_type_width(&target_type),
+            simple_type_signed(&target_type),
+        ) {
+            (Some(width), Some(signed)) if width > 0 => (width, signed),
+            _ => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support conversion target '{target_type}'"
+                ))
+            }
+        };
+        let (source_width, source_signed) = match (
+            simple_type_width(&source_type),
+            simple_type_signed(&source_type),
+        ) {
+            (Some(width), Some(signed)) if width > 0 => (width, signed),
+            _ => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support conversion operand '{source_type}'"
+                ))
+            }
+        };
+
+        let expression = self.lower_expression(operand)?;
+        if target_width == source_width
+            && target_signed == source_signed
+            && expression.is_signed() == target_signed
+        {
+            return Ok(expression);
+        }
+
+        let resized = if target_width < source_width {
+            Expr::Index {
+                e: Box::new(expression),
+                msb: target_width - 1,
+                lsb: 0,
+            }
+        } else if target_width > source_width {
+            let extension = target_width - source_width;
+            let padding = if source_signed {
+                let sign = Expr::Index {
+                    e: Box::new(expression.clone()),
+                    msb: source_width - 1,
+                    lsb: source_width - 1,
+                };
+                Expr::Repeat {
+                    times: extension,
+                    e: Box::new(sign),
+                }
+            } else {
+                Expr::Const(LogicWord::zero(extension))
+            };
+            Expr::Concat(vec![padding, expression])
+        } else {
+            expression
+        };
+        Ok(Expr::Signed {
+            e: Box::new(resized),
+            signed: target_signed,
+        })
     }
 
     pub(super) fn lower_wildcard_equality(

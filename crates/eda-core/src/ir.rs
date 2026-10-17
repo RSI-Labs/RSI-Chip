@@ -452,13 +452,10 @@ impl Expr {
                 | BinOp::Pow
                 | BinOp::And
                 | BinOp::Or
-                | BinOp::Xor
-                | BinOp::Eq
-                | BinOp::Ne
-                | BinOp::Lt
-                | BinOp::Le
-                | BinOp::Gt
-                | BinOp::Ge => a.is_signed() && b.is_signed(),
+                | BinOp::Xor => a.is_signed() && b.is_signed(),
+                // Comparison and equality expressions are one-bit unsigned results
+                // even when their operands are signed.
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => false,
                 BinOp::LogAnd | BinOp::LogOr | BinOp::CaseEq | BinOp::CaseNe => false,
             },
             Expr::Cond { t, f, .. } => t.is_signed() && f.is_signed(),

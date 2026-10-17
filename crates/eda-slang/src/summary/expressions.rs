@@ -186,6 +186,8 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("BinaryOp", "LogicalOr") => Some("LogOr"),
         ("BinaryOp", "Equality") => Some("Eq"),
         ("BinaryOp", "Inequality") => Some("Ne"),
+        ("BinaryOp", "CaseEquality") => Some("CaseEq"),
+        ("BinaryOp", "CaseInequality") => Some("CaseNe"),
         ("BinaryOp", "LessThan") => Some("Lt"),
         ("BinaryOp", "LessThanEqual") => Some("Le"),
         ("BinaryOp", "GreaterThan") => Some("Gt"),
@@ -440,6 +442,20 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             word.width(),
             word.to_bin_str()
         );
+    }
+    if let Expr::Signed {
+        e: signed_operand,
+        signed: true,
+    } = expression
+    {
+        if let Expr::Const(word) = signed_operand.as_ref() {
+            return format!(
+                "Const:{}:s[{}:{}]",
+                word.width(),
+                word.width(),
+                word.to_bin_str()
+            );
+        }
     }
     if let Expr::Repeat { times, e } = expression {
         return format!("Repeat:{times}:u[{}]", design_expr_fingerprint(design, e));

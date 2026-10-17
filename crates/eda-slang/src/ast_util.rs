@@ -112,7 +112,14 @@ pub(super) fn literal_word(type_name: &str, raw: &str) -> Option<eda_core::logic
         if reported_width != width {
             return None;
         }
-        return eda_core::logic::LogicWord::parse(width, &format!("'{}", &raw[separator + 1..]));
+        let mut literal = &raw[separator + 1..];
+        if let Some(unsigned_body) = literal
+            .strip_prefix('s')
+            .or_else(|| literal.strip_prefix('S'))
+        {
+            literal = unsigned_body;
+        }
+        return eda_core::logic::LogicWord::parse(width, &format!("'{literal}"));
     }
     let digits = raw.replace('_', "");
     let signed_value = digits.parse::<i128>().ok()?;

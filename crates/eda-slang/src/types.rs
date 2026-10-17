@@ -30,12 +30,24 @@ pub(super) struct AstMemoryType {
 
 pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
     simple_type_width(type_name).map(|_| {
-        type_name
+        let tokens = type_name
             .split('[')
             .next()
             .unwrap_or_default()
             .split_whitespace()
-            .any(|token| token == "signed")
+            .collect::<Vec<_>>();
+        if tokens.contains(&"signed") {
+            true
+        } else if tokens.contains(&"unsigned") {
+            false
+        } else {
+            // byte, shortint, int, integer, and longint are signed by
+            // definition; logic, reg, and bit are unsigned.
+            matches!(
+                tokens.last().copied(),
+                Some("byte" | "shortint" | "int" | "integer" | "longint")
+            )
+        }
     })
 }
 
