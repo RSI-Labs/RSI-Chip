@@ -288,7 +288,7 @@ fn vcd(c: &mut CaseList) {
     c.add("vcd_without_enable_is_none", || {
         let src: &'static str = "module m(input a, output y); assign y = ~a; endmodule";
         let d = cache(src);
-        let sim = Simulator::new(d).map_err(|e| e.to_string())?;
+        let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         if sim.vcd().is_some() {
             Err("vcd should be None".into())
         } else {

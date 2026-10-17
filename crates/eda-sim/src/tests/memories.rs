@@ -158,3 +158,41 @@ fn sparse_memory_runtime_index_and_out_of_range_read() {
         .unwrap();
     assert_eq!(simulator.read("q").unwrap().to_u64(), None);
 }
+
+#[test]
+fn sparse_memory_vcd_dumps_touched_elements() {
+    let mut sim = sim_for(
+        r#"
+module memory_vcd(
+  input logic clk,
+  input logic [19:0] address,
+  input logic [7:0] din,
+  output logic [7:0] initialized,
+  output logic [7:0] runtime
+);
+  logic [7:0] memory [0:1048575];
+  initial memory[5] = 8'h3c;
+  always @(posedge clk) memory[address] <= din;
+  assign initialized = memory[5];
+  assign runtime = memory[12345];
+endmodule
+"#,
+    );
+    sim.enable_vcd();
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    let initial_vcd = sim.vcd().unwrap();
+    assert!(initial_vcd.contains("$var reg 8 "));
+    assert!(initial_vcd.contains(" memory[5] "));
+    assert!(initial_vcd.contains("b00111100"));
+    assert!(!initial_vcd.contains(" memory[999999] $end"));
+
+    sim.set_input("address", &LogicWord::from_u64(20, 12345))
+        .unwrap();
+    sim.set_input("din", &LogicWord::from_u64(8, 0xa5)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    let runtime_vcd = sim.vcd().unwrap();
+    assert!(runtime_vcd.contains(" memory[12345] "));
+    assert!(runtime_vcd.contains("b10100101"));
+    assert!(runtime_vcd.contains("b00111100"));
+    assert!(!runtime_vcd.contains(" memory[999999] $end"));
+}

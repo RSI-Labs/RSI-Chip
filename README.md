@@ -79,7 +79,8 @@ large `inout` memory-port sharing through the hierarchy. Post-elaboration
 inference marks runtime-written canonical alias groups as RAM and
 initializer-only memories as ROM, then assigns technology-independent timing
 templates (`AsyncRom`, `SyncRom`, `MixedRom`, `AsyncRam`, `SyncRam`, or
-`MixedRam`). Direct slang-AST
+`MixedRam`). Sparse-memory VCD output dynamically declares only touched
+words rather than expanding a 1 MiB memory. Direct slang-AST
 lowering supports inline multidimensional sparse-memory initializers and
 compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps. The bounded path expands
 two-to-four-argument memory-file loads/dumps with constant bounds relative to the first source file and accepts

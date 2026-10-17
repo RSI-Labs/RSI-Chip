@@ -82,6 +82,7 @@ pub struct Simulator<'d> {
     monitors: Vec<Monitor<'d>>,
     vcd: Option<VcdWriter>,
     vcd_changes: HashSet<usize>,
+    vcd_memory_changes: HashSet<(usize, u64)>,
     event_count: u64,
     has_zero_delay_feedback: bool,
     zero_delay_feedback_nets: Vec<String>,
@@ -196,6 +197,7 @@ impl<'d> Simulator<'d> {
                 .collect(),
             vcd: None,
             vcd_changes: HashSet::new(),
+            vcd_memory_changes: HashSet::new(),
             event_count: 0,
             has_zero_delay_feedback: !zero_delay_feedback_nets.is_empty(),
             zero_delay_feedback_nets,
@@ -261,8 +263,10 @@ impl<'d> Simulator<'d> {
         self.vcd = Some(VcdWriter::new(self.design));
     }
 
-    pub fn vcd(&self) -> Option<String> {
-        self.vcd.as_ref().map(|v| v.render(&self.vals))
+    pub fn vcd(&mut self) -> Option<String> {
+        self.vcd
+            .as_mut()
+            .map(|v| v.render(&self.vals, &self.memory_elements))
     }
 
     /// Set an input port by name; propagates immediately (delta cycles).
@@ -688,6 +692,7 @@ impl<'d> Simulator<'d> {
             return Ok(());
         }
         storage.insert(index, value);
+        self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
         if self.event_count > MAX_EVENTS {
             return Err("event budget exceeded".into());
@@ -735,6 +740,7 @@ impl<'d> Simulator<'d> {
             return Ok(());
         }
         storage.insert(index, updated);
+        self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
         if self.event_count > MAX_EVENTS {
             return Err("event budget exceeded".into());
@@ -1490,12 +1496,26 @@ impl<'d> Simulator<'d> {
         }
     }
 
+    fn mark_vcd_memory_change(&mut self, memory: usize, address: u64) {
+        if self.vcd.is_some() {
+            self.vcd_memory_changes.insert((memory, address));
+        }
+    }
+
     fn flush_vcd(&mut self) {
         if let Some(vcd) = self.vcd.as_mut() {
             let changes = std::mem::take(&mut self.vcd_changes);
-            vcd.advance(self.now, &self.vals, &changes);
+            let memory_changes = std::mem::take(&mut self.vcd_memory_changes);
+            vcd.advance(
+                self.now,
+                &self.vals,
+                &changes,
+                &self.memory_elements,
+                &memory_changes,
+            );
         } else {
             self.vcd_changes.clear();
+            self.vcd_memory_changes.clear();
         }
     }
 }
