@@ -58,7 +58,7 @@ additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
 if/case control flow, single posedge/negedge sensitivity, recursive
 parameterized module hierarchy with port connections, generated members, and
-one-dimensional sparse-memory reads/writes directly from slang's elaborated
+one-dimensional sparse-memory whole-element operations, part-select reads, and indexed part writes directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate
 the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1

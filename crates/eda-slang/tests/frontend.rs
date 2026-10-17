@@ -528,6 +528,152 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_uses_sparse_memory_part_selects() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-parts");
+    let source_path = root.join("memory-parts.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory_parts(
+  input logic clk,
+  input logic [2:0] start,
+  input logic [7:0] data,
+  input logic [1:0] raddr,
+  output logic [3:0] simple,
+  output logic [3:0] up,
+  output logic [3:0] down,
+  output logic [3:0] updated
+);
+  logic [7:0] mem [0:3];
+  initial begin
+    mem[0] = 8'h9c;
+    mem[1] = 8'h22;
+  end
+  assign simple = mem[0][0 +: 4];
+  assign up = mem[0][2 +: 4];
+  assign down = mem[0][6 -: 4];
+  assign updated = mem[raddr][start +: 4];
+  always @(posedge clk) begin
+    mem[1][start +: 4] <= data[3:0];
+  end
+endmodule
+"#,
+    )
+    .expect("write sparse-memory part-select source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory part selects");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("memory_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower sparse-memory part selects through the preprocessed path");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(design.initials.len(), 1);
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create part-select simulator");
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize clk");
+    simulator
+        .set_input("start", &LogicWord::from_u64(3, 2))
+        .expect("set part-select start");
+    simulator
+        .set_input("raddr", &LogicWord::from_u64(2, 1))
+        .expect("set read element");
+    assert_eq!(simulator.read("simple").unwrap().to_u64(), Some(0b1100));
+    assert_eq!(simulator.read("up").unwrap().to_u64(), Some(0b0111));
+    assert_eq!(simulator.read("down").unwrap().to_u64(), Some(0b0011));
+    assert_eq!(simulator.read("updated").unwrap().to_u64(), Some(0b1000));
+
+    simulator
+        .set_input("data", &LogicWord::from_u64(8, 0b1011))
+        .expect("set part-write data");
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create part-write posedge");
+    assert_eq!(simulator.read("updated").unwrap().to_u64(), Some(0b1011));
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create legacy part-select simulator");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize legacy clk");
+    reference_simulator
+        .set_input("start", &LogicWord::from_u64(3, 2))
+        .expect("set legacy part-select start");
+    reference_simulator
+        .set_input("raddr", &LogicWord::from_u64(2, 1))
+        .expect("set legacy read element");
+    assert_eq!(
+        reference_simulator.read("simple").unwrap().to_u64(),
+        Some(0b1100)
+    );
+    assert_eq!(
+        reference_simulator.read("up").unwrap().to_u64(),
+        Some(0b0111)
+    );
+    assert_eq!(
+        reference_simulator.read("down").unwrap().to_u64(),
+        Some(0b0011)
+    );
+    assert_eq!(
+        reference_simulator.read("updated").unwrap().to_u64(),
+        Some(0b1000)
+    );
+    reference_simulator
+        .set_input("data", &LogicWord::from_u64(8, 0b1011))
+        .expect("set legacy part-write data");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create legacy part-write posedge");
+    assert_eq!(
+        reference_simulator.read("updated").unwrap().to_u64(),
+        Some(0b1011)
+    );
+
+    let simple_path = root.join("simple-part.sv");
+    std::fs::write(
+        &simple_path,
+        r#"
+module simple_part(output logic [3:0] y);
+  logic [7:0] mem [0:0];
+  initial begin
+    mem[0] = 8'h9c;
+  end
+  assign y = mem[0][3:0];
+endmodule
+"#,
+    )
+    .expect("write simple memory part-select source");
+    let simple_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&simple_path),
+            Some("simple_part"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simple memory part select");
+    let mut simple_simulator =
+        Simulator::new(&simple_design).expect("create simple part-select simulator");
+    simple_simulator
+        .run_until(0)
+        .expect("settle simple part-select outputs");
+    assert_eq!(simple_simulator.read("y").unwrap().to_u64(), Some(0b1100));
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

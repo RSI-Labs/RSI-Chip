@@ -1012,6 +1012,28 @@ impl SlangAstLowerer {
                 }
             });
         }
+        if let Some((memory, indexes, start, width, ascending)) = self.memory_range_select(left)? {
+            let expression = self.lower_expression(right)?;
+            return Ok(if bool_field(assignment, "isNonBlocking") {
+                Stmt::MemoryNBlPart {
+                    memory,
+                    indexes,
+                    start: Box::new(start),
+                    width,
+                    ascending,
+                    e: expression,
+                }
+            } else {
+                Stmt::MemoryBlPart {
+                    memory,
+                    indexes,
+                    start: Box::new(start),
+                    width,
+                    ascending,
+                    e: expression,
+                }
+            });
+        }
         let lv = self.lower_lvalue(left)?;
         let expression = self.lower_expression(right)?;
         if bool_field(assignment, "isNonBlocking") {
@@ -1069,6 +1091,12 @@ impl SlangAstLowerer {
                 })
             }
             Some("RangeSelect") => {
+                if self.memory_range_select(value)?.is_some() {
+                    return Err(
+                        "sparse-memory part selects require the memory assignment lowering path"
+                            .into(),
+                    );
+                }
                 let (lv, msb, lsb) = self.lower_constant_range_lvalue(value)?;
                 Ok(eda_core::ir::LValue {
                     net: lv.net,
@@ -1227,6 +1255,17 @@ impl SlangAstLowerer {
                 })
             }
             "RangeSelect" => {
+                if let Some((memory, indexes, start, width, ascending)) =
+                    self.memory_range_select(value)?
+                {
+                    return Ok(Expr::MemoryReadPart {
+                        memory,
+                        indexes,
+                        start: Box::new(start),
+                        width,
+                        ascending,
+                    });
+                }
                 let (base, msb, lsb) = self.lower_constant_range(value)?;
                 Ok(Expr::Index {
                     e: Box::new(base),
@@ -1280,6 +1319,81 @@ impl SlangAstLowerer {
             .get("selector")
             .ok_or_else(|| "memory element select has no selector".to_string())?;
         Ok(Some((memory, vec![self.lower_expression(selector)?])))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn memory_range_select(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<
+        Option<(
+            usize,
+            Vec<eda_core::ir::Expr>,
+            eda_core::ir::Expr,
+            usize,
+            bool,
+        )>,
+        String,
+    > {
+        if string_field(value, "kind").as_deref() != Some("RangeSelect") {
+            return Ok(None);
+        }
+        let Some(selected) = value.get("value") else {
+            return Ok(None);
+        };
+        let Some((memory, indexes)) = self.memory_element_select(selected)? else {
+            return Ok(None);
+        };
+        let element_width = self.design.memories[memory].element_width;
+        let selection_kind = string_field(value, "selectionKind").unwrap_or_default();
+        let (start, width, ascending) = match selection_kind.as_str() {
+            "Simple" => {
+                let left = value
+                    .get("left")
+                    .ok_or_else(|| "memory range select has no left bound".to_string())?;
+                let right = value
+                    .get("right")
+                    .ok_or_else(|| "memory range select has no right bound".to_string())?;
+                let msb = constant_index(left)?;
+                let lsb = constant_index(right)?;
+                if msb < lsb {
+                    return Err(
+                        "direct slang-AST lowering does not yet support reversed simple ranges"
+                            .into(),
+                    );
+                }
+                (
+                    eda_core::ir::Expr::Const(eda_core::logic::LogicWord::from_u64(32, lsb as u64)),
+                    msb - lsb + 1,
+                    true,
+                )
+            }
+            "IndexedUp" | "IndexedDown" => {
+                let left = value
+                    .get("left")
+                    .ok_or_else(|| "indexed memory select has no start".to_string())?;
+                let right = value
+                    .get("right")
+                    .ok_or_else(|| "indexed memory select has no width".to_string())?;
+                let width = constant_index(right)?;
+                (
+                    self.lower_expression(left)?,
+                    width,
+                    selection_kind == "IndexedUp",
+                )
+            }
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support memory selection kind '{other}'"
+                ))
+            }
+        };
+        if width == 0 || width > element_width {
+            return Err(format!(
+                "memory part-select width {width} exceeds element width {element_width}"
+            ));
+        }
+        Ok(Some((memory, indexes, start, width, ascending)))
     }
 
     fn lower_constant_select_lvalue(
