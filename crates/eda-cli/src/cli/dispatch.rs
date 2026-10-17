@@ -84,6 +84,7 @@ pub(crate) fn dispatch(ctx: &RunContext) -> Result<String, String> {
             let d = eda_api::compile(ctx.src, ctx.top.as_deref())?;
             let mut s = format!("module {}\n", d.name);
             s += &format!("  nets: {} (flat bits)\n", d.n_nets);
+            s += &format!("  memories: {}\n", d.memories.len());
             s += &format!("  ports: {}\n", d.ports.len());
             s += &format!(
                 "  assigns: {}, processes: {}, initials: {}\n",

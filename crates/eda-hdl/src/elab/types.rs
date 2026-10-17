@@ -16,6 +16,9 @@ pub(super) struct NetEntry {
     pub(super) type_name: Option<String>,
     pub(super) is_signed: bool,
     pub(super) array: Option<NetArray>,
+    /// Index into `Design::memories` when this declaration has a first-class
+    /// sparse-memory object.
+    pub(super) memory: Option<usize>,
 }
 
 #[derive(Clone)]

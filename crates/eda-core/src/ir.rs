@@ -47,6 +47,106 @@ pub struct PortDecl {
     pub width: usize,
 }
 
+/// One unpacked-array dimension retained by a first-class memory object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryDimension {
+    /// First logical index exposed by this dimension.
+    pub base: i64,
+    /// +1 for ascending ranges and -1 for descending ranges.
+    pub step: i64,
+    pub length: usize,
+}
+
+/// A sparse unpacked-array object.
+///
+/// Memory elements do not need to occupy flat net IDs. This is the IR boundary
+/// for RAM/ROM storage; read/write operations still carry source expressions
+/// for their logical indexes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDecl {
+    pub name: String,
+    pub element_width: usize,
+    pub element_msb: i64,
+    pub element_lsb: i64,
+    pub dimensions: Vec<MemoryDimension>,
+    /// Product of all dimension lengths.
+    pub flat_length: u64,
+}
+
+impl MemoryDecl {
+    pub fn physical_index(&self, indexes: &[i64]) -> Option<u64> {
+        if indexes.len() != self.dimensions.len() {
+            return None;
+        }
+        let mut physical = 0_i128;
+        let mut stride = i128::from(self.flat_length);
+        for (index, dimension) in indexes.iter().zip(&self.dimensions) {
+            let last = dimension.base + dimension.step * (dimension.length as i64 - 1);
+            let lower = dimension.base.min(last);
+            let upper = dimension.base.max(last);
+            if *index < lower || *index > upper {
+                return None;
+            }
+            let normalized = i128::from((*index - dimension.base) * dimension.step);
+            stride /= dimension.length as i128;
+            physical += normalized * stride;
+        }
+        u64::try_from(physical).ok()
+    }
+
+    /// Map a logical indexed part-select to physical element-bit offsets.
+    ///
+    /// The returned range is `(low_physical, high_physical)` and is inclusive.
+    /// Ascending and descending packed element declarations both map their
+    /// logical bit sequence onto contiguous physical storage.
+    pub fn element_part_offsets(
+        &self,
+        start: i64,
+        width: usize,
+        ascending: bool,
+    ) -> Option<(usize, usize)> {
+        if width == 0 || width > self.element_width {
+            return None;
+        }
+        let low_logical = if ascending {
+            start
+        } else {
+            start - width as i64 + 1
+        };
+        let high_logical = if ascending {
+            start + width as i64 - 1
+        } else {
+            start
+        };
+        let low_logical_offset = self.element_bit_offset(low_logical)?;
+        let high_logical_offset = self.element_bit_offset(high_logical)?;
+        let low = low_logical_offset.min(high_logical_offset);
+        let high = low_logical_offset.max(high_logical_offset);
+        if high < low || high - low + 1 != width {
+            return None;
+        }
+        Some((low, high))
+    }
+
+    fn element_bit_offset(&self, logical: i64) -> Option<usize> {
+        let lower = self.element_msb.min(self.element_lsb);
+        let upper = self.element_msb.max(self.element_lsb);
+        if logical < lower || logical > upper {
+            return None;
+        }
+        let offset = if self.element_msb >= self.element_lsb {
+            logical - self.element_lsb
+        } else {
+            self.element_lsb - logical
+        };
+        usize::try_from(offset).ok()
+    }
+
+    pub fn element_is_reversed(&self) -> bool {
+        self.element_msb < self.element_lsb
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
     Not,
@@ -115,6 +215,21 @@ pub enum Expr {
         e: Box<Expr>,
         signed: bool,
     },
+    /// Whole-element read from a first-class sparse memory.
+    MemoryRead {
+        memory: usize,
+        indexes: Vec<Expr>,
+        width: usize,
+        signed: bool,
+    },
+    /// Indexed part-select read from a first-class sparse-memory element.
+    MemoryReadPart {
+        memory: usize,
+        indexes: Vec<Expr>,
+        start: Box<Expr>,
+        width: usize,
+        ascending: bool,
+    },
     /// Part-select of an arbitrary sub-expression: `[msb:lsb]`.
     Index {
         e: Box<Expr>,
@@ -153,6 +268,8 @@ impl Expr {
             Expr::Concat(parts) => parts.iter().map(|p| p.width()).sum(),
             Expr::Repeat { times, e } => times * e.width(),
             Expr::Signed { e, .. } => e.width(),
+            Expr::MemoryRead { width, .. } => *width,
+            Expr::MemoryReadPart { width, .. } => *width,
             Expr::Index { msb, lsb, .. } => msb - lsb + 1,
         }
     }
@@ -185,6 +302,9 @@ impl Expr {
             Expr::Concat(_) => false,
             Expr::Repeat { e, .. } => e.is_signed(),
             Expr::Signed { signed, .. } => *signed,
+            Expr::MemoryRead { signed, .. } => *signed,
+            // A part-select is unsigned even when its base declaration is signed.
+            Expr::MemoryReadPart { .. } => false,
             Expr::Index { .. } => false,
         }
     }
@@ -215,6 +335,38 @@ pub enum Stmt {
     /// Non-blocking `<=`.
     NBl {
         lv: LValue,
+        e: Expr,
+    },
+    /// Blocking whole-element write to a first-class sparse memory.
+    MemoryBl {
+        memory: usize,
+        indexes: Vec<Expr>,
+        e: Expr,
+    },
+    /// Non-blocking whole-element write to a first-class sparse memory. Index
+    /// and data expressions are sampled in the active region.
+    MemoryNBl {
+        memory: usize,
+        indexes: Vec<Expr>,
+        e: Expr,
+    },
+    /// Blocking indexed part-select write to a sparse-memory element.
+    MemoryBlPart {
+        memory: usize,
+        indexes: Vec<Expr>,
+        start: Box<Expr>,
+        width: usize,
+        ascending: bool,
+        e: Expr,
+    },
+    /// Non-blocking indexed part-select write. Index/start/data are sampled in
+    /// the active region, and only the selected bits commit in the NBA region.
+    MemoryNBlPart {
+        memory: usize,
+        indexes: Vec<Expr>,
+        start: Box<Expr>,
+        width: usize,
+        ascending: bool,
         e: Expr,
     },
     /// Blocking assignment to a runtime-indexed part-select.
@@ -342,6 +494,7 @@ pub struct Assign {
 pub struct Design {
     pub name: String,
     pub net_decls: Vec<NetDecl>,
+    pub memories: Vec<MemoryDecl>,
     pub n_nets: usize,
     pub ports: Vec<PortDecl>,
     pub assigns: Vec<Assign>,
@@ -473,5 +626,56 @@ mod tests {
         assert_eq!(d.net_name(2), "a[2]");
         assert_eq!(d.net_name(4), "clk");
         assert_eq!(d.net_name(9), "net9");
+    }
+
+    #[test]
+    fn memory_physical_indices_preserve_dimensions_and_bounds() {
+        let memory = MemoryDecl {
+            name: "mem".into(),
+            element_width: 8,
+            element_msb: 7,
+            element_lsb: 0,
+            dimensions: vec![
+                MemoryDimension {
+                    base: -2,
+                    step: 1,
+                    length: 4,
+                },
+                MemoryDimension {
+                    base: 3,
+                    step: -1,
+                    length: 2,
+                },
+            ],
+            flat_length: 8,
+        };
+        assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
+        assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
+        assert_eq!(memory.physical_index(&[-1, 3]), Some(2));
+        assert_eq!(memory.physical_index(&[1, 2]), Some(7));
+        assert_eq!(memory.physical_index(&[-3, 3]), None);
+        assert_eq!(memory.physical_index(&[0, 1]), None);
+        assert_eq!(memory.physical_index(&[0]), None);
+    }
+
+    #[test]
+    fn reversed_memory_element_maps_indexed_part_selects() {
+        let memory = MemoryDecl {
+            name: "mem".into(),
+            element_width: 8,
+            element_msb: 0,
+            element_lsb: 7,
+            dimensions: vec![MemoryDimension {
+                base: 0,
+                step: 1,
+                length: 513,
+            }],
+            flat_length: 513,
+        };
+        assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
+        assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));
+        assert_eq!(memory.element_part_offsets(4, 4, false), Some((3, 6)));
+        assert_eq!(memory.element_part_offsets(8, 1, true), None);
+        assert_eq!(memory.element_part_offsets(0, 9, true), None);
     }
 }

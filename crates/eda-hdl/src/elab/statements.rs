@@ -546,6 +546,12 @@ impl<'a> Elaborator<'a> {
             e,
         } = s
         {
+            if let Ok(entry) = env.net(name) {
+                if entry.memory.is_some() {
+                    let indexes = std::slice::from_ref(index.as_ref());
+                    return self.memory_write_statement(entry, indexes, e, false, env);
+                }
+            }
             if env
                 .net(name)
                 .map(|entry| entry.array.is_some())
@@ -576,6 +582,12 @@ impl<'a> Elaborator<'a> {
             e,
         } = s
         {
+            if let Ok(entry) = env.net(name) {
+                if entry.memory.is_some() {
+                    let indexes = std::slice::from_ref(index.as_ref());
+                    return self.memory_write_statement(entry, indexes, e, true, env);
+                }
+            }
             if env
                 .net(name)
                 .map(|entry| entry.array.is_some())
@@ -606,6 +618,11 @@ impl<'a> Elaborator<'a> {
             e,
         } = s
         {
+            if let Ok(entry) = env.net(name) {
+                if entry.memory.is_some() {
+                    return self.memory_write_statement(entry, indexes, e, false, env);
+                }
+            }
             if indexes
                 .iter()
                 .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
@@ -634,6 +651,11 @@ impl<'a> Elaborator<'a> {
             e,
         } = s
         {
+            if let Ok(entry) = env.net(name) {
+                if entry.memory.is_some() {
+                    return self.memory_write_statement(entry, indexes, e, true, env);
+                }
+            }
             if indexes
                 .iter()
                 .any(|index| self.const_eval(index, env.params, env.module_name).is_err())

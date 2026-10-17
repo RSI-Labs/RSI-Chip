@@ -4,6 +4,7 @@ mod aggregates;
 mod core;
 mod frontend_regressions;
 mod functions;
+mod memories;
 mod properties;
 
 use crate::Simulator;

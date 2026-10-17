@@ -85,6 +85,7 @@ impl<'a> Elaborator<'a> {
                             type_name: None,
                             is_signed: false,
                             array: None,
+                            memory: None,
                         },
                     );
                 }

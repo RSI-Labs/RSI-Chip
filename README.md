@@ -55,11 +55,13 @@ IR can represent.
 The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
 `compile_sources` for deterministic named multi-unit compilation with parser
 errors mapped back to their originating file and line.
-One-dimensional module unpacked arrays now support up to 4096 elements and a
-one-million-bit flat budget; runtime whole-element reads and writes lower to
-bounds-checked dynamic shift/mask operations instead of expanding one conditional
-per element. This makes natural 4 KiB byte arrays executable without the former
-512-byte array ceiling.
+One-dimensional module unpacked arrays now support whole-element reads and
+writes. Large memories lower to first-class sparse `MemoryDecl` objects with
+explicit read, blocking-write, and NBA-write operations; a natural 4 KiB byte
+array uses 30 flat bits rather than 32,797, and the sparse-memory regression
+extends to 1 MiB-by-8. Small compatibility arrays retain bounded flat storage. Sparse memories
+support indexed part-select reads and writes with runtime starts, reversed
+elements, continuous lvalue preservation, and disjoint NBA-field merging.
 
 The data-driven regression target currently contains **15,159 unique named
 cases**. It is not a collection of three or four broad assertions: every case
@@ -365,6 +367,10 @@ The analog contribution includes:
   assignment simulation cases.
 * 100 runtime unpacked-array element-index indexed assignment synthesis and
   RTL-versus-gate simulation cases.
+* Direct sparse-memory IR and frontend tests covering multidimensional
+  logical/physical mapping, reversed elements, part-select reads/writes,
+  blocking writes, NBA field merging, continuous lvalues, runtime indexes, X
+  out-of-range reads, 4 KiB arrays, and 1 MiB-by-8 arrays.
 * 100 runtime unpacked-array element-index constant-packed-base continuous
   indexed-lvalue simulation cases.
 * 100 inline-function runtime array element-index indexed assignment

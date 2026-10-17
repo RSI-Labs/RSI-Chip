@@ -1489,6 +1489,19 @@ fn duplicate_module_declarations_are_rejected() {
 }
 
 #[test]
+fn huge_sparse_memory_port_is_rejected_until_memory_ports_exist() {
+    let error = compile(
+        "module top(input [7:0] memory [0:1048575]); endmodule",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("sparse memory ports are not supported yet"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn monitor_flag_propagates() {
     let d = compile_ok("module tb; reg a; initial $monitor(\"a=%b\", a); endmodule");
     match &d.initials[0] {

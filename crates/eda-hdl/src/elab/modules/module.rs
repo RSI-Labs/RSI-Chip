@@ -213,9 +213,21 @@ impl<'a> Elaborator<'a> {
                             "net",
                         )?;
                         self.apply_element_range(&mut array, range, &params, &module.name)?;
+                        let memory = array.as_ref().and_then(|array| {
+                            let use_sparse_memory = !array.dynamic
+                                && array.dimensions.len() == 1
+                                && array.element_width * array.length > 4096;
+                            use_sparse_memory.then(|| self.declare_memory(n, prefix, array))
+                        });
                         let declaration_range = if array.is_some() {
-                            let length = array.as_ref().map_or(1, |resolved| resolved.length);
-                            Self::flat_array_range(element_width * length)
+                            match memory {
+                                Some(_) => None,
+                                None => {
+                                    let length =
+                                        array.as_ref().map_or(1, |resolved| resolved.length);
+                                    Self::flat_array_range(element_width * length)
+                                }
+                            }
                         } else {
                             range.clone()
                         };
@@ -230,6 +242,7 @@ impl<'a> Elaborator<'a> {
                             type_name.as_deref(),
                         )?;
                         e.array = array;
+                        e.memory = memory;
                         if e.array.as_ref().is_some_and(|array| array.dynamic) {
                             let size_name = format!("__{n}_dynamic_size");
                             let size_entry = self.declare_net(
@@ -375,6 +388,15 @@ impl<'a> Elaborator<'a> {
                                     module.name, n
                                 ));
                             }
+                            if let Some(resolved) = array.as_ref() {
+                                let total_width = resolved.element_width * resolved.length;
+                                if total_width > 1 << 20 {
+                                    return Err(format!(
+                                        "module '{}': unpacked array port '{}' exceeds the 1 MiB flat budget; sparse memory ports are not supported yet",
+                                        module.name, n
+                                    ));
+                                }
+                            }
                             self.apply_element_range(&mut array, range, &params, &module.name)?;
                             let declaration_range = if array.is_some() {
                                 let length = array.as_ref().map_or(1, |resolved| resolved.length);
@@ -393,6 +415,7 @@ impl<'a> Elaborator<'a> {
                                 type_name.as_deref(),
                             )?;
                             e.array = array;
+                            e.memory = None;
                             nets.insert(n.clone(), e);
                         } else if !array_ranges.is_empty() {
                             return Err(format!(
@@ -494,6 +517,57 @@ impl<'a> Elaborator<'a> {
                     }
                 }
                 ast::Item::Assign { delay, lv, e } => {
+                    let memory_target = match lv {
+                        ast::Expr::Select(name, index) => {
+                            Some((name, std::slice::from_ref(index.as_ref())))
+                        }
+                        ast::Expr::ArraySelect(name, indexes) => Some((name, indexes.as_slice())),
+                        _ => None,
+                    };
+                    if let Some((name, indexes)) = memory_target {
+                        let entry = env.net(name)?;
+                        if entry.memory.is_some() {
+                            if *delay != 0 {
+                                return Err(
+                                    "delayed sparse-memory continuous lvalue is not supported"
+                                        .to_string(),
+                                );
+                            }
+                            let body =
+                                self.memory_write_statement(entry, indexes, e, false, &env)?;
+                            self.design.processes.push(Process {
+                                sens: SensIR::Comb,
+                                body,
+                            });
+                            continue;
+                        }
+                    }
+                    if let ast::Expr::ArrayIndexedPart {
+                        name,
+                        indexes,
+                        start,
+                        width,
+                        ascending,
+                    } = lv
+                    {
+                        let entry = env.net(name)?;
+                        if entry.memory.is_some() {
+                            if *delay != 0 {
+                                return Err(
+                                    "delayed sparse-memory continuous lvalue is not supported"
+                                        .to_string(),
+                                );
+                            }
+                            let body = self.memory_part_write_statement(
+                                entry, indexes, start, width, *ascending, e, false, &env,
+                            )?;
+                            self.design.processes.push(Process {
+                                sens: SensIR::Comb,
+                                body,
+                            });
+                            continue;
+                        }
+                    }
                     if let ast::Expr::Select(name, index) = lv {
                         if env
                             .net(name)

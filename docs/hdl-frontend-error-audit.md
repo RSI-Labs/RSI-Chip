@@ -1,7 +1,7 @@
 # HDL frontend error and coverage audit
 
 Date: 2026-10-16  
-Repository state: branch `fix-digital`, commit `9827bcd`, with substantial uncommitted frontend/CPU-platform work present.  
+Repository state: branch `fix-digital`, commit `0e836e9`, with frontend/sparse-memory follow-up work in progress.
 Scope: `crates/eda-hdl` and the `crates/eda-slang` integration boundary. Simulator behavior is discussed only where the frontend lowering causes the limitation.
 
 ## Executive summary
@@ -9,7 +9,7 @@ Scope: `crates/eda-hdl` and the `crates/eda-slang` integration boundary. Simulat
 The serious frontend failures are structural, not isolated typos:
 
 1. The internal frontend is a hand-written, bounded Verilog/SystemVerilog subset. It is not an IEEE 1800 compiler and was never a replacement for a commercial frontend by itself.
-2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. Exact-width whole-element access is now shift/mask lowered, but array storage remains a flat packed vector, narrower/reversed/negative-index cases still have expansion paths, and there is no first-class sparse-memory object.
+2. The old runtime array lowering expanded dynamic array element selects into per-element condition trees. The current IR now has first-class `MemoryDecl` objects plus sparse whole-element and indexed part-select read/write operations. Large one-dimensional module arrays use sparse storage and retain only a one-bit flat placeholder; small arrays, multidimensional arrays, and ports retain their legacy bounded representation.
 3. The initial audit found malformed elaborations silently accepted, including unknown or duplicate named port/parameter connections and excess positional connections. The current worktree now rejects those cases; see the status column below.
 4. A representative slang-validated probe set contained 42 valid SystemVerilog constructs. The internal frontend accepted only 2 of them; 40 were rejected. This is expected for a bounded subset, but it quantifies how far the internal parser is from full-language coverage.
 5. The `eda-slang` adapter can validate full SystemVerilog and export slang AST JSON, but normal compilation still feeds slang-preprocessed text back into the bounded internal parser. There is no full slang-AST-to-repository-IR lowering.
@@ -18,10 +18,12 @@ Current automated status at the time of this audit:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p eda-hdl --all-targets -- --nocapture` | 84 passed after the P0 remediation below |
-| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 6 passed |
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 85 passed after the P0/sparse-memory remediation below |
+| `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
+| `cargo test -p eda-sim --all-targets -- --nocapture` | 81 passed, including sparse blocking/NBA/runtime-index/part-select/out-of-range tests |
+| `cargo test -p eda-sim frontend_regressions -- --nocapture` | 11 passed |
 | `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 5 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 143.27 s after P0 remediation |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 151.55 s after P0/sparse-memory remediation |
 | `cargo clippy -p eda-hdl -p eda-slang --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
@@ -29,30 +31,30 @@ Passing tests do not establish commercial frontend completeness. The tests are i
 
 ## Why the runtime-memory failure happened
 
-The internal elaborator represents an unpacked array as one packed flat net. For example, this valid design:
+The original elaborator represented every unpacked array as one packed flat net. That design turned a 4 KiB memory into 32,768 storage bits even when only two elements were initialized.
 
-```systemverilog
-module top(input clk, input [11:0] addr, input [7:0] din, output [7:0] q);
-  logic [7:0] mem [0:4095];
-  always @(posedge clk) mem[addr] <= din;
-  assign q = mem[addr];
-endmodule
-```
+The current architecture adds:
 
-reports `32797` flat bits through `eda info`: 32768 storage bits plus generated selector/control bits. The simulator state is a `Vec<LogicValue>`, so even unused memory elements consume state. The recent whole-element shift/mask lowering reduces expression-tree explosion but does not change this storage representation.
+- `MemoryDecl` with element width, logical dimensions, stride/direction, and flat length;
+- sparse simulator element storage (`HashMap<physical_index, LogicWord>`);
+- `Expr::MemoryRead` and `Expr::MemoryReadPart`;
+- blocking `Stmt::MemoryBl` and `Stmt::MemoryBlPart`;
+- non-blocking `Stmt::MemoryNBl` and `Stmt::MemoryNBlPart`;
+- memory-change notification to continuous readers and combinational processes;
+- logical-index bounds checks with X reads / no-op writes outside the range.
 
-Remaining scaling problems include:
+A large one-dimensional module array whose flattened width exceeds 4096 bits now lowers whole-element and indexed part-select reads/writes to these operations and leaves only a one-bit storage declaration placeholder in the flat net space. The checked-in 4 KiB regression now reports 30 flat bits rather than 32,797. A new 1 MiB (`1,048,576 x 8`) memory regression reports 38 flat bits and stores only initialized/touched elements.
 
-- one-dimensional arrays are capped at 4096 elements and 1 MiB of flattened bits;
-- multidimensional dimensions are capped at 256 elements per dimension;
-- module/interface arrays are capped at 4096 total elements;
-- narrower indexed slices of dynamically selected array elements still generate per-element alternatives;
-- reversed element declarations take bit-by-bit concatenation paths;
-- negative array-index bases disable the optimized physical-index path and fall back to expansion;
-- physical index expressions are lowered as 32-bit values;
-- there is no sparse-memory IR, memory hierarchy, lazy backfill, or independent memory subsystem.
+Remaining memory limitations:
 
-This is why the correct architectural fix is a first-class sparse memory object in IR and simulator, not another local transformation over a flat vector.
+- indexed part-select reads and writes work on large sparse memories, including runtime starts, reversed packed elements, continuous lvalues, and disjoint NBA-field merging;
+- sparse-memory reads/writes are not synthesizable to RAM macros yet;
+- memory ports, typed byte enables/write-mask metadata, banks, initialization files, and memory macros are not yet first-class;
+- multidimensional and small compatibility arrays still use flat representation;
+- VCD memory visualization is not yet implemented;
+- the sparse element cap is currently 16,777,216 elements, not unbounded host memory.
+
+This closes the original dense-storage blocker for whole-element and indexed part-select one-dimensional RTL memories, but not the full commercial memory-modeling surface.
 
 ## A. Confirmed correctness and diagnostic defects
 
@@ -113,7 +115,7 @@ This is why the correct architectural fix is a first-class sparse memory object 
 | HF-G25 | P0 | Coverage | No SystemVerilog `covergroup`, coverpoints, crosses, bins, illegal/ignore bins, per-instance coverage, or coverage sampling semantics in the HDL frontend. |
 | HF-G26 | P0 | Elaboration lint | No `unique`/`priority` enforcement, full case-overlap analysis, full always kind checking, unused/conflicting name diagnostics, or elaboration-policy waivers. |
 | HF-G27 | P1 | System tasks/functions | Only a selected display/format/control subset. No complete file I/O, math/random conversion, assertion control, PLI/VPI/DPI tasks, or vendor-task policy. |
-| HF-G28 | P0 | Memory architecture | No first-class sparse memories, memory macros, byte enables, banked memories, hierarchical memories, lazy initialization, or independent memory netlist mapping. |
+| HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, and indexed part-select IR plus simulator storage now exist for large one-dimensional module memories. Memory macros, typed byte enables, banks, hierarchical memories, initialization files, sparse-memory synthesis, ports, and VCD visualization remain. |
 | HF-G29 | P1 | Literal limits | Packed literals/types are capped at 4096 bits; string literals at 64 bytes. Valid larger constructs are rejected rather than represented. |
 | HF-G30 | P1 | Elaboration bounds | Generate loops stop at 131072 steps, function loops at 256 iterations, class composition at eight levels, hierarchy at 64 levels. These are safety caps, not language semantics. |
 | HF-G31 | P0 | slang integration | No full slang elaborated AST to repository IR lowering. `compile_files` validates with slang, preprocesses to one text unit, then invokes the bounded internal parser. |
@@ -184,7 +186,7 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 
 ### P0 architecture
 
-1. Define a sparse-memory IR object with logical dimensions, element width, initialization policy, byte/part enables, bank/interface metadata, and simulator/runtime mapping.
+1. Extend the new sparse-memory IR with initialization policy, typed byte enables, bank/interface metadata, ports, memory macros, synthesis mapping, and waveform visibility.
 2. Stop lowering general dynamic array accesses through per-element expansion. Keep expansion only for tiny explicitly requested constants.
 3. Lower slang's elaborated AST/compilation model into repository IR rather than preprocessing source and reparsing it with the bounded parser.
 4. Introduce a typed frontend IR before flattening so signedness, widths, lifetimes, aggregate shape, and source identity survive elaboration.
@@ -194,7 +196,7 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 
 - Add a slang-conformance corpus that is valid under slang and deliberately unsupported in the internal frontend; expected results must be explicit, not accidental parse errors.
 - Add malformed-source diagnostics for every accepted-by-mistake case in section A.
-- Add array scaling tests at 1, 256, 4096, >4096, negative bases, multidimensional forms, partial-width slices, and out-of-range X indices.
+- Add array scaling tests at 1, 256, 4096, >4096, negative bases, multidimensional forms, additional partial-width forms, and out-of-range X indices.
 - Add expression width/signedness differential matrices, including >64-bit constants.
 - Keep official UVM elaboration separate from any claim that UVM runs.
 - Add source-location golden tests for parser and elaborator errors.
@@ -205,6 +207,6 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 - Full slang or equivalent standard frontend is the parser/type/elaboration authority.
 - No valid input is silently transformed into a different hierarchy, direction, type, width, or driver structure.
 - Every unsupported construct has a precise, source-located diagnostic.
-- Arrays and memories do not require dense allocation for sparse designs.
+- Whole-element one-dimensional sparse memories do not require dense allocation; extend this guarantee to memory ports, typed byte enables, banks, and aggregates.
 - Parser, type checker, elaborator, linter, and simulator use one typed source-span-carrying representation.
 - Official UVM execution, if claimed, is validated against a documented behavioral reference, not merely slang elaboration.

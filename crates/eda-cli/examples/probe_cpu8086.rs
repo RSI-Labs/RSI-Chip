@@ -21,6 +21,13 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         Expr::Repeat { e, .. } => expr_nets(e, out),
         Expr::Index { e, .. } => expr_nets(e, out),
         Expr::Signed { e, .. } => expr_nets(e, out),
+        Expr::MemoryRead { indexes, .. } => {
+            indexes.iter().for_each(|e| expr_nets(e, out));
+        }
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes.iter().for_each(|e| expr_nets(e, out));
+            expr_nets(start, out);
+        }
     }
 }
 
@@ -39,6 +46,20 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
                 expr_nets(e, reads);
                 writes.extend(lv_bits(lv));
+            }
+            Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+                indexes.iter().for_each(|e| expr_nets(e, reads));
+                expr_nets(e, reads);
+            }
+            Stmt::MemoryBlPart {
+                indexes, start, e, ..
+            }
+            | Stmt::MemoryNBlPart {
+                indexes, start, e, ..
+            } => {
+                indexes.iter().for_each(|e| expr_nets(e, reads));
+                expr_nets(start, reads);
+                expr_nets(e, reads);
             }
             Stmt::NBlIndexed {
                 net,

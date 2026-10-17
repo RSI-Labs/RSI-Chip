@@ -1195,6 +1195,7 @@ mod tests {
         Design {
             name: "m".into(),
             net_decls,
+            memories: Vec::new(),
             n_nets: 3,
             ports: vec![
                 PortDecl {

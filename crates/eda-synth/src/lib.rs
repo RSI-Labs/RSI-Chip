@@ -464,6 +464,14 @@ impl<'a> Synth<'a> {
                 out
             }
             Expr::Signed { e, .. } => self.blast_nat(e)?,
+            Expr::MemoryRead { .. } => {
+                return Err("first-class sparse-memory reads are not synthesizable yet".into())
+            }
+            Expr::MemoryReadPart { .. } => {
+                return Err(
+                    "first-class sparse-memory part-select reads are not synthesizable yet".into(),
+                )
+            }
         })
     }
 
@@ -1034,6 +1042,12 @@ impl<'a> Synth<'a> {
                 Ok(())
             }
             Stmt::Delay { .. } => Err("#delay is not synthesizable".into()),
+            Stmt::MemoryBl { .. } | Stmt::MemoryNBl { .. } => {
+                Err("first-class sparse-memory writes are not synthesizable yet".into())
+            }
+            Stmt::MemoryBlPart { .. } | Stmt::MemoryNBlPart { .. } => {
+                Err("first-class sparse-memory part-select writes are not synthesizable yet".into())
+            }
             Stmt::Display { .. }
             | Stmt::Finish
             | Stmt::Assert { .. }

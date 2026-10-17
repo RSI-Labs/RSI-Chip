@@ -1752,6 +1752,12 @@ unbounded EM lifetime, findings, per-scenario UPF reports, the physical timing
 report, stimulus kind/sample count, and mapped statistics. Direct RPC and
 async jobs share cancellation.
 
+### Follow-up: first-class sparse RTL memory IR
+
+The elaborated IR now models unpacked memories as first-class `MemoryDecl` objects with element width, ascending/descending logical dimensions, and physical-index metadata. The simulator stores their elements sparsely and executes whole-element reads, blocking writes, and non-blocking writes through explicit memory operations. Logical-index bounds are enforced: out-of-range reads return X and out-of-range writes are no-ops. Memory changes wake continuous readers and combinational processes.
+
+Large one-dimensional module memories (more than 4096 flattened bits) no longer allocate one flat bit per element. They retain a one-bit flat placeholder and use sparse storage. The 4 KiB runtime regression fell from 32,797 flat bits to 30, and a new 1 MiB-by-8 regression uses 38 flat bits while storing only initialized or touched elements. Indexed part-select reads and writes support runtime starts, reversed packed elements, continuous-lvalue preservation, and disjoint NBA-field merging. Sparse-memory synthesis/macros, typed byte enables, memory ports, banks, initialization files, and waveform visibility remain future work.
+
 ### Follow-up: i8086 randomized sparse-memory differential validation
 
 The i8086 differential matrix now includes 32 deterministic randomized seeds
@@ -1762,8 +1768,9 @@ a 768-byte sparse-memory window against the independent Rust golden model. The
 new stream exposed and fixed incoming-carry leakage into register and immediate
 SUB, zero-count shift flag mutation, byte/word RCL and RCR result/carry
 extraction, SHL/SAL carry exhaustion past operand width, and SAR sign carry
-after saturation. An exhaustive immediate shift/rotate matrix additionally
-sweeps every operation at masked counts 0 through 31.
+after saturation. A shift/rotate boundary matrix additionally sweeps
+every operation at the zero, width, width-plus-one, and near-maximum masked
+counts.
 
 ## Remaining high-priority gaps
 

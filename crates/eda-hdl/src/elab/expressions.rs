@@ -214,6 +214,10 @@ impl<'a> Elaborator<'a> {
             }
             ast::Expr::Select(n, idx) => {
                 let entry = env.net(n)?;
+                if entry.memory.is_some() {
+                    let indexes = std::slice::from_ref(idx.as_ref());
+                    return self.memory_read_expr(entry, indexes, env);
+                }
                 if entry.array.is_some()
                     && self.const_eval(idx, env.params, env.module_name).is_err()
                 {
@@ -253,6 +257,9 @@ impl<'a> Elaborator<'a> {
                     unreachable!("pattern was already checked");
                 };
                 let entry = env.net(n)?;
+                if entry.memory.is_some() {
+                    return self.memory_read_expr(entry, indexes, env);
+                }
                 if indexes
                     .iter()
                     .any(|index| self.const_eval(index, env.params, env.module_name).is_err())

@@ -81,8 +81,9 @@ The segment matrix loads through default DS plus explicit ES/SS/DS overrides
 after installing distinct non-zero segment registers.
 The shift/rotate matrices compare every legal `/0` through `/5` and `/7`
 operation for byte and word forms using both CL-relative and immediate counts.
-An exhaustive immediate-count matrix repeats every operation for masked counts
-0 through 31. These tests exposed and now guard zero-count flag preservation,
+A boundary-count matrix repeats every operation at masked counts surrounding
+zero, seven/eight, fifteen/sixteen/seventeen, and thirty/thirty-one. These
+tests exposed and now guard zero-count flag preservation,
 RCL/RCR rotate-through-carry extraction, SHL/SAL carry exhaustion beyond the
 operand width, and SAR sign carry once the shifted value has saturated.
 They also regression-guard missing `0xC0/0xC1` support in both models and

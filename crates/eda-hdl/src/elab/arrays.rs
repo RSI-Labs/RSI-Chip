@@ -41,6 +41,7 @@ impl<'a> Elaborator<'a> {
             type_name: type_name.map(str::to_string),
             is_signed,
             array: None,
+            memory: None,
         })
     }
 
@@ -177,6 +178,10 @@ impl<'a> Elaborator<'a> {
         ascending: bool,
         env: &Env<'_>,
     ) -> Result<ExprIR, String> {
+        if env.net(name)?.memory.is_some() {
+            let entry_ref = env.net(name)?;
+            return self.memory_part_read_expr(entry_ref, indexes, start, width, ascending, env);
+        }
         if indexes
             .iter()
             .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
@@ -656,6 +661,19 @@ impl<'a> Elaborator<'a> {
         nonblocking: bool,
         env: &Env<'_>,
     ) -> Result<StmtIR, String> {
+        if env.net(name)?.memory.is_some() {
+            let entry = env.net(name)?;
+            return self.memory_part_write_statement(
+                entry,
+                indexes,
+                start,
+                width,
+                ascending,
+                value,
+                nonblocking,
+                env,
+            );
+        }
         if indexes
             .iter()
             .any(|index| self.const_eval(index, env.params, env.module_name).is_err())
@@ -1468,10 +1486,12 @@ impl<'a> Elaborator<'a> {
         object_name: &str,
         object_kind: &str,
     ) -> Result<Option<NetArray>, String> {
-        const MAX_UNPACKED_ARRAY_ELEMENTS: usize = 4096;
+        const MAX_MULTIDIMENSION_ARRAY_ELEMENTS: usize = 4096;
+        const MAX_SPARSE_ARRAY_ELEMENTS: usize = 1 << 24;
         const MAX_UNPACKED_ARRAY_BITS: usize = 1 << 20;
+        let one_dimensional = array_ranges.len() == 1;
         let maximum_dimension = if array_ranges.len() == 1 {
-            MAX_UNPACKED_ARRAY_ELEMENTS
+            MAX_SPARSE_ARRAY_ELEMENTS
         } else {
             256
         };
@@ -1517,7 +1537,13 @@ impl<'a> Elaborator<'a> {
             }
             length = length
                 .checked_mul(dimension_length)
-                .filter(|total| *total <= MAX_UNPACKED_ARRAY_ELEMENTS)
+                .filter(|total| {
+                    *total <= if one_dimensional {
+                        MAX_SPARSE_ARRAY_ELEMENTS
+                    } else {
+                        MAX_MULTIDIMENSION_ARRAY_ELEMENTS
+                    }
+                })
                 .ok_or_else(|| {
                     format!(
                         "module '{module_name}': unpacked {object_kind} '{object_name}' exceeds the element limit"
@@ -1532,14 +1558,16 @@ impl<'a> Elaborator<'a> {
         if dimensions.is_empty() {
             return Ok(None);
         }
-        element_width
-            .checked_mul(length)
-            .filter(|total| *total <= MAX_UNPACKED_ARRAY_BITS)
-            .ok_or_else(|| {
-                format!(
-                    "module '{module_name}': unpacked {object_kind} '{object_name}' exceeds the packed-width limit"
-                )
-            })?;
+        if !one_dimensional {
+            element_width
+                .checked_mul(length)
+                .filter(|total| *total <= MAX_UNPACKED_ARRAY_BITS)
+                .ok_or_else(|| {
+                    format!(
+                        "module '{module_name}': unpacked {object_kind} '{object_name}' exceeds the packed-width limit"
+                    )
+                })?;
+        }
         Ok(Some(NetArray {
             dimensions,
             length,
@@ -1566,6 +1594,207 @@ impl<'a> Elaborator<'a> {
             resolved.element_lsb = self.const_eval(lsb, params, module_name)?;
         }
         Ok(())
+    }
+
+    pub(super) fn declare_memory(&mut self, name: &str, prefix: &str, array: &NetArray) -> usize {
+        let memory = self.design.memories.len();
+        self.design.memories.push(MemoryDecl {
+            name: format!("{prefix}{name}"),
+            element_width: array.element_width,
+            element_msb: array.element_msb,
+            element_lsb: array.element_lsb,
+            dimensions: array
+                .dimensions
+                .iter()
+                .map(|dimension| MemoryDimension {
+                    base: dimension.base,
+                    step: dimension.step,
+                    length: dimension.length,
+                })
+                .collect(),
+            flat_length: array.length as u64,
+        });
+        memory
+    }
+
+    pub(super) fn memory_read_expr(
+        &self,
+        entry: &NetEntry,
+        indexes: &[ast::Expr],
+        env: &Env<'_>,
+    ) -> Result<ExprIR, String> {
+        let array = entry
+            .array
+            .as_ref()
+            .ok_or_else(|| "identifier is not an unpacked array".to_string())?;
+        let memory = entry
+            .memory
+            .ok_or_else(|| "unpacked array has no memory object".to_string())?;
+        let mut elaborated = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            elaborated.push(self.elab_expr(index, env)?);
+        }
+        let read = ExprIR::MemoryRead {
+            memory,
+            indexes: elaborated,
+            width: array.element_width,
+            signed: entry.is_signed,
+        };
+        Ok(if array.element_msb < array.element_lsb {
+            Self::reverse_bits_expr(read, array.element_width)
+        } else {
+            read
+        })
+    }
+
+    pub(super) fn memory_write_statement(
+        &self,
+        entry: &NetEntry,
+        indexes: &[ast::Expr],
+        value: &ast::Expr,
+        nonblocking: bool,
+        env: &Env<'_>,
+    ) -> Result<StmtIR, String> {
+        let array = entry
+            .array
+            .as_ref()
+            .ok_or_else(|| "identifier is not an unpacked array".to_string())?;
+        let memory = entry
+            .memory
+            .ok_or_else(|| "unpacked array has no memory object".to_string())?;
+        let mut elaborated = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            elaborated.push(self.elab_expr(index, env)?);
+        }
+        let value = self.elab_expr(value, env)?;
+        let value = if array.element_msb < array.element_lsb {
+            Self::reverse_bits_expr(value, array.element_width)
+        } else {
+            value
+        };
+        Ok(if nonblocking {
+            StmtIR::MemoryNBl {
+                memory,
+                indexes: elaborated,
+                e: value,
+            }
+        } else {
+            StmtIR::MemoryBl {
+                memory,
+                indexes: elaborated,
+                e: value,
+            }
+        })
+    }
+
+    fn reverse_bits_expr(value: ExprIR, width: usize) -> ExprIR {
+        ExprIR::Concat(
+            (0..width)
+                .map(|bit| ExprIR::Index {
+                    e: Box::new(value.clone()),
+                    msb: bit,
+                    lsb: bit,
+                })
+                .collect(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn memory_part_read_expr(
+        &self,
+        entry: &NetEntry,
+        indexes: &[ast::Expr],
+        start: &ast::Expr,
+        width: &ast::Expr,
+        ascending: bool,
+        env: &Env<'_>,
+    ) -> Result<ExprIR, String> {
+        let array = entry
+            .array
+            .as_ref()
+            .ok_or_else(|| "identifier is not an unpacked array".to_string())?;
+        let memory = entry
+            .memory
+            .ok_or_else(|| "unpacked array has no memory object".to_string())?;
+        let selected_width = usize::try_from(
+            self.const_eval(width, env.params, env.module_name)
+                .map_err(|_| "indexed part-select width must be constant".to_string())?,
+        )
+        .map_err(|_| "indexed part-select width is out of range".to_string())?;
+        if selected_width == 0 || selected_width > array.element_width {
+            return Err(format!(
+                "indexed part-select width {selected_width} exceeds memory element width {}",
+                array.element_width
+            ));
+        }
+        let mut elaborated = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            elaborated.push(self.elab_expr(index, env)?);
+        }
+        Ok(ExprIR::MemoryReadPart {
+            memory,
+            indexes: elaborated,
+            start: Box::new(self.elab_expr(start, env)?),
+            width: selected_width,
+            ascending,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn memory_part_write_statement(
+        &self,
+        entry: &NetEntry,
+        indexes: &[ast::Expr],
+        start: &ast::Expr,
+        width: &ast::Expr,
+        ascending: bool,
+        value: &ast::Expr,
+        nonblocking: bool,
+        env: &Env<'_>,
+    ) -> Result<StmtIR, String> {
+        let array = entry
+            .array
+            .as_ref()
+            .ok_or_else(|| "identifier is not an unpacked array".to_string())?;
+        let memory = entry
+            .memory
+            .ok_or_else(|| "unpacked array has no memory object".to_string())?;
+        let selected_width = usize::try_from(
+            self.const_eval(width, env.params, env.module_name)
+                .map_err(|_| "indexed part-select width must be constant".to_string())?,
+        )
+        .map_err(|_| "indexed part-select width is out of range".to_string())?;
+        if selected_width == 0 || selected_width > array.element_width {
+            return Err(format!(
+                "indexed part-select width {selected_width} exceeds memory element width {}",
+                array.element_width
+            ));
+        }
+        let mut elaborated = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            elaborated.push(self.elab_expr(index, env)?);
+        }
+        let value = self.elab_expr(value, env)?;
+        let statement = if nonblocking {
+            StmtIR::MemoryNBlPart {
+                memory,
+                indexes: elaborated,
+                start: Box::new(self.elab_expr(start, env)?),
+                width: selected_width,
+                ascending,
+                e: value,
+            }
+        } else {
+            StmtIR::MemoryBlPart {
+                memory,
+                indexes: elaborated,
+                start: Box::new(self.elab_expr(start, env)?),
+                width: selected_width,
+                ascending,
+                e: value,
+            }
+        };
+        Ok(statement)
     }
 
     pub(super) fn flat_array_range(total_width: usize) -> ast::RangeAst {

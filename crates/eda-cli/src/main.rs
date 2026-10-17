@@ -149,6 +149,7 @@ fn main() -> ExitCode {
                 Ok(design) => {
                     println!("module {}", design.name);
                     println!("  nets: {} (flat bits)", design.n_nets);
+                    println!("  memories: {}", design.memories.len());
                     println!("  ports: {}", design.ports.len());
                     println!(
                         "  assigns: {}, processes: {}, initials: {}",

@@ -10,7 +10,7 @@
 use eda_core::cancellation::FlowCancellation;
 use eda_core::ir::{Design, Dir, Expr, LValue, Range, Sens, Stmt};
 use eda_core::logic::{LogicValue, LogicWord};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod vcd;
 pub use vcd::VcdWriter;
@@ -28,6 +28,22 @@ struct Update {
     val: LogicValue,
     /// Continuous-assign driver index (for multi-driver resolution).
     driver: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+enum MemoryNbaUpdate {
+    Whole {
+        memory: usize,
+        index: u64,
+        value: LogicWord,
+    },
+    Part {
+        memory: usize,
+        index: u64,
+        low_offset: usize,
+        width: usize,
+        value: LogicWord,
+    },
 }
 
 struct Cont<'d> {
@@ -52,6 +68,10 @@ pub struct Simulator<'d> {
     now: u64,
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
+    memory_elements: Vec<HashMap<u64, LogicWord>>,
+    memory_nba: Vec<MemoryNbaUpdate>,
+    memory_readers: Vec<Vec<usize>>,
+    memory_assign_fanin: Vec<Vec<usize>>,
     assign_fanin: Vec<Vec<usize>>,
     proc_edges: Vec<Vec<(usize, Edge)>>,
     pub displays: Vec<String>,
@@ -79,8 +99,31 @@ impl<'d> Simulator<'d> {
             }
         }
         let mut proc_edges: Vec<Vec<(usize, Edge)>> = vec![Vec::new(); n];
+        let mut memory_elements = Vec::with_capacity(design.memories.len());
+        for memory in &design.memories {
+            if memory.flat_length == 0 {
+                return Err(format!("memory '{}' is empty", memory.name));
+            }
+            memory_elements.push(HashMap::new());
+        }
+        let mut memory_readers: Vec<Vec<usize>> = vec![Vec::new(); design.memories.len()];
+        let mut memory_assign_fanin: Vec<Vec<usize>> = vec![Vec::new(); design.memories.len()];
+        for (ai, assign) in design.assigns.iter().enumerate() {
+            for memory in expr_memories(&assign.e) {
+                if memory < design.memories.len() {
+                    memory_assign_fanin[memory].push(ai);
+                }
+            }
+        }
         for (pi, p) in design.processes.iter().enumerate() {
             register_sens(&p.sens, pi, &p.body, &mut proc_edges, n);
+            if matches!(p.sens, Sens::Comb) {
+                for memory in stmt_memories(&p.body) {
+                    if memory < design.memories.len() {
+                        memory_readers[memory].push(pi);
+                    }
+                }
+            }
         }
         let mut mons = Vec::new();
         for init in &design.initials {
@@ -106,6 +149,10 @@ impl<'d> Simulator<'d> {
             now: 0,
             nba: Vec::new(),
             busy_procs: HashSet::new(),
+            memory_elements,
+            memory_nba: Vec::new(),
+            memory_readers,
+            memory_assign_fanin,
             assign_fanin,
             proc_edges,
             displays: Vec::new(),
@@ -429,7 +476,7 @@ impl<'d> Simulator<'d> {
             if self.finished {
                 break;
             }
-            if !did && !self.nba.is_empty() {
+            if !did && (!self.nba.is_empty() || !self.memory_nba.is_empty()) {
                 let updates = std::mem::take(&mut self.nba);
                 for (net, val) in updates {
                     if self.cancellation.is_cancelled() {
@@ -440,6 +487,28 @@ impl<'d> Simulator<'d> {
                         val,
                         driver: None,
                     });
+                }
+                let memory_updates = std::mem::take(&mut self.memory_nba);
+                for update in memory_updates {
+                    if self.cancellation.is_cancelled() {
+                        return Err("simulation cancelled".into());
+                    }
+                    match update {
+                        MemoryNbaUpdate::Whole {
+                            memory,
+                            index,
+                            value,
+                        } => self.apply_memory_update(memory, index, value)?,
+                        MemoryNbaUpdate::Part {
+                            memory,
+                            index,
+                            low_offset,
+                            width,
+                            value,
+                        } => {
+                            self.apply_memory_part_update(memory, index, low_offset, width, value)?;
+                        }
+                    }
                 }
                 continue;
             }
@@ -577,6 +646,114 @@ impl<'d> Simulator<'d> {
         Ok(())
     }
 
+    fn apply_memory_update(
+        &mut self,
+        memory: usize,
+        index: u64,
+        value: LogicWord,
+    ) -> Result<(), String> {
+        let Some(storage) = self.memory_elements.get_mut(memory) else {
+            return Ok(());
+        };
+        let element_width = self.design.memories[memory].element_width;
+        let value = value.sized(element_width);
+        if storage.get(&index) == Some(&value) {
+            return Ok(());
+        }
+        storage.insert(index, value);
+        self.event_count += 1;
+        if self.event_count > MAX_EVENTS {
+            return Err("event budget exceeded".into());
+        }
+        self.notify_memory_write(memory)
+    }
+
+    fn apply_memory_part_update(
+        &mut self,
+        memory: usize,
+        index: u64,
+        low_offset: usize,
+        width: usize,
+        value: LogicWord,
+    ) -> Result<(), String> {
+        let Some(storage) = self.memory_elements.get_mut(memory) else {
+            return Ok(());
+        };
+        let declaration = &self.design.memories[memory];
+        let element_width = declaration.element_width;
+        let high_offset = low_offset + width - 1;
+        if width == 0 || high_offset >= element_width {
+            return Ok(());
+        }
+        let old = storage
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| LogicWord::xes(element_width));
+        let value = value.sized(width);
+        let mut updated = Vec::with_capacity(element_width);
+        for bit in 0..element_width {
+            if (low_offset..=high_offset).contains(&bit) {
+                let selected_bit = if declaration.element_is_reversed() {
+                    high_offset - bit
+                } else {
+                    bit - low_offset
+                };
+                updated.push(value.bit(selected_bit));
+            } else {
+                updated.push(old.bit(bit));
+            }
+        }
+        let updated = LogicWord { bits: updated };
+        if updated == old {
+            return Ok(());
+        }
+        storage.insert(index, updated);
+        self.event_count += 1;
+        if self.event_count > MAX_EVENTS {
+            return Err("event budget exceeded".into());
+        }
+        self.notify_memory_write(memory)
+    }
+
+    fn notify_memory_write(&mut self, memory: usize) -> Result<(), String> {
+        let readers = self.memory_readers.get(memory).cloned().unwrap_or_default();
+        for pi in readers {
+            let body = &self.design.processes[pi].body;
+            self.conts.entry(self.now).or_default().push(Cont {
+                process: Some(pi),
+                work: vec![body],
+            });
+        }
+
+        let assign_sinks = self
+            .memory_assign_fanin
+            .get(memory)
+            .cloned()
+            .unwrap_or_default();
+        for ai in assign_sinks {
+            let value = self.eval(&self.design.assigns[ai].e);
+            let delay = self.design.assigns[ai].delay;
+            let time = self.now + delay;
+            for (bit, net) in lv_bits(&self.design.assigns[ai].lv).into_iter().enumerate() {
+                let val = value.bit(bit);
+                if time == self.now {
+                    self.schedule(Update {
+                        net,
+                        val,
+                        driver: Some(ai),
+                    });
+                } else {
+                    self.events.entry(time).or_default().push(Update {
+                        net,
+                        val,
+                        driver: Some(ai),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
         let mut work = c.work;
         while let Some(s) = work.pop() {
@@ -626,6 +803,62 @@ impl<'d> Simulator<'d> {
                     for (i, net) in lv_bits(lv).into_iter().enumerate() {
                         self.nba.push((net, v.bit(i)));
                     }
+                }
+                Stmt::MemoryBl { memory, indexes, e } => {
+                    let Some(index) = self.memory_index(*memory, indexes) else {
+                        continue;
+                    };
+                    let value = self.eval(e);
+                    self.apply_memory_update(*memory, index, value)?;
+                }
+                Stmt::MemoryNBl { memory, indexes, e } => {
+                    let Some(index) = self.memory_index(*memory, indexes) else {
+                        continue;
+                    };
+                    let value = self.eval(e);
+                    self.memory_nba.push(MemoryNbaUpdate::Whole {
+                        memory: *memory,
+                        index,
+                        value,
+                    });
+                }
+                Stmt::MemoryBlPart {
+                    memory,
+                    indexes,
+                    start,
+                    width,
+                    ascending,
+                    e,
+                } => {
+                    let Some((index, low_offset)) =
+                        self.memory_part_location(*memory, indexes, start, *width, *ascending)
+                    else {
+                        continue;
+                    };
+                    let value = self.eval(e);
+                    self.apply_memory_part_update(*memory, index, low_offset, *width, value)?;
+                }
+                Stmt::MemoryNBlPart {
+                    memory,
+                    indexes,
+                    start,
+                    width,
+                    ascending,
+                    e,
+                } => {
+                    let Some((index, low_offset)) =
+                        self.memory_part_location(*memory, indexes, start, *width, *ascending)
+                    else {
+                        continue;
+                    };
+                    let value = self.eval(e);
+                    self.memory_nba.push(MemoryNbaUpdate::Part {
+                        memory: *memory,
+                        index,
+                        low_offset,
+                        width: *width,
+                        value,
+                    });
                 }
                 Stmt::BlIndexed {
                     net,
@@ -845,6 +1078,33 @@ impl<'d> Simulator<'d> {
         Some(targets)
     }
 
+    fn memory_index(&self, memory: usize, indexes: &[Expr]) -> Option<u64> {
+        let declaration = self.design.memories.get(memory)?;
+        let mut logical = Vec::with_capacity(indexes.len());
+        for expression in indexes {
+            logical.push(self.eval(expression).to_u64()? as i64);
+        }
+        declaration.physical_index(&logical)
+    }
+
+    fn memory_part_location(
+        &self,
+        memory: usize,
+        indexes: &[Expr],
+        start: &Expr,
+        width: usize,
+        ascending: bool,
+    ) -> Option<(u64, usize)> {
+        let index = self.memory_index(memory, indexes)?;
+        let start = self.eval(start).to_u64()? as i64;
+        let (low_offset, _) = self
+            .design
+            .memories
+            .get(memory)?
+            .element_part_offsets(start, width, ascending)?;
+        Some((index, low_offset))
+    }
+
     pub fn eval(&self, e: &Expr) -> LogicWord {
         use eda_core::ir::{BinOp, UnOp};
         match e {
@@ -1042,6 +1302,49 @@ impl<'d> Simulator<'d> {
             }
             Expr::Index { e, msb, lsb } => self.eval(e).slice(*msb, *lsb),
             Expr::Signed { e, .. } => self.eval(e),
+            Expr::MemoryRead {
+                memory,
+                indexes,
+                width,
+                ..
+            } => match self.memory_index(*memory, indexes) {
+                Some(index) => self
+                    .memory_elements
+                    .get(*memory)
+                    .and_then(|elements| elements.get(&index))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(*width)),
+                None => LogicWord::xes(*width),
+            },
+            Expr::MemoryReadPart {
+                memory,
+                indexes,
+                start,
+                width,
+                ascending,
+            } => match self.memory_part_location(*memory, indexes, start, *width, *ascending) {
+                Some((index, low_offset)) => {
+                    let element = self
+                        .memory_elements
+                        .get(*memory)
+                        .and_then(|elements| elements.get(&index))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            LogicWord::xes(self.design.memories[*memory].element_width)
+                        });
+                    if self.design.memories[*memory].element_is_reversed() {
+                        let high_offset = low_offset + width - 1;
+                        let mut bits = Vec::with_capacity(*width);
+                        for bit in (low_offset..=high_offset).rev() {
+                            bits.push(element.bit(bit));
+                        }
+                        LogicWord { bits }
+                    } else {
+                        element.slice(low_offset + width - 1, low_offset)
+                    }
+                }
+                None => LogicWord::xes(*width),
+            },
         }
     }
 
@@ -1225,6 +1528,54 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         Expr::Repeat { e, .. } => walk_expr(e, out),
         Expr::Index { e, .. } => walk_expr(e, out),
         Expr::Signed { e, .. } => walk_expr(e, out),
+        Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes.iter().for_each(|x| walk_expr(x, out));
+            walk_expr(start, out);
+        }
+    }
+}
+
+fn expr_memories(e: &Expr) -> Vec<usize> {
+    let mut out = Vec::new();
+    walk_expr_memories(e, &mut out);
+    out
+}
+
+fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
+    match e {
+        Expr::Const(_) => {}
+        Expr::Ref { .. } => {}
+        Expr::MemoryRead {
+            memory, indexes, ..
+        } => {
+            out.push(*memory);
+            indexes.iter().for_each(|x| walk_expr_memories(x, out));
+        }
+        Expr::Un { a, .. } => walk_expr_memories(a, out),
+        Expr::Bin { a, b, .. } => {
+            walk_expr_memories(a, out);
+            walk_expr_memories(b, out);
+        }
+        Expr::Cond { c, t, f } => {
+            walk_expr_memories(c, out);
+            walk_expr_memories(t, out);
+            walk_expr_memories(f, out);
+        }
+        Expr::Concat(v) => v.iter().for_each(|x| walk_expr_memories(x, out)),
+        Expr::Repeat { e, .. } => walk_expr_memories(e, out),
+        Expr::Index { e, .. } => walk_expr_memories(e, out),
+        Expr::Signed { e, .. } => walk_expr_memories(e, out),
+        Expr::MemoryReadPart {
+            memory,
+            indexes,
+            start,
+            ..
+        } => {
+            out.push(*memory);
+            indexes.iter().for_each(|x| walk_expr_memories(x, out));
+            walk_expr_memories(start, out);
+        }
     }
 }
 
@@ -1234,6 +1585,71 @@ fn stmt_nets(s: &Stmt) -> Vec<usize> {
     out
 }
 
+fn stmt_memories(s: &Stmt) -> Vec<usize> {
+    let mut out = Vec::new();
+    walk_stmt_memories(s, &mut out);
+    out
+}
+
+fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
+    match s {
+        Stmt::Block(v) => v.iter().for_each(|x| walk_stmt_memories(x, out)),
+        Stmt::Forever(b) => walk_stmt_memories(b, out),
+        Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => walk_expr_memories(e, out),
+        Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
+            out.push(*memory);
+            indexes.iter().for_each(|x| walk_expr_memories(x, out));
+            walk_expr_memories(e, out);
+        }
+        Stmt::MemoryBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        }
+        | Stmt::MemoryNBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        } => {
+            out.push(*memory);
+            indexes.iter().for_each(|x| walk_expr_memories(x, out));
+            walk_expr_memories(start, out);
+            walk_expr_memories(e, out);
+        }
+        Stmt::NBlIndexed { start, e, .. } | Stmt::BlIndexed { start, e, .. } => {
+            walk_expr_memories(start, out);
+            walk_expr_memories(e, out);
+        }
+        Stmt::If { c, t, f } => {
+            walk_expr_memories(c, out);
+            walk_stmt_memories(t, out);
+            if let Some(fs) = f {
+                walk_stmt_memories(fs, out);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            walk_expr_memories(e, out);
+            for (label, body) in arms {
+                walk_expr_memories(label, out);
+                walk_stmt_memories(body, out);
+            }
+            if let Some(body) = dflt {
+                walk_stmt_memories(body, out);
+            }
+        }
+        Stmt::Delay { body, .. } => walk_stmt_memories(body, out),
+        Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
+        Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
+        Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
+        Stmt::Cover { cond, .. } => walk_expr_memories(cond, out),
+        Stmt::Finish => {}
+    }
+}
+
 fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSet<usize>) {
     match s {
         Stmt::Block(v) => v.iter().for_each(|s| collect_stmt_access(s, reads, writes)),
@@ -1241,6 +1657,20 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             reads.extend(expr_nets(e));
             writes.extend(lv_bits(lv));
+        }
+        Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+            reads.extend(indexes.iter().flat_map(expr_nets));
+            reads.extend(expr_nets(e));
+        }
+        Stmt::MemoryBlPart {
+            indexes, start, e, ..
+        }
+        | Stmt::MemoryNBlPart {
+            indexes, start, e, ..
+        } => {
+            reads.extend(indexes.iter().flat_map(expr_nets));
+            reads.extend(expr_nets(start));
+            reads.extend(expr_nets(e));
         }
         Stmt::NBlIndexed {
             net,
@@ -1299,6 +1729,20 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Block(v) => v.iter().for_each(|x| walk_stmt(x, out)),
         Stmt::Forever(b) => walk_stmt(b, out),
         Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => {
+            walk_expr(e, out);
+        }
+        Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+            indexes.iter().for_each(|x| walk_expr(x, out));
+            walk_expr(e, out);
+        }
+        Stmt::MemoryBlPart {
+            indexes, start, e, ..
+        }
+        | Stmt::MemoryNBlPart {
+            indexes, start, e, ..
+        } => {
+            indexes.iter().for_each(|x| walk_expr(x, out));
+            walk_expr(start, out);
             walk_expr(e, out);
         }
         Stmt::NBlIndexed { start, e, .. } => {

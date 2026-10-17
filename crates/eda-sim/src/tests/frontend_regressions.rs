@@ -82,8 +82,11 @@ endmodule
 "#,
     );
 
-    // The ten additional nets are generated bounds/selectors for runtime access.
-    assert_eq!(sim.design.n_nets, 32_797);
+    // The 4 KiB array is sparse: only its one-bit storage declaration placeholder
+    // remains in the flat net space.
+    assert_eq!(sim.design.n_nets, 30);
+    assert_eq!(sim.design.memories.len(), 1);
+    assert_eq!(sim.design.memories[0].flat_length, 4096);
     sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
     sim.set_input("selector", &LogicWord::from_u64(12, 0))
         .unwrap();
@@ -96,6 +99,158 @@ endmodule
     sim.set_input("din", &LogicWord::from_u64(8, 0xa7)).unwrap();
     sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
     assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xa7));
+}
+
+#[test]
+fn one_mebibyte_sparse_memory_uses_one_flat_placeholder_net() {
+    let mut sim = sim_for(
+        r#"
+module large_memory(input clk, input [19:0] selector, input [7:0] din,
+                     output [7:0] q);
+  logic [7:0] memory [0:1048575];
+  initial begin
+    memory[0] = 8'h12;
+    memory[1048575] = 8'h34;
+  end
+  always @(posedge clk) memory[selector] <= din;
+  assign q = memory[selector];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.n_nets, 38);
+    assert_eq!(sim.design.memories.len(), 1);
+    assert_eq!(sim.design.memories[0].flat_length, 1_048_576);
+
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("selector", &LogicWord::from_u64(20, 0))
+        .unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x12));
+
+    sim.set_input("selector", &LogicWord::from_u64(20, 1_048_575))
+        .unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x34));
+
+    sim.set_input("din", &LogicWord::from_u64(8, 0x56)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x56));
+}
+
+#[test]
+fn sparse_memory_partial_reads_and_writes_preserve_other_bits() {
+    let mut sim = sim_for(
+        r#"
+module m(input clk, input [11:0] selector, input [3:0] offset,
+         input [3:0] din, output [3:0] q, output [7:0] whole);
+  logic [7:0] memory [0:4095];
+  initial begin
+    memory[5] = 8'hA5;
+    memory[5][2 +: 4] = 4'hC;
+    memory[6] = 8'h3c;
+  end
+  always @(posedge clk) memory[selector][offset +: 4] <= din;
+  assign q = memory[selector][offset +: 4];
+  assign whole = memory[5];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.n_nets, 34);
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("selector", &LogicWord::from_u64(12, 5))
+        .unwrap();
+    sim.set_input("offset", &LogicWord::from_u64(4, 2)).unwrap();
+    assert_eq!(sim.read("whole").unwrap().to_u64(), Some(0xB1));
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xC));
+
+    sim.set_input("din", &LogicWord::from_u64(4, 0x5)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("whole").unwrap().to_u64(), Some(0x95));
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x5));
+
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("offset", &LogicWord::from_u64(4, 6)).unwrap();
+    sim.set_input("din", &LogicWord::from_u64(4, 0xF)).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), None);
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("whole").unwrap().to_u64(), Some(0x95));
+}
+
+#[test]
+fn reversed_sparse_memory_element_part_selects_use_logical_bit_order() {
+    let mut sim = sim_for(
+        r#"
+module m(input clk, input [8:0] selector, input [2:0] offset,
+         input [3:0] din, output [3:0] q, output [7:0] whole);
+  logic [0:7] memory [0:512];
+  initial begin
+    memory[5] = 8'h12;
+    memory[5][0 +: 4] = 4'hC;
+    memory[5][4 +: 4] = 4'h3;
+  end
+  always @(posedge clk) memory[selector][offset +: 4] <= din;
+  assign q = memory[selector][offset +: 4];
+  assign whole = memory[5];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.n_nets, 30);
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("selector", &LogicWord::from_u64(9, 5))
+        .unwrap();
+    sim.set_input("offset", &LogicWord::from_u64(3, 0)).unwrap();
+    assert_eq!(sim.read("whole").unwrap().to_u64(), Some(0x3C));
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xC));
+
+    sim.set_input("offset", &LogicWord::from_u64(3, 4)).unwrap();
+    sim.set_input("din", &LogicWord::from_u64(4, 0xA)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("whole").unwrap().to_u64(), Some(0xAC));
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xA));
+
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("offset", &LogicWord::from_u64(3, 5)).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), None);
+}
+
+#[test]
+fn sparse_memory_nonblocking_partial_writes_merge_disjoint_fields() {
+    let mut sim = sim_for(
+        r#"
+module m(output [7:0] q);
+  logic [7:0] memory [0:4095];
+  initial begin
+    memory[5] = 8'hA5;
+    memory[5][0 +: 4] <= 4'hC;
+    memory[5][4 +: 4] <= 4'h3;
+  end
+  assign q = memory[5];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.n_nets, 9);
+    sim.run_until(0).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x3C));
+}
+
+#[test]
+fn sparse_memory_partial_continuous_lvalue_preserves_other_bits() {
+    let mut sim = sim_for(
+        r#"
+module m(input [3:0] offset, input [3:0] din, output [7:0] q);
+  logic [7:0] memory [0:4095];
+  initial memory[5] = 8'hA5;
+  assign memory[5][offset +: 4] = din;
+  assign q = memory[5];
+endmodule
+"#,
+    );
+    assert_eq!(sim.design.n_nets, 17);
+    sim.set_input("offset", &LogicWord::from_u64(4, 2)).unwrap();
+    sim.set_input("din", &LogicWord::from_u64(4, 0xC)).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xB1));
+
+    sim.set_input("offset", &LogicWord::from_u64(4, 6)).unwrap();
+    sim.set_input("din", &LogicWord::from_u64(4, 0xF)).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0xB1));
 }
 
 #[test]

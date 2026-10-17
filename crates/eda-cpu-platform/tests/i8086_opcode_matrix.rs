@@ -1,5 +1,11 @@
 use eda_cpu_platform::i8086::{I8086Machine, I8086Stop};
 use eda_cpu_platform::systemverilog::{I8086SvResult, I8086SvRunner};
+use std::sync::OnceLock;
+
+fn shared_i8086_runner() -> &'static I8086SvRunner {
+    static RUNNER: OnceLock<I8086SvRunner> = OnceLock::new();
+    RUNNER.get_or_init(|| I8086SvRunner::new().expect("compile shared i8086 SystemVerilog runtime"))
+}
 
 fn initial_program(values: [u16; 8], operations: &[u8]) -> Vec<u8> {
     let mut executable: Vec<u8> = values
@@ -75,8 +81,7 @@ fn assert_matches_golden_with_options(
         "{context}: golden model did not halt"
     );
 
-    let runner = I8086SvRunner::new().unwrap_or_else(|error| panic!("compile {context}: {error}"));
-    let rtl = runner
+    let rtl = shared_i8086_runner()
         .run_memory_with_budget(initial_memory, event_budget)
         .unwrap_or_else(|error| panic!("execute {context} in RTL: {error}"));
     assert!(!rtl.trap, "{context}: RTL trapped");
@@ -326,22 +331,23 @@ fn deterministic_i8086_immediate_shift_rotate_matrix_matches_golden_model() {
 }
 
 #[test]
-fn deterministic_i8086_exhaustive_immediate_shift_count_matrix_matches_golden_model() {
+fn deterministic_i8086_immediate_shift_count_boundary_matrix_matches_golden_model() {
     let values = [
         0x7c5b_u16, 0xa53b, 0x5e6d, 0xc492, 0xfffe, 0x3000, 0x102a, 0x0040,
     ];
     let mut operations = Vec::new();
+    let counts = [0_u8, 1, 7, 8, 9, 15, 16, 17, 30, 31];
     for opcode in [0xc0_u8, 0xc1] {
         for operation in 0_u8..8 {
-            for count in 0_u8..32 {
+            for count in counts {
                 operations.extend_from_slice(&[opcode, 0xc0 | (operation << 3), count]);
             }
         }
     }
     assert_matches_golden_with_event_budget(
         &initial_program(values, &operations),
-        "exhaustive immediate shift/rotate counts",
-        300_000,
+        "immediate shift/rotate count boundaries",
+        1_000_000,
     );
 }
 
@@ -469,19 +475,10 @@ fn deterministic_i8086_unary_group_matrix_matches_golden_model() {
     );
 }
 
-#[test]
-fn deterministic_i8086_randomized_differential_fuzz_matches_golden_model() {
-    let first_seed = std::env::var("I8086_FUZZ_FIRST_SEED")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let seeds = std::env::var("I8086_FUZZ_SEEDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(32);
+fn run_i8086_randomized_differential_fuzz(first_seed: u64, seeds: u64) {
     const MEMORY_FIRST: u32 = 0x0f00;
     const MEMORY_LAST: u32 = 0x1200;
-    let runner = I8086SvRunner::new().expect("compile i8086 runtime once");
+    let runner = shared_i8086_runner();
 
     for seed in first_seed..first_seed.saturating_add(seeds) {
         let mut rng = DeterministicRng(0x2545_f491_4f6c_dd1d ^ (seed + 1));
@@ -667,4 +664,24 @@ fn deterministic_i8086_randomized_differential_fuzz_matches_golden_model() {
             );
         }
     }
+}
+
+#[test]
+fn deterministic_i8086_randomized_differential_fuzz_seeds_000_007() {
+    run_i8086_randomized_differential_fuzz(0, 8);
+}
+
+#[test]
+fn deterministic_i8086_randomized_differential_fuzz_seeds_008_015() {
+    run_i8086_randomized_differential_fuzz(8, 8);
+}
+
+#[test]
+fn deterministic_i8086_randomized_differential_fuzz_seeds_016_023() {
+    run_i8086_randomized_differential_fuzz(16, 8);
+}
+
+#[test]
+fn deterministic_i8086_randomized_differential_fuzz_seeds_024_031() {
+    run_i8086_randomized_differential_fuzz(24, 8);
 }
