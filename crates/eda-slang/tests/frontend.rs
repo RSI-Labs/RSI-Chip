@@ -158,7 +158,7 @@ endmodule
         )
         .expect_err("direct path must reject unsupported constructs");
     assert!(
-        error.contains("supports only assignment expression statements"),
+        error.contains("does not support system call"),
         "unexpected error: {error}"
     );
 }
@@ -1060,6 +1060,72 @@ endmodule
     assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("middle").unwrap().to_u64(), Some(3));
     assert_eq!(simulator.read("last").unwrap().to_u64(), Some(6));
+}
+
+#[test]
+fn slang_ast_direct_lowering_reads_sparse_memory_files() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-readmem");
+    let source_path = root.join("readmem.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module readmem(
+  output logic [7:0] first,
+  output logic [7:0] second,
+  output logic [7:0] skipped,
+  output logic [7:0] last,
+  output logic [1:0] binary
+);
+  logic [7:0] mem [0:1][0:1];
+  logic [1:0] bits [0:1];
+  initial begin
+    $readmemh("memory.hex", mem);
+    $readmemb("bits.bin", bits);
+  end
+  assign first = mem[0][0];
+  assign second = mem[0][1];
+  assign skipped = mem[1][0];
+  assign last = mem[1][1];
+  assign binary = bits[1];
+endmodule
+"#,
+    )
+    .expect("write memory-file source");
+    std::fs::write(
+        root.join("memory.hex"),
+        r#"
+// leading comment
+01 02
+/* block
+   comment with ff ff */
+@3 04
+"#,
+    )
+    .expect("write hexadecimal memory file");
+    std::fs::write(root.join("bits.bin"), "01\n10\n").expect("write binary memory file");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("readmem"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory file loads");
+    assert_eq!(design.memories.len(), 2);
+    assert_eq!(design.initials.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create memory-file simulator");
+    simulator
+        .run_until(0)
+        .expect("settle memory-file initializers");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("skipped").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("last").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("binary").unwrap().to_u64(), Some(2));
 }
 
 #[test]
