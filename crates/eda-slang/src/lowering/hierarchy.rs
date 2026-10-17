@@ -329,6 +329,8 @@ impl super::SlangAstLowerer {
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
+            type_enums: std::collections::BTreeMap::new(),
+            enum_constants: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };

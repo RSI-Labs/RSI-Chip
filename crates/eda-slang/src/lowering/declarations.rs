@@ -1,6 +1,8 @@
 //! Module member, port, net, memory, and parameter lowering.
 
-use super::{declaration_name, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer};
+use super::{
+    declaration_name, AstEnumType, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer,
+};
 use crate::ast_util::{bool_field, literal_word, memory_initializer_statements, string_field};
 use crate::types::{
     memory_type, simple_type_shape, simple_type_signed, AstPackedDimension, AstTypeShape,
@@ -12,6 +14,20 @@ impl SlangAstLowerer {
         let target = member
             .get("target")
             .ok_or_else(|| format!("type alias '{name}' has no detailed target type"))?;
+        if target.is_string() {
+            let target_name = target
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .rsplit(['.', '#'])
+                .next()
+                .unwrap_or_default();
+            if self.type_enums.contains_key(target_name) {
+                return Ok(());
+            }
+        }
         if string_field(target, "kind").as_deref() != Some("PackedStructType") {
             return Err(format!(
                 "direct slang-AST lowering does not support type alias '{name}' target"
@@ -70,7 +86,38 @@ impl SlangAstLowerer {
         Ok(())
     }
 
-    fn net_type(
+    pub(super) fn collect_enum_type(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let name = declaration_name(member, "EnumType")?;
+        let base = member
+            .get("baseType")
+            .ok_or_else(|| format!("enum type '{name}' has no base type"))?;
+        let width = detailed_type_width(base)?;
+        let signed = detailed_type_signed(base);
+        let value_type = if width == 1 {
+            "logic".to_string()
+        } else {
+            format!("logic[{}:0]", width - 1)
+        };
+        let values = member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("enum type '{name}' has no values"))?;
+        for value in values {
+            let value_name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("enum type '{name}' has an unnamed value"))?;
+            let raw = string_field(value, "value")
+                .ok_or_else(|| format!("enum value '{name}.{value_name}' has no value"))?;
+            let word = literal_word(&value_type, &raw)
+                .ok_or_else(|| format!("enum value '{name}.{value_name}' is invalid"))?;
+            self.enum_constants.insert(value_name.to_string(), word);
+        }
+        self.type_enums.insert(name, AstEnumType { width, signed });
+        Ok(())
+    }
+
+    pub(super) fn net_type(
         &self,
         type_name: &str,
     ) -> Result<
@@ -94,6 +141,17 @@ impl SlangAstLowerer {
             .rsplit(['.', '#'])
             .next()
             .unwrap_or_default();
+        if let Some(definition) = self.type_enums.get(alias_name) {
+            return Ok((
+                AstTypeShape {
+                    width: definition.width,
+                    bounds: None,
+                    dimensions: Vec::<AstPackedDimension>::new(),
+                },
+                definition.signed,
+                std::collections::BTreeMap::new(),
+            ));
+        }
         let definition = self
             .type_aliases
             .get(alias_name)
@@ -376,5 +434,19 @@ fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> 
             "direct lowering does not support detailed type kind '{kind}'"
         )),
         None => Err("detailed type has no kind".into()),
+    }
+}
+
+fn detailed_type_signed(type_value: &serde_json::Value) -> bool {
+    match string_field(type_value, "kind").as_deref() {
+        Some("PackedArrayType") => type_value
+            .get("elementType")
+            .map(detailed_type_signed)
+            .unwrap_or(false),
+        Some("PredefinedIntegerType") => !matches!(
+            string_field(type_value, "name").as_deref(),
+            Some("byte unsigned" | "shortint unsigned" | "int unsigned" | "longint unsigned")
+        ),
+        _ => bool_field(type_value, "isSigned"),
     }
 }

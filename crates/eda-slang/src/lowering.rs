@@ -67,12 +67,20 @@ struct AstStructType {
     fields: std::collections::BTreeMap<String, AstStructField>,
 }
 
+#[derive(Clone)]
+struct AstEnumType {
+    width: usize,
+    signed: bool,
+}
+
 pub(super) struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     constants: std::collections::BTreeMap<String, LogicWord>,
     subroutines: std::collections::BTreeMap<String, serde_json::Value>,
     type_aliases: std::collections::BTreeMap<String, AstStructType>,
+    type_enums: std::collections::BTreeMap<String, AstEnumType>,
+    enum_constants: std::collections::BTreeMap<String, LogicWord>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
 }
@@ -97,6 +105,8 @@ impl SlangAstLowerer {
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
+            type_enums: std::collections::BTreeMap::new(),
+            enum_constants: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
@@ -148,6 +158,7 @@ impl SlangAstLowerer {
             match string_field(member, "kind").as_deref() {
                 Some("Subroutine") => self.collect_subroutine(member)?,
                 Some("TypeAlias") => self.collect_type_alias(member)?,
+                Some("EnumType") => self.collect_enum_type(member)?,
                 _ => {}
             }
         }
@@ -162,6 +173,7 @@ impl SlangAstLowerer {
                 "Instance" => self.lower_instance(member)?,
                 "Subroutine" => {}
                 "TypeAlias" => {}
+                "EnumType" => {}
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}
@@ -180,9 +192,13 @@ impl SlangAstLowerer {
                     }
                     let outer_subroutines = self.subroutines.clone();
                     let outer_type_aliases = self.type_aliases.clone();
+                    let outer_type_enums = self.type_enums.clone();
+                    let outer_enum_constants = self.enum_constants.clone();
                     let result = self.lower_members(members);
                     self.subroutines = outer_subroutines;
                     self.type_aliases = outer_type_aliases;
+                    self.type_enums = outer_type_enums;
+                    self.enum_constants = outer_enum_constants;
                     if !self.generate_path.is_empty()
                         && self.generate_path.last().is_some_and(|last| {
                             member
@@ -232,6 +248,8 @@ impl SlangAstLowerer {
                 .push(format!("{array_name}[{construct_index}]"));
             let outer_subroutines = self.subroutines.clone();
             let outer_type_aliases = self.type_aliases.clone();
+            let outer_type_enums = self.type_enums.clone();
+            let outer_enum_constants = self.enum_constants.clone();
             let nested_members = nested
                 .get("members")
                 .and_then(serde_json::Value::as_array)
@@ -239,6 +257,8 @@ impl SlangAstLowerer {
             let result = self.lower_members(nested_members);
             self.subroutines = outer_subroutines;
             self.type_aliases = outer_type_aliases;
+            self.type_enums = outer_type_enums;
+            self.enum_constants = outer_enum_constants;
             self.generate_path.pop();
             result?;
         }

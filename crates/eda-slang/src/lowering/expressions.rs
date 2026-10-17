@@ -188,6 +188,9 @@ impl super::SlangAstLowerer {
                 if let Some(word) = self.constants.get(&name).cloned() {
                     return Ok(Expr::Const(word));
                 }
+                if let Some(word) = self.enum_constants.get(&name).cloned() {
+                    return Ok(Expr::Const(word));
+                }
                 if let Some(symbol) = self.symbols.get(&name) {
                     Ok(Expr::Ref {
                         net: symbol.base,
@@ -920,28 +923,13 @@ impl super::SlangAstLowerer {
             .ok_or_else(|| "conversion has no operand".to_string())?;
         let target_type = string_field(value, "type").unwrap_or_default();
         let source_type = string_field(operand, "type").unwrap_or_default();
-        let (target_width, target_signed) = match (
-            simple_type_width(&target_type),
-            simple_type_signed(&target_type),
-        ) {
-            (Some(width), Some(signed)) if width > 0 => (width, signed),
-            _ => {
-                return Err(format!(
-                    "direct slang-AST lowering does not support conversion target '{target_type}'"
-                ))
-            }
-        };
-        let (source_width, source_signed) = match (
-            simple_type_width(&source_type),
-            simple_type_signed(&source_type),
-        ) {
-            (Some(width), Some(signed)) if width > 0 => (width, signed),
-            _ => {
-                return Err(format!(
-                    "direct slang-AST lowering does not support conversion operand '{source_type}'"
-                ))
-            }
-        };
+        let (target_shape, target_signed, _) = self.net_type(&target_type)?;
+        let (source_shape, source_signed, _) = self.net_type(&source_type)?;
+        let target_width = target_shape.width;
+        let source_width = source_shape.width;
+        if target_width == 0 || source_width == 0 {
+            return Err("integral conversion width cannot be zero".into());
+        }
 
         let expression = self.lower_expression(operand)?;
         if target_width == source_width

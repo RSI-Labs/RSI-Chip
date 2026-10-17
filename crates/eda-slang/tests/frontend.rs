@@ -2465,6 +2465,79 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_enum_types() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-enum");
+    let source_path = root.join("enum.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module enum_module(
+  input logic [1:0] selector,
+  output logic [1:0] raw,
+  output logic is_b,
+  output logic [1:0] cast_raw
+);
+  typedef enum logic [1:0] {
+    A = 2'b00,
+    B = 2'b01,
+    C = 2'b10
+  } state_t;
+
+  state_t state;
+  always_comb begin
+    case (selector)
+      A: state = A;
+      B: state = B;
+      default: state = C;
+    endcase
+  end
+  assign raw = state;
+  assign is_b = state == B;
+  assign cast_raw = state_t'(2'b11);
+endmodule
+"#,
+    )
+    .expect("write enum source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("enum_module"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower enum type");
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 3);
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "state")
+            .expect("enum state declaration")
+            .width,
+        2
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create enum simulator");
+    for (selector, expected_raw, expected_is_b) in
+        [(0b00, 0b00, false), (0b01, 0b01, true), (0b10, 0b10, false)]
+    {
+        simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        assert_eq!(simulator.read("raw").unwrap().to_u64(), Some(expected_raw));
+        assert_eq!(
+            simulator.read("is_b").unwrap().to_u64(),
+            Some(expected_is_b as u64)
+        );
+    }
+    assert_eq!(simulator.read("cast_raw").unwrap().to_u64(), Some(0b11));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
