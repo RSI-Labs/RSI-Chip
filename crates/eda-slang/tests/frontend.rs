@@ -2360,6 +2360,56 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_nested_packed_struct_types() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nested-packed-struct");
+    let source_path = root.join("nested_packed_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module nested_packed_struct(
+  output logic [7:0] whole,
+  output logic [1:0] selected
+);
+  typedef struct packed {
+    logic [1:0] a;
+    logic [1:0] b;
+  } inner_t;
+
+  typedef struct packed {
+    inner_t left;
+    logic [3:0] right;
+  } outer_t;
+
+  outer_t value;
+  assign value.left.a = 2'b10;
+  assign value.left.b = 2'b01;
+  assign value.right = 4'h3;
+  assign whole = value;
+  assign selected = value.left.a;
+endmodule
+"#,
+    )
+    .expect("write nested packed-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("nested_packed_struct"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower nested packed struct");
+    assert_eq!(design.assigns.len(), 5);
+
+    let mut simulator = Simulator::new(&design).expect("create nested packed-struct simulator");
+    simulator.run_until(0).expect("settle nested packed struct");
+    assert_eq!(simulator.read("whole").unwrap().to_u64(), Some(0x93));
+    assert_eq!(simulator.read("selected").unwrap().to_u64(), Some(0b10));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

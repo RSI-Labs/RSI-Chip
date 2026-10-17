@@ -733,13 +733,7 @@ impl super::SlangAstLowerer {
         let member = string_field(value, "member")
             .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
             .ok_or_else(|| "struct member access has no member".to_string())?;
-        let symbol = self.direct_packed_symbol(selected)?.ok_or_else(|| {
-            "struct member access requires a named struct declaration".to_string()
-        })?;
-        let field = symbol
-            .struct_fields
-            .get(&member)
-            .ok_or_else(|| format!("struct has no member '{member}'"))?;
+        let field = self.struct_field_for_type(selected, &member)?;
         let base = self.lower_expression(selected)?;
         Ok((base, field.offset + field.width - 1, field.offset))
     }
@@ -754,15 +748,65 @@ impl super::SlangAstLowerer {
         let member = string_field(value, "member")
             .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
             .ok_or_else(|| "struct member access has no member".to_string())?;
-        let symbol = self.direct_packed_symbol(selected)?.ok_or_else(|| {
-            "struct member access requires a named struct declaration".to_string()
-        })?;
-        let field = symbol
-            .struct_fields
-            .get(&member)
-            .ok_or_else(|| format!("struct has no member '{member}'"))?;
+        let selected_offset = self.selected_struct_offset(selected)?;
+        let field = self.struct_field_for_type(selected, &member)?;
         let base = self.lower_lvalue(selected)?;
-        Ok((base, field.offset + field.width - 1, field.offset))
+        let lsb = selected_offset + field.offset;
+        Ok((base, lsb + field.width - 1, lsb))
+    }
+
+    fn selected_struct_offset(&self, value: &serde_json::Value) -> Result<usize, String> {
+        if string_field(value, "kind").as_deref() == Some("NamedValue") {
+            self.direct_packed_symbol(value)?
+                .ok_or_else(|| "struct member access requires a named declaration".to_string())?;
+            return Ok(0);
+        }
+        if string_field(value, "kind").as_deref() != Some("MemberAccess") {
+            return Err("nested struct member access has an unsupported selected value".into());
+        }
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "struct member access has no selected value".to_string())?;
+        let selected_offset = self.selected_struct_offset(selected)?;
+        let member = string_field(value, "member")
+            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "struct member access has no member".to_string())?;
+        let field = self.struct_field_for_type(selected, &member)?;
+        Ok(selected_offset + field.offset)
+    }
+
+    fn struct_field_for_type(
+        &self,
+        value: &serde_json::Value,
+        member: &str,
+    ) -> Result<super::AstStructField, String> {
+        let type_name = string_field(value, "type").unwrap_or_default();
+        let alias_name = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        if let Some(definition) = self.type_aliases.get(alias_name) {
+            return definition
+                .fields
+                .get(member)
+                .copied()
+                .ok_or_else(|| format!("struct type has no member '{member}'"));
+        }
+        if string_field(value, "kind").as_deref() == Some("NamedValue") {
+            if let Some(symbol) = self.direct_packed_symbol(value)? {
+                return symbol
+                    .struct_fields
+                    .get(member)
+                    .copied()
+                    .ok_or_else(|| format!("struct has no member '{member}'"));
+            }
+        }
+        Err(format!(
+            "struct member '{member}' requires a known packed struct type"
+        ))
     }
 
     pub(super) fn lower_integral_conversion(

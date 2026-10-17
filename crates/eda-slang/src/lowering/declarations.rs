@@ -38,7 +38,12 @@ impl SlangAstLowerer {
             let field_type = field
                 .get("type")
                 .ok_or_else(|| format!("packed struct field '{name}.{field_name}' has no type"))?;
-            let field_width = detailed_type_width(field_type)?;
+            let field_width = if field_type.is_object() {
+                detailed_type_width(field_type)?
+            } else {
+                let type_name = string_field(field, "type").unwrap_or_default();
+                self.net_type(&type_name)?.0.width
+            };
             width = width.max(offset.saturating_add(field_width));
             struct_fields.insert(
                 field_name.to_string(),
