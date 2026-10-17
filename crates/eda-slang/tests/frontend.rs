@@ -2538,6 +2538,95 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_enum_next_and_prev() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-enum-next-prev");
+    let source_path = root.join("enum_next_prev.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module enum_next_prev(
+  input logic [1:0] selector,
+  output logic [1:0] next_state,
+  output logic [1:0] prev_state,
+  output logic [1:0] next_by_two,
+  output logic [1:0] constant_next,
+  output logic [1:0] constant_prev,
+  output logic [1:0] invalid_next
+);
+  typedef enum logic [1:0] {
+    A = 2'b00,
+    B = 2'b01,
+    C = 2'b10
+  } state_t;
+
+  state_t state;
+  always_comb state = state_t'(selector);
+  assign next_state = state.next();
+  assign prev_state = state.prev();
+  assign next_by_two = state.next(2);
+  assign constant_next = C.next();
+  assign constant_prev = A.prev();
+  assign invalid_next = state_t'(2'b11).next();
+endmodule
+"#,
+    )
+    .expect("write enum next/prev source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("enum_next_prev"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower enum next/prev");
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 6);
+
+    let mut simulator = Simulator::new(&design).expect("create enum next/prev simulator");
+    for (selector, expected_next, expected_prev, expected_by_two) in [
+        (0b00, 0b01, 0b10, 0b10),
+        (0b01, 0b10, 0b00, 0b00),
+        (0b10, 0b00, 0b01, 0b01),
+    ] {
+        simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        assert_eq!(
+            simulator.read("next_state").unwrap().to_u64(),
+            Some(expected_next)
+        );
+        assert_eq!(
+            simulator.read("prev_state").unwrap().to_u64(),
+            Some(expected_prev)
+        );
+        assert_eq!(
+            simulator.read("next_by_two").unwrap().to_u64(),
+            Some(expected_by_two)
+        );
+    }
+
+    simulator
+        .set_input("selector", &LogicWord::from_u64(2, 0))
+        .unwrap();
+    assert_eq!(
+        simulator.read("constant_next").unwrap().to_u64(),
+        Some(0b00)
+    );
+    assert_eq!(
+        simulator.read("constant_prev").unwrap().to_u64(),
+        Some(0b10)
+    );
+
+    simulator
+        .set_input("selector", &LogicWord::from_u64(2, 0b11))
+        .unwrap();
+    assert_eq!(simulator.read("invalid_next").unwrap().to_hex_str(), "x");
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

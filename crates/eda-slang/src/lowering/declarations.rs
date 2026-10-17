@@ -102,6 +102,7 @@ impl SlangAstLowerer {
             .get("members")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| format!("enum type '{name}' has no values"))?;
+        let mut ordered_values = Vec::with_capacity(values.len());
         for value in values {
             let value_name = value
                 .get("name")
@@ -111,9 +112,17 @@ impl SlangAstLowerer {
                 .ok_or_else(|| format!("enum value '{name}.{value_name}' has no value"))?;
             let word = literal_word(&value_type, &raw)
                 .ok_or_else(|| format!("enum value '{name}.{value_name}' is invalid"))?;
+            ordered_values.push(word.clone());
             self.enum_constants.insert(value_name.to_string(), word);
         }
-        self.type_enums.insert(name, AstEnumType { width, signed });
+        self.type_enums.insert(
+            name,
+            AstEnumType {
+                width,
+                signed,
+                values: ordered_values,
+            },
+        );
         Ok(())
     }
 

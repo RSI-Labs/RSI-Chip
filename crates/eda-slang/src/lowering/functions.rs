@@ -18,6 +18,9 @@ impl SlangAstLowerer {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Err("function call has no subroutine symbol".into());
         };
+        if matches!(subroutine.as_str(), "next" | "prev") {
+            return self.lower_enum_next_prev(value, subroutine == "next");
+        }
         let subroutine_name = expression_symbol(value)
             .or_else(|| {
                 subroutine
@@ -102,6 +105,68 @@ impl SlangAstLowerer {
         };
         self.inline_stack.borrow_mut().pop();
         result
+    }
+
+    fn lower_enum_next_prev(
+        &self,
+        value: &Value,
+        next: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "enum method call has no receiver".to_string())?;
+        if arguments.is_empty() || arguments.len() > 2 {
+            return Err("enum next/prev expects one receiver and at most one count".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "enum next/prev has no receiver".to_string())?;
+        let receiver_type = string_field(receiver, "type").unwrap_or_default();
+        let enum_name = receiver_type
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        let definition = self
+            .type_enums
+            .get(enum_name)
+            .ok_or_else(|| format!("enum next/prev receiver is not an enum: '{receiver_type}'"))?;
+        if definition.values.is_empty() {
+            return Err("enum next/prev requires a nonempty enum".into());
+        }
+
+        let mut count = 1_i64;
+        if let Some(count_value) = arguments.get(1) {
+            count = constant_ast_i64(count_value)
+                .map_err(|_| "enum next/prev count must be an inline integer constant")?;
+        }
+        if !next {
+            count = -count;
+        }
+        let length = definition.values.len() as i64;
+        let offset = count.rem_euclid(length);
+
+        let receiver = self.lower_expression(receiver)?;
+        let mut result = Expr::Const(eda_core::logic::LogicWord::xes(definition.width));
+        for (index, current) in definition.values.iter().enumerate() {
+            let target_index = (index as i64 + offset) % length;
+            let target = &definition.values[target_index as usize];
+            result = Expr::Cond {
+                c: Box::new(Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(receiver.clone()),
+                    b: Box::new(Expr::Const(current.clone())),
+                }),
+                t: Box::new(Expr::Const(target.clone())),
+                f: Box::new(result),
+            };
+        }
+        Ok(result)
     }
 
     fn inline_function_body(
