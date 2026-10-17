@@ -90,6 +90,11 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             remap_expression(start, offset);
         }
         Expr::Index { e, .. } => remap_expression(e, offset),
+        Expr::StringLength { e } => remap_expression(e, offset),
+        Expr::StringConcat { left, right } => {
+            remap_expression(left, offset);
+            remap_expression(right, offset);
+        }
     }
 }
 
@@ -218,6 +223,11 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
             remap_expression_memory_ids(start, offset);
         }
         Expr::Index { e, .. } => remap_expression_memory_ids(e, offset),
+        Expr::StringLength { e } => remap_expression_memory_ids(e, offset),
+        Expr::StringConcat { left, right } => {
+            remap_expression_memory_ids(left, offset);
+            remap_expression_memory_ids(right, offset);
+        }
     }
 }
 

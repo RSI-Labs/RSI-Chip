@@ -103,6 +103,7 @@ pub struct SlangAssignmentSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangExpressionSummary {
     pub kind: String,
+    pub type_name: String,
     pub operator: String,
     /// Packed width for simple slang expression types. Complex/aggregate types
     /// remain unresolved.

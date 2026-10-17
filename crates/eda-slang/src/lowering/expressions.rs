@@ -263,6 +263,15 @@ impl super::SlangAstLowerer {
                     })?;
                     return self.lower_streaming(operand, target_width);
                 }
+                if string_field(value, "type").as_deref() == Some("string")
+                    && string_field(operand, "kind").as_deref() == Some("Concatenation")
+                {
+                    let operands = operand
+                        .get("operands")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| "string concatenation has no operands".to_string())?;
+                    return self.lower_string_concatenation(operands);
+                }
                 self.lower_integral_conversion(value)
             }
             "UnaryOp" => {
@@ -435,6 +444,9 @@ impl super::SlangAstLowerer {
                     .get("operands")
                     .and_then(serde_json::Value::as_array)
                     .ok_or_else(|| "concatenation has no operands".to_string())?;
+                if string_field(value, "type").as_deref() == Some("string") {
+                    return self.lower_string_concatenation(operands);
+                }
                 let mut parts = Vec::new();
                 for operand in operands {
                     parts.push(self.lower_expression(operand)?);
@@ -759,6 +771,62 @@ impl super::SlangAstLowerer {
             });
         }
         Ok(Expr::Concat(reversed_blocks))
+    }
+
+    pub(super) fn lower_string_concatenation(
+        &self,
+        operands: &[serde_json::Value],
+    ) -> Result<eda_core::ir::Expr, String> {
+        let Some((first, rest)) = operands.split_first() else {
+            return Err("string concatenation has no operands".to_string());
+        };
+        let mut result = self.lower_string_operand(first)?;
+        for operand in rest {
+            let value = self.lower_string_operand(operand)?;
+            result = self.lower_string_concat_pair(result, value)?;
+        }
+        Ok(result)
+    }
+
+    fn lower_string_operand(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let converted = serde_json::json!({
+            "kind": "Conversion",
+            "type": "string",
+            "operand": value,
+        });
+        self.lower_expression(&converted)
+    }
+
+    fn lower_string_concat_pair(
+        &self,
+        left: eda_core::ir::Expr,
+        right: eda_core::ir::Expr,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        if left.width() != crate::types::STRING_WIDTH || right.width() != crate::types::STRING_WIDTH
+        {
+            return Err("string concatenation requires 512-bit string operands".into());
+        }
+        Ok(Expr::StringConcat {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    pub(super) fn lower_string_length(
+        &self,
+        value: eda_core::ir::Expr,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        if value.width() != crate::types::STRING_WIDTH {
+            return Err("string len requires a 512-bit string receiver".into());
+        }
+        Ok(Expr::StringLength { e: Box::new(value) })
     }
 
     pub(super) fn lower_struct_member(

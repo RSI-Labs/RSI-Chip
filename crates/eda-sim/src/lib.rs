@@ -1417,6 +1417,20 @@ impl<'d> Simulator<'d> {
             }
             Expr::Index { e, msb, lsb } => self.eval(e).slice(*msb, *lsb),
             Expr::Signed { e, .. } => self.eval(e),
+            Expr::StringLength { e } => match ascii_string_length(&self.eval(e)) {
+                Some(length) => LogicWord::from_u64(32, length as u64),
+                None => LogicWord::xes(32),
+            },
+            Expr::StringConcat { left, right } => {
+                let left = self.eval(left);
+                let right = self.eval(right);
+                match (ascii_string_length(&left), ascii_string_length(&right)) {
+                    (Some(left_length), Some(right_length)) => {
+                        concat_packed_strings(&left, left_length, &right, right_length)
+                    }
+                    _ => LogicWord::xes(left.width()),
+                }
+            }
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1594,6 +1608,52 @@ fn sext_word(w: &LogicWord, width: usize) -> LogicWord {
     LogicWord { bits }
 }
 
+fn ascii_string_length(word: &LogicWord) -> Option<usize> {
+    for (byte, bits) in word.bits.chunks(8).enumerate() {
+        let mut value = 0_u8;
+        let mut known = true;
+        for (bit, state) in bits.iter().enumerate() {
+            match state.as_bool() {
+                Some(true) => value |= 1 << bit,
+                Some(false) => {}
+                None => known = false,
+            }
+        }
+        if !known {
+            return None;
+        }
+        if value == 0 {
+            return Some(byte);
+        }
+    }
+    Some(word.bits.chunks(8).len())
+}
+
+fn concat_packed_strings(
+    left: &LogicWord,
+    left_length: usize,
+    right: &LogicWord,
+    right_length: usize,
+) -> LogicWord {
+    let width = left.width();
+    let mut bits = vec![LogicValue::Zero; width];
+    for byte in 0..width / 8 {
+        if byte < left_length {
+            for bit in 0..8 {
+                bits[byte * 8 + bit] = left.bit(byte * 8 + bit);
+            }
+        } else {
+            let right_byte = byte - left_length;
+            if right_byte < right_length {
+                for bit in 0..8 {
+                    bits[byte * 8 + bit] = right.bit(right_byte * 8 + bit);
+                }
+            }
+        }
+    }
+    LogicWord { bits }
+}
+
 fn case_eq_words(a: &LogicWord, b: &LogicWord) -> bool {
     let w = a.width().max(b.width());
     (0..w).all(|i| {
@@ -1657,6 +1717,11 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         Expr::Repeat { e, .. } => walk_expr(e, out),
         Expr::Index { e, .. } => walk_expr(e, out),
         Expr::Signed { e, .. } => walk_expr(e, out),
+        Expr::StringLength { e } => walk_expr(e, out),
+        Expr::StringConcat { left, right } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1695,6 +1760,11 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         Expr::Repeat { e, .. } => walk_expr_memories(e, out),
         Expr::Index { e, .. } => walk_expr_memories(e, out),
         Expr::Signed { e, .. } => walk_expr_memories(e, out),
+        Expr::StringLength { e } => walk_expr_memories(e, out),
+        Expr::StringConcat { left, right } => {
+            walk_expr_memories(left, out);
+            walk_expr_memories(right, out);
+        }
         Expr::MemoryReadPart {
             memory,
             indexes,

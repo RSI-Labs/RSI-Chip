@@ -398,6 +398,15 @@ pub enum Expr {
         msb: usize,
         lsb: usize,
     },
+    /// Number of bytes before the first NUL in a fixed-width packed string.
+    StringLength {
+        e: Box<Expr>,
+    },
+    /// Bounded string concatenation in little-endian byte layout.
+    StringConcat {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -433,6 +442,8 @@ impl Expr {
             Expr::MemoryRead { width, .. } => *width,
             Expr::MemoryReadPart { width, .. } => *width,
             Expr::Index { msb, lsb, .. } => msb - lsb + 1,
+            Expr::StringLength { .. } => 32,
+            Expr::StringConcat { left, .. } => left.width(),
         }
     }
 
@@ -466,6 +477,8 @@ impl Expr {
             // A part-select is unsigned even when its base declaration is signed.
             Expr::MemoryReadPart { .. } => false,
             Expr::Index { .. } => false,
+            Expr::StringLength { .. } => true,
+            Expr::StringConcat { .. } => false,
         }
     }
 }
@@ -1042,6 +1055,11 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             .for_each(|part| collect_memory_expr_reads(part, synchronous, accesses)),
         Expr::Repeat { e, .. } | Expr::Signed { e, .. } | Expr::Index { e, .. } => {
             collect_memory_expr_reads(e, synchronous, accesses)
+        }
+        Expr::StringLength { e } => collect_memory_expr_reads(e, synchronous, accesses),
+        Expr::StringConcat { left, right } => {
+            collect_memory_expr_reads(left, synchronous, accesses);
+            collect_memory_expr_reads(right, synchronous, accesses);
         }
     }
 }

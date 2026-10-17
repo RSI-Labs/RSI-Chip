@@ -1804,6 +1804,7 @@ endmodule
             source: "ContinuousAssign".into(),
             rhs: eda_slang::SlangExpressionSummary {
                 kind: "BinaryOp".into(),
+                type_name: String::new(),
                 operator: "Add".into(),
                 type_width: None,
                 type_signed: None,
@@ -2914,10 +2915,16 @@ fn slang_ast_direct_lowering_supports_string_literals_and_enum_names() {
         r#"
 module strings(
   input logic [1:0] selector,
+  input string left,
+  input string right,
   output string literal_value,
+  output string joined,
+  output string literal_joined,
   output string state_name,
   output string constant_name,
-  output string invalid_name
+  output string invalid_name,
+  output int left_length,
+  output int right_length
 );
   typedef enum logic [1:0] {
     A = 2'b00,
@@ -2928,9 +2935,13 @@ module strings(
   state_t state;
   always_comb state = state_t'(selector);
   assign literal_value = "READY";
+  assign joined = {left, right};
+  assign literal_joined = {"AB", "CD"};
   assign state_name = state.name();
   assign constant_name = B.name();
   assign invalid_name = state_t'(2'b11).name();
+  assign left_length = left.len();
+  assign right_length = right.len();
 endmodule
 "#,
     )
@@ -2944,7 +2955,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(design.assigns.len(), 8);
     assert_eq!(
         design
             .net_decls
@@ -2959,6 +2970,15 @@ endmodule
     for (selector, name) in [(0, "A"), (1, "B"), (2, "C")] {
         simulator
             .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        simulator
+            .set_input(
+                "left",
+                &LogicWord::from_bytes_le(512, selector.to_string().as_bytes()),
+            )
+            .unwrap();
+        simulator
+            .set_input("right", &LogicWord::from_bytes_le(512, b"-STATE"))
             .unwrap();
         assert_eq!(
             simulator
@@ -2988,6 +3008,26 @@ endmodule
                 .to_ascii_string_nul_terminated(),
             ""
         );
+        let joined = format!("{selector}-STATE");
+        assert_eq!(
+            simulator
+                .read("joined")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            joined
+        );
+        assert_eq!(
+            simulator
+                .read("literal_joined")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "ABCD"
+        );
+        assert_eq!(
+            simulator.read("left_length").unwrap().to_u64(),
+            Some(selector.to_string().len() as u64)
+        );
+        assert_eq!(simulator.read("right_length").unwrap().to_u64(), Some(6));
     }
 }
 

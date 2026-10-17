@@ -127,6 +127,12 @@ impl<'a> Synth<'a> {
                     "first-class sparse-memory part-select reads are not synthesizable yet".into(),
                 )
             }
+            Expr::StringLength { .. } => {
+                return Err("bounded string methods are not synthesizable yet".into())
+            }
+            Expr::StringConcat { .. } => {
+                return Err("bounded string concatenation is not synthesizable yet".into())
+            }
         })
     }
 

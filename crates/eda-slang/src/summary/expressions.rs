@@ -25,6 +25,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     };
     SlangExpressionSummary {
         kind,
+        type_name: string_field(value, "type").unwrap_or_default(),
         operator: string_field(value, "op").unwrap_or_default(),
         type_width: string_field(value, "type").and_then(|type_name| simple_type_width(&type_name)),
         type_signed,
@@ -38,6 +39,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
 pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
     SlangExpressionSummary {
         kind: String::new(),
+        type_name: String::new(),
         operator: String::new(),
         type_width: None,
         type_signed: None,
@@ -169,6 +171,7 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
 
 pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Option<&'static str> {
     match (expression.kind.as_str(), expression.operator.as_str()) {
+        ("Concatenation", _) if expression.type_name == "string" => None,
         ("NamedValue", _) if expression.literal.is_some() => Some("Const"),
         ("NamedValue", _) => Some("Ref"),
         ("IntegerLiteral" | "RealLiteral" | "StringLiteral", _) => Some("Const"),
@@ -483,6 +486,8 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::Repeat { .. } => "Repeat",
         Expr::Signed { .. } => "Signed",
         Expr::Index { .. } => "Index",
+        Expr::StringLength { .. } => "StringLength",
+        Expr::StringConcat { .. } => "StringConcat",
     }
 }
 
@@ -549,6 +554,11 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         Expr::Repeat { e, .. } => vec![design_expr_fingerprint(design, e)],
         Expr::Signed { e, .. } => vec![design_expr_fingerprint(design, e)],
         Expr::Index { e, .. } => vec![design_expr_fingerprint(design, e)],
+        Expr::StringLength { e, .. } => vec![design_expr_fingerprint(design, e)],
+        Expr::StringConcat { left, right } => vec![
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right),
+        ],
     };
     format!(
         "{}:{}:{}[{}]",

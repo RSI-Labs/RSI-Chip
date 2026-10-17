@@ -31,6 +31,7 @@ impl SlangAstLowerer {
             "first" | "last" => return self.lower_enum_first_last(value, subroutine == "first"),
             "num" => return self.lower_enum_num(value),
             "name" => return self.lower_enum_name(value),
+            "len" => return self.lower_string_len(value),
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -626,6 +627,24 @@ impl SlangAstLowerer {
             };
         }
         Ok(result)
+    }
+
+    fn lower_string_len(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string len call has no receiver".to_string())?;
+        if arguments.len() != 1 {
+            return Err("string len expects one string receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string len call has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string len receiver is not a string".into());
+        }
+        let receiver = self.lower_expression(receiver)?;
+        self.lower_string_length(receiver)
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {
