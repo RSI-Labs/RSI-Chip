@@ -224,6 +224,38 @@ impl Parser {
             return Ok(Stmt::Forever(body));
         }
         if let Tok::Ident(s) = self.peek().clone() {
+            if s == "$readmemh" || s == "$readmemb" {
+                let radix = if s == "$readmemh" { 16 } else { 2 };
+                self.bump();
+                self.expect_punct("(")?;
+                let path = match self.peek().clone() {
+                    Tok::Str(path) => {
+                        self.bump();
+                        path
+                    }
+                    _ => {
+                        return Err(format!(
+                            "line {}: {s} requires a string literal file path",
+                            line
+                        ))
+                    }
+                };
+                self.expect_punct(",")?;
+                let memory = self.ident()?;
+                if self.eat_punct(",") {
+                    return Err(format!(
+                        "line {}: bounded {s} supports only (file, memory)",
+                        line
+                    ));
+                }
+                self.expect_punct(")")?;
+                self.expect_punct(";")?;
+                return Ok(Stmt::ReadMem {
+                    radix,
+                    path,
+                    memory,
+                });
+            }
             if s == "$display"
                 || s == "$write"
                 || s == "$monitor"

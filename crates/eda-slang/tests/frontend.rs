@@ -1079,16 +1079,16 @@ module readmem(
   output logic [7:0] last,
   output logic [1:0] binary
 );
-  logic [7:0] mem [0:1][0:1];
-  logic [1:0] bits [0:1];
+  logic [7:0] mem [0:4096];
+  logic [1:0] bits [0:2048];
   initial begin
     $readmemh("memory.hex", mem);
     $readmemb("bits.bin", bits);
   end
-  assign first = mem[0][0];
-  assign second = mem[0][1];
-  assign skipped = mem[1][0];
-  assign last = mem[1][1];
+  assign first = mem[0];
+  assign second = mem[1];
+  assign skipped = mem[2];
+  assign last = mem[3];
   assign binary = bits[1];
 endmodule
 "#,
@@ -1114,8 +1114,17 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower sparse-memory file loads");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("readmem"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower memory files through the bounded path");
     assert_eq!(design.memories.len(), 2);
     assert_eq!(design.initials.len(), 1);
+    assert_eq!(reference.memories.len(), 2);
+    assert_eq!(reference.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create memory-file simulator");
     simulator
@@ -1126,6 +1135,23 @@ endmodule
     assert_eq!(simulator.read("skipped").unwrap().to_u64(), None);
     assert_eq!(simulator.read("last").unwrap().to_u64(), Some(4));
     assert_eq!(simulator.read("binary").unwrap().to_u64(), Some(2));
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create bounded memory-file simulator");
+    reference_simulator
+        .run_until(0)
+        .expect("settle bounded memory-file initializers");
+    assert_eq!(reference_simulator.read("first").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        reference_simulator.read("second").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(reference_simulator.read("skipped").unwrap().to_u64(), None);
+    assert_eq!(reference_simulator.read("last").unwrap().to_u64(), Some(4));
+    assert_eq!(
+        reference_simulator.read("binary").unwrap().to_u64(),
+        Some(2)
+    );
 }
 
 #[test]

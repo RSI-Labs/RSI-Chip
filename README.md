@@ -75,10 +75,12 @@ operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
-large `inout` memory-port sharing through the hierarchy. Direct slang-AST lowering also supports inline multidimensional sparse-memory initializers and compile-time `$readmemh`/`$readmemb` expansion. The bounded parser
-also accepts combined net/data declarations such as `wire logic`, allowing the
-preprocessed and direct slang paths to share the same sparse-memory-port
-differential.
+large `inout` memory-port sharing through the hierarchy. Direct slang-AST
+lowering supports inline multidimensional sparse-memory initializers and
+compile-time `$readmemh`/`$readmemb` expansion. The bounded path expands
+two-argument memory-file loads relative to the first source file and accepts
+combined net/data declarations such as `wire logic`, allowing the preprocessed
+and direct slang paths to share sparse-memory differentials.
 
 The data-driven regression target currently contains **15,159 unique named
 cases**. It is not a collection of three or four broad assertions: every case

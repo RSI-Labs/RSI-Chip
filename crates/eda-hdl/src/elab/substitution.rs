@@ -917,5 +917,14 @@ pub(super) fn subst_stmt(stmt: &ast::Stmt, var: &str, value: i64) -> ast::Stmt {
             monitor: *monitor,
         },
         ast::Stmt::Finish => ast::Stmt::Finish,
+        ast::Stmt::ReadMem {
+            radix,
+            path,
+            memory,
+        } => ast::Stmt::ReadMem {
+            radix: *radix,
+            path: path.clone(),
+            memory: memory.clone(),
+        },
     }
 }

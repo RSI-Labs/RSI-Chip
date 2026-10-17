@@ -11,5 +11,6 @@ pub mod ir;
 pub mod liberty;
 pub mod library;
 pub mod logic;
+pub mod memory_file;
 pub mod netlist;
 pub mod to_design;

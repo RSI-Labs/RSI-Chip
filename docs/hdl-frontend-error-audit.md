@@ -19,18 +19,18 @@ The serious frontend failures are structural, not isolated typos:
 8. The first AST-summary implementation recursively collected every named symbol under an assignment LHS, so `mem[addr]` incorrectly reported both `mem` and `addr` as assignment targets. Target extraction now follows only the selected base value. Legacy small-array procedural assignments still use bounded per-element expansion; their slang comparison preserves assignment-count checking without pretending that the expanded expression tree has source-level shape equivalence.
 9. The bounded parser now accepts combined net/data type spellings such as `wire logic`. Together with the existing sparse `inout` memory-port model, both direct slang-AST and preprocessed bounded paths execute the same 4 KiB shared-memory differential.
 10. Direct slang-AST lowering now expands inline multidimensional sparse-memory `SimpleAssignmentPattern` initializers into time-zero sparse blocking writes and validates them in simulation.
-11. Direct slang-AST lowering resolves relative `$readmemh`/`$readmemb` files against the statement source file, strips comments, supports `@address` tokens, maps physical addresses to multidimensional logical indexes, and expands touched entries into sparse blocking writes.
+11. Both direct slang-AST and bounded elaboration resolve relative two-argument `$readmemh`/`$readmemb` files against the statement source file, strips comments, supports `@address` tokens, maps physical addresses to multidimensional logical indexes, and expands touched entries into sparse blocking writes.
 
 Current automated status at the time of this audit:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p eda-hdl --all-targets -- --nocapture` | 88 passed after combined net/data-type remediation |
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 89 passed after memory-file-task remediation |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 83 passed, including consecutive sparse whole/part-write tests |
 | `cargo test -p eda-sim frontend_regressions -- --nocapture` | 14 passed |
 | `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 19 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 130.34 s after the memory-file follow-up |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 130.81 s after the bounded memory-file follow-up |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 

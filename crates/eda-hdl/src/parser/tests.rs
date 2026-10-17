@@ -156,6 +156,22 @@ fn net_type_keyword_can_combine_with_data_type() {
 }
 
 #[test]
+fn memory_file_tasks_parse_to_readmem_statements() {
+    let file =
+        parse_ok("module m; logic [7:0] mem [0:3]; initial $readmemh(\"mem.hex\", mem); endmodule");
+    assert!(matches!(
+        &file.modules[0].items[1],
+        Item::Initial {
+            body: Stmt::ReadMem {
+                radix: 16,
+                path,
+                memory,
+            }
+        } if path == "mem.hex" && memory == "mem"
+    ));
+}
+
+#[test]
 fn conditional_and_concat() {
     let f = parse_ok("module m(s,a,b,y); assign y = s ? {a, b[3:0]} : 4'b0; endmodule");
     if let Item::Assign { e, .. } = &f.modules[0].items[4] {

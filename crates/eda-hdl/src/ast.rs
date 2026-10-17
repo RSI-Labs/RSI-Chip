@@ -527,6 +527,12 @@ pub enum Stmt {
         args: Vec<Expr>,
         monitor: bool,
     },
+    /// Compile-time two-argument `$readmemh`/`$readmemb` load.
+    ReadMem {
+        radix: u32,
+        path: String,
+        memory: String,
+    },
     Finish,
 }
 

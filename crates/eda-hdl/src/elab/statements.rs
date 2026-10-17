@@ -791,6 +791,14 @@ impl<'a> Elaborator<'a> {
                 return self.dynamic_indexed_part_nbl(name, start, width, *ascending, e, env);
             }
         }
+        if let ast::Stmt::ReadMem {
+            radix,
+            path,
+            memory,
+        } = s
+        {
+            return self.memory_file_statement(*radix, path, memory, env);
+        }
         Ok(match s {
             ast::Stmt::Block(v) => StmtIR::Block(
                 v.iter()
@@ -902,7 +910,54 @@ impl<'a> Elaborator<'a> {
                 }
             }
             ast::Stmt::Finish => StmtIR::Finish,
+            ast::Stmt::ReadMem {
+                radix,
+                path,
+                memory,
+            } => return self.memory_file_statement(*radix, path, memory, env),
         })
+    }
+
+    fn memory_file_statement(
+        &self,
+        radix: u32,
+        path: &str,
+        memory_name: &str,
+        env: &Env<'_>,
+    ) -> Result<StmtIR, String> {
+        let entry = env.net(memory_name)?;
+        let memory_index = entry
+            .memory
+            .ok_or_else(|| format!("'{memory_name}' is not a sparse memory"))?;
+        let declaration = &self.design.memories[memory_index];
+        let raw_path = std::path::PathBuf::from(path);
+        let resolved_path = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            self.source_dir
+                .as_deref()
+                .map(|source_dir| source_dir.join(&raw_path))
+                .unwrap_or(raw_path)
+        };
+        let values = eda_core::memory_file::read_memory_file(
+            &resolved_path,
+            radix,
+            declaration.element_width,
+        )?;
+        let mut statements = Vec::with_capacity(values.len());
+        for physical_index in values.keys().copied().collect::<Vec<_>>() {
+            let indexes =
+                eda_core::memory_file::physical_to_logical_indexes(declaration, physical_index)?;
+            statements.push(StmtIR::MemoryBl {
+                memory: memory_index,
+                indexes: indexes
+                    .into_iter()
+                    .map(|index| ExprIR::Const(LogicWord::from_u64(32, index as u64)))
+                    .collect(),
+                e: ExprIR::Const(values[&physical_index].clone()),
+            });
+        }
+        Ok(StmtIR::Block(statements))
     }
 
     pub(super) fn elab_lvalue(&self, e: &ast::Expr, env: &Env) -> Result<LValue, String> {

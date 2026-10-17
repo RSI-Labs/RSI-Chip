@@ -30,8 +30,17 @@ use types::*;
 
 /// Parse + elaborate in one step.
 pub fn compile(source: &str, top: Option<&str>) -> Result<Design, String> {
+    compile_with_source_dir(source, top, None)
+}
+
+/// Parses and elaborates with a base directory for compile-time file tasks.
+pub fn compile_with_source_dir(
+    source: &str,
+    top: Option<&str>,
+    source_dir: Option<&std::path::Path>,
+) -> Result<Design, String> {
     let file = parser::parse(source)?;
-    elaborate(&file, top)
+    elaborate_with_source_dir(&file, top, source_dir)
 }
 
 /// A named compilation unit.
@@ -117,7 +126,10 @@ pub fn compile_sources(sources: &[HdlSource], top: Option<&str>) -> Result<Desig
     let manager = SourceManager::new(sources);
     let file =
         parser::parse(manager.combined()).map_err(|error| remap_parse_error(&error, &manager))?;
-    elaborate(&file, top)
+    let source_dir = sources
+        .first()
+        .map(|source| std::path::Path::new(&source.name));
+    elaborate_with_source_dir(&file, top, source_dir)
 }
 
 fn remap_parse_error(error: &str, manager: &SourceManager) -> String {
@@ -142,6 +154,14 @@ fn remap_parse_error(error: &str, manager: &SourceManager) -> String {
 }
 
 pub fn elaborate(file: &ast::SourceFile, top: Option<&str>) -> Result<Design, String> {
+    elaborate_with_source_dir(file, top, None)
+}
+
+pub fn elaborate_with_source_dir(
+    file: &ast::SourceFile,
+    top: Option<&str>,
+    source_dir: Option<&std::path::Path>,
+) -> Result<Design, String> {
     let mut mods: HashMap<String, &ast::Module> = HashMap::new();
     for m in &file.modules {
         if mods.insert(m.name.clone(), m).is_some() {
@@ -165,6 +185,7 @@ pub fn elaborate(file: &ast::SourceFile, top: Option<&str>) -> Result<Design, St
             name: top_name.clone(),
             ..Default::default()
         },
+        source_dir: source_dir.map(std::path::Path::to_path_buf),
         depth: 0,
         classes: collect_classes(file)?,
         next_object_id: 1,

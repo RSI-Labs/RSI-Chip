@@ -210,6 +210,7 @@ pub(super) struct Elaborator<'a> {
     pub(super) packages: &'a PackageTables,
     pub(super) file_imports: &'a [ast::Import],
     pub(super) design: Design,
+    pub(super) source_dir: Option<std::path::PathBuf>,
     pub(super) depth: usize,
     /// SystemVerilog class definitions visible to the design (module scope,
     /// package scope, and the built-in UVM-lite base classes).
