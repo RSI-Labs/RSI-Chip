@@ -3568,6 +3568,59 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_task_inout_and_ref_arguments() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-inout-ref");
+    let source_path = root.join("task_inout_ref.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_inout_ref(
+  output int inout_result,
+  output int ref_result
+);
+  task automatic add_inout(inout int value, input int delta);
+    value = value + delta;
+  endtask
+
+  task automatic add_ref(ref int value, input int delta);
+    value = value + delta;
+  endtask
+
+  int inout_state = 10;
+  int ref_state = 20;
+
+  initial begin
+    add_inout(inout_state, 5);
+    add_ref(ref_state, 7);
+  end
+
+  assign inout_result = inout_state;
+  assign ref_result = ref_state;
+endmodule
+"#,
+    )
+    .expect("write task inout/ref source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_inout_ref"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task inout/ref arguments");
+    assert_eq!(design.initials.len(), 1);
+    assert_eq!(design.assigns.len(), 4);
+
+    let mut simulator = Simulator::new(&design).expect("create task inout/ref simulator");
+    simulator.run_until(0).expect("settle task inout/ref calls");
+    assert_eq!(simulator.read("inout_result").unwrap().to_u64(), Some(15));
+    assert_eq!(simulator.read("ref_result").unwrap().to_u64(), Some(27));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_task_local_variables() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

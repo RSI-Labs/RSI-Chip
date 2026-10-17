@@ -177,14 +177,23 @@ impl SlangAstLowerer {
                     );
                 }
                 "Out" | "InOut" | "Ref" => {
-                    if string_field(actual, "kind").as_deref() != Some("Assignment") {
+                    let actual_kind = string_field(actual, "kind").unwrap_or_default();
+                    let target = if actual_kind == "Assignment" {
+                        actual
+                            .get("left")
+                            .ok_or_else(|| format!("task argument '{formal_name}' has no target"))?
+                    } else if direction == "Ref"
+                        && matches!(
+                            actual_kind.as_str(),
+                            "NamedValue" | "ElementSelect" | "MemberAccess"
+                        )
+                    {
+                        actual
+                    } else {
                         return Err(format!(
                             "task '{task_name}' argument '{formal_name}' must be connected to an assignable target"
                         ));
-                    }
-                    let target = actual
-                        .get("left")
-                        .ok_or_else(|| format!("task argument '{formal_name}' has no target"))?;
+                    };
                     let formal_type = formal.get("type").cloned().unwrap_or_default();
                     let target_type = target.get("type").cloned().unwrap_or_default();
                     if formal_type != target_type {
@@ -192,7 +201,7 @@ impl SlangAstLowerer {
                             "task '{task_name}' argument '{formal_name}' type {formal_type} does not match target type {target_type}"
                         ));
                     }
-                    if direction != "InOut"
+                    if !matches!(direction.as_str(), "InOut" | "Ref")
                         && task_value_reads_formal(
                             definition
                                 .get("body")
