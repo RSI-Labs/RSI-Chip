@@ -2,7 +2,21 @@
 //! generic primitives become Verilog gate primitives / assigns.
 
 use eda_core::library::CellLibrary;
-use eda_core::netlist::{CellKind, Dir, Netlist};
+use eda_core::logic::LogicWord;
+use eda_core::netlist::{CellKind, Dir, NetId, Netlist};
+use std::collections::HashMap;
+
+struct BlockRomGroup<'a> {
+    name: String,
+    address_width: usize,
+    contents: &'a [LogicWord],
+}
+
+type BlockRomKey = (usize, Vec<NetId>, usize);
+
+fn block_rom_key(address_width: usize, contents: &[LogicWord], inputs: &[NetId]) -> BlockRomKey {
+    (contents.as_ptr() as usize, inputs.to_vec(), address_width)
+}
 
 /// Emit one behavioral model module per library cell used by the netlist so
 /// the output can be re-parsed by our own frontend.
@@ -91,18 +105,54 @@ fn paren_join(
 pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
     let mut s = String::new();
     s.push_str(&lib_models(nl, lib));
-    s.push_str(&format!("module {}(", nl.name));
-    let port_names: Vec<String> = nl
-        .ports
-        .iter()
-        .map(|p| {
-            if p.bits.len() > 1 {
-                format!("{}[{}:0]", p.name, p.bits.len() - 1)
-            } else {
-                p.name.clone()
+    let mut block_rom_group_ids = HashMap::<BlockRomKey, usize>::new();
+    let mut block_rom_groups = Vec::<BlockRomGroup>::new();
+    for c in nl.cells() {
+        if let CellKind::BlockRom {
+            address_width,
+            contents,
+            ..
+        } = &c.kind
+        {
+            let key = block_rom_key(*address_width, contents, &c.inputs);
+            if let std::collections::hash_map::Entry::Vacant(entry) = block_rom_group_ids.entry(key)
+            {
+                let index = block_rom_groups.len();
+                entry.insert(index);
+                block_rom_groups.push(BlockRomGroup {
+                    name: format!("block_rom_{index}"),
+                    address_width: *address_width,
+                    contents,
+                });
             }
-        })
-        .collect();
+        }
+    }
+    let mut block_rom_models = String::new();
+    for group in &block_rom_groups {
+        let Some(first) = group.contents.first() else {
+            continue;
+        };
+        let element_width = first.width();
+        block_rom_models.push_str(&format!(
+            "  reg [{}:0] {} [0:{}];\n",
+            element_width.saturating_sub(1),
+            group.name,
+            group.contents.len() - 1
+        ));
+        block_rom_models.push_str("  initial begin\n");
+        for (address, word) in group.contents.iter().enumerate() {
+            block_rom_models.push_str(&format!(
+                "    {}[{}] = {}'b{};\n",
+                group.name,
+                address,
+                element_width,
+                word.to_bin_str()
+            ));
+        }
+        block_rom_models.push_str("  end\n");
+    }
+    s.push_str(&format!("module {}(", nl.name));
+    let port_names: Vec<String> = nl.ports.iter().map(|p| p.name.clone()).collect();
     s.push_str(&port_names.join(", "));
     s.push_str(");\n");
     for p in &nl.ports {
@@ -113,6 +163,7 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
             s.push_str(&format!("  {} {};\n", dir, p.name));
         }
     }
+    s.push_str(&block_rom_models);
     // internal wires
     let port_nets: Vec<usize> = nl
         .ports
@@ -128,8 +179,31 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
     if !wires.is_empty() {
         s.push_str(&format!("  wire {};\n", wires.join(", ")));
     }
+    let port_net_names = nl
+        .ports
+        .iter()
+        .flat_map(|port| {
+            let width = port.bits.len();
+            port.bits.iter().enumerate().map(move |(msb, net)| {
+                let logical_bit = width - 1 - msb;
+                (
+                    *net,
+                    if width == 1 {
+                        port.name.clone()
+                    } else {
+                        format!("{}[{}]", port.name, logical_bit)
+                    },
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
     for (ci, c) in nl.cells().iter().enumerate() {
-        let netname = |n: usize| nl.nets()[n].name.clone();
+        let netname = |n: usize| {
+            port_net_names
+                .get(&n)
+                .cloned()
+                .unwrap_or_else(|| nl.nets()[n].name.clone())
+        };
         match &c.kind {
             CellKind::Lib(lid) => {
                 let def = lib.get(*lid);
@@ -154,6 +228,47 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
             CellKind::Const(v) => {
                 let bit = v.to_char();
                 s.push_str(&format!("  assign {} = 1'b{};\n", netname(c.output), bit));
+            }
+            CellKind::BlockRom {
+                address_width,
+                bit_index,
+                contents,
+            } => {
+                let key = block_rom_key(*address_width, contents, &c.inputs);
+                let valid = block_rom_group_ids
+                    .get(&key)
+                    .and_then(|index| block_rom_groups.get(*index))
+                    .is_some_and(|group| {
+                        c.inputs.len() == group.address_width
+                            && group
+                                .contents
+                                .first()
+                                .is_some_and(|word| *bit_index < word.width())
+                    });
+                if valid {
+                    let address_bits = (0..*address_width)
+                        .rev()
+                        .map(|bit| netname(c.inputs[bit]))
+                        .collect::<Vec<_>>();
+                    let address = if address_bits.len() == 1 {
+                        address_bits[0].clone()
+                    } else {
+                        format!("{{{}}}", address_bits.join(", "))
+                    };
+                    s.push_str(&format!(
+                        "  assign {} = block_rom_{}[{}][{}:{}];\n",
+                        netname(c.output),
+                        block_rom_group_ids[&key],
+                        address,
+                        bit_index,
+                        bit_index
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "  assign {} = 1'bx; // invalid BlockRom cell\n",
+                        netname(c.output)
+                    ));
+                }
             }
             CellKind::Not => {
                 s.push_str(&format!(
@@ -266,5 +381,58 @@ mod tests {
         let text = write_verilog(&nl, &lib);
         assert!(text.contains("module m(a, b, y);"));
         assert!(text.contains("NAND2 u1 (.a(a), .b(b), .y(y));"));
+    }
+
+    #[test]
+    fn writes_one_behavioral_model_per_block_rom_macro() {
+        let lib = CellLibrary::std();
+        let contents = vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+        ];
+        let contents = std::sync::Arc::new(contents);
+        let mut nl = Netlist::new("rom");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        for bit_index in 0..2 {
+            let output = nl.add_net(format!("q{bit_index}"));
+            nl.add_cell(eda_core::netlist::Cell {
+                name: format!("rom_bit{bit_index}"),
+                kind: CellKind::BlockRom {
+                    address_width: 2,
+                    bit_index,
+                    contents: contents.clone(),
+                },
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+        nl.add_port("address", Dir::In, vec![address1, address0]);
+        nl.add_port("q0", Dir::Out, vec![nl.net_by_name("q0").unwrap()]);
+        nl.add_port("q1", Dir::Out, vec![nl.net_by_name("q1").unwrap()]);
+
+        let text = write_verilog(&nl, &lib);
+        assert_eq!(
+            text.matches("  reg [1:0] block_rom_0 [0:2];\n").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("assign q0 = block_rom_0[{address[1], address[0]}][0:0];"));
+        assert!(text.contains("assign q1 = block_rom_0[{address[1], address[0]}][1:1];"));
+        assert!(!text.contains("block_rom_1"));
+
+        let reparsed = eda_hdl::compile(&text, Some("rom")).expect("reparse BlockRom model");
+        let mut simulator = eda_sim::Simulator::new(&reparsed).unwrap();
+        for (address, expected) in [(0_u64, 0b01), (1, 0b10), (2, 0b11)] {
+            simulator
+                .set_input("address", &LogicWord::from_u64(2, address))
+                .unwrap();
+            assert_eq!(simulator.read("q0").unwrap().to_u64(), Some(expected & 1));
+            assert_eq!(
+                simulator.read("q1").unwrap().to_u64(),
+                Some((expected >> 1) & 1)
+            );
+        }
     }
 }

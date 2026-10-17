@@ -5,6 +5,17 @@ use crate::ir;
 use crate::library::LibFunc;
 use crate::logic::LogicWord;
 use crate::netlist::{self, CellKind, Netlist};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+type BlockRomKey = (usize, Vec<netlist::NetId>, usize);
+
+struct ReconstructedBlockRom {
+    address_base: usize,
+    address_width: usize,
+    element_width: usize,
+    memory: usize,
+}
 
 pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
     let mut d = ir::Design {
@@ -83,6 +94,102 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
                     delay: 0,
                 }),
             }
+        }
+    }
+
+    // Reconstruct one sparse ROM per shared macro payload/address port rather
+    // than duplicating its contents once per output-bit cell.
+    let mut block_rom_group_ids = HashMap::<BlockRomKey, usize>::new();
+    let mut block_rom_groups = Vec::<ReconstructedBlockRom>::new();
+    for c in nl.cells() {
+        if let CellKind::BlockRom {
+            address_width,
+            contents,
+            ..
+        } = &c.kind
+        {
+            let key = (
+                Arc::as_ptr(contents) as *const _ as usize,
+                c.inputs.clone(),
+                *address_width,
+            );
+            if block_rom_group_ids.contains_key(&key) {
+                continue;
+            }
+            let Some(first) = contents.first() else {
+                continue;
+            };
+            let element_width = first.width();
+            if element_width == 0
+                || c.inputs.len() != *address_width
+                || !contents.iter().all(|word| word.width() == element_width)
+            {
+                continue;
+            }
+
+            let group_index = block_rom_groups.len();
+            block_rom_group_ids.insert(key, group_index);
+            let address_base = d.n_nets;
+            d.net_decls.push(ir::NetDecl {
+                name: format!("block_rom_{group_index}_address"),
+                width: *address_width,
+                is_reg: false,
+                is_signed: false,
+                base: address_base,
+            });
+            d.n_nets += address_width;
+            for (address_bit, source) in c.inputs.iter().enumerate() {
+                d.assigns.push(ir::Assign {
+                    lv: ir::LValue {
+                        net: address_base + address_bit,
+                        decl_width: 1,
+                        range: ir::Range::Bit(0),
+                    },
+                    e: bit(*source),
+                    delay: 0,
+                });
+            }
+
+            let memory = d.memories.len();
+            d.memories.push(ir::MemoryDecl {
+                name: format!("block_rom_{group_index}_rom"),
+                element_width,
+                element_msb: element_width as i64 - 1,
+                element_lsb: 0,
+                dimensions: vec![ir::MemoryDimension {
+                    base: 0,
+                    step: 1,
+                    length: contents.len(),
+                }],
+                flat_length: contents.len() as u64,
+                kind: ir::MemoryKind::Rom,
+                template: ir::MemoryTemplate::AsyncRom,
+                write_mask: None,
+                byte_enable: None,
+                banking: ir::MemoryBanking {
+                    count: 1,
+                    depth: contents.len() as u64,
+                },
+            });
+            let initialization = contents
+                .iter()
+                .enumerate()
+                .map(|(address, word)| ir::Stmt::MemoryBl {
+                    memory,
+                    indexes: vec![ir::Expr::Const(LogicWord::from_u64(
+                        32,
+                        u64::try_from(address).unwrap_or(u64::MAX),
+                    ))],
+                    e: ir::Expr::Const(word.clone()),
+                })
+                .collect();
+            d.initials.push(ir::Stmt::Block(initialization));
+            block_rom_groups.push(ReconstructedBlockRom {
+                address_base,
+                address_width: *address_width,
+                element_width,
+                memory,
+            });
         }
     }
 
@@ -190,6 +297,55 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
                         })),
                     },
                 });
+            }
+            CellKind::BlockRom {
+                address_width,
+                bit_index,
+                contents,
+            } => {
+                let key = (
+                    Arc::as_ptr(contents) as *const _ as usize,
+                    c.inputs.clone(),
+                    *address_width,
+                );
+                let group = block_rom_group_ids
+                    .get(&key)
+                    .and_then(|index| block_rom_groups.get(*index));
+                if let Some(group) = group {
+                    let read = ir::Expr::MemoryRead {
+                        memory: group.memory,
+                        indexes: vec![ir::Expr::Ref {
+                            net: group.address_base,
+                            decl_width: group.address_width,
+                            range: if group.address_width == 1 {
+                                ir::Range::Bit(0)
+                            } else {
+                                ir::Range::Span {
+                                    msb: group.address_width - 1,
+                                    lsb: 0,
+                                }
+                            },
+                            signed: false,
+                        }],
+                        width: group.element_width,
+                        signed: false,
+                    };
+                    d.assigns.push(ir::Assign {
+                        lv: lv_out,
+                        e: ir::Expr::Index {
+                            e: Box::new(read),
+                            msb: *bit_index,
+                            lsb: *bit_index,
+                        },
+                        delay: 0,
+                    });
+                } else {
+                    d.assigns.push(ir::Assign {
+                        lv: lv_out,
+                        e: ir::Expr::Const(LogicWord::xes(1)),
+                        delay: 0,
+                    });
+                }
             }
             CellKind::Lib(lid) => {
                 if let Some(lib) = &nl.lib_cache {
@@ -395,5 +551,45 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn block_rom_output_bits_share_one_sparse_memory() {
+        let contents = Arc::new(vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+        ]);
+        let mut nl = Netlist::new("rom");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        let q0 = nl.add_net("q0");
+        let q1 = nl.add_net("q1");
+        for (bit_index, output) in [(0, q0), (1, q1)] {
+            nl.add_cell(Cell {
+                name: format!("rom_bit{bit_index}"),
+                kind: CellKind::BlockRom {
+                    address_width: 2,
+                    bit_index,
+                    contents: contents.clone(),
+                },
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+        // Netlist ports store bits MSB-first.
+        nl.add_port("address", netlist::Dir::In, vec![address1, address0]);
+        nl.add_port("q0", netlist::Dir::Out, vec![q0]);
+        nl.add_port("q1", netlist::Dir::Out, vec![q1]);
+
+        let design = netlist_to_design(&nl);
+        assert_eq!(design.memories.len(), 1);
+        assert_eq!(design.memories[0].flat_length, 3);
+        assert_eq!(design.memories[0].kind, ir::MemoryKind::Rom);
+        assert_eq!(design.initials.len(), 1);
+        assert!(matches!(
+            &design.initials[0],
+            ir::Stmt::Block(statements) if statements.len() == 3
+        ));
     }
 }

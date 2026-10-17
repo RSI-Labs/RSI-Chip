@@ -231,7 +231,7 @@ struct Synth<'a> {
     read_sym: Option<HashMap<usize, Vec<NetId>>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RomContents {
     values: BTreeMap<Vec<i64>, LogicWord>,
     deterministic: bool,
@@ -1047,6 +1047,103 @@ impl<'a> Synth<'a> {
                     *bit = self.mux(select, *new_value, *bit);
                 }
             }
+            return Ok(output);
+        }
+        if macro_candidate(memory.template, total_bits) == MemoryMacroCandidate::BlockRom {
+            if indexes.len() != 1 {
+                return Err(format!(
+                    "memory '{}' requires exactly one BlockRom address index, got {}",
+                    memory.name,
+                    indexes.len()
+                ));
+            }
+            if memory.dimensions.len() != 1
+                || memory.dimensions[0].base != 0
+                || memory.dimensions[0].step != 1
+                || memory.dimensions[0].length as u64 != memory.flat_length
+            {
+                return Err(format!(
+                    "memory '{}' uses non-normalized indexing and cannot yet map to one BlockRom address port",
+                    memory.name
+                ));
+            }
+            let flat_length = usize::try_from(memory.flat_length).map_err(|_| {
+                format!(
+                    "memory '{}' is too large for the current BlockRom model",
+                    memory.name
+                )
+            })?;
+            if flat_length == 0 {
+                return Err(format!(
+                    "memory '{}' has an empty BlockRom address space",
+                    memory.name
+                ));
+            }
+            let contents = self
+                .rom_contents
+                .get(&memory_index)
+                .cloned()
+                .ok_or_else(|| format!("memory '{}' has no ROM contents", memory.name))?;
+            if !contents.deterministic {
+                return Err(format!(
+                    "memory '{}' has conditional ROM initialization and cannot map to BlockRom",
+                    memory.name
+                ));
+            }
+            let mut words = vec![LogicWord::xes(memory.element_width); memory.flat_length as usize];
+            for (logical, word) in contents.values {
+                if logical.len() != 1 {
+                    return Err(format!(
+                        "memory '{}' has invalid BlockRom index rank {}",
+                        memory.name,
+                        logical.len()
+                    ));
+                }
+                let Some(logical_index) = logical.first().copied() else {
+                    return Err(format!("memory '{}' has invalid ROM index", memory.name));
+                };
+                let Some(physical) = memory.physical_index(&[logical_index]) else {
+                    return Err(format!(
+                        "memory '{}' has out-of-range ROM index",
+                        memory.name
+                    ));
+                };
+                words[physical as usize] = word;
+            }
+            let contents = std::sync::Arc::new(words);
+            let address_width = flat_length.max(2).next_power_of_two().trailing_zeros() as usize;
+            if address_width == 0 || address_width > u32::BITS as usize {
+                return Err(format!(
+                    "memory '{}' has an invalid BlockRom address width",
+                    memory.name
+                ));
+            }
+            let mut address = Vec::with_capacity(address_width);
+            for index in indexes {
+                address.extend(self.blast(index, address_width)?);
+            }
+            if address.len() != address_width {
+                return Err(format!(
+                    "memory '{}' BlockRom address width mismatch",
+                    memory.name
+                ));
+            }
+            let mut output = Vec::with_capacity(memory.element_width);
+            for bit_index in 0..memory.element_width {
+                let out = self.new_tmp("block_rom_q");
+                self.add_cell(
+                    "block_rom",
+                    CellKind::BlockRom {
+                        address_width,
+                        bit_index,
+                        contents: contents.clone(),
+                    },
+                    address.clone(),
+                    out,
+                );
+                output.push(out);
+            }
+            self.lowered_memories.insert(memory_index);
             return Ok(output);
         }
         if macro_candidate(memory.template, total_bits) != MemoryMacroCandidate::DistributedRom {
@@ -2004,6 +2101,121 @@ endmodule
                 "address {address}"
             );
         }
+    }
+
+    #[test]
+    fn block_rom_preserves_one_macro_and_matches_direct_ast_semantics() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source_path = std::env::temp_dir().join(format!("eda-synth-block-rom-{unique}.sv"));
+        let image_path = std::env::temp_dir().join(format!("eda-synth-block-rom-{unique}.hex"));
+        let mut image = String::new();
+        for address in 0..4096_u64 {
+            let value = (address.wrapping_mul(7).wrapping_add(13) & 0xff) as u8;
+            image.push_str(&format!("{value:02x}\n"));
+        }
+        std::fs::write(&image_path, image).expect("write BlockRom image");
+        std::fs::write(
+            &source_path,
+            format!(
+                r#"
+module block_rom(
+  input logic clk,
+  input logic [11:0] address,
+  output logic [7:0] q
+);
+  logic [7:0] memory [0:4095];
+  initial $readmemh("{}", memory);
+  always @(posedge clk) q <= memory[address];
+endmodule
+"#,
+                image_path.display()
+            ),
+        )
+        .expect("write BlockRom source");
+
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("block_rom"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("directly lower BlockRom source");
+        let result = synthesize(&rtl, &SynthOptions::default())
+            .expect("lower large synchronous ROM to one BlockRom macro");
+        assert_eq!(result.memory_plans.len(), 1);
+        assert_eq!(
+            result.memory_plans[0].candidate,
+            MemoryMacroCandidate::BlockRom
+        );
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no synthesis lowering")));
+
+        let stats = result.netlist.stats();
+        assert_eq!(stats.memory_macros, 1);
+        assert_eq!(
+            result
+                .netlist
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell.kind, CellKind::BlockRom { .. }))
+                .count(),
+            8
+        );
+
+        let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+        assert_eq!(gate.memories.len(), 1);
+        assert_eq!(gate.memories[0].flat_length, 4096);
+        assert_eq!(gate.memories[0].kind, MemoryKind::Rom);
+
+        let mut rtl_sim = Simulator::new(&rtl).unwrap();
+        let mut gate_sim = Simulator::new(&gate).unwrap();
+        for address in [0_u64, 1, 255, 2048, 4095] {
+            for simulator in [&mut rtl_sim, &mut gate_sim] {
+                simulator
+                    .set_input("clk", &LogicWord::from_u64(1, 0))
+                    .unwrap();
+                simulator
+                    .set_input("address", &LogicWord::from_u64(12, address))
+                    .unwrap();
+                simulator
+                    .set_input("clk", &LogicWord::from_u64(1, 1))
+                    .unwrap();
+            }
+            assert_eq!(
+                rtl_sim.read("q").unwrap(),
+                gate_sim.read("q").unwrap(),
+                "address {address}"
+            );
+            assert_eq!(
+                gate_sim.read("q").unwrap().to_u64(),
+                Some(address.wrapping_mul(7).wrapping_add(13) & 0xff),
+                "address {address}"
+            );
+        }
+
+        let verilog = crate::writer::write_verilog(&result.netlist, result.library.as_ref());
+        assert_eq!(
+            verilog
+                .matches("  reg [7:0] block_rom_0 [0:4095];\n")
+                .count(),
+            1
+        );
+        assert_eq!(verilog.matches("block_rom_1").count(), 0);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&image_path);
     }
 
     #[test]

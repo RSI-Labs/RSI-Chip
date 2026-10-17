@@ -193,6 +193,16 @@ impl<'a> Mapper<'a> {
                         output: out,
                     });
                 }
+                CellKind::BlockRom { .. } => {
+                    // Keep the macro boundary intact. A block ROM is deliberately
+                    // not exploded into standard-cell logic during mapping.
+                    self.out.add_cell(Cell {
+                        name: c.name.clone(),
+                        kind: c.kind.clone(),
+                        inputs: ins,
+                        output: out,
+                    });
+                }
             }
         }
         for (not_ci, name) in &merges {

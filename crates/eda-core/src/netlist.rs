@@ -6,8 +6,8 @@
 
 use crate::ir::Design;
 use crate::library::{CellLibrary, LibCellId};
-use crate::logic::LogicValue;
-use std::collections::HashMap;
+use crate::logic::{LogicValue, LogicWord};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub type NetId = usize;
@@ -36,6 +36,17 @@ pub enum CellKind {
     DffR {
         posedge: bool,
         reset_high: bool,
+    },
+    /// One output bit of a synchronous/asynchronous block-ROM read port.
+    ///
+    /// Inputs are address bits in LSB-first order. Each output-bit cell
+    /// shares the full contents, allowing downstream RTL/formal consumers to
+    /// reconstruct one macro while preserving the netlist's one-bit output
+    /// contract.
+    BlockRom {
+        address_width: usize,
+        bit_index: usize,
+        contents: std::sync::Arc<Vec<LogicWord>>,
     },
     /// Standard-cell instance; behaviour comes from the [`CellLibrary`].
     Lib(LibCellId),
@@ -98,6 +109,28 @@ impl CellKind {
                         }
                     }
                 }
+            }
+            CellKind::BlockRom {
+                address_width,
+                bit_index,
+                contents,
+            } => {
+                if ins.len() < *address_width || *address_width > u32::BITS as usize {
+                    return LogicValue::X;
+                }
+                let mut address = 0_u32;
+                for (bit, value) in ins.iter().take(*address_width).enumerate() {
+                    let Some(set) = value.as_bool() else {
+                        return LogicValue::X;
+                    };
+                    if set {
+                        address |= 1 << bit;
+                    }
+                }
+                contents
+                    .get(address as usize)
+                    .map(|word| word.bit(*bit_index))
+                    .unwrap_or(LogicValue::X)
             }
             _ => LogicValue::X, // sequential / lib cells are not combinational
         }
@@ -554,10 +587,22 @@ impl Netlist {
             cells: self.cells.len(),
             ..Default::default()
         };
+        let mut block_rom_macros = HashSet::<(usize, Vec<NetId>, usize)>::new();
         for c in &self.cells {
             match &c.kind {
                 CellKind::Const(_) => s.consts += 1,
                 CellKind::Dff { .. } | CellKind::DffR { .. } => s.seq += 1,
+                CellKind::BlockRom {
+                    address_width,
+                    contents,
+                    ..
+                } => {
+                    block_rom_macros.insert((
+                        Arc::as_ptr(contents) as *const _ as usize,
+                        c.inputs.clone(),
+                        *address_width,
+                    ));
+                }
                 CellKind::Lib(id) => {
                     s.lib_cells += 1;
                     if self
@@ -571,6 +616,7 @@ impl Netlist {
                 _ => s.comb += 1,
             }
         }
+        s.memory_macros = block_rom_macros.len();
         s
     }
 }
@@ -583,6 +629,7 @@ pub struct NetlistStats {
     pub seq: usize,
     pub consts: usize,
     pub lib_cells: usize,
+    pub memory_macros: usize,
 }
 
 #[cfg(test)]
@@ -689,5 +736,46 @@ mod tests {
         let s = nl.stats();
         assert_eq!(s.comb, 2);
         assert_eq!(s.seq, 0);
+    }
+
+    #[test]
+    fn block_rom_evaluates_addresses_and_counts_one_macro_per_port() {
+        let contents = Arc::new(vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+        ]);
+        let make_cell = |address_width, bit_index| CellKind::BlockRom {
+            address_width,
+            bit_index,
+            contents: contents.clone(),
+        };
+
+        let zero = LogicValue::Zero;
+        let one = LogicValue::One;
+        let x = LogicValue::X;
+        assert_eq!(make_cell(2, 0).eval(&[zero, zero]), one);
+        assert_eq!(make_cell(2, 0).eval(&[one, zero]), zero);
+        assert_eq!(make_cell(2, 1).eval(&[zero, zero]), zero);
+        assert_eq!(make_cell(2, 1).eval(&[one, zero]), one);
+        assert_eq!(make_cell(2, 0).eval(&[zero, one]), one);
+        assert_eq!(make_cell(2, 0).eval(&[one, one]), x);
+        assert_eq!(make_cell(2, 0).eval(&[x, zero]), x);
+
+        let mut nl = Netlist::new("rom");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        for bit_index in 0..2 {
+            let output = nl.add_net(format!("q{bit_index}"));
+            nl.add_cell(Cell {
+                name: format!("rom_bit{bit_index}"),
+                kind: make_cell(2, bit_index),
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+        let stats = nl.stats();
+        assert_eq!(stats.memory_macros, 1);
+        assert_eq!(stats.cells, 2);
     }
 }

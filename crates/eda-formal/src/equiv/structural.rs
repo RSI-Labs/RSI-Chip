@@ -33,6 +33,7 @@ pub(super) fn cell_class(nl: &Netlist, kind: &CellKind) -> Option<FuncClass> {
         CellKind::Xnor => Some(FuncClass::Xnor),
         CellKind::Mux => Some(FuncClass::Mux),
         CellKind::Dff { .. } | CellKind::DffR { .. } => None,
+        CellKind::BlockRom { .. } => None,
         CellKind::Lib(id) => {
             let lib = nl.library()?;
             let def = lib.get(*id);

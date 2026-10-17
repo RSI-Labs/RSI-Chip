@@ -140,6 +140,37 @@ impl<'a> NetlistEncoder<'a> {
                 // sequential boundary: treated as free state vars by callers
                 return Err("sequential cell in combinational cone".into());
             }
+            CellKind::BlockRom {
+                address_width,
+                bit_index,
+                contents,
+            } => {
+                if *address_width > 20 {
+                    return Err(
+                        "BlockRom is too large for the current truth-table SAT encoder".to_string(),
+                    );
+                }
+                if contents.len() != (1_usize << *address_width) {
+                    return Err(
+                        "BlockRom with a partial address space cannot be encoded in two-valued SAT"
+                            .to_string(),
+                    );
+                }
+                let contents = contents.clone();
+                self.enc_truthtable(
+                    &ins,
+                    &|address| {
+                        let mut index = 0_usize;
+                        for (bit, set) in address.iter().enumerate() {
+                            if *set {
+                                index |= 1 << bit;
+                            }
+                        }
+                        contents[index].bit(*bit_index).as_bool().unwrap_or(false)
+                    },
+                    out,
+                );
+            }
             CellKind::Lib(lid) => {
                 let lib = self
                     .nl
