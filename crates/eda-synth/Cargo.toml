@@ -8,5 +8,6 @@ license.workspace = true
 eda-core = { path = "../eda-core" }
 
 [dev-dependencies]
+eda-slang = { path = "../eda-slang" }
 eda-hdl = { path = "../eda-hdl" }
 eda-sim = { path = "../eda-sim" }

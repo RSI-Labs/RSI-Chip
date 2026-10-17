@@ -10,9 +10,9 @@ use eda_core::ir::{
     Range, Sens, Stmt, UnOp,
 };
 use eda_core::library::CellLibrary;
-use eda_core::logic::LogicValue;
+use eda_core::logic::{LogicValue, LogicWord};
 use eda_core::netlist::{Cell, CellKind, Dir, NetId, Netlist};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 fn sorted_set(set: &HashSet<usize>) -> Vec<usize> {
@@ -69,6 +69,7 @@ pub enum MemoryMacroCandidate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryMacroPlan {
+    pub memory: usize,
     pub name: String,
     pub kind: MemoryKind,
     pub template: MemoryTemplate,
@@ -86,7 +87,8 @@ pub fn plan_memories(design: &Design) -> Vec<MemoryMacroPlan> {
     design
         .memories
         .iter()
-        .map(|memory| {
+        .enumerate()
+        .map(|(memory_index, memory)| {
             let total_bits =
                 u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
             let candidate = macro_candidate(memory.template, total_bits);
@@ -114,6 +116,7 @@ pub fn plan_memories(design: &Design) -> Vec<MemoryMacroPlan> {
                 }
             };
             MemoryMacroPlan {
+                memory: memory_index,
                 name: memory.name.clone(),
                 kind: memory.kind,
                 template: memory.template,
@@ -183,10 +186,13 @@ pub fn synthesize_with_library(
     let mut s = Synth::new(design)?;
     s.run()?;
     let mut warnings = std::mem::take(&mut s.warnings);
-    if !memory_plans.is_empty() {
+    let unlowered = memory_plans
+        .iter()
+        .filter(|plan| !s.lowered_memories.contains(&plan.memory))
+        .count();
+    if unlowered != 0 {
         warnings.push(format!(
-            "{} sparse-memory object(s) have macro plans but sparse-memory synthesis lowering is not implemented",
-            memory_plans.len()
+            "{unlowered} sparse-memory object(s) have macro plans but no synthesis lowering"
         ));
     }
     let mut nl = s.finish()?;
@@ -212,6 +218,8 @@ struct Synth<'a> {
     design: &'a Design,
     nl: Netlist,
     flat2net: Vec<NetId>,
+    rom_contents: HashMap<usize, RomContents>,
+    lowered_memories: HashSet<usize>,
     sym: HashMap<usize, Vec<NetId>>,
     written: HashSet<usize>,
     warnings: Vec<String>,
@@ -219,6 +227,110 @@ struct Synth<'a> {
     driver_log: Vec<(NetId, NetId)>,
     /// Fixed present-state symbols while lowering a clocked process.
     read_sym: Option<HashMap<usize, Vec<NetId>>>,
+}
+
+#[derive(Default)]
+struct RomContents {
+    values: BTreeMap<Vec<i64>, LogicWord>,
+    deterministic: bool,
+}
+
+impl RomContents {
+    fn deterministic() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            deterministic: true,
+        }
+    }
+}
+
+fn rom_contents_from_design(design: &Design) -> HashMap<usize, RomContents> {
+    let mut contents = HashMap::<usize, RomContents>::new();
+    for statement in &design.initials {
+        collect_rom_initializer(statement, &mut contents);
+    }
+    contents
+}
+
+fn collect_rom_initializer(statement: &Stmt, contents: &mut HashMap<usize, RomContents>) {
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter()
+            .for_each(|statement| collect_rom_initializer(statement, contents)),
+        Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
+            let entry = contents
+                .entry(*memory)
+                .or_insert_with(RomContents::deterministic);
+            let Some(indexes) = indexes
+                .iter()
+                .map(constant_index)
+                .collect::<Option<Vec<_>>>()
+            else {
+                entry.deterministic = false;
+                return;
+            };
+            let Some(value) = constant_word(e) else {
+                entry.deterministic = false;
+                return;
+            };
+            entry.values.insert(indexes, value);
+        }
+        Stmt::If { t, f, .. } => {
+            collect_rom_initializer(t, contents);
+            if let Some(f) = f {
+                collect_rom_initializer(f, contents);
+            }
+            for entry in contents.values_mut() {
+                entry.deterministic = false;
+            }
+        }
+        Stmt::Case { arms, dflt, .. } => {
+            for (_, body) in arms {
+                collect_rom_initializer(body, contents);
+            }
+            if let Some(body) = dflt {
+                collect_rom_initializer(body, contents);
+            }
+            for entry in contents.values_mut() {
+                entry.deterministic = false;
+            }
+        }
+        _ => {
+            for entry in contents.values_mut() {
+                entry.deterministic = false;
+            }
+        }
+    }
+}
+
+fn constant_index(expression: &Expr) -> Option<i64> {
+    constant_word(expression)?
+        .to_u64()
+        .map(|value| value as i64)
+}
+
+fn constant_word(expression: &Expr) -> Option<LogicWord> {
+    match expression {
+        Expr::Const(word) => Some(word.clone()),
+        Expr::Signed { e, .. } => constant_word(e),
+        _ => None,
+    }
+}
+
+fn physical_to_logical(memory: &eda_core::ir::MemoryDecl, physical_index: u64) -> Option<Vec<i64>> {
+    if physical_index >= memory.flat_length {
+        return None;
+    }
+    let mut remaining = physical_index;
+    let mut stride = memory.flat_length;
+    let mut indexes = Vec::with_capacity(memory.dimensions.len());
+    for dimension in &memory.dimensions {
+        stride /= dimension.length as u64;
+        let offset = remaining / stride % dimension.length as u64;
+        remaining %= stride;
+        indexes.push(dimension.base + dimension.step * offset as i64);
+    }
+    Some(indexes)
 }
 
 impl<'a> Synth<'a> {
@@ -248,6 +360,8 @@ impl<'a> Synth<'a> {
             design,
             nl,
             flat2net,
+            rom_contents: rom_contents_from_design(design),
+            lowered_memories: HashSet::new(),
             sym: HashMap::new(),
             written: HashSet::new(),
             warnings: Vec::new(),
@@ -594,15 +708,90 @@ impl<'a> Synth<'a> {
                 out
             }
             Expr::Signed { e, .. } => self.blast_nat(e)?,
-            Expr::MemoryRead { .. } => {
-                return Err("first-class sparse-memory reads are not synthesizable yet".into())
-            }
+            Expr::MemoryRead {
+                memory, indexes, ..
+            } => self.blast_distributed_rom(*memory, indexes)?,
             Expr::MemoryReadPart { .. } => {
                 return Err(
                     "first-class sparse-memory part-select reads are not synthesizable yet".into(),
                 )
             }
         })
+    }
+
+    fn blast_distributed_rom(
+        &mut self,
+        memory_index: usize,
+        indexes: &[Expr],
+    ) -> Result<Vec<NetId>, String> {
+        let memory = self
+            .design
+            .memories
+            .get(memory_index)
+            .ok_or_else(|| format!("memory read refers to missing memory {memory_index}"))?
+            .clone();
+        if memory.kind != MemoryKind::Rom {
+            return Err(format!(
+                "memory '{}' is a RAM and requires a writable macro model",
+                memory.name
+            ));
+        }
+        let total_bits =
+            u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
+        if macro_candidate(memory.template, total_bits) != MemoryMacroCandidate::DistributedRom {
+            return Err(format!(
+                "memory '{}' requires block macro synthesis, which is not implemented",
+                memory.name
+            ));
+        }
+        let contents = self
+            .rom_contents
+            .get(&memory_index)
+            .ok_or_else(|| format!("memory '{}' has no deterministic ROM contents", memory.name))?;
+        if !contents.deterministic {
+            return Err(format!(
+                "memory '{}' has conditional or unsupported initialization and cannot lower to distributed ROM",
+                memory.name
+            ));
+        }
+        let contents = contents.values.clone();
+
+        self.lowered_memories.insert(memory_index);
+        let mut output = (0..memory.element_width)
+            .map(|_| self.const_net(LogicValue::X))
+            .collect::<Vec<_>>();
+        for physical_index in 0..memory.flat_length {
+            let logical = physical_to_logical(&memory, physical_index)
+                .ok_or_else(|| format!("memory '{}' has invalid banking geometry", memory.name))?;
+            let mut select = None;
+            for (index, logical_index) in indexes.iter().zip(logical.iter()) {
+                let width = index.width().max(1);
+                let target = Expr::Const(LogicWord::from_u64(width, *logical_index as u64));
+                let equal = self.blast_bin(BinOp::Eq, index, &target)?;
+                let Some(equal) = equal.first() else {
+                    return Err(format!(
+                        "memory '{}' address comparison produced no select bit",
+                        memory.name
+                    ));
+                };
+                select = Some(match select {
+                    Some(previous) => self.combine(CellKind::And, previous, *equal),
+                    None => *equal,
+                });
+            }
+            let Some(select) = select else {
+                return Err(format!("memory '{}' read has no index", memory.name));
+            };
+            let value = contents
+                .get(&logical)
+                .cloned()
+                .unwrap_or_else(|| LogicWord::xes(memory.element_width));
+            for (bit, value_bit) in output.iter_mut().zip(value.bits.iter()) {
+                let constant = self.const_net(*value_bit);
+                *bit = self.mux(select, constant, *bit);
+            }
+        }
+        Ok(output)
     }
 
     fn decl_of_flat(&self, flat: usize) -> Result<&eda_core::ir::NetDecl, String> {
@@ -1429,6 +1618,72 @@ endmodule
             .as_ref()
             .expect("full byte-enable mask")
             .is_full());
+    }
+
+    #[test]
+    fn distributed_rom_synthesizes_and_matches_direct_ast_semantics() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let source_path = std::env::temp_dir().join(format!(
+            "eda-synth-distributed-rom-{}-{}.sv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &source_path,
+            r#"
+module rom(input logic [1:0] address, output logic [7:0] q);
+  logic [7:0] memory [0:3];
+  initial begin
+    memory[0] = 8'h12;
+    memory[1] = 8'h34;
+    memory[2] = 8'h56;
+    memory[3] = 8'h78;
+  end
+  assign q = memory[address];
+endmodule
+"#,
+        )
+        .expect("write distributed ROM source");
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("rom"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("directly lower distributed ROM");
+        let result = synthesize(&rtl, &SynthOptions::default())
+            .expect("lower distributed ROM to combinational logic");
+        assert_eq!(result.memory_plans.len(), 1);
+        assert_eq!(
+            result.memory_plans[0].candidate,
+            MemoryMacroCandidate::DistributedRom
+        );
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no synthesis lowering")));
+
+        let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+        let mut rtl_sim = Simulator::new(&rtl).unwrap();
+        let mut gate_sim = Simulator::new(&gate).unwrap();
+        for address in 0..4_u64 {
+            rtl_sim
+                .set_input("address", &LogicWord::from_u64(2, address))
+                .unwrap();
+            gate_sim
+                .set_input("address", &LogicWord::from_u64(2, address))
+                .unwrap();
+            assert_eq!(
+                rtl_sim.read("q").unwrap(),
+                gate_sim.read("q").unwrap(),
+                "address {address}"
+            );
+        }
     }
 
     #[test]
