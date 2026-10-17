@@ -426,6 +426,7 @@ impl SlangAstLowerer {
                 "Net" | "Variable" => lowerer.lower_declaration(member)?,
                 "Parameter" => continue,
                 "ContinuousAssign" => lowerer.lower_continuous_assignment(member)?,
+                "ProceduralBlock" => lowerer.lower_procedural_block(member)?,
                 _ => {
                     return Err(format!(
                         "direct slang-AST lowering does not yet support top member kind '{kind}'"
@@ -543,6 +544,194 @@ impl SlangAstLowerer {
             delay: 0,
         });
         Ok(())
+    }
+
+    fn lower_procedural_block(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
+        let body = member
+            .get("body")
+            .ok_or_else(|| "slang ProceduralBlock has no body".to_string())?;
+        match procedure_kind.as_str() {
+            "Initial" => {
+                let statement = self.lower_statement(body)?;
+                self.design.initials.push(statement);
+            }
+            "AlwaysComb" => {
+                let statement = self.lower_statement(body)?;
+                self.design.processes.push(eda_core::ir::Process {
+                    sens: eda_core::ir::Sens::Comb,
+                    body: statement,
+                });
+            }
+            "Always" | "AlwaysFF" | "AlwaysLatch" => {
+                if string_field(body, "kind").as_deref() == Some("Timed") {
+                    let timing = body
+                        .get("timing")
+                        .ok_or_else(|| "timed procedure has no timing control".to_string())?;
+                    let statement = body
+                        .get("stmt")
+                        .ok_or_else(|| "timed procedure has no statement".to_string())?;
+                    let sens = self.lower_sensitivity(timing)?;
+                    let statement = self.lower_statement(statement)?;
+                    self.design.processes.push(eda_core::ir::Process {
+                        sens,
+                        body: statement,
+                    });
+                } else {
+                    let statement = self.lower_statement(body)?;
+                    self.design.processes.push(eda_core::ir::Process {
+                        sens: eda_core::ir::Sens::Comb,
+                        body: statement,
+                    });
+                }
+            }
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support procedure kind {other:?}"
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_sensitivity(&self, timing: &serde_json::Value) -> Result<eda_core::ir::Sens, String> {
+        if string_field(timing, "kind").as_deref() != Some("SignalEvent") {
+            return Err(
+                "direct slang-AST lowering supports only a single signal event sensitivity".into(),
+            );
+        }
+        let expression = timing
+            .get("expr")
+            .ok_or_else(|| "signal event has no expression".to_string())?;
+        let signal = self.lower_lvalue(expression)?;
+        match string_field(timing, "edge").as_deref() {
+            Some("PosEdge") => Ok(eda_core::ir::Sens::Posedge(signal.net)),
+            Some("NegEdge") => Ok(eda_core::ir::Sens::Negedge(signal.net)),
+            _ => Err("direct slang-AST lowering requires PosEdge or NegEdge sensitivity".into()),
+        }
+    }
+
+    fn lower_statement(&self, statement: &serde_json::Value) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::Stmt;
+        let kind = string_field(statement, "kind").unwrap_or_default();
+        match kind.as_str() {
+            "Block" => {
+                if let Some(nested) = statement.get("body") {
+                    if string_field(nested, "kind").as_deref() == Some("List") {
+                        return self.lower_statement(nested);
+                    }
+                    let nested = self.lower_statement(nested)?;
+                    return Ok(Stmt::Block(vec![nested]));
+                }
+                Ok(Stmt::Block(Vec::new()))
+            }
+            "List" => {
+                let mut statements = Vec::new();
+                if let Some(items) = statement.get("list").and_then(Value::as_array) {
+                    for item in items {
+                        statements.push(self.lower_statement(item)?);
+                    }
+                }
+                Ok(Stmt::Block(statements))
+            }
+            "ExpressionStatement" => {
+                let expression = statement
+                    .get("expr")
+                    .ok_or_else(|| "expression statement has no expression".to_string())?;
+                if string_field(expression, "kind").as_deref() != Some("Assignment") {
+                    return Err(
+                        "direct slang-AST lowering supports only assignment expression statements"
+                            .into(),
+                    );
+                }
+                self.lower_assignment(expression)
+            }
+            "Assignment" => self.lower_assignment(statement),
+            "Conditional" => {
+                let conditions = statement
+                    .get("conditions")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "conditional statement has no conditions".to_string())?;
+                if conditions.len() != 1 {
+                    return Err(
+                        "direct slang-AST lowering supports one unqualified if condition".into(),
+                    );
+                }
+                let condition = conditions
+                    .first()
+                    .and_then(|condition| condition.get("expr"))
+                    .ok_or_else(|| {
+                        "conditional statement has no condition expression".to_string()
+                    })?;
+                let true_statement = statement
+                    .get("ifTrue")
+                    .ok_or_else(|| "conditional statement has no true branch".to_string())?;
+                let false_statement = match statement.get("ifFalse") {
+                    Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
+                    None => None,
+                };
+                Ok(Stmt::If {
+                    c: self.lower_expression(condition)?,
+                    t: Box::new(self.lower_statement(true_statement)?),
+                    f: false_statement,
+                })
+            }
+            "Case" => {
+                let expression = statement
+                    .get("expr")
+                    .ok_or_else(|| "case statement has no expression".to_string())?;
+                let items = statement
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "case statement has no items".to_string())?;
+                let mut arms = Vec::new();
+                for item in items {
+                    let body = item
+                        .get("stmt")
+                        .ok_or_else(|| "case item has no statement".to_string())?;
+                    let body = self.lower_statement(body)?;
+                    let expressions = item
+                        .get("expressions")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| "case item has no expressions".to_string())?;
+                    for expression in expressions {
+                        arms.push((self.lower_expression(expression)?, body.clone()));
+                    }
+                }
+                let default = match statement.get("defaultCase") {
+                    Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
+                    None => None,
+                };
+                Ok(Stmt::Case {
+                    e: self.lower_expression(expression)?,
+                    arms,
+                    dflt: default,
+                })
+            }
+            other => Err(format!(
+                "direct slang-AST lowering does not support statement kind '{other}'"
+            )),
+        }
+    }
+
+    fn lower_assignment(
+        &self,
+        assignment: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::Stmt;
+        let left = assignment
+            .get("left")
+            .ok_or_else(|| "assignment has no left side".to_string())?;
+        let right = assignment
+            .get("right")
+            .ok_or_else(|| "assignment has no right side".to_string())?;
+        let lv = self.lower_lvalue(left)?;
+        let expression = self.lower_expression(right)?;
+        if bool_field(assignment, "isNonBlocking") {
+            Ok(Stmt::NBl { lv, e: expression })
+        } else {
+            Ok(Stmt::Bl { lv, e: expression })
+        }
     }
 
     fn push_assignment(&mut self, name: String, rhs: eda_core::ir::Expr) {
@@ -827,9 +1016,13 @@ fn simple_type_signed(type_name: &str) -> Option<bool> {
 }
 
 fn full_range(width: usize) -> eda_core::ir::Range {
-    eda_core::ir::Range::Span {
-        msb: width.saturating_sub(1),
-        lsb: 0,
+    if width == 1 {
+        eda_core::ir::Range::Bit(0)
+    } else {
+        eda_core::ir::Range::Span {
+            msb: width.saturating_sub(1),
+            lsb: 0,
+        }
     }
 }
 

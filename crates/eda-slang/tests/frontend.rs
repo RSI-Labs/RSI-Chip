@@ -147,7 +147,7 @@ endmodule
     let unsupported_path = root.join("unsupported.sv");
     std::fs::write(
         &unsupported_path,
-        "module unsupported(output logic y); initial y = 1'b1; endmodule\n",
+        "module unsupported(output logic y); initial $display(\"unsupported\"); endmodule\n",
     )
     .expect("write unsupported source");
     let error = slang
@@ -158,7 +158,111 @@ endmodule
         )
         .expect_err("direct path must reject unsupported constructs");
     assert!(
-        error.contains("does not yet support top member kind 'ProceduralBlock'"),
+        error.contains("supports only assignment expression statements"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_compiles_procedural_control_flow() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-procedural");
+    let source_path = root.join("procedural.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module procedural(
+  input logic a,
+  input logic clk,
+  input logic [1:0] sel,
+  output logic y,
+  output logic z,
+  output logic q
+);
+  initial q = 1'b0;
+  always_comb begin
+    if (a) begin
+      y = 1'b1;
+    end else begin
+      y = 1'b0;
+    end
+    case (sel)
+      2'b00: z = 1'b0;
+      2'b01: z = 1'b1;
+      default: z = a;
+    endcase
+  end
+  always @(posedge clk) q <= a;
+endmodule
+"#,
+    )
+    .expect("write procedural direct-lowering source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("procedural"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower procedural slang AST");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("procedural"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower procedural module through the preprocessed path");
+    assert_eq!(design.n_nets, 7);
+    assert_eq!(design.initials.len(), 1);
+    assert_eq!(design.processes.len(), 2);
+    assert_eq!(
+        format!("{:?}", reference.initials),
+        format!("{:?}", design.initials)
+    );
+    assert_eq!(
+        format!("{:?}", reference.processes),
+        format!("{:?}", design.processes)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create procedural simulator");
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize clk low");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .expect("set a");
+    simulator
+        .set_input("sel", &LogicWord::from_u64(2, 2))
+        .expect("set default case selector");
+    assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(1));
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create posedge");
+    assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+
+    let mixed_event_path = root.join("mixed-event.sv");
+    std::fs::write(
+        &mixed_event_path,
+        r#"
+module mixed_event(input logic a, input logic clk, output logic y);
+  always @(posedge clk or a) y = a;
+endmodule
+"#,
+    )
+    .expect("write mixed-event source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&mixed_event_path),
+            Some("mixed_event"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("mixed edge/level sensitivity must fail closed");
+    assert!(
+        error.contains("single signal event sensitivity"),
         "unexpected error: {error}"
     );
 }

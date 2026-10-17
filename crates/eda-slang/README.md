@@ -17,8 +17,10 @@ frontend. It uses slang for:
    post-elaboration parameter values as authoritative metadata;
 6. explicit direct AST lowering for a small verified subset: ports/nets,
    initializers, continuous assignments, integer/reference/parameter-constant
-   leaves, unary and binary operators, concatenation, conditionals, and
-   constant selects.
+   leaves, unary and binary operators, concatenation, conditional expressions,
+   constant selects, initial/always procedures, blocking/non-blocking
+   assignments, blocks, if/case control flow, and single posedge/negedge
+   sensitivity.
 
 The adapter deliberately reports slang diagnostics instead of silently
 bypassing them. If the downstream elaborator cannot represent a construct, that

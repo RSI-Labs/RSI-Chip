@@ -54,9 +54,11 @@ declaration widths, top parameter metadata, continuous/procedural assignment
 targets, recursive RHS operand shapes/order/symbol identity, sized
 integer-literal values, simple type width/signedness, and direct/generated
 instance inventory against the slang AST. `compile_files_via_ast`
-additionally lowers a simple module subset with elaborated parameter-constant leaves
-directly from slang's elaborated AST—without preprocessing and reparsing—and
-reports unsupported constructs explicitly. Its conformance tests also validate
+additionally lowers a simple module subset with elaborated parameter-constant
+leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
+if/case control flow, and single posedge/negedge sensitivity directly from
+slang's elaborated AST—without preprocessing and reparsing—and reports
+unsupported constructs explicitly. Its conformance tests also validate
 the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
 reference source with `UVM_NO_DPI`. This establishes a full-language validation
 path and the first direct-AST lowering path, while downstream execution remains
