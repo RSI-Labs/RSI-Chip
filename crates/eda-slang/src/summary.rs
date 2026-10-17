@@ -1,7 +1,8 @@
 //! Typed summaries and structural validation for slang's elaborated AST.
 
 use super::ast_util::{
-    expression_target_names, instance_parameters, parameter_summary, source_span, string_field,
+    expression_target_names, instance_parameters, normalize_instance_bodies, parameter_summary,
+    source_span, string_field,
 };
 use crate::types::simple_type_width;
 use eda_core::ir::Design;
@@ -139,6 +140,9 @@ impl SlangAstSummary {
         } else {
             root
         };
+        let mut root = root.clone();
+        normalize_instance_bodies(&mut root);
+        let root = &root;
         if string_field(root, "kind").as_deref() != Some("Instance") {
             return Err("slang AST root is not an elaborated Instance".into());
         }
@@ -293,6 +297,7 @@ impl SlangAstSummary {
                 generate_kind if generate_kind.starts_with("GenerateBlock") => {
                     collect_generate_summary(
                         member,
+                        &[],
                         &mut instances,
                         &mut continuous_targets,
                         &mut procedural_blocks,

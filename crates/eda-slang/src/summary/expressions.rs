@@ -301,13 +301,53 @@ pub(crate) fn collect_kinds(value: &Value, kinds: &mut std::collections::BTreeSe
 
 pub(crate) fn collect_generate_summary(
     value: &Value,
+    prefix: &[String],
     instances: &mut Vec<SlangInstanceSummary>,
     continuous_targets: &mut Vec<SlangContinuousTarget>,
     procedural_blocks: &mut Vec<SlangProceduralBlockSummary>,
 ) -> Result<(), String> {
+    if string_field(value, "kind").as_deref() == Some("GenerateBlockArray") {
+        let array_name = string_field(value, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "slang GenerateBlockArray has no name".to_string())?;
+        let array_members = value
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "slang GenerateBlockArray has no members".to_string())?;
+        for (position, member) in array_members.iter().enumerate() {
+            let kind = string_field(member, "kind").unwrap_or_default();
+            if kind == "Genvar" || bool_field(member, "isUninstantiated") {
+                continue;
+            }
+            if !kind.starts_with("GenerateBlock") {
+                continue;
+            }
+            let construct_index = member
+                .get("constructIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(position as u64);
+            let mut nested_prefix = prefix.to_vec();
+            nested_prefix.push(format!("{array_name}[{construct_index}]"));
+            collect_generate_summary(
+                member,
+                &nested_prefix,
+                instances,
+                continuous_targets,
+                procedural_blocks,
+            )?;
+        }
+        return Ok(());
+    }
+
     let Some(members) = value.get("members").and_then(Value::as_array) else {
         return Ok(());
     };
+    let mut working_prefix = prefix.to_vec();
+    if string_field(value, "kind").as_deref() == Some("GenerateBlock") {
+        if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
+            working_prefix.push(name);
+        }
+    }
     for member in members {
         let Some(kind) = string_field(member, "kind") else {
             continue;
@@ -317,6 +357,12 @@ pub(crate) fn collect_generate_summary(
                 let instance_name = string_field(member, "name")
                     .filter(|name| !name.is_empty())
                     .ok_or_else(|| "slang AST Instance has no name".to_string())?;
+                let instance_name = working_prefix
+                    .iter()
+                    .chain(std::iter::once(&instance_name))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(".");
                 let definition_name = member
                     .get("body")
                     .and_then(|body| string_field(body, "name"))
@@ -365,7 +411,13 @@ pub(crate) fn collect_generate_summary(
                 });
             }
             nested if nested.starts_with("GenerateBlock") => {
-                collect_generate_summary(member, instances, continuous_targets, procedural_blocks)?;
+                collect_generate_summary(
+                    member,
+                    &working_prefix,
+                    instances,
+                    continuous_targets,
+                    procedural_blocks,
+                )?;
             }
             _ => {}
         }

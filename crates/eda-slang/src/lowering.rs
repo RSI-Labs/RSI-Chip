@@ -1,6 +1,6 @@
 //! Direct lowering from slang's post-elaboration AST JSON into the repository IR.
 
-use crate::ast_util::{bool_field, string_field};
+use crate::ast_util::{bool_field, normalize_instance_bodies, string_field};
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
 
@@ -31,7 +31,9 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     if string_field(root, "kind").as_deref() != Some("Instance") {
         return Err("slang AST root is not an elaborated Instance".into());
     }
-    Ok(root.clone())
+    let mut root = root.clone();
+    normalize_instance_bodies(&mut root);
+    Ok(root)
 }
 
 #[derive(Clone)]
@@ -50,6 +52,7 @@ pub(super) struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     constants: std::collections::BTreeMap<String, LogicWord>,
+    generate_path: Vec<String>,
 }
 
 impl SlangAstLowerer {
@@ -70,6 +73,7 @@ impl SlangAstLowerer {
             },
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
+            generate_path: Vec::new(),
         };
         let root_hierarchy_index = lowerer.design.hierarchy.len();
         lowerer
@@ -127,6 +131,7 @@ impl SlangAstLowerer {
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}
+                "GenerateBlockArray" => self.lower_generate_array(member)?,
                 generate_kind if generate_kind.starts_with("GenerateBlock") => {
                     if bool_field(member, "isUninstantiated") {
                         continue;
@@ -135,7 +140,22 @@ impl SlangAstLowerer {
                         .get("members")
                         .and_then(serde_json::Value::as_array)
                         .ok_or_else(|| "slang GenerateBlock has no members".to_string())?;
-                    self.lower_members(members)?;
+                    if let Some(name) = string_field(member, "name").filter(|name| !name.is_empty())
+                    {
+                        self.generate_path.push(name);
+                    }
+                    let result = self.lower_members(members);
+                    if !self.generate_path.is_empty()
+                        && self.generate_path.last().is_some_and(|last| {
+                            member
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|name| name == last)
+                        })
+                    {
+                        self.generate_path.pop();
+                    }
+                    result?;
                 }
                 _ => {
                     return Err(format!(
@@ -143,6 +163,42 @@ impl SlangAstLowerer {
                     ))
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn lower_generate_array(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let array_name = declaration_name(member, "GenerateBlockArray")?;
+        let members = member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "slang GenerateBlockArray has no members".to_string())?;
+        for (position, nested) in members.iter().enumerate() {
+            let kind = string_field(nested, "kind").unwrap_or_default();
+            if kind == "Genvar" {
+                continue;
+            }
+            if !kind.starts_with("GenerateBlock") {
+                return Err(format!(
+                    "direct slang-AST lowering does not support generated member kind '{kind}'"
+                ));
+            }
+            if bool_field(nested, "isUninstantiated") {
+                continue;
+            }
+            let construct_index = nested
+                .get("constructIndex")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(position as u64);
+            self.generate_path
+                .push(format!("{array_name}[{construct_index}]"));
+            let nested_members = nested
+                .get("members")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "slang GenerateBlock has no members".to_string())?;
+            let result = self.lower_members(nested_members);
+            self.generate_path.pop();
+            result?;
         }
         Ok(())
     }

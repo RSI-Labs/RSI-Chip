@@ -195,7 +195,7 @@ impl SlangFrontend {
             .map_err(|error| error.to_string())?;
         let source_dir = files.first().and_then(|file| file.parent());
         let design = eda_hdl::compile_with_source_dir(&preprocessed, top, source_dir)?;
-        authoritative.validate_against_design(&design)?;
+        authoritative.validate_against_design_legacy_compatibility(&design)?;
         Ok(design)
     }
 

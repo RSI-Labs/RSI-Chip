@@ -8,6 +8,69 @@ pub(super) fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
+pub(super) fn normalize_instance_bodies(value: &mut Value) {
+    let mut bodies = std::collections::BTreeMap::new();
+    collect_instance_bodies(value, &mut bodies);
+    replace_instance_body_references(value, &bodies);
+}
+
+fn collect_instance_bodies(value: &Value, bodies: &mut std::collections::BTreeMap<String, Value>) {
+    match value {
+        Value::Object(fields) => {
+            if fields.get("kind").and_then(Value::as_str) == Some("Instance") {
+                if let Some(body) = fields.get("body") {
+                    if body.get("kind").and_then(Value::as_str) == Some("InstanceBody") {
+                        if let (Some(address), Some(name)) =
+                            (body.get("addr"), body.get("name").and_then(Value::as_str))
+                        {
+                            bodies.insert(format!("{address} {name}"), body.clone());
+                        }
+                    }
+                }
+            }
+            for nested in fields.values() {
+                collect_instance_bodies(nested, bodies);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                collect_instance_bodies(nested, bodies);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_instance_body_references(
+    value: &mut Value,
+    bodies: &std::collections::BTreeMap<String, Value>,
+) {
+    match value {
+        Value::Object(fields) => {
+            if fields.get("kind").and_then(Value::as_str) == Some("Instance") {
+                let reference = fields
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(reference) = reference {
+                    if let Some(body) = bodies.get(reference.as_str()) {
+                        fields.insert("body".to_string(), body.clone());
+                    }
+                }
+            }
+            for nested in fields.values_mut() {
+                replace_instance_body_references(nested, bodies);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                replace_instance_body_references(nested, bodies);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn bool_field(value: &Value, field: &str) -> bool {
     value.get(field).and_then(Value::as_bool).unwrap_or(false)
 }

@@ -312,6 +312,13 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
 impl super::SlangAstLowerer {
     pub(super) fn lower_instance(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let instance_name = declaration_name(member, "Instance")?;
+        let scoped_instance_name = self
+            .generate_path
+            .iter()
+            .chain(std::iter::once(&instance_name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(".");
         let body = member
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
@@ -320,6 +327,7 @@ impl super::SlangAstLowerer {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
+            generate_path: Vec::new(),
         };
         child.lower_body(body)?;
 
@@ -330,7 +338,7 @@ impl super::SlangAstLowerer {
         let child_memories = child.design.memories.clone();
         for memory in &child.design.memories {
             let mut memory = memory.clone();
-            memory.name = format!("{instance_name}.{}", memory.name);
+            memory.name = format!("{scoped_instance_name}.{}", memory.name);
             self.design.memories.push(memory);
         }
         for mut connection in child.design.memory_connections {
@@ -340,7 +348,7 @@ impl super::SlangAstLowerer {
         }
         for declaration in &child.design.net_decls {
             self.design.net_decls.push(eda_core::ir::NetDecl {
-                name: format!("{instance_name}.{}", declaration.name),
+                name: format!("{scoped_instance_name}.{}", declaration.name),
                 width: declaration.width,
                 is_reg: declaration.is_reg,
                 is_signed: declaration.is_signed,
@@ -398,7 +406,7 @@ impl super::SlangAstLowerer {
                 .ok_or_else(|| "instance connection has no port".to_string())?;
             let Some(port) = child_ports.iter().find(|port| port.name == port_name) else {
                 return Err(format!(
-                    "instance '{instance_name}' connects unknown child port '{port_name}'"
+                    "instance '{scoped_instance_name}' connects unknown child port '{port_name}'"
                 ));
             };
             let expression = connection
@@ -428,7 +436,7 @@ impl super::SlangAstLowerer {
                     || child.flat_length != parent.flat_length
                 {
                     return Err(format!(
-                        "instance '{instance_name}' inout memory port '{port_name}' shape does not match parent memory '{parent_name}'"
+                        "instance '{scoped_instance_name}' inout memory port '{port_name}' shape does not match parent memory '{parent_name}'"
                     ));
                 }
                 self.design
@@ -461,7 +469,7 @@ impl super::SlangAstLowerer {
                 eda_core::ir::Dir::Out => {
                     if string_field(expression, "kind").as_deref() != Some("Assignment") {
                         return Err(format!(
-                            "instance '{instance_name}' output port '{port_name}' has no parent assignment"
+                            "instance '{scoped_instance_name}' output port '{port_name}' has no parent assignment"
                         ));
                     }
                     let parent_target = expression
@@ -501,7 +509,7 @@ impl super::SlangAstLowerer {
         self.design
             .hierarchy
             .push(eda_core::ir::HierarchicalInstance {
-                path: format!("{}.{}", self.design.name, instance_name),
+                path: format!("{}.{}", self.design.name, scoped_instance_name),
                 module: definition_name,
                 parent: Some(self.design.name.clone()),
                 depth: 1,
@@ -509,7 +517,7 @@ impl super::SlangAstLowerer {
                 net_end: self.design.n_nets,
                 ports,
             });
-        let child_path = format!("{}.{}", self.design.name, instance_name);
+        let child_path = format!("{}.{}", self.design.name, scoped_instance_name);
         for mut nested in nested_hierarchy {
             nested.path = rewrite_hierarchy_path(&nested.path, &child_path);
             if let Some(parent) = nested.parent.as_deref() {

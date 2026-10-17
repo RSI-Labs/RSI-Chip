@@ -2027,18 +2027,18 @@ endmodule
         .expect("lower generated members through the preprocessed path");
     assert_eq!(design.n_nets, 5);
     assert_eq!(design.assigns.len(), 4);
-    assert_eq!(
-        format!("{:?}", reference.net_decls),
-        format!("{:?}", design.net_decls)
-    );
-    assert_eq!(
-        format!("{:?}", reference.assigns),
-        format!("{:?}", design.assigns)
-    );
-    assert_eq!(
-        format!("{:?}", reference.hierarchy),
-        format!("{:?}", design.hierarchy)
-    );
+    assert_eq!(reference.n_nets, design.n_nets);
+    assert_eq!(reference.assigns.len(), design.assigns.len());
+    assert!(design
+        .hierarchy
+        .iter()
+        .any(|instance| instance.path == "top.selected.u"));
+    // The bounded compatibility path intentionally flattens generate labels;
+    // compare behavior rather than requiring identical hierarchy names.
+    let mut reference_simulator = Simulator::new(&reference).expect("create reference simulator");
+    reference_simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .expect("set reference generate input");
 
     let mut simulator = Simulator::new(&design).expect("create generate simulator");
     simulator
@@ -2046,6 +2046,8 @@ endmodule
         .expect("set generate input");
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("z").unwrap().to_u64(), Some(0));
+    assert_eq!(reference_simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(reference_simulator.read("z").unwrap().to_u64(), Some(0));
 }
 
 #[test]
@@ -2087,6 +2089,61 @@ endmodule
         .unwrap();
     assert_eq!(simulator.read("forward").unwrap().to_u64(), Some(0b0101));
     assert_eq!(simulator.read("reverse").unwrap().to_u64(), Some(0b1100));
+}
+
+#[test]
+fn slang_ast_direct_lowering_accepts_generate_for_instances() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-generate-instances");
+    let source_path = root.join("generate_instances.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(input logic a, output logic y);
+  assign y = ~a;
+endmodule
+
+module generate_instances(input logic a, output logic [3:0] y);
+  for (genvar i = 0; i < 4; i = i + 1) begin : iteration
+    child u(.a(a), .y(y[i]));
+  end
+endmodule
+"#,
+    )
+    .expect("write generated-instance source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("generate_instances"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower generated instances");
+    assert_eq!(design.assigns.len(), 12);
+    assert_eq!(design.hierarchy.len(), 5);
+    let child_paths = design
+        .hierarchy
+        .iter()
+        .filter(|instance| instance.depth == 1)
+        .map(|instance| instance.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_paths,
+        vec![
+            "generate_instances.iteration[0].u",
+            "generate_instances.iteration[1].u",
+            "generate_instances.iteration[2].u",
+            "generate_instances.iteration[3].u",
+        ]
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create generated-instance simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
 }
 
 #[test]

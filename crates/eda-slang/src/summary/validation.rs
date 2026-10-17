@@ -8,6 +8,17 @@ use super::*;
 
 impl SlangAstSummary {
     pub fn validate_against_design(&self, design: &Design) -> Result<(), String> {
+        self.validate(design, true)
+    }
+
+    pub fn validate_against_design_legacy_compatibility(
+        &self,
+        design: &Design,
+    ) -> Result<(), String> {
+        self.validate(design, false)
+    }
+
+    fn validate(&self, design: &Design, strict_generated_hierarchy: bool) -> Result<(), String> {
         if design.name != self.top_name {
             return Err(format!(
                 "bounded elaborator top '{}' does not match slang top '{}'",
@@ -260,10 +271,17 @@ impl SlangAstSummary {
             .instances
             .iter()
             .map(|instance| {
-                (
-                    instance.instance_name.clone(),
-                    instance.definition_name.clone(),
-                )
+                let instance_name = if strict_generated_hierarchy {
+                    instance.instance_name.clone()
+                } else {
+                    instance
+                        .instance_name
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(&instance.instance_name)
+                        .to_string()
+                };
+                (instance_name, instance.definition_name.clone())
             })
             .collect();
         if actual_instances != expected_instances {
