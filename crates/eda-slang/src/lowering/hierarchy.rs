@@ -327,7 +327,9 @@ impl super::SlangAstLowerer {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
+            subroutines: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
+            inline_stack: std::cell::RefCell::new(Vec::new()),
         };
         child.lower_body(body)?;
 

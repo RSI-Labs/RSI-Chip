@@ -2779,6 +2779,99 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_straight_line_function_calls() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-functions");
+    let source_path = root.join("functions.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module functions(
+  input byte signed a,
+  input int b,
+  output int sum,
+  output int constant,
+  output int nested,
+  output int initial_sum
+);
+  function automatic int add(int x, int y);
+    int result;
+    begin
+      result = x + y;
+      return result;
+    end
+  endfunction
+
+  function automatic int twice(int x);
+    return add(x, x);
+  endfunction
+
+  assign sum = add(a, b);
+  assign constant = add(2, 3);
+  assign nested = twice(b);
+  initial initial_sum = add(7, 8);
+endmodule
+"#,
+    )
+    .expect("write function-call source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("functions"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower function calls");
+    assert_eq!(design.assigns.len(), 3);
+    assert_eq!(design.initials.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create function simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 0xff))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(32, 4))
+        .unwrap();
+    assert_eq!(simulator.read("sum").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("constant").unwrap().to_u64(), Some(5));
+    assert_eq!(simulator.read("nested").unwrap().to_u64(), Some(8));
+    assert_eq!(simulator.read("initial_sum").unwrap().to_u64(), Some(15));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_recursive_function_calls() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-recursive-function");
+    let source_path = root.join("recursive_function.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module recursive_function(output int y);
+  function automatic int loop(int x);
+    return loop(x);
+  endfunction
+
+  assign y = loop(0);
+endmodule
+"#,
+    )
+    .expect("write recursive-function source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("recursive_function"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unbounded recursive function inlining must be rejected");
+    assert!(error.contains("recursive function"), "{error}");
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_case_equality() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

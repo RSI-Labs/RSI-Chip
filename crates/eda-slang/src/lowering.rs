@@ -6,6 +6,7 @@ use eda_core::logic::LogicWord;
 
 mod declarations;
 mod expressions;
+mod functions;
 mod hierarchy;
 mod statements;
 
@@ -52,7 +53,9 @@ pub(super) struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     constants: std::collections::BTreeMap<String, LogicWord>,
+    subroutines: std::collections::BTreeMap<String, serde_json::Value>,
     generate_path: Vec<String>,
+    inline_stack: std::cell::RefCell<Vec<String>>,
 }
 
 impl SlangAstLowerer {
@@ -73,7 +76,9 @@ impl SlangAstLowerer {
             },
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
+            subroutines: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
+            inline_stack: std::cell::RefCell::new(Vec::new()),
         };
         let root_hierarchy_index = lowerer.design.hierarchy.len();
         lowerer
@@ -120,6 +125,11 @@ impl SlangAstLowerer {
 
     fn lower_members(&mut self, members: &[serde_json::Value]) -> Result<(), String> {
         for member in members {
+            if string_field(member, "kind").as_deref() == Some("Subroutine") {
+                self.collect_subroutine(member)?;
+            }
+        }
+        for member in members {
             let kind = string_field(member, "kind").unwrap_or_default();
             match kind.as_str() {
                 "Port" => self.lower_port(member)?,
@@ -128,6 +138,7 @@ impl SlangAstLowerer {
                 "ContinuousAssign" => self.lower_continuous_assignment(member)?,
                 "ProceduralBlock" => self.lower_procedural_block(member)?,
                 "Instance" => self.lower_instance(member)?,
+                "Subroutine" => {}
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}
@@ -144,7 +155,9 @@ impl SlangAstLowerer {
                     {
                         self.generate_path.push(name);
                     }
+                    let outer_subroutines = self.subroutines.clone();
                     let result = self.lower_members(members);
+                    self.subroutines = outer_subroutines;
                     if !self.generate_path.is_empty()
                         && self.generate_path.last().is_some_and(|last| {
                             member
@@ -192,11 +205,13 @@ impl SlangAstLowerer {
                 .unwrap_or(position as u64);
             self.generate_path
                 .push(format!("{array_name}[{construct_index}]"));
+            let outer_subroutines = self.subroutines.clone();
             let nested_members = nested
                 .get("members")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "slang GenerateBlock has no members".to_string())?;
             let result = self.lower_members(nested_members);
+            self.subroutines = outer_subroutines;
             self.generate_path.pop();
             result?;
         }

@@ -208,6 +208,7 @@ impl super::SlangAstLowerer {
                     Ok(Expr::Const(word))
                 }
             }
+            "Call" => self.lower_function_call(value),
             "Conversion" => {
                 let operand = value
                     .get("operand")
