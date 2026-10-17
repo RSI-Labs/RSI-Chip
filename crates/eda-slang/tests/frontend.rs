@@ -2917,6 +2917,7 @@ module strings(
   input logic [1:0] selector,
   input string left,
   input string right,
+  input int byte_index,
   output string literal_value,
   output string joined,
   output string literal_joined,
@@ -2924,7 +2925,11 @@ module strings(
   output string constant_name,
   output string invalid_name,
   output int left_length,
-  output int right_length
+  output int right_length,
+  output byte constant_byte,
+  output byte dynamic_byte,
+  output byte method_byte,
+  output byte out_of_range
 );
   typedef enum logic [1:0] {
     A = 2'b00,
@@ -2933,7 +2938,13 @@ module strings(
   } state_t;
 
   state_t state;
-  always_comb state = state_t'(selector);
+  always_comb begin
+    state = state_t'(selector);
+    constant_byte = right[1];
+    dynamic_byte = right[byte_index];
+    method_byte = right.getc(byte_index);
+    out_of_range = right.getc(100);
+  end
   assign literal_value = "READY";
   assign joined = {left, right};
   assign literal_joined = {"AB", "CD"};
@@ -2979,6 +2990,9 @@ endmodule
             .unwrap();
         simulator
             .set_input("right", &LogicWord::from_bytes_le(512, b"-STATE"))
+            .unwrap();
+        simulator
+            .set_input("byte_index", &LogicWord::from_u64(32, selector))
             .unwrap();
         assert_eq!(
             simulator
@@ -3028,6 +3042,20 @@ endmodule
             Some(selector.to_string().len() as u64)
         );
         assert_eq!(simulator.read("right_length").unwrap().to_u64(), Some(6));
+        assert_eq!(
+            simulator.read("constant_byte").unwrap().to_u64(),
+            Some(b'S' as u64)
+        );
+        let expected_byte = b"-STATE"[selector as usize] as u64;
+        assert_eq!(
+            simulator.read("dynamic_byte").unwrap().to_u64(),
+            Some(expected_byte)
+        );
+        assert_eq!(
+            simulator.read("method_byte").unwrap().to_u64(),
+            Some(expected_byte)
+        );
+        assert_eq!(simulator.read("out_of_range").unwrap().to_u64(), Some(0));
     }
 }
 

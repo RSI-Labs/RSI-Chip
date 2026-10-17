@@ -1431,6 +1431,14 @@ impl<'d> Simulator<'d> {
                     _ => LogicWord::xes(left.width()),
                 }
             }
+            Expr::StringGetByte { e, index } => {
+                let value = self.eval(e);
+                let index = self.eval(index);
+                match index.to_u64().map(|index| index as usize) {
+                    Some(index) => packed_string_byte(&value, index),
+                    None => LogicWord::xes(8),
+                }
+            }
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1629,6 +1637,13 @@ fn ascii_string_length(word: &LogicWord) -> Option<usize> {
     Some(word.bits.chunks(8).len())
 }
 
+fn packed_string_byte(word: &LogicWord, index: usize) -> LogicWord {
+    if index >= word.width() / 8 {
+        return LogicWord::zero(8);
+    }
+    word.slice(index * 8 + 7, index * 8)
+}
+
 fn concat_packed_strings(
     left: &LogicWord,
     left_length: usize,
@@ -1722,6 +1737,10 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(left, out);
             walk_expr(right, out);
         }
+        Expr::StringGetByte { e, index } => {
+            walk_expr(e, out);
+            walk_expr(index, out);
+        }
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1764,6 +1783,10 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         Expr::StringConcat { left, right } => {
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
+        }
+        Expr::StringGetByte { e, index } => {
+            walk_expr_memories(e, out);
+            walk_expr_memories(index, out);
         }
         Expr::MemoryReadPart {
             memory,

@@ -488,6 +488,7 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::Index { .. } => "Index",
         Expr::StringLength { .. } => "StringLength",
         Expr::StringConcat { .. } => "StringConcat",
+        Expr::StringGetByte { .. } => "StringGetByte",
     }
 }
 
@@ -558,6 +559,10 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         Expr::StringConcat { left, right } => vec![
             design_expr_fingerprint(design, left),
             design_expr_fingerprint(design, right),
+        ],
+        Expr::StringGetByte { e, index } => vec![
+            design_expr_fingerprint(design, e),
+            design_expr_fingerprint(design, index),
         ],
     };
     format!(

@@ -26,6 +26,10 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
             expr_nets(left, out);
             expr_nets(right, out);
         }
+        Expr::StringGetByte { e, index } => {
+            expr_nets(e, out);
+            expr_nets(index, out);
+        }
         Expr::MemoryRead { indexes, .. } => {
             indexes.iter().for_each(|e| expr_nets(e, out));
         }

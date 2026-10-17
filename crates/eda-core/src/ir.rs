@@ -407,6 +407,11 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Reads one byte from a fixed-width packed string.
+    StringGetByte {
+        e: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -444,6 +449,7 @@ impl Expr {
             Expr::Index { msb, lsb, .. } => msb - lsb + 1,
             Expr::StringLength { .. } => 32,
             Expr::StringConcat { left, .. } => left.width(),
+            Expr::StringGetByte { .. } => 8,
         }
     }
 
@@ -479,6 +485,7 @@ impl Expr {
             Expr::Index { .. } => false,
             Expr::StringLength { .. } => true,
             Expr::StringConcat { .. } => false,
+            Expr::StringGetByte { .. } => false,
         }
     }
 }
@@ -1060,6 +1067,10 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
         Expr::StringConcat { left, right } => {
             collect_memory_expr_reads(left, synchronous, accesses);
             collect_memory_expr_reads(right, synchronous, accesses);
+        }
+        Expr::StringGetByte { e, index } => {
+            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(index, synchronous, accesses);
         }
     }
 }

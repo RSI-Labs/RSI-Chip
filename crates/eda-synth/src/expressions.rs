@@ -133,6 +133,9 @@ impl<'a> Synth<'a> {
             Expr::StringConcat { .. } => {
                 return Err("bounded string concatenation is not synthesizable yet".into())
             }
+            Expr::StringGetByte { .. } => {
+                return Err("bounded string indexing is not synthesizable yet".into())
+            }
         })
     }
 

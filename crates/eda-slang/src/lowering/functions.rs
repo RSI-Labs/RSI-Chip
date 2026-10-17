@@ -32,6 +32,7 @@ impl SlangAstLowerer {
             "num" => return self.lower_enum_num(value),
             "name" => return self.lower_enum_name(value),
             "len" => return self.lower_string_len(value),
+            "getc" => return self.lower_string_getc(value),
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -645,6 +646,26 @@ impl SlangAstLowerer {
         }
         let receiver = self.lower_expression(receiver)?;
         self.lower_string_length(receiver)
+    }
+
+    fn lower_string_getc(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string getc call has no arguments".to_string())?;
+        if arguments.len() != 2 {
+            return Err("string getc expects a string receiver and one index".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string getc call has no receiver".to_string())?;
+        let index = arguments
+            .get(1)
+            .ok_or_else(|| "string getc call has no index".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string getc receiver is not a string".into());
+        }
+        self.lower_string_get_byte(receiver, index)
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {

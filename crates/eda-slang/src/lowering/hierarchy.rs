@@ -95,6 +95,10 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             remap_expression(left, offset);
             remap_expression(right, offset);
         }
+        Expr::StringGetByte { e, index } => {
+            remap_expression(e, offset);
+            remap_expression(index, offset);
+        }
     }
 }
 
@@ -227,6 +231,10 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         Expr::StringConcat { left, right } => {
             remap_expression_memory_ids(left, offset);
             remap_expression_memory_ids(right, offset);
+        }
+        Expr::StringGetByte { e, index } => {
+            remap_expression_memory_ids(e, offset);
+            remap_expression_memory_ids(index, offset);
         }
     }
 }

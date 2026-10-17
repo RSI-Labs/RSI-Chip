@@ -501,6 +501,14 @@ impl super::SlangAstLowerer {
                 })
             }
             "ElementSelect" => {
+                if let Some(selected) = value.get("value") {
+                    if string_field(selected, "type").as_deref() == Some("string") {
+                        let selector = value
+                            .get("selector")
+                            .ok_or_else(|| "string select has no selector".to_string())?;
+                        return self.lower_string_get_byte(selected, selector);
+                    }
+                }
                 if let Some((memory, indexes)) = self.memory_element_select(value)? {
                     let symbol = self.design.memories[memory].clone();
                     let signed = self
@@ -827,6 +835,27 @@ impl super::SlangAstLowerer {
             return Err("string len requires a 512-bit string receiver".into());
         }
         Ok(Expr::StringLength { e: Box::new(value) })
+    }
+
+    pub(super) fn lower_string_get_byte(
+        &self,
+        selected: &serde_json::Value,
+        selector: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        let value = self.lower_expression(selected)?;
+        if value.width() != crate::types::STRING_WIDTH {
+            return Err("string byte selection requires a 512-bit string".into());
+        }
+        let index = self.lower_expression(selector)?;
+        if index.width() > 32 {
+            return Err("string byte index exceeds 32 bits".into());
+        }
+        Ok(Expr::StringGetByte {
+            e: Box::new(value),
+            index: Box::new(index),
+        })
     }
 
     pub(super) fn lower_struct_member(
