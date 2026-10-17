@@ -3689,6 +3689,69 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_task_local_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-local-loops");
+    let source_path = root.join("task_local_loops.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_local_loops(
+  output int for_sum,
+  output int while_product,
+  output int repeat_sum
+);
+  task automatic sum_for(output int result);
+    int total = 0;
+    for (int i = 0; i < 4; i = i + 1) total = total + i;
+    result = total;
+  endtask
+
+  task automatic product_while(output int result);
+    int total = 1;
+    int i = 0;
+    while (i < 4) begin
+      total = total * 2;
+      i = i + 1;
+    end
+    result = total;
+  endtask
+
+  task automatic sum_repeat(output int result);
+    int total = 2;
+    repeat (4) total = total + 1;
+    result = total;
+  endtask
+
+  always_comb begin
+    sum_for(for_sum);
+    product_while(while_product);
+    sum_repeat(repeat_sum);
+  end
+endmodule
+"#,
+    )
+    .expect("write task-local loop source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_local_loops"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task-local loops");
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create task-local loop simulator");
+    simulator.run_until(0).expect("settle task-local loops");
+    assert_eq!(simulator.read("for_sum").unwrap().to_u64(), Some(6));
+    assert_eq!(simulator.read("while_product").unwrap().to_u64(), Some(16));
+    assert_eq!(simulator.read("repeat_sum").unwrap().to_u64(), Some(6));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_recursive_tasks() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

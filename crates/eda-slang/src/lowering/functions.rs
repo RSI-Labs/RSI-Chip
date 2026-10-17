@@ -391,6 +391,102 @@ impl SlangAstLowerer {
                     "ifFalse": false_body.unwrap_or(empty_block),
                 })))
             }
+            Some("ForLoop") => {
+                const MAX_INLINE_TASK_LOOP_STEPS: usize = 256;
+                let mut statements = Vec::new();
+                if let Some(initializers) = value.get("initializers").and_then(Value::as_array) {
+                    for initializer in initializers {
+                        if let Some(statement) =
+                            self.inline_task_body(initializer, environment, locals)?
+                        {
+                            statements.push(statement);
+                        }
+                    }
+                }
+                let stop = value
+                    .get("stopExpr")
+                    .ok_or_else(|| "task for-loop has no stop expression".to_string())?;
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "task for-loop has no body".to_string())?;
+                let steps = value
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "task for-loop has no steps".to_string())?;
+                for _ in 0..=MAX_INLINE_TASK_LOOP_STEPS {
+                    let stop = substitute_named_values(stop, environment);
+                    let stop_value = constant_ast_i64(&stop)
+                        .map_err(|_| "task for-loop stop must be an inline integer constant")?;
+                    if stop_value == 0 {
+                        return Ok(Some(json!({
+                            "kind": "List",
+                            "list": statements,
+                        })));
+                    }
+                    if let Some(statement) = self.inline_task_body(body, environment, locals)? {
+                        statements.push(statement);
+                    }
+                    for step in steps {
+                        if let Some(statement) = self.inline_task_body(step, environment, locals)? {
+                            statements.push(statement);
+                        }
+                    }
+                }
+                Err("task for-loop exceeds the 256-iteration inlining limit".into())
+            }
+            Some("WhileLoop") => {
+                const MAX_INLINE_TASK_LOOP_STEPS: usize = 256;
+                let condition = value
+                    .get("cond")
+                    .ok_or_else(|| "task while-loop has no condition".to_string())?;
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "task while-loop has no body".to_string())?;
+                let mut statements = Vec::new();
+                for _ in 0..=MAX_INLINE_TASK_LOOP_STEPS {
+                    let condition = substitute_named_values(condition, environment);
+                    let condition_value = constant_ast_i64(&condition).map_err(|_| {
+                        "task while-loop condition must be an inline integer constant"
+                    })?;
+                    if condition_value == 0 {
+                        return Ok(Some(json!({
+                            "kind": "List",
+                            "list": statements,
+                        })));
+                    }
+                    if let Some(statement) = self.inline_task_body(body, environment, locals)? {
+                        statements.push(statement);
+                    }
+                }
+                Err("task while-loop exceeds the 256-iteration inlining limit".into())
+            }
+            Some("RepeatLoop") => {
+                const MAX_INLINE_TASK_LOOP_STEPS: usize = 256;
+                let count = value
+                    .get("count")
+                    .ok_or_else(|| "task repeat-loop has no count".to_string())?;
+                let count = substitute_named_values(count, environment);
+                let count = constant_ast_i64(&count)
+                    .map_err(|_| "task repeat-loop count must be an inline integer constant")?;
+                let count = usize::try_from(count)
+                    .map_err(|_| "task repeat-loop count is negative".to_string())?;
+                if count > MAX_INLINE_TASK_LOOP_STEPS {
+                    return Err("task repeat-loop exceeds the 256-iteration inlining limit".into());
+                }
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "task repeat-loop has no body".to_string())?;
+                let mut statements = Vec::new();
+                for _ in 0..count {
+                    if let Some(statement) = self.inline_task_body(body, environment, locals)? {
+                        statements.push(statement);
+                    }
+                }
+                Ok(Some(json!({
+                    "kind": "List",
+                    "list": statements,
+                })))
+            }
             Some(kind) => {
                 if task_contains_local_assignment(value, locals) {
                     return Err(format!(
