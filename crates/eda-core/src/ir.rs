@@ -86,6 +86,31 @@ pub enum MemoryTemplate {
     MixedRam,
 }
 
+/// Conservative runtime write-mask contract.
+///
+/// A `true` bit means some runtime write port may update that element bit.
+/// Unknown dynamic starts conservatively set the complete mask. ROMs have no
+/// runtime write mask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryWriteMask {
+    pub width: usize,
+    /// LSB-first, matching `LogicWord` and flat net ordering.
+    pub bits: Vec<bool>,
+}
+
+impl MemoryWriteMask {
+    pub fn full(width: usize) -> Self {
+        Self {
+            width,
+            bits: vec![true; width],
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.width == self.bits.len() && self.bits.iter().all(|bit| *bit)
+    }
+}
+
 /// A sparse unpacked-array object.
 ///
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
@@ -104,6 +129,8 @@ pub struct MemoryDecl {
     pub kind: MemoryKind,
     /// Inferred technology-independent macro candidate.
     pub template: MemoryTemplate,
+    /// Inferred runtime write-port mask. `None` for ROM.
+    pub write_mask: Option<MemoryWriteMask>,
 }
 
 /// Aliases a child instance's memory object to the parent memory supplied on
@@ -607,9 +634,14 @@ impl Design {
     /// memory (including hierarchy aliases) a RAM.
     pub fn infer_memory_kinds(&mut self) {
         let mut accesses = MemoryAccesses::default();
+        let memory_widths = self
+            .memories
+            .iter()
+            .map(|memory| memory.element_width)
+            .collect::<Vec<_>>();
         for process in &self.processes {
             let synchronous = process_is_edge_clocked(&process.sens);
-            collect_memory_accesses(&process.body, synchronous, &mut accesses);
+            collect_memory_accesses(&process.body, synchronous, &memory_widths, &mut accesses);
         }
         for assignment in &self.assigns {
             collect_memory_expr_reads(&assignment.e, false, &mut accesses);
@@ -625,6 +657,7 @@ impl Design {
                     MemoryKind::Rom
                 };
             memory.template = accesses.template(root);
+            memory.write_mask = accesses.write_mask(root, memory.element_width);
         }
     }
 
@@ -666,6 +699,14 @@ struct MemoryAccesses {
     async_reads: std::collections::HashSet<usize>,
     sync_writes: std::collections::HashSet<usize>,
     async_writes: std::collections::HashSet<usize>,
+    write_observations: std::collections::HashMap<usize, Vec<MemoryWriteObservation>>,
+}
+
+#[derive(Clone, Copy)]
+struct MemoryWriteObservation {
+    start: Option<i64>,
+    width: usize,
+    ascending: bool,
 }
 
 impl MemoryAccesses {
@@ -685,6 +726,13 @@ impl MemoryAccesses {
             async_reads: canonicalize_set(self.async_reads, aliases),
             sync_writes: canonicalize_set(self.sync_writes, aliases),
             async_writes: canonicalize_set(self.async_writes, aliases),
+            write_observations: self
+                .write_observations
+                .into_iter()
+                .map(|(memory, observations)| {
+                    (aliases.get(memory).copied().unwrap_or(memory), observations)
+                })
+                .collect(),
         }
     }
 
@@ -708,6 +756,26 @@ impl MemoryAccesses {
             (false, false) => MemoryTemplate::Unmapped,
         }
     }
+
+    fn write_mask(&self, memory: usize, width: usize) -> Option<MemoryWriteMask> {
+        let observations = self.write_observations.get(&memory)?;
+        let mut mask = vec![false; width];
+        for observation in observations {
+            let Some(start) = observation.start else {
+                return Some(MemoryWriteMask::full(width));
+            };
+            let (low, high) = if observation.ascending {
+                (start, start + observation.width as i64 - 1)
+            } else {
+                (start - observation.width as i64 + 1, start)
+            };
+            if low < 0 || high < low || high as usize >= width {
+                return Some(MemoryWriteMask::full(width));
+            }
+            mask[low as usize..=high as usize].fill(true);
+        }
+        Some(MemoryWriteMask { width, bits: mask })
+    }
 }
 
 fn process_is_edge_clocked(sensitivity: &Sens) -> bool {
@@ -720,13 +788,26 @@ fn process_is_edge_clocked(sensitivity: &Sens) -> bool {
     }
 }
 
-fn collect_memory_accesses(statement: &Stmt, synchronous: bool, accesses: &mut MemoryAccesses) {
+fn constant_expression_i64(expression: &Expr) -> Option<i64> {
+    match expression {
+        Expr::Const(word) => word.to_u64().map(|value| value as i64),
+        Expr::Signed { e, .. } => constant_expression_i64(e),
+        _ => None,
+    }
+}
+
+fn collect_memory_accesses(
+    statement: &Stmt,
+    synchronous: bool,
+    memory_widths: &[usize],
+    accesses: &mut MemoryAccesses,
+) {
     match statement {
-        Stmt::Block(statements) => statements
-            .iter()
-            .for_each(|statement| collect_memory_accesses(statement, synchronous, accesses)),
+        Stmt::Block(statements) => statements.iter().for_each(|statement| {
+            collect_memory_accesses(statement, synchronous, memory_widths, accesses)
+        }),
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
-            collect_memory_accesses(body, synchronous, accesses)
+            collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
@@ -738,20 +819,31 @@ fn collect_memory_accesses(statement: &Stmt, synchronous: bool, accesses: &mut M
             } else {
                 accesses.async_writes.insert(*memory);
             }
+            accesses
+                .write_observations
+                .entry(*memory)
+                .or_default()
+                .push(MemoryWriteObservation {
+                    start: Some(0),
+                    width: memory_widths.get(*memory).copied().unwrap_or(0),
+                    ascending: true,
+                });
         }
         Stmt::MemoryBlPart {
             memory,
             indexes,
             start,
+            width,
+            ascending,
             e,
-            ..
         }
         | Stmt::MemoryNBlPart {
             memory,
             indexes,
             start,
+            width,
+            ascending,
             e,
-            ..
         } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, accesses);
@@ -763,19 +855,28 @@ fn collect_memory_accesses(statement: &Stmt, synchronous: bool, accesses: &mut M
             } else {
                 accesses.async_writes.insert(*memory);
             }
+            accesses
+                .write_observations
+                .entry(*memory)
+                .or_default()
+                .push(MemoryWriteObservation {
+                    start: constant_expression_i64(start),
+                    width: *width,
+                    ascending: *ascending,
+                });
         }
         Stmt::If { t, f, .. } => {
-            collect_memory_accesses(t, synchronous, accesses);
+            collect_memory_accesses(t, synchronous, memory_widths, accesses);
             if let Some(f) = f {
-                collect_memory_accesses(f, synchronous, accesses);
+                collect_memory_accesses(f, synchronous, memory_widths, accesses);
             }
         }
         Stmt::Case { arms, dflt, .. } => {
             for (_, body) in arms {
-                collect_memory_accesses(body, synchronous, accesses);
+                collect_memory_accesses(body, synchronous, memory_widths, accesses);
             }
             if let Some(body) = dflt {
-                collect_memory_accesses(body, synchronous, accesses);
+                collect_memory_accesses(body, synchronous, memory_widths, accesses);
             }
         }
         Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => {
@@ -930,6 +1031,7 @@ mod tests {
             flat_length: 8,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
+            write_mask: None,
         };
         assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
         assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
@@ -955,6 +1057,7 @@ mod tests {
             flat_length: 513,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
+            write_mask: None,
         };
         assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
         assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));

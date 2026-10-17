@@ -449,6 +449,11 @@ endmodule
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::SyncRam
     );
+    assert!(design.memories[0]
+        .write_mask
+        .as_ref()
+        .expect("runtime memory write mask")
+        .is_full());
     assert!(reference.memories.is_empty());
     assert_eq!(
         format!("{:?}", reference.ports),
@@ -587,6 +592,11 @@ endmodule
     assert_eq!(design.assigns.len(), 4);
     assert_eq!(design.initials.len(), 1);
     assert_eq!(design.processes.len(), 1);
+    assert!(design.memories[0]
+        .write_mask
+        .as_ref()
+        .expect("dynamic part writes require a conservative mask")
+        .is_full());
 
     let mut simulator = Simulator::new(&design).expect("create part-select simulator");
     simulator
@@ -1081,6 +1091,7 @@ endmodule
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::AsyncRom
     );
+    assert_eq!(design.memories[0].write_mask, None);
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create initializer simulator");
@@ -1260,6 +1271,64 @@ endmodule
         assert_eq!(simulator.read("second").unwrap().to_u64(), Some(2));
         assert_eq!(simulator.read("third").unwrap().to_u64(), Some(3));
         assert_eq!(simulator.read("after").unwrap().to_u64(), None);
+    }
+}
+
+#[test]
+fn slang_and_bounded_paths_infer_fixed_partial_write_masks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("fixed-write-mask");
+    let source_path = root.join("write-mask.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module write_mask(
+  input logic clk,
+  input logic [3:0] din,
+  output logic [15:0] q
+);
+  logic [15:0] mem [0:4095];
+  always @(posedge clk) mem[0][3:0] <= din;
+  assign q = mem[0];
+endmodule
+"#,
+    )
+    .expect("write fixed memory mask source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("write_mask"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fixed memory mask");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("write_mask"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower fixed memory mask through bounded path");
+    for design in [&direct, &bounded] {
+        assert_eq!(design.memories.len(), 1);
+        assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Ram);
+        assert_eq!(
+            design.memories[0].template,
+            eda_core::ir::MemoryTemplate::SyncRam
+        );
+        assert_eq!(
+            design.memories[0].write_mask,
+            Some(eda_core::ir::MemoryWriteMask {
+                width: 16,
+                bits: [
+                    true, true, true, true, false, false, false, false, false, false, false, false,
+                    false, false, false, false
+                ]
+                .to_vec()
+            })
+        );
     }
 }
 

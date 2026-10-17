@@ -1644,6 +1644,7 @@ impl<'a> Elaborator<'a> {
             flat_length: array.length as u64,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
+            write_mask: None,
         });
         memory
     }

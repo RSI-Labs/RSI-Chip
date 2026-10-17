@@ -834,6 +834,7 @@ impl SlangAstLowerer {
             flat_length: memory.flat_length,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,
+            write_mask: None,
         });
         self.symbols.insert(
             name.to_string(),
