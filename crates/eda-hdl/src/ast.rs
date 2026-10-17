@@ -535,6 +535,14 @@ pub enum Stmt {
         start: Option<Expr>,
         finish: Option<Expr>,
     },
+    /// Runtime two-to-four-argument `$writememh`/`$writememb` dump.
+    WriteMem {
+        radix: u32,
+        path: String,
+        memory: String,
+        start: Option<Expr>,
+        finish: Option<Expr>,
+    },
     Finish,
 }
 

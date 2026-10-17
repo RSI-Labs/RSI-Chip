@@ -1112,9 +1112,11 @@ impl SlangAstLowerer {
         call: &serde_json::Value,
         statement: &serde_json::Value,
     ) -> Result<eda_core::ir::Stmt, String> {
-        let radix = match string_field(call, "subroutine").as_deref() {
-            Some("$readmemh") => 16,
-            Some("$readmemb") => 2,
+        let subroutine = string_field(call, "subroutine").unwrap_or_default();
+        let is_write = matches!(subroutine.as_str(), "$writememh" | "$writememb");
+        let radix = match subroutine.as_str() {
+            "$readmemh" | "$writememh" => 16,
+            "$readmemb" | "$writememb" => 2,
             other => {
                 return Err(format!(
                     "direct slang-AST lowering does not support system call {other:?}"
@@ -1127,15 +1129,19 @@ impl SlangAstLowerer {
             .ok_or_else(|| "memory-file call has no arguments".to_string())?;
         if arguments.len() < 2 || arguments.len() > 4 {
             return Err(format!(
-                "direct slang-AST lowering supports two to four arguments for $readmem tasks, got {}",
+                "direct slang-AST lowering supports two to four arguments for memory-file tasks, got {}",
                 arguments.len()
             ));
         }
         let raw_path = string_field(&arguments[0], "literal")
             .ok_or_else(|| "memory-file call requires a string literal path".to_string())?;
-        let target = arguments[1]
-            .get("left")
-            .ok_or_else(|| "memory-file call has no target".to_string())?;
+        let target = if is_write {
+            &arguments[1]
+        } else {
+            arguments[1]
+                .get("left")
+                .ok_or_else(|| "memory-file call has no target".to_string())?
+        };
         let name = expression_symbol(target)
             .ok_or_else(|| "memory-file call target has no symbol".to_string())?;
         let symbol = self
@@ -1148,7 +1154,24 @@ impl SlangAstLowerer {
         let start = arguments.get(2).map(slang_constant_u64).transpose()?;
         let finish = arguments.get(3).map(slang_constant_u64).transpose()?;
         let declaration = &self.design.memories[memory];
-        let path = resolve_memory_file_path(&raw_path, statement);
+        let path = if is_write {
+            resolve_memory_output_path(&raw_path, statement)
+        } else {
+            resolve_memory_file_path(&raw_path, statement)
+        };
+        if is_write {
+            return Ok(eda_core::ir::Stmt::WriteMem {
+                radix,
+                path: path.to_string_lossy().into_owned(),
+                memory,
+                start: start.map(|start| {
+                    eda_core::ir::Expr::Const(eda_core::logic::LogicWord::from_u64(32, start))
+                }),
+                finish: finish.map(|finish| {
+                    eda_core::ir::Expr::Const(eda_core::logic::LogicWord::from_u64(32, finish))
+                }),
+            });
+        }
         let values = eda_core::memory_file::read_memory_file(
             &path,
             radix,
@@ -1862,6 +1885,14 @@ fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize) {
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             remap_expression(cond, offset)
         }
+        Stmt::WriteMem { start, finish, .. } => {
+            if let Some(start) = start {
+                remap_expression(start, offset);
+            }
+            if let Some(finish) = finish {
+                remap_expression(finish, offset);
+            }
+        }
         Stmt::Finish => {}
     }
 }
@@ -1992,6 +2023,20 @@ fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, offset: usize)
         }
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             remap_expression_memory_ids(cond, offset)
+        }
+        Stmt::WriteMem {
+            memory,
+            start,
+            finish,
+            ..
+        } => {
+            *memory += offset;
+            if let Some(start) = start {
+                remap_expression_memory_ids(start, offset);
+            }
+            if let Some(finish) = finish {
+                remap_expression_memory_ids(finish, offset);
+            }
         }
         Stmt::Finish => {}
     }
@@ -2765,6 +2810,31 @@ fn resolve_memory_file_path(raw_path: &str, statement: &serde_json::Value) -> st
     }
 }
 
+fn resolve_memory_output_path(raw_path: &str, statement: &serde_json::Value) -> std::path::PathBuf {
+    let raw_path = std::path::PathBuf::from(raw_path);
+    let source_file = source_span(statement)
+        .map(|span| std::path::PathBuf::from(span.file))
+        .unwrap_or_default();
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        source_file
+            .parent()
+            .map(|parent| parent.join(&raw_path))
+            .unwrap_or(raw_path)
+    };
+    let Some(parent) = resolved.parent() else {
+        return resolved;
+    };
+    let Ok(canonical_parent) = parent.canonicalize() else {
+        return resolved;
+    };
+    match resolved.file_name() {
+        Some(file_name) => canonical_parent.join(file_name),
+        None => resolved,
+    }
+}
+
 fn integer_literal_word(value: &serde_json::Value) -> Option<eda_core::logic::LogicWord> {
     if string_field(value, "kind").as_deref() != Some("IntegerLiteral") {
         return None;
@@ -3267,6 +3337,7 @@ fn design_stmt_assignments(
         | Stmt::Assert { .. }
         | Stmt::Assume { .. }
         | Stmt::Cover { .. }
+        | Stmt::WriteMem { .. }
         | Stmt::Finish => {}
     }
     assignments

@@ -186,6 +186,21 @@ fn memory_file_tasks_parse_to_readmem_statements() {
             }
         }
     ));
+
+    let written = parse_ok(
+        "module m; logic [7:0] mem [0:7]; initial $writememh(\"out.hex\", mem, 2, 4); endmodule",
+    );
+    assert!(matches!(
+        &written.modules[0].items[1],
+        Item::Initial {
+            body: Stmt::WriteMem {
+                radix: 16,
+                start: Some(_),
+                finish: Some(_),
+                ..
+            }
+        }
+    ));
 }
 
 #[test]

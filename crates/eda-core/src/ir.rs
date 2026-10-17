@@ -444,6 +444,15 @@ pub enum Stmt {
         label: String,
         cond: Expr,
     },
+    /// Runtime `$writememh`/`$writememb` dump. The frontend resolves the path;
+    /// start/finish are sampled when the task executes.
+    WriteMem {
+        radix: u32,
+        path: String,
+        memory: usize,
+        start: Option<Expr>,
+        finish: Option<Expr>,
+    },
     Finish,
 }
 

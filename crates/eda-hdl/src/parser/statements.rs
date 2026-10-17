@@ -224,8 +224,12 @@ impl Parser {
             return Ok(Stmt::Forever(body));
         }
         if let Tok::Ident(s) = self.peek().clone() {
-            if s == "$readmemh" || s == "$readmemb" {
-                let radix = if s == "$readmemh" { 16 } else { 2 };
+            if matches!(
+                s.as_str(),
+                "$readmemh" | "$readmemb" | "$writememh" | "$writememb"
+            ) {
+                let is_write = s.starts_with("$write");
+                let radix = if s.ends_with('h') { 16 } else { 2 };
                 self.bump();
                 self.expect_punct("(")?;
                 let path = match self.peek().clone() {
@@ -256,12 +260,25 @@ impl Parser {
                 self.expect_punct(";")?;
                 let start = bounds.first().cloned();
                 let finish = bounds.get(1).cloned();
-                return Ok(Stmt::ReadMem {
-                    radix,
-                    path,
-                    memory,
-                    start,
-                    finish,
+                let fields = (radix, path, memory, start, finish);
+                return Ok(if is_write {
+                    let (radix, path, memory, start, finish) = fields;
+                    Stmt::WriteMem {
+                        radix,
+                        path,
+                        memory,
+                        start,
+                        finish,
+                    }
+                } else {
+                    let (radix, path, memory, start, finish) = fields;
+                    Stmt::ReadMem {
+                        radix,
+                        path,
+                        memory,
+                        start,
+                        finish,
+                    }
                 });
             }
             if s == "$display"

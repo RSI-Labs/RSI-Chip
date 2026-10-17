@@ -801,6 +801,16 @@ impl<'a> Elaborator<'a> {
         {
             return self.memory_file_statement(*radix, path, memory, start, finish, env);
         }
+        if let ast::Stmt::WriteMem {
+            radix,
+            path,
+            memory,
+            start,
+            finish,
+        } = s
+        {
+            return self.write_memory_file_statement(*radix, path, memory, start, finish, env);
+        }
         Ok(match s {
             ast::Stmt::Block(v) => StmtIR::Block(
                 v.iter()
@@ -919,6 +929,13 @@ impl<'a> Elaborator<'a> {
                 start,
                 finish,
             } => return self.memory_file_statement(*radix, path, memory, start, finish, env),
+            ast::Stmt::WriteMem {
+                radix,
+                path,
+                memory,
+                start,
+                finish,
+            } => return self.write_memory_file_statement(*radix, path, memory, start, finish, env),
         })
     }
 
@@ -936,15 +953,7 @@ impl<'a> Elaborator<'a> {
             .memory
             .ok_or_else(|| format!("'{memory_name}' is not a sparse memory"))?;
         let declaration = &self.design.memories[memory_index];
-        let raw_path = std::path::PathBuf::from(path);
-        let resolved_path = if raw_path.is_absolute() {
-            raw_path
-        } else {
-            self.source_dir
-                .as_deref()
-                .map(|source_dir| source_dir.join(&raw_path))
-                .unwrap_or(raw_path)
-        };
+        let resolved_path = self.resolve_memory_task_path(path, false);
         let start = start
             .as_ref()
             .map(|start| {
@@ -982,6 +991,60 @@ impl<'a> Elaborator<'a> {
             });
         }
         Ok(StmtIR::Block(statements))
+    }
+
+    fn write_memory_file_statement(
+        &self,
+        radix: u32,
+        path: &str,
+        memory_name: &str,
+        start: &Option<ast::Expr>,
+        finish: &Option<ast::Expr>,
+        env: &Env<'_>,
+    ) -> Result<StmtIR, String> {
+        let entry = env.net(memory_name)?;
+        let memory = entry
+            .memory
+            .ok_or_else(|| format!("'{memory_name}' is not a sparse memory"))?;
+        let path = self.resolve_memory_task_path(path, true);
+        Ok(StmtIR::WriteMem {
+            radix,
+            path: path.to_string_lossy().into_owned(),
+            memory,
+            start: start
+                .as_ref()
+                .map(|start| self.elab_expr(start, env))
+                .transpose()?,
+            finish: finish
+                .as_ref()
+                .map(|finish| self.elab_expr(finish, env))
+                .transpose()?,
+        })
+    }
+
+    fn resolve_memory_task_path(&self, path: &str, for_write: bool) -> std::path::PathBuf {
+        let raw_path = std::path::PathBuf::from(path);
+        let resolved_path = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            self.source_dir
+                .as_deref()
+                .map(|source_dir| source_dir.join(&raw_path))
+                .unwrap_or(raw_path)
+        };
+        if !for_write {
+            return resolved_path;
+        }
+        let Some(parent) = resolved_path.parent() else {
+            return resolved_path;
+        };
+        let Ok(canonical_parent) = parent.canonicalize() else {
+            return resolved_path;
+        };
+        match resolved_path.file_name() {
+            Some(file_name) => canonical_parent.join(file_name),
+            None => resolved_path,
+        }
     }
 
     pub(super) fn elab_lvalue(&self, e: &ast::Expr, env: &Env) -> Result<LValue, String> {

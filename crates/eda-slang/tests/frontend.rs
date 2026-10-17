@@ -1214,6 +1214,66 @@ endmodule
 }
 
 #[test]
+fn slang_and_bounded_paths_write_sparse_memory_files() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("memory-write-files");
+    let source_path = root.join("writemem.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module writemem;
+  logic [7:0] mem [0:4096];
+  logic [1:0] bits [0:2048];
+  initial begin
+    mem[2] = 8'h01;
+    mem[3] = 8'h02;
+    bits[1] = 2'b10;
+    $writememh("writemem.hex", mem, 2, 4);
+    $writememb("writemem.bin", bits, 1, 2);
+  end
+endmodule
+"#,
+    )
+    .expect("write sparse-memory dump source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("writemem"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory dump tasks");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("writemem"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower sparse-memory dump tasks through bounded path");
+    assert_eq!(direct.memories.len(), 2);
+    assert_eq!(bounded.memories.len(), 2);
+    assert_eq!(direct.initials.len(), 1);
+    assert_eq!(bounded.initials.len(), 1);
+
+    for design in [&direct, &bounded] {
+        let mut simulator = Simulator::new(design).expect("create sparse-memory dump simulator");
+        simulator
+            .run_until(0)
+            .expect("execute sparse-memory dump tasks");
+        assert_eq!(
+            std::fs::read_to_string(root.join("writemem.hex")).unwrap(),
+            "1\n2\nxx\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("writemem.bin")).unwrap(),
+            "10\nxx\n"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

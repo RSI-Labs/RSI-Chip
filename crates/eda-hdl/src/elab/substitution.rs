@@ -930,5 +930,18 @@ pub(super) fn subst_stmt(stmt: &ast::Stmt, var: &str, value: i64) -> ast::Stmt {
             start: start.as_ref().map(|start| subst_expr(start, var, value)),
             finish: finish.as_ref().map(|finish| subst_expr(finish, var, value)),
         },
+        ast::Stmt::WriteMem {
+            radix,
+            path,
+            memory,
+            start,
+            finish,
+        } => ast::Stmt::WriteMem {
+            radix: *radix,
+            path: path.clone(),
+            memory: memory.clone(),
+            start: start.as_ref().map(|start| subst_expr(start, var, value)),
+            finish: finish.as_ref().map(|finish| subst_expr(finish, var, value)),
+        },
     }
 }

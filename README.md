@@ -58,7 +58,7 @@ additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
 if/case control flow, single posedge/negedge sensitivity, recursive
 parameterized module hierarchy with port connections, generated members, and
-multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` expansion with constant start/finish bounds, and direct inout child-memory sharing directly from slang's elaborated
+multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate
 the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
@@ -77,8 +77,8 @@ support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
 large `inout` memory-port sharing through the hierarchy. Direct slang-AST
 lowering supports inline multidimensional sparse-memory initializers and
-compile-time `$readmemh`/`$readmemb` expansion with constant start/finish bounds. The bounded path expands
-two-to-four-argument memory-file loads with constant bounds relative to the first source file and accepts
+compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps. The bounded path expands
+two-to-four-argument memory-file loads/dumps with constant bounds relative to the first source file and accepts
 combined net/data declarations such as `wire logic`, allowing the preprocessed
 and direct slang paths to share sparse-memory differentials.
 

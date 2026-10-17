@@ -1050,6 +1050,7 @@ impl<'a> Synth<'a> {
             }
             Stmt::Display { .. }
             | Stmt::Finish
+            | Stmt::WriteMem { .. }
             | Stmt::Assert { .. }
             | Stmt::Assume { .. }
             | Stmt::Cover { .. } => Ok(()),

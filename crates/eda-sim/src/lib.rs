@@ -785,6 +785,70 @@ impl<'d> Simulator<'d> {
         self.memory_aliases.get(memory).copied().unwrap_or(memory)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn write_memory_file(
+        &self,
+        radix: u32,
+        path: &str,
+        memory: usize,
+        start: Option<&Expr>,
+        finish: Option<&Expr>,
+    ) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("memory-file dump refers to missing memory {memory}"))?;
+        let start = start
+            .map(|start| {
+                self.eval(start)
+                    .to_u64()
+                    .ok_or_else(|| "memory-file dump start must be known".to_string())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let finish = finish
+            .map(|finish| {
+                self.eval(finish)
+                    .to_u64()
+                    .ok_or_else(|| "memory-file dump finish must be known".to_string())
+            })
+            .transpose()?
+            .unwrap_or(declaration.flat_length.saturating_sub(1));
+        if start > finish {
+            return Err(format!(
+                "memory-file dump finish {finish} is below start {start}"
+            ));
+        }
+        if finish >= declaration.flat_length {
+            return Err(format!(
+                "memory-file dump address {finish} is outside memory '{}'",
+                declaration.name
+            ));
+        }
+        let storage = self
+            .memory_elements
+            .get(memory)
+            .ok_or_else(|| format!("memory '{}' has no sparse storage", declaration.name))?;
+        let mut output = String::new();
+        for address in start..=finish {
+            let value = storage
+                .get(&address)
+                .cloned()
+                .unwrap_or_else(|| LogicWord::xes(declaration.element_width));
+            let text = if radix == 16 {
+                value.to_hex_str()
+            } else {
+                value.to_bin_str()
+            };
+            output.push_str(&text);
+            output.push('\n');
+        }
+        std::fs::write(path, output)
+            .map_err(|error| format!("cannot write memory file '{path}': {error}"))
+    }
+
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
         let mut work = c.work;
         while let Some(s) = work.pop() {
@@ -1032,6 +1096,15 @@ impl<'d> Simulator<'d> {
                     if value.reduce_or().as_bool() == Some(true) {
                         *self.property_covers.entry(label.clone()).or_insert(0) += 1;
                     }
+                }
+                Stmt::WriteMem {
+                    radix,
+                    path,
+                    memory,
+                    start,
+                    finish,
+                } => {
+                    self.write_memory_file(*radix, path, *memory, start.as_ref(), finish.as_ref())?
                 }
                 Stmt::Finish => {
                     self.finished = true;
@@ -1681,6 +1754,20 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Cover { cond, .. } => walk_expr_memories(cond, out),
+        Stmt::WriteMem {
+            memory,
+            start,
+            finish,
+            ..
+        } => {
+            out.push(*memory);
+            if let Some(start) = start {
+                walk_expr_memories(start, out);
+            }
+            if let Some(finish) = finish {
+                walk_expr_memories(finish, out);
+            }
+        }
         Stmt::Finish => {}
     }
 }
@@ -1755,6 +1842,14 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Cover { cond, .. } => reads.extend(expr_nets(cond)),
+        Stmt::WriteMem { start, finish, .. } => {
+            if let Some(start) = start {
+                reads.extend(expr_nets(start));
+            }
+            if let Some(finish) = finish {
+                reads.extend(expr_nets(finish));
+            }
+        }
         Stmt::Finish => {}
     }
 }
@@ -1810,6 +1905,14 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),
         Stmt::Cover { cond, .. } => walk_expr(cond, out),
+        Stmt::WriteMem { start, finish, .. } => {
+            if let Some(start) = start {
+                walk_expr(start, out);
+            }
+            if let Some(finish) = finish {
+                walk_expr(finish, out);
+            }
+        }
         Stmt::Finish => {}
     }
 }

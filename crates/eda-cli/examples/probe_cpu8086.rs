@@ -100,6 +100,14 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
                 expr_nets(cond, reads)
             }
+            Stmt::WriteMem { start, finish, .. } => {
+                if let Some(start) = start {
+                    expr_nets(start, reads);
+                }
+                if let Some(finish) = finish {
+                    expr_nets(finish, reads);
+                }
+            }
             Stmt::Display { .. } | Stmt::Finish => {}
         }
     }
