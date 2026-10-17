@@ -1,6 +1,8 @@
 //! Direct lowering from slang's post-elaboration AST JSON into the repository IR.
 
-use crate::ast_util::{bool_field, normalize_instance_bodies, string_field};
+use crate::ast_util::{
+    bool_field, normalize_detailed_types, normalize_instance_bodies, string_field,
+};
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
 
@@ -34,6 +36,7 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     }
     let mut root = root.clone();
     normalize_instance_bodies(&mut root);
+    normalize_detailed_types(&mut root);
     Ok(root)
 }
 
@@ -47,6 +50,20 @@ struct AstLoweredSymbol {
     bounds: Option<(i64, i64)>,
     dimensions: Vec<crate::types::AstPackedDimension>,
     memory: Option<usize>,
+    struct_fields: std::collections::BTreeMap<String, AstStructField>,
+}
+
+#[derive(Clone, Copy)]
+struct AstStructField {
+    offset: usize,
+    width: usize,
+}
+
+#[derive(Clone)]
+struct AstStructType {
+    width: usize,
+    signed: bool,
+    fields: std::collections::BTreeMap<String, AstStructField>,
 }
 
 pub(super) struct SlangAstLowerer {
@@ -54,6 +71,7 @@ pub(super) struct SlangAstLowerer {
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     constants: std::collections::BTreeMap<String, LogicWord>,
     subroutines: std::collections::BTreeMap<String, serde_json::Value>,
+    type_aliases: std::collections::BTreeMap<String, AstStructType>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
 }
@@ -77,6 +95,7 @@ impl SlangAstLowerer {
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
+            type_aliases: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
@@ -125,8 +144,10 @@ impl SlangAstLowerer {
 
     fn lower_members(&mut self, members: &[serde_json::Value]) -> Result<(), String> {
         for member in members {
-            if string_field(member, "kind").as_deref() == Some("Subroutine") {
-                self.collect_subroutine(member)?;
+            match string_field(member, "kind").as_deref() {
+                Some("Subroutine") => self.collect_subroutine(member)?,
+                Some("TypeAlias") => self.collect_type_alias(member)?,
+                _ => {}
             }
         }
         for member in members {
@@ -139,6 +160,7 @@ impl SlangAstLowerer {
                 "ProceduralBlock" => self.lower_procedural_block(member)?,
                 "Instance" => self.lower_instance(member)?,
                 "Subroutine" => {}
+                "TypeAlias" => {}
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}
@@ -156,8 +178,10 @@ impl SlangAstLowerer {
                         self.generate_path.push(name);
                     }
                     let outer_subroutines = self.subroutines.clone();
+                    let outer_type_aliases = self.type_aliases.clone();
                     let result = self.lower_members(members);
                     self.subroutines = outer_subroutines;
+                    self.type_aliases = outer_type_aliases;
                     if !self.generate_path.is_empty()
                         && self.generate_path.last().is_some_and(|last| {
                             member
@@ -206,12 +230,14 @@ impl SlangAstLowerer {
             self.generate_path
                 .push(format!("{array_name}[{construct_index}]"));
             let outer_subroutines = self.subroutines.clone();
+            let outer_type_aliases = self.type_aliases.clone();
             let nested_members = nested
                 .get("members")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "slang GenerateBlock has no members".to_string())?;
             let result = self.lower_members(nested_members);
             self.subroutines = outer_subroutines;
+            self.type_aliases = outer_type_aliases;
             self.generate_path.pop();
             result?;
         }

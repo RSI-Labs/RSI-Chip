@@ -14,6 +14,71 @@ pub(super) fn normalize_instance_bodies(value: &mut Value) {
     replace_instance_body_references(value, &bodies);
 }
 
+pub(super) fn normalize_detailed_types(value: &mut Value) {
+    if let Value::Array(values) = value {
+        for nested in values {
+            normalize_detailed_types(nested);
+        }
+        return;
+    }
+    let Value::Object(fields) = value else {
+        return;
+    };
+    for (key, nested) in fields.iter_mut() {
+        if key == "target" {
+            continue;
+        }
+        if (key == "type" || key == "returnType") && nested.is_object() {
+            if let Some(type_name) = canonical_detailed_type(nested) {
+                *nested = Value::String(type_name);
+            }
+            continue;
+        }
+        normalize_detailed_types(nested);
+    }
+}
+
+fn canonical_detailed_type(value: &Value) -> Option<String> {
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "ScalarType" => {
+            let name = value.get("name").and_then(Value::as_str)?;
+            if value.get("isSigned").and_then(Value::as_bool) == Some(true) {
+                Some(format!("{name} signed"))
+            } else {
+                Some(name.to_string())
+            }
+        }
+        "PackedArrayType" => {
+            let element = value.get("elementType")?;
+            let range = value.get("range").and_then(Value::as_str)?;
+            let element = canonical_detailed_type(element)?;
+            let split = element.find('[').unwrap_or(element.len());
+            Some(format!("{}{range}{}", &element[..split], &element[split..]))
+        }
+        "PredefinedIntegerType" | "FloatingType" | "StringType" => value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "FixedSizeUnpackedArrayType" => {
+            let element = value.get("elementType")?;
+            let range = value.get("range").and_then(Value::as_str)?;
+            let element = canonical_detailed_type(element)?;
+            if element.contains('$') {
+                let split = element.find('$').unwrap_or(element.len());
+                Some(format!(
+                    "{}{range}{}",
+                    &element[..=split],
+                    &element[split + 1..]
+                ))
+            } else {
+                Some(format!("{element}${range}"))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn collect_instance_bodies(value: &Value, bodies: &mut std::collections::BTreeMap<String, Value>) {
     match value {
         Value::Object(fields) => {

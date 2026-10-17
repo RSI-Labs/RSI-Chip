@@ -1,10 +1,101 @@
 //! Module member, port, net, memory, and parameter lowering.
 
-use super::{declaration_name, AstLoweredSymbol, SlangAstLowerer};
-use crate::ast_util::{literal_word, memory_initializer_statements, string_field};
-use crate::types::{memory_type, simple_type_shape, simple_type_signed};
+use super::{declaration_name, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer};
+use crate::ast_util::{bool_field, literal_word, memory_initializer_statements, string_field};
+use crate::types::{
+    memory_type, simple_type_shape, simple_type_signed, AstPackedDimension, AstTypeShape,
+};
 
 impl SlangAstLowerer {
+    pub(super) fn collect_type_alias(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let name = declaration_name(member, "TypeAlias")?;
+        let target = member
+            .get("target")
+            .ok_or_else(|| format!("type alias '{name}' has no detailed target type"))?;
+        if string_field(target, "kind").as_deref() != Some("PackedStructType") {
+            return Err(format!(
+                "direct slang-AST lowering does not support type alias '{name}' target"
+            ));
+        }
+        let fields = target
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("packed struct type '{name}' has no fields"))?;
+        let mut struct_fields = std::collections::BTreeMap::new();
+        let mut width = 0_usize;
+        for field in fields {
+            let field_name = field
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("packed struct type '{name}' has an unnamed field"))?;
+            let offset = field
+                .get("bitOffset")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| {
+                    format!("packed struct field '{name}.{field_name}' has no bit offset")
+                })?;
+            let field_type = field
+                .get("type")
+                .ok_or_else(|| format!("packed struct field '{name}.{field_name}' has no type"))?;
+            let field_width = detailed_type_width(field_type)?;
+            width = width.max(offset.saturating_add(field_width));
+            struct_fields.insert(
+                field_name.to_string(),
+                AstStructField {
+                    offset,
+                    width: field_width,
+                },
+            );
+        }
+        let definition = AstStructType {
+            width,
+            signed: bool_field(target, "isSigned"),
+            fields: struct_fields,
+        };
+        self.type_aliases.insert(name, definition);
+        Ok(())
+    }
+
+    fn net_type(
+        &self,
+        type_name: &str,
+    ) -> Result<
+        (
+            AstTypeShape,
+            bool,
+            std::collections::BTreeMap<String, AstStructField>,
+        ),
+        String,
+    > {
+        if let Some(shape) = simple_type_shape(type_name) {
+            let signed = simple_type_signed(type_name).ok_or_else(|| {
+                format!("direct lowering cannot resolve signedness of '{type_name}'")
+            })?;
+            return Ok((shape, signed, std::collections::BTreeMap::new()));
+        }
+        let alias_name = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        let definition = self
+            .type_aliases
+            .get(alias_name)
+            .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
+        Ok((
+            AstTypeShape {
+                width: definition.width,
+                bounds: None,
+                dimensions: Vec::<AstPackedDimension>::new(),
+            },
+            definition.signed,
+            definition.fields.clone(),
+        ))
+    }
+
     pub(super) fn lower_port(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "Port")?;
         if memory_type(&string_field(member, "type").unwrap_or_default()).is_some() {
@@ -136,6 +227,7 @@ impl SlangAstLowerer {
                 bounds: Some((memory.element_msb, memory.element_lsb)),
                 dimensions: Vec::new(),
                 memory: Some(memory_index),
+                struct_fields: std::collections::BTreeMap::new(),
             },
         );
         if let Some(initializer) = initializer {
@@ -157,11 +249,7 @@ impl SlangAstLowerer {
         if self.symbols.contains_key(name) {
             let existing = self.symbols[name].clone();
             let type_name = string_field(member, "type").unwrap_or_default();
-            let shape = simple_type_shape(&type_name)
-                .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
-            let signed = simple_type_signed(&type_name).ok_or_else(|| {
-                format!("direct lowering cannot resolve signedness of '{type_name}'")
-            })?;
+            let (shape, signed, _) = self.net_type(&type_name)?;
             if existing.width != shape.width
                 || existing.bounds != shape.bounds
                 || existing.signed != signed
@@ -181,10 +269,7 @@ impl SlangAstLowerer {
             return Ok(existing);
         }
         let type_name = string_field(member, "type").unwrap_or_default();
-        let shape = simple_type_shape(&type_name)
-            .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
-        let signed = simple_type_signed(&type_name)
-            .ok_or_else(|| format!("direct lowering cannot resolve signedness of '{type_name}'"))?;
+        let (shape, signed, struct_fields) = self.net_type(&type_name)?;
         let base = self.design.n_nets;
         let symbol = AstLoweredSymbol {
             base,
@@ -193,6 +278,7 @@ impl SlangAstLowerer {
             bounds: shape.bounds,
             dimensions: shape.dimensions,
             memory: None,
+            struct_fields,
         };
         self.design.n_nets += shape.width;
         self.design.net_decls.push(eda_core::ir::NetDecl {
@@ -224,5 +310,58 @@ impl SlangAstLowerer {
         }
         self.constants.insert(name, word);
         Ok(())
+    }
+}
+
+fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> {
+    match string_field(type_value, "kind").as_deref() {
+        Some("ScalarType") => Ok(1),
+        Some("PackedArrayType") => {
+            let element = type_value
+                .get("elementType")
+                .ok_or_else(|| "packed array type has no element type".to_string())?;
+            let element_width = detailed_type_width(element)?;
+            let range = string_field(type_value, "range").unwrap_or_default();
+            let Some((left, right)) = range.trim_matches(|c| c == '[' || c == ']').split_once(':')
+            else {
+                return Err(format!("packed array type has invalid range '{range}'"));
+            };
+            let left = left
+                .trim()
+                .parse::<i128>()
+                .map_err(|_| format!("packed array type has invalid range bound '{left}'"))?;
+            let right = right
+                .trim()
+                .parse::<i128>()
+                .map_err(|_| format!("packed array type has invalid range bound '{right}'"))?;
+            let length = (left - right).unsigned_abs() + 1;
+            usize::try_from(length)
+                .ok()
+                .and_then(|length| element_width.checked_mul(length))
+                .ok_or_else(|| "packed array type width overflows".to_string())
+        }
+        Some("PackedStructType") => {
+            let mut width = 0_usize;
+            let members = type_value
+                .get("members")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "packed struct type has no members".to_string())?;
+            for member in members {
+                let offset = member
+                    .get("bitOffset")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or_else(|| "packed struct member has no bit offset".to_string())?;
+                let field_type = member
+                    .get("type")
+                    .ok_or_else(|| "packed struct member has no type".to_string())?;
+                width = width.max(offset.saturating_add(detailed_type_width(field_type)?));
+            }
+            Ok(width)
+        }
+        Some(kind) => Err(format!(
+            "direct lowering does not support detailed type kind '{kind}'"
+        )),
+        None => Err("detailed type has no kind".into()),
     }
 }

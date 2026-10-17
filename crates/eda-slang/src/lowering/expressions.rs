@@ -160,6 +160,14 @@ impl super::SlangAstLowerer {
                     range: eda_core::ir::Range::Span { msb, lsb },
                 })
             }
+            Some("MemberAccess") => {
+                let (lv, msb, lsb) = self.lower_struct_member_lvalue(value)?;
+                Ok(eda_core::ir::LValue {
+                    net: lv.net,
+                    decl_width: lv.decl_width,
+                    range: eda_core::ir::Range::Span { msb, lsb },
+                })
+            }
             Some(kind) => Err(format!(
                 "direct slang-AST lowering does not support lvalue kind '{kind}'"
             )),
@@ -514,6 +522,14 @@ impl super::SlangAstLowerer {
                     lsb,
                 })
             }
+            "MemberAccess" => {
+                let (base, msb, lsb) = self.lower_struct_member(value)?;
+                Ok(Expr::Index {
+                    e: Box::new(base),
+                    msb,
+                    lsb,
+                })
+            }
             _ => Err(format!(
                 "direct slang-AST lowering does not support expression kind '{kind}'"
             )),
@@ -705,6 +721,48 @@ impl super::SlangAstLowerer {
             });
         }
         Ok(Expr::Concat(reversed_blocks))
+    }
+
+    pub(super) fn lower_struct_member(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(eda_core::ir::Expr, usize, usize), String> {
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "struct member access has no selected value".to_string())?;
+        let member = string_field(value, "member")
+            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "struct member access has no member".to_string())?;
+        let symbol = self.direct_packed_symbol(selected)?.ok_or_else(|| {
+            "struct member access requires a named struct declaration".to_string()
+        })?;
+        let field = symbol
+            .struct_fields
+            .get(&member)
+            .ok_or_else(|| format!("struct has no member '{member}'"))?;
+        let base = self.lower_expression(selected)?;
+        Ok((base, field.offset + field.width - 1, field.offset))
+    }
+
+    pub(super) fn lower_struct_member_lvalue(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(eda_core::ir::LValue, usize, usize), String> {
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "struct member access has no selected value".to_string())?;
+        let member = string_field(value, "member")
+            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "struct member access has no member".to_string())?;
+        let symbol = self.direct_packed_symbol(selected)?.ok_or_else(|| {
+            "struct member access requires a named struct declaration".to_string()
+        })?;
+        let field = symbol
+            .struct_fields
+            .get(&member)
+            .ok_or_else(|| format!("struct has no member '{member}'"))?;
+        let base = self.lower_lvalue(selected)?;
+        Ok((base, field.offset + field.width - 1, field.offset))
     }
 
     pub(super) fn lower_integral_conversion(

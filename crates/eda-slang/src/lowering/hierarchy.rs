@@ -328,6 +328,7 @@ impl super::SlangAstLowerer {
             symbols: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
+            type_aliases: std::collections::BTreeMap::new(),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };

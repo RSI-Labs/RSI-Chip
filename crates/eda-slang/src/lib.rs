@@ -159,6 +159,7 @@ impl SlangFrontend {
             command.arg("--top").arg(top);
         }
         command.arg("--ast-json").arg("-");
+        command.arg("--ast-json-detailed-types");
         command.arg("--ast-json-source-info");
         for scope in scopes {
             command.arg("--ast-json-scope").arg(scope);

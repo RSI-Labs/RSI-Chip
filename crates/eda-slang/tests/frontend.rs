@@ -2309,6 +2309,57 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_packed_struct_types() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-packed-struct");
+    let source_path = root.join("packed_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module packed_struct(
+  input logic [3:0] high,
+  input logic [3:0] low,
+  output logic [7:0] whole,
+  output logic [3:0] selected_low
+);
+  typedef struct packed {
+    logic [3:0] high;
+    logic [3:0] low;
+  } pair_t;
+
+  pair_t pair;
+  assign pair.high = high;
+  assign pair.low = low;
+  assign whole = pair;
+  assign selected_low = pair.low;
+endmodule
+"#,
+    )
+    .expect("write packed-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("packed_struct"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower packed struct");
+    assert_eq!(design.assigns.len(), 4);
+
+    let mut simulator = Simulator::new(&design).expect("create packed-struct simulator");
+    simulator
+        .set_input("high", &LogicWord::from_u64(4, 0xa))
+        .unwrap();
+    simulator
+        .set_input("low", &LogicWord::from_u64(4, 0x5))
+        .unwrap();
+    assert_eq!(simulator.read("whole").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(simulator.read("selected_low").unwrap().to_u64(), Some(0x5));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
