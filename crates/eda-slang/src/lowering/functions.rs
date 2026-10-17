@@ -18,8 +18,13 @@ impl SlangAstLowerer {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Err("function call has no subroutine symbol".into());
         };
-        if matches!(subroutine.as_str(), "next" | "prev") {
-            return self.lower_enum_next_prev(value, subroutine == "next");
+        match subroutine.as_str() {
+            "next" | "prev" => {
+                return self.lower_enum_next_prev(value, subroutine == "next");
+            }
+            "first" | "last" => return self.lower_enum_first_last(value, subroutine == "first"),
+            "num" => return self.lower_enum_num(value),
+            _ => {}
         }
         let subroutine_name = expression_symbol(value)
             .or_else(|| {
@@ -167,6 +172,56 @@ impl SlangAstLowerer {
             };
         }
         Ok(result)
+    }
+
+    fn lower_enum_first_last(
+        &self,
+        value: &Value,
+        first: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let definition = self.enum_method_definition(value)?;
+        let value = if first {
+            definition.values.first()
+        } else {
+            definition.values.last()
+        }
+        .ok_or_else(|| "enum first/last requires a nonempty enum".to_string())?;
+        Ok(eda_core::ir::Expr::Const(value.clone()))
+    }
+
+    fn lower_enum_num(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let definition = self.enum_method_definition(value)?;
+        let count = u64::try_from(definition.values.len())
+            .map_err(|_| "enum num count is out of range".to_string())?;
+        let word = eda_core::logic::LogicWord::from_u64(32, count);
+        Ok(eda_core::ir::Expr::Signed {
+            e: Box::new(eda_core::ir::Expr::Const(word)),
+            signed: true,
+        })
+    }
+
+    fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "enum method call has no receiver".to_string())?;
+        if arguments.len() != 1 {
+            return Err("enum method expects one enum receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "enum method has no receiver".to_string())?;
+        let receiver_type = string_field(receiver, "type").unwrap_or_default();
+        let enum_name = receiver_type
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        self.type_enums
+            .get(enum_name)
+            .ok_or_else(|| format!("enum method receiver is not an enum: '{receiver_type}'"))
     }
 
     fn inline_function_body(

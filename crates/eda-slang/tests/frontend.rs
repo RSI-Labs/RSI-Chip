@@ -2554,7 +2554,10 @@ module enum_next_prev(
   output logic [1:0] next_by_two,
   output logic [1:0] constant_next,
   output logic [1:0] constant_prev,
-  output logic [1:0] invalid_next
+  output logic [1:0] invalid_next,
+  output logic [1:0] first_value,
+  output logic [1:0] last_value,
+  output int count
 );
   typedef enum logic [1:0] {
     A = 2'b00,
@@ -2570,6 +2573,9 @@ module enum_next_prev(
   assign constant_next = C.next();
   assign constant_prev = A.prev();
   assign invalid_next = state_t'(2'b11).next();
+  assign first_value = state.first();
+  assign last_value = state.last();
+  assign count = state.num();
 endmodule
 "#,
     )
@@ -2583,7 +2589,7 @@ endmodule
         )
         .expect("lower enum next/prev");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 6);
+    assert_eq!(design.assigns.len(), 9);
 
     let mut simulator = Simulator::new(&design).expect("create enum next/prev simulator");
     for (selector, expected_next, expected_prev, expected_by_two) in [
@@ -2619,6 +2625,9 @@ endmodule
         simulator.read("constant_prev").unwrap().to_u64(),
         Some(0b10)
     );
+    assert_eq!(simulator.read("first_value").unwrap().to_u64(), Some(0b00));
+    assert_eq!(simulator.read("last_value").unwrap().to_u64(), Some(0b10));
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(3));
 
     simulator
         .set_input("selector", &LogicWord::from_u64(2, 0b11))
