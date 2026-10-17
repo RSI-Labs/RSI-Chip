@@ -5,7 +5,10 @@
 //! folding, buffer collapse, duplicate merging, dead-code elimination), and
 //! technology mapping onto the standard-cell library.
 
-use eda_core::ir::{BinOp, Design, Expr, LValue, Range, Sens, Stmt, UnOp};
+use eda_core::ir::{
+    BinOp, Design, Expr, LValue, MemoryByteEnable, MemoryKind, MemoryTemplate, MemoryWriteMask,
+    Range, Sens, Stmt, UnOp,
+};
 use eda_core::library::CellLibrary;
 use eda_core::logic::LogicValue;
 use eda_core::netlist::{Cell, CellKind, Dir, NetId, Netlist};
@@ -45,6 +48,125 @@ pub struct SynthResult {
     pub netlist: Netlist,
     pub library: Arc<CellLibrary>,
     pub warnings: Vec<String>,
+    pub memory_plans: Vec<MemoryMacroPlan>,
+}
+
+/// Technology-independent macro candidate.
+///
+/// This is not a vendor cell selection. The thresholds deliberately separate
+/// small structures that can reasonably remain distributed logic from larger
+/// structures that require block-RAM/ROM mapping or explicit partitioning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryMacroCandidate {
+    DistributedRom,
+    BlockRom,
+    DistributedRam,
+    BlockRam,
+    NoStoragePort,
+    PartitionRequired,
+    UnsupportedAsyncLargeMemory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryMacroPlan {
+    pub name: String,
+    pub kind: MemoryKind,
+    pub template: MemoryTemplate,
+    pub element_width: usize,
+    pub bank_count: u64,
+    pub bank_depth: u64,
+    pub total_bits: u128,
+    pub write_mask: Option<MemoryWriteMask>,
+    pub byte_enable: Option<MemoryByteEnable>,
+    pub candidate: MemoryMacroCandidate,
+    pub rationale: String,
+}
+
+pub fn plan_memories(design: &Design) -> Vec<MemoryMacroPlan> {
+    design
+        .memories
+        .iter()
+        .map(|memory| {
+            let total_bits =
+                u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
+            let candidate = macro_candidate(memory.template, total_bits);
+            let rationale = match candidate {
+                MemoryMacroCandidate::DistributedRom => {
+                    "small read-only structure can remain distributed logic"
+                }
+                MemoryMacroCandidate::BlockRom => {
+                    "synchronous read timing and size favor block-ROM mapping"
+                }
+                MemoryMacroCandidate::DistributedRam => {
+                    "small runtime-writable structure can map to distributed/LUT RAM"
+                }
+                MemoryMacroCandidate::BlockRam => {
+                    "synchronous write timing and size favor block-RAM mapping"
+                }
+                MemoryMacroCandidate::NoStoragePort => {
+                    "no hardware storage access was inferred for this object"
+                }
+                MemoryMacroCandidate::PartitionRequired => {
+                    "mixed timing requires explicit port/bank partitioning"
+                }
+                MemoryMacroCandidate::UnsupportedAsyncLargeMemory => {
+                    "large asynchronous access is not covered by the current macro model"
+                }
+            };
+            MemoryMacroPlan {
+                name: memory.name.clone(),
+                kind: memory.kind,
+                template: memory.template,
+                element_width: memory.element_width,
+                bank_count: memory.banking.count,
+                bank_depth: memory.banking.depth,
+                total_bits,
+                write_mask: memory.write_mask.clone(),
+                byte_enable: memory.byte_enable.clone(),
+                candidate,
+                rationale: rationale.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn macro_candidate(template: MemoryTemplate, total_bits: u128) -> MemoryMacroCandidate {
+    const DISTRIBUTED_ROM_LIMIT: u128 = 2048;
+    const DISTRIBUTED_RAM_LIMIT: u128 = 4096;
+    match template {
+        MemoryTemplate::Unmapped => MemoryMacroCandidate::NoStoragePort,
+        MemoryTemplate::AsyncRom => {
+            if total_bits <= DISTRIBUTED_ROM_LIMIT {
+                MemoryMacroCandidate::DistributedRom
+            } else {
+                MemoryMacroCandidate::UnsupportedAsyncLargeMemory
+            }
+        }
+        MemoryTemplate::SyncRom => {
+            if total_bits <= DISTRIBUTED_ROM_LIMIT {
+                MemoryMacroCandidate::DistributedRom
+            } else {
+                MemoryMacroCandidate::BlockRom
+            }
+        }
+        MemoryTemplate::AsyncRam => {
+            if total_bits <= DISTRIBUTED_RAM_LIMIT {
+                MemoryMacroCandidate::DistributedRam
+            } else {
+                MemoryMacroCandidate::UnsupportedAsyncLargeMemory
+            }
+        }
+        MemoryTemplate::SyncRam => {
+            if total_bits <= DISTRIBUTED_RAM_LIMIT {
+                MemoryMacroCandidate::DistributedRam
+            } else {
+                MemoryMacroCandidate::BlockRam
+            }
+        }
+        MemoryTemplate::MixedRom | MemoryTemplate::MixedRam => {
+            MemoryMacroCandidate::PartitionRequired
+        }
+    }
 }
 
 pub fn synthesize(design: &Design, opts: &SynthOptions) -> Result<SynthResult, String> {
@@ -57,9 +179,16 @@ pub fn synthesize_with_library(
     opts: &SynthOptions,
     lib: &CellLibrary,
 ) -> Result<SynthResult, String> {
+    let memory_plans = plan_memories(design);
     let mut s = Synth::new(design)?;
     s.run()?;
     let mut warnings = std::mem::take(&mut s.warnings);
+    if !memory_plans.is_empty() {
+        warnings.push(format!(
+            "{} sparse-memory object(s) have macro plans but sparse-memory synthesis lowering is not implemented",
+            memory_plans.len()
+        ));
+    }
     let mut nl = s.finish()?;
     if opts.optimize {
         opt::optimize(&mut nl, &mut warnings);
@@ -75,6 +204,7 @@ pub fn synthesize_with_library(
         netlist: nl,
         library: lib,
         warnings,
+        memory_plans,
     })
 }
 
@@ -1246,6 +1376,90 @@ mod tests {
     }
 
     #[test]
+    fn sparse_memory_macro_plans_preserve_timing_and_write_contracts() {
+        let rom = compile(
+            r#"
+module rom(input clk, input [11:0] address, output reg [7:0] q);
+  logic [7:0] memory [0:4095];
+  initial memory[0] = 8'h1;
+  always @(posedge clk) q <= memory[address];
+endmodule
+"#,
+            None,
+        )
+        .unwrap();
+        let rom_plans = plan_memories(&rom);
+        assert_eq!(rom_plans.len(), 1);
+        assert_eq!(rom_plans[0].candidate, MemoryMacroCandidate::BlockRom);
+        assert_eq!(rom_plans[0].bank_count, 1);
+        assert_eq!(rom_plans[0].bank_depth, 4096);
+        assert_eq!(rom_plans[0].write_mask, None);
+        assert_eq!(rom_plans[0].byte_enable, None);
+
+        let ram = compile(
+            r#"
+module ram(
+  input logic clk,
+  input logic write,
+  input logic [11:0] address,
+  input logic [7:0] din,
+  output logic [7:0] q
+);
+  logic [7:0] memory [0:4095];
+  always @(posedge clk) if (write) memory[address] <= din;
+  assign q = memory[address];
+endmodule
+"#,
+            None,
+        )
+        .unwrap();
+        let ram_plans = plan_memories(&ram);
+        assert_eq!(ram_plans.len(), 1);
+        assert_eq!(ram_plans[0].candidate, MemoryMacroCandidate::BlockRam);
+        assert_eq!(ram_plans[0].bank_count, 1);
+        assert_eq!(ram_plans[0].bank_depth, 4096);
+        assert_eq!(ram_plans[0].total_bits, 32768);
+        assert!(ram_plans[0]
+            .write_mask
+            .as_ref()
+            .expect("RAM write mask")
+            .is_full());
+        assert!(ram_plans[0]
+            .byte_enable
+            .as_ref()
+            .expect("full byte-enable mask")
+            .is_full());
+    }
+
+    #[test]
+    fn memory_macro_thresholds_separate_distributed_and_block_candidates() {
+        assert_eq!(
+            macro_candidate(MemoryTemplate::SyncRom, 2048),
+            MemoryMacroCandidate::DistributedRom
+        );
+        assert_eq!(
+            macro_candidate(MemoryTemplate::SyncRom, 2049),
+            MemoryMacroCandidate::BlockRom
+        );
+        assert_eq!(
+            macro_candidate(MemoryTemplate::SyncRam, 4096),
+            MemoryMacroCandidate::DistributedRam
+        );
+        assert_eq!(
+            macro_candidate(MemoryTemplate::SyncRam, 4097),
+            MemoryMacroCandidate::BlockRam
+        );
+        assert_eq!(
+            macro_candidate(MemoryTemplate::AsyncRom, 2049),
+            MemoryMacroCandidate::UnsupportedAsyncLargeMemory
+        );
+        assert_eq!(
+            macro_candidate(MemoryTemplate::MixedRam, 1),
+            MemoryMacroCandidate::PartitionRequired
+        );
+    }
+
+    #[test]
     fn exhaustive_case_without_default_does_not_create_a_false_loop() {
         let r = synth(
             r#"
@@ -1269,6 +1483,7 @@ mod tests {
             r.netlist.topo_cells().is_some(),
             "an exhaustive exact case must not feed its own output back to itself"
         );
+        assert!(r.memory_plans.is_empty());
     }
 
     #[test]
