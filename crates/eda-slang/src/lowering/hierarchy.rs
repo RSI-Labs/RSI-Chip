@@ -2,7 +2,6 @@
 
 use super::declaration_name;
 use crate::ast_util::{expression_symbol, string_field};
-use crate::types::memory_type;
 use eda_core::ir::Design;
 
 pub(super) fn full_range(width: usize) -> eda_core::ir::Range {
@@ -390,7 +389,9 @@ impl super::SlangAstLowerer {
             .filter_map(|port| {
                 let name = string_field(port, "name")?;
                 let is_inout_memory = string_field(port, "direction").as_deref() == Some("InOut")
-                    && memory_type(&string_field(port, "type").unwrap_or_default()).is_some();
+                    && self
+                        .declared_memory_type(&string_field(port, "type").unwrap_or_default())
+                        .is_some();
                 if !is_inout_memory {
                     return None;
                 }

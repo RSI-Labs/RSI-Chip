@@ -63,7 +63,11 @@ fn canonical_detailed_type(value: &Value) -> Option<String> {
         "FixedSizeUnpackedArrayType" => {
             let element = value.get("elementType")?;
             let range = value.get("range").and_then(Value::as_str)?;
-            let element = canonical_detailed_type(element)?;
+            let element = if let Some(element_name) = element.as_str() {
+                element_name.to_string()
+            } else {
+                canonical_detailed_type(element)?
+            };
             if element.contains('$') {
                 let split = element.find('$').unwrap_or(element.len());
                 Some(format!(

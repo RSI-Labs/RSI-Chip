@@ -67,10 +67,24 @@ fn parse_type_range(text: &str) -> Option<(i64, i64)> {
 pub(super) fn memory_type(type_name: &str) -> Option<AstMemoryType> {
     let separator = type_name.find('$')?;
     let element_type = type_name[..separator].trim();
-    let dimension_type = type_name[separator + 1..].trim();
     let element = simple_type_shape(element_type)?;
-    let element_width = element.width;
-    let (element_msb, element_lsb) = element.bounds?;
+    memory_type_with_element(
+        type_name,
+        element.width,
+        element.bounds?,
+        simple_type_signed(element_type)?,
+    )
+}
+
+pub(super) fn memory_type_with_element(
+    type_name: &str,
+    element_width: usize,
+    element_bounds: (i64, i64),
+    signed: bool,
+) -> Option<AstMemoryType> {
+    let separator = type_name.find('$')?;
+    let dimension_type = type_name[separator + 1..].trim();
+    let (element_msb, element_lsb) = element_bounds;
     let mut dimensions = Vec::new();
     let mut remaining = dimension_type;
     while !remaining.is_empty() {
@@ -98,7 +112,7 @@ pub(super) fn memory_type(type_name: &str) -> Option<AstMemoryType> {
         element_lsb,
         dimensions,
         flat_length,
-        signed: simple_type_signed(element_type)?,
+        signed,
     })
 }
 

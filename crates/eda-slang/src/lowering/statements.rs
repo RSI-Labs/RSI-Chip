@@ -361,6 +361,9 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "assignment has no right side".to_string())?;
+        if let Some(statement) = self.memory_struct_member_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
         if let Some(statement) = self.dynamic_packed_element_assignment(assignment, left, right)? {
             return Ok(statement);
         }
@@ -454,6 +457,80 @@ impl SlangAstLowerer {
                 }
             })
             .map(Some)
+    }
+
+    fn memory_struct_member_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        use eda_core::ir::{Expr, Stmt};
+
+        if string_field(left, "kind").as_deref() != Some("MemberAccess") {
+            return Ok(None);
+        }
+        let selected = left
+            .get("value")
+            .ok_or_else(|| "struct member access has no selected value".to_string())?;
+        let Some((memory, indexes)) = self.memory_element_select(selected)? else {
+            return Ok(None);
+        };
+        let member = string_field(left, "member")
+            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "struct member access has no member".to_string())?;
+        let field = self.struct_field_for_type(selected, &member)?;
+        let element_width = self.design.memories[memory].element_width;
+        if field.offset + field.width > element_width {
+            return Err(format!(
+                "struct member '{member}' exceeds memory element width {element_width}"
+            ));
+        }
+
+        let value = self.lower_expression(right)?;
+        if value.width() != field.width {
+            return Err(format!(
+                "memory struct member '{member}' width {} does not match assignment width {}",
+                field.width,
+                value.width()
+            ));
+        }
+        let old = Expr::MemoryRead {
+            memory,
+            indexes: indexes.clone(),
+            width: element_width,
+            signed: false,
+        };
+        let mut parts = Vec::new();
+        if field.offset + field.width < element_width {
+            parts.push(Expr::Index {
+                e: Box::new(old.clone()),
+                msb: element_width - 1,
+                lsb: field.offset + field.width,
+            });
+        }
+        parts.push(value);
+        if field.offset > 0 {
+            parts.push(Expr::Index {
+                e: Box::new(old),
+                msb: field.offset - 1,
+                lsb: 0,
+            });
+        }
+        let updated = Expr::Concat(parts);
+        Ok(Some(if bool_field(assignment, "isNonBlocking") {
+            Stmt::MemoryNBl {
+                memory,
+                indexes,
+                e: updated,
+            }
+        } else {
+            Stmt::MemoryBl {
+                memory,
+                indexes,
+                e: updated,
+            }
+        }))
     }
 
     fn lower_dynamic_packed_group(

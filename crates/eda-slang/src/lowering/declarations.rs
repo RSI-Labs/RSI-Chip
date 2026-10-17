@@ -5,7 +5,8 @@ use super::{
 };
 use crate::ast_util::{bool_field, literal_word, memory_initializer_statements, string_field};
 use crate::types::{
-    memory_type, simple_type_shape, simple_type_signed, AstPackedDimension, AstTypeShape,
+    memory_type, memory_type_with_element, simple_type_shape, simple_type_signed, AstMemoryType,
+    AstPackedDimension, AstTypeShape,
 };
 
 impl SlangAstLowerer {
@@ -189,9 +190,22 @@ impl SlangAstLowerer {
         ))
     }
 
+    pub(super) fn declared_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
+        if let Some(memory) = memory_type(type_name) {
+            return Some(memory);
+        }
+        let separator = type_name.find('$')?;
+        let element_type = type_name[..separator].trim();
+        let (shape, signed, _) = self.net_type(element_type).ok()?;
+        let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
+        let bounds = shape.bounds.unwrap_or((element_msb, 0));
+        memory_type_with_element(type_name, shape.width, bounds, signed)
+    }
+
     pub(super) fn lower_port(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "Port")?;
-        if memory_type(&string_field(member, "type").unwrap_or_default()).is_some() {
+        let type_name = string_field(member, "type").unwrap_or_default();
+        if self.declared_memory_type(&type_name).is_some() {
             return self.lower_memory_port(member, &name);
         }
         let direction = match string_field(member, "direction").as_deref() {
@@ -248,7 +262,8 @@ impl SlangAstLowerer {
     pub(super) fn lower_declaration(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
-        if memory_type(&string_field(member, "type").unwrap_or_default()).is_some() {
+        let type_name = string_field(member, "type").unwrap_or_default();
+        if self.declared_memory_type(&type_name).is_some() {
             self.lower_memory_declaration(member, &name)?;
             return Ok(());
         }
@@ -266,7 +281,9 @@ impl SlangAstLowerer {
         member: &serde_json::Value,
         name: &str,
     ) -> Result<(), String> {
-        let memory = memory_type(&string_field(member, "type").unwrap_or_default())
+        let type_name = string_field(member, "type").unwrap_or_default();
+        let memory = self
+            .declared_memory_type(&type_name)
             .ok_or_else(|| format!("cannot parse sparse-memory type for '{name}'"))?;
         if let Some(existing) = self.symbols.get(name) {
             let Some(memory_index) = existing.memory else {

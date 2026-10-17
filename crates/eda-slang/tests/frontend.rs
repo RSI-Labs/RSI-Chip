@@ -2487,6 +2487,89 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_packed_struct_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-packed-struct-array");
+    let source_path = root.join("packed_struct_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module packed_struct_array(
+  input logic [1:0] index,
+  input logic [3:0] high,
+  input logic [3:0] low,
+  output logic [3:0] selected_high,
+  output logic [3:0] selected_low,
+  output logic [31:0] all_values
+);
+  typedef struct packed {
+    logic [3:0] high;
+    logic [3:0] low;
+  } pair_t;
+
+  pair_t pairs [0:3];
+  always_comb begin
+    pairs[0].high = 4'h1;
+    pairs[0].low = 4'h2;
+    pairs[1].high = 4'h3;
+    pairs[1].low = 4'h4;
+    pairs[2].high = 4'h5;
+    pairs[2].low = 4'h6;
+    pairs[3].high = high;
+    pairs[3].low = low;
+  end
+
+  assign selected_high = pairs[index].high;
+  assign selected_low = pairs[index].low;
+  assign all_values = {pairs[3], pairs[2], pairs[1], pairs[0]};
+endmodule
+"#,
+    )
+    .expect("write packed struct array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("packed_struct_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower packed struct array");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].element_width, 8);
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 3);
+
+    let mut simulator = Simulator::new(&design).expect("create packed struct array simulator");
+    simulator
+        .set_input("high", &LogicWord::from_u64(4, 0xa))
+        .unwrap();
+    simulator
+        .set_input("low", &LogicWord::from_u64(4, 0x5))
+        .unwrap();
+    assert_eq!(
+        simulator.read("all_values").unwrap().to_u64(),
+        Some(0xa556_3412)
+    );
+    for (index, selected_high, selected_low) in
+        [(0, 0x1, 0x2), (1, 0x3, 0x4), (2, 0x5, 0x6), (3, 0xa, 0x5)]
+    {
+        simulator
+            .set_input("index", &LogicWord::from_u64(2, index))
+            .unwrap();
+        assert_eq!(
+            simulator.read("selected_high").unwrap().to_u64(),
+            Some(selected_high)
+        );
+        assert_eq!(
+            simulator.read("selected_low").unwrap().to_u64(),
+            Some(selected_low)
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_packed_struct_assignment_patterns() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

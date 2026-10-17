@@ -881,7 +881,7 @@ impl super::SlangAstLowerer {
         Ok(selected_offset + field.offset)
     }
 
-    fn struct_field_for_type(
+    pub(super) fn struct_field_for_type(
         &self,
         value: &serde_json::Value,
         member: &str,
