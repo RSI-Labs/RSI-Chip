@@ -8,6 +8,7 @@
 //! that the downstream bounded elaborator cannot represent.
 
 use eda_core::ir::Design;
+use eda_core::logic::LogicWord;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -392,7 +393,17 @@ struct AstLoweredSymbol {
     base: usize,
     width: usize,
     signed: bool,
+    /// Declared index bounds for a simple packed vector. `None` means the
+    /// declaration has multiple packed dimensions and cannot be selected with
+    /// the current one-level lowering.
+    bounds: Option<(i64, i64)>,
     memory: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct AstTypeShape {
+    width: usize,
+    bounds: Option<(i64, i64)>,
 }
 
 struct AstMemoryType {
@@ -407,6 +418,7 @@ struct AstMemoryType {
 struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    constants: std::collections::BTreeMap<String, LogicWord>,
 }
 
 impl SlangAstLowerer {
@@ -426,6 +438,7 @@ impl SlangAstLowerer {
                 ..Design::default()
             },
             symbols: std::collections::BTreeMap::new(),
+            constants: std::collections::BTreeMap::new(),
         };
         let root_hierarchy_index = lowerer.design.hierarchy.len();
         lowerer
@@ -476,7 +489,7 @@ impl SlangAstLowerer {
             match kind.as_str() {
                 "Port" => self.lower_port(member)?,
                 "Net" | "Variable" => self.lower_declaration(member)?,
-                "Parameter" => continue,
+                "Parameter" => self.lower_parameter(member)?,
                 "ContinuousAssign" => self.lower_continuous_assignment(member)?,
                 "ProceduralBlock" => self.lower_procedural_block(member)?,
                 "Instance" => self.lower_instance(member)?,
@@ -509,6 +522,7 @@ impl SlangAstLowerer {
         let mut child = Self {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
+            constants: std::collections::BTreeMap::new(),
         };
         child.lower_body(body)?;
 
@@ -844,6 +858,7 @@ impl SlangAstLowerer {
                 base,
                 width: memory.element_width,
                 signed: memory.signed,
+                bounds: Some((memory.element_msb, memory.element_lsb)),
                 memory: Some(memory_index),
             },
         );
@@ -866,12 +881,15 @@ impl SlangAstLowerer {
         if self.symbols.contains_key(name) {
             let existing = self.symbols[name];
             let type_name = string_field(member, "type").unwrap_or_default();
-            let width = simple_type_width(&type_name)
+            let shape = simple_type_shape(&type_name)
                 .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
             let signed = simple_type_signed(&type_name).ok_or_else(|| {
                 format!("direct lowering cannot resolve signedness of '{type_name}'")
             })?;
-            if existing.width != width || existing.signed != signed {
+            if existing.width != shape.width
+                || existing.bounds != shape.bounds
+                || existing.signed != signed
+            {
                 return Err(format!("conflicting declarations for '{name}'"));
             }
             if kind == "Variable" {
@@ -887,21 +905,22 @@ impl SlangAstLowerer {
             return Ok(existing);
         }
         let type_name = string_field(member, "type").unwrap_or_default();
-        let width = simple_type_width(&type_name)
+        let shape = simple_type_shape(&type_name)
             .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
         let signed = simple_type_signed(&type_name)
             .ok_or_else(|| format!("direct lowering cannot resolve signedness of '{type_name}'"))?;
         let base = self.design.n_nets;
         let symbol = AstLoweredSymbol {
             base,
-            width,
+            width: shape.width,
             signed,
+            bounds: shape.bounds,
             memory: None,
         };
-        self.design.n_nets += width;
+        self.design.n_nets += shape.width;
         self.design.net_decls.push(eda_core::ir::NetDecl {
             name: name.to_string(),
-            width,
+            width: shape.width,
             is_reg: kind == "Port" || kind == "Variable",
             is_signed: signed,
             base,
@@ -910,7 +929,28 @@ impl SlangAstLowerer {
         Ok(symbol)
     }
 
+    fn lower_parameter(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let name = declaration_name(member, "Parameter")?;
+        let type_name = string_field(member, "type").unwrap_or_default();
+        let shape = simple_type_shape(&type_name)
+            .ok_or_else(|| format!("parameter '{name}' has unsupported type '{type_name}'"))?;
+        let value = string_field(member, "value")
+            .ok_or_else(|| format!("parameter '{name}' has no elaborated constant value"))?;
+        let word = literal_word(&type_name, &value)
+            .ok_or_else(|| format!("parameter '{name}' has unsupported value '{value}'"))?;
+        if word.width() != shape.width {
+            return Err(format!(
+                "parameter '{name}' value width {} does not match type width {}",
+                word.width(),
+                shape.width
+            ));
+        }
+        self.constants.insert(name, word);
+        Ok(())
+    }
+
     fn lower_continuous_assignment(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let delay = continuous_assignment_delay(member)?;
         let assignment = member
             .get("assignment")
             .ok_or_else(|| "ContinuousAssign has no assignment".to_string())?;
@@ -922,6 +962,11 @@ impl SlangAstLowerer {
             .ok_or_else(|| "continuous assignment has no right side".to_string())?;
         if self.memory_element_select(left)?.is_some() || self.memory_range_select(left)?.is_some()
         {
+            if delay != 0 {
+                return Err(
+                    "delayed sparse-memory continuous assignments are not supported".to_string(),
+                );
+            }
             let body = self.lower_assignment(assignment)?;
             self.design.processes.push(eda_core::ir::Process {
                 sens: eda_core::ir::Sens::Comb,
@@ -931,11 +976,9 @@ impl SlangAstLowerer {
         }
         let lv = self.lower_lvalue(left)?;
         let rhs = self.lower_expression(right)?;
-        self.design.assigns.push(eda_core::ir::Assign {
-            lv,
-            e: rhs,
-            delay: 0,
-        });
+        self.design
+            .assigns
+            .push(eda_core::ir::Assign { lv, e: rhs, delay });
         Ok(())
     }
 
@@ -1012,6 +1055,14 @@ impl SlangAstLowerer {
         let kind = string_field(statement, "kind").unwrap_or_default();
         match kind.as_str() {
             "Block" => {
+                match string_field(statement, "blockKind").as_deref() {
+                    None | Some("Sequential") => {}
+                    Some(other) => {
+                        return Err(format!(
+                            "direct slang-AST lowering does not support concurrency block kind '{other}'"
+                        ));
+                    }
+                }
                 if let Some(nested) = statement.get("body") {
                     if string_field(nested, "kind").as_deref() == Some("List") {
                         return self.lower_statement(nested);
@@ -1339,6 +1390,9 @@ impl SlangAstLowerer {
             "NamedValue" => {
                 let name = expression_symbol(value)
                     .ok_or_else(|| "expression has no symbol".to_string())?;
+                if let Some(word) = self.constants.get(&name).cloned() {
+                    return Ok(Expr::Const(word));
+                }
                 if let Some(symbol) = self.symbols.get(&name) {
                     Ok(Expr::Ref {
                         net: symbol.base,
@@ -1395,6 +1449,15 @@ impl SlangAstLowerer {
                 let operand = value
                     .get("operand")
                     .ok_or_else(|| "unary expression has no operand".to_string())?;
+                if string_field(value, "op").as_deref() == Some("LogicalNot") {
+                    return Ok(Expr::Un {
+                        op: UnOp::Not,
+                        a: Box::new(Expr::Un {
+                            op: UnOp::OrR,
+                            a: Box::new(self.lower_expression(operand)?),
+                        }),
+                    });
+                }
                 Ok(Expr::Un {
                     op,
                     a: Box::new(self.lower_expression(operand)?),
@@ -1510,9 +1573,43 @@ impl SlangAstLowerer {
         let selector = value
             .get("selector")
             .ok_or_else(|| "element select has no selector".to_string())?;
-        let index = constant_index(selector)?;
+        let symbol = self
+            .direct_packed_symbol(selected)?
+            .ok_or_else(|| "direct packed selects require a named declaration".to_string())?;
+        let index = self.declared_bit_index(symbol, constant_i64(selector)?)?;
         let base = self.lower_expression(selected)?;
         Ok((base, index))
+    }
+
+    fn direct_packed_symbol(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<AstLoweredSymbol>, String> {
+        if string_field(value, "kind").as_deref() != Some("NamedValue") {
+            return Ok(None);
+        }
+        let name = expression_symbol(value)
+            .ok_or_else(|| "packed select has no declaration symbol".to_string())?;
+        Ok(self.symbols.get(&name).copied())
+    }
+
+    fn declared_bit_index(&self, symbol: AstLoweredSymbol, index: i64) -> Result<usize, String> {
+        let Some((msb, lsb)) = symbol.bounds else {
+            return Err(
+                "multi-packed selects require dimension-aware lowering and are not supported yet"
+                    .to_string(),
+            );
+        };
+        let lower = msb.min(lsb);
+        let upper = msb.max(lsb);
+        if index < lower || index > upper {
+            return Err(format!("packed select index {index} is out of range"));
+        }
+        let canonical = if msb >= lsb { index - lsb } else { lsb - index };
+        usize::try_from(canonical)
+            .ok()
+            .filter(|index| *index < symbol.width)
+            .ok_or_else(|| "packed select maps to an invalid physical bit".to_string())
     }
 
     fn memory_element_select(
@@ -1637,7 +1734,11 @@ impl SlangAstLowerer {
         let selector = value
             .get("selector")
             .ok_or_else(|| "element select has no selector".to_string())?;
-        Ok((self.lower_lvalue(selected)?, constant_index(selector)?))
+        let symbol = self
+            .direct_packed_symbol(selected)?
+            .ok_or_else(|| "direct packed selects require a named declaration".to_string())?;
+        let index = self.declared_bit_index(symbol, constant_i64(selector)?)?;
+        Ok((self.lower_lvalue(selected)?, index))
     }
 
     fn lower_constant_range(
@@ -1647,19 +1748,47 @@ impl SlangAstLowerer {
         let selected = value
             .get("value")
             .ok_or_else(|| "range select has no value".to_string())?;
-        let left = value
-            .get("left")
-            .ok_or_else(|| "range select has no left bound".to_string())?;
-        let right = value
-            .get("right")
-            .ok_or_else(|| "range select has no right bound".to_string())?;
-        let msb = constant_index(left)?;
-        let lsb = constant_index(right)?;
-        if msb < lsb {
-            return Err("descending direct range selects are not yet lowered".into());
-        }
+        let (msb, lsb) = self.declared_range_indices(value)?;
         let base = self.lower_expression(selected)?;
         Ok((base, msb, lsb))
+    }
+
+    fn declared_range_indices(&self, value: &serde_json::Value) -> Result<(usize, usize), String> {
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "range select has no value".to_string())?;
+        let left_value = value
+            .get("left")
+            .ok_or_else(|| "range select has no left bound".to_string())?;
+        let right_value = value
+            .get("right")
+            .ok_or_else(|| "range select has no right bound".to_string())?;
+        let symbol = self
+            .direct_packed_symbol(selected)?
+            .ok_or_else(|| "direct packed selects require a named declaration".to_string())?;
+        let Some((declaration_msb, declaration_lsb)) = symbol.bounds else {
+            return Err(
+                "multi-packed range selects require dimension-aware lowering and are not supported yet"
+                    .to_string(),
+            );
+        };
+        let left = constant_i64(left_value)?;
+        let right = constant_i64(right_value)?;
+        let lower = declaration_msb.min(declaration_lsb);
+        let upper = declaration_msb.max(declaration_lsb);
+        let direction_valid = if declaration_msb >= declaration_lsb {
+            left >= right
+        } else {
+            left <= right
+        };
+        if !direction_valid || left < lower || left > upper || right < lower || right > upper {
+            return Err(format!(
+                "packed range select [{left}:{right}] is invalid for declaration [{declaration_msb}:{declaration_lsb}]"
+            ));
+        }
+        let mapped_left = self.declared_bit_index(symbol, left)?;
+        let mapped_right = self.declared_bit_index(symbol, right)?;
+        Ok((mapped_left.max(mapped_right), mapped_left.min(mapped_right)))
     }
 
     fn lower_constant_range_lvalue(
@@ -1669,17 +1798,7 @@ impl SlangAstLowerer {
         let selected = value
             .get("value")
             .ok_or_else(|| "range select has no value".to_string())?;
-        let left = value
-            .get("left")
-            .ok_or_else(|| "range select has no left bound".to_string())?;
-        let right = value
-            .get("right")
-            .ok_or_else(|| "range select has no right bound".to_string())?;
-        let msb = constant_index(left)?;
-        let lsb = constant_index(right)?;
-        if msb < lsb {
-            return Err("descending direct range-select lvalues are not yet lowered".into());
-        }
+        let (msb, lsb) = self.declared_range_indices(value)?;
         Ok((self.lower_lvalue(selected)?, msb, lsb))
     }
 }
@@ -1712,12 +1831,9 @@ fn memory_type(type_name: &str) -> Option<AstMemoryType> {
     let separator = type_name.find('$')?;
     let element_type = type_name[..separator].trim();
     let dimension_type = type_name[separator + 1..].trim();
-    let element_width = simple_type_width(element_type)?;
-    let (element_msb, element_lsb) =
-        parse_type_range(element_type).unwrap_or((element_width as i64 - 1, 0));
-    if (element_msb - element_lsb).unsigned_abs() as usize + 1 != element_width {
-        return None;
-    }
+    let element = simple_type_shape(element_type)?;
+    let element_width = element.width;
+    let (element_msb, element_lsb) = element.bounds?;
     let mut dimensions = Vec::new();
     let mut remaining = dimension_type;
     while !remaining.is_empty() {
@@ -2075,11 +2191,65 @@ fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::BinOp, String
     }
 }
 
+fn continuous_assignment_delay(member: &Value) -> Result<u64, String> {
+    let Some(delay) = member.get("delay") else {
+        return Ok(0);
+    };
+    if delay.is_null() {
+        return Ok(0);
+    }
+    if string_field(delay, "kind").as_deref() != Some("Delay") {
+        return Err("continuous assignment has an unsupported delay form".to_string());
+    }
+    if delay.get("minValue").is_some()
+        || delay.get("typicalValue").is_some()
+        || delay.get("maxValue").is_some()
+    {
+        return Err("min:typ:max continuous-assignment delays are not supported".to_string());
+    }
+    let expression = delay
+        .get("expr")
+        .ok_or_else(|| "continuous-assignment delay has no expression".to_string())?;
+    let word = integer_literal_word(expression)
+        .or_else(|| named_constant_word(expression))
+        .and_then(|word| word.to_u64())
+        .ok_or_else(|| "continuous-assignment delay must be an integer constant".to_string())?;
+    Ok(word)
+}
+
 fn constant_index(value: &serde_json::Value) -> Result<usize, String> {
     integer_literal_word(value)
         .and_then(|word| word.to_u64())
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| "direct lowering requires an integer constant index".to_string())
+}
+
+fn constant_i64(value: &serde_json::Value) -> Result<i64, String> {
+    let word = integer_literal_word(value)
+        .or_else(|| named_constant_word(value))
+        .ok_or_else(|| "direct lowering requires an integer constant index".to_string())?;
+    if word.width() == 0 {
+        return Err("integer constant index has zero width".to_string());
+    }
+    if word.width() > u64::BITS as usize {
+        return Err("integer constant index is too large".to_string());
+    }
+    let mut magnitude = 0_u128;
+    for (bit, value) in word.bits.iter().enumerate() {
+        if value.as_bool() == Some(true) {
+            magnitude |= 1_u128 << bit;
+        }
+    }
+    let signed = string_field(value, "type")
+        .and_then(|type_name| simple_type_signed(&type_name))
+        .unwrap_or(false);
+    let sign_bit = 1_u128 << (word.width() - 1);
+    let signed_value = if signed && word.width() > 0 && magnitude & sign_bit != 0 {
+        magnitude as i128 - (1_i128 << word.width())
+    } else {
+        magnitude as i128
+    };
+    i64::try_from(signed_value).map_err(|_| "integer constant index is out of range".to_string())
 }
 
 impl SlangAstSummary {
@@ -2369,7 +2539,10 @@ impl SlangAstSummary {
             expected_continuous_targets
                 .entry(target.name.clone())
                 .or_default()
-                .push(slang_expression_fingerprint(&target.rhs).unwrap_or_else(|| "?".to_string()));
+                .push(
+                    slang_expression_fingerprint_with_parameters(&target.rhs, &self.parameters)
+                        .unwrap_or_else(|| "?".to_string()),
+                );
         }
         let memory_names: std::collections::BTreeSet<String> = design
             .memories
@@ -2460,8 +2633,11 @@ impl SlangAstSummary {
                             // without guessing an equivalence.
                             "?".to_string()
                         } else {
-                            slang_expression_fingerprint(&assignment.rhs)
-                                .unwrap_or_else(|| "?".to_string())
+                            slang_expression_fingerprint_with_parameters(
+                                &assignment.rhs,
+                                &self.parameters,
+                            )
+                            .unwrap_or_else(|| "?".to_string())
                         };
                         expected_procedural_targets
                             .entry(target.clone())
@@ -2998,7 +3174,28 @@ fn contains_expected_shapes(actual: &[String], expected: &[String]) -> bool {
     true
 }
 
-fn slang_expression_fingerprint(expression: &SlangExpressionSummary) -> Option<String> {
+fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) -> Option<String> {
+    let word = literal_word(&parameter.type_name, &parameter.value)?;
+    let width = simple_type_width(&parameter.type_name)?;
+    let signed = simple_type_signed(&parameter.type_name)?;
+    let signed_label = if signed { "s" } else { "u" };
+    Some(format!(
+        "Const:{width}:{signed_label}[{}:{}]",
+        word.width(),
+        word.to_bin_str()
+    ))
+}
+
+fn slang_expression_fingerprint_with_parameters(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+) -> Option<String> {
+    if expression.kind == "UnaryOp" && expression.operator == "LogicalNot" {
+        let operand = expression.operands.first()?;
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters)?;
+        return Some(format!("Not:1:u[Reduction:1:u[{operand_fingerprint}]]"));
+    }
     if expression.kind == "Conversion" {
         let operand = expression.operands.first()?;
         if operand.kind != "IntegerLiteral"
@@ -3008,7 +3205,7 @@ fn slang_expression_fingerprint(expression: &SlangExpressionSummary) -> Option<S
         {
             return None;
         }
-        return slang_expression_fingerprint(operand);
+        return slang_expression_fingerprint_with_parameters(operand, parameters);
     }
     let root = slang_expression_shape(expression)?;
     let width = expression.type_width?;
@@ -3016,6 +3213,9 @@ fn slang_expression_fingerprint(expression: &SlangExpressionSummary) -> Option<S
     let signed_label = if signed { "s" } else { "u" };
     if root == "Ref" {
         let symbol = expression.symbol.as_deref()?;
+        if let Some(parameter) = parameters.iter().find(|parameter| parameter.name == symbol) {
+            return parameter_constant_fingerprint(parameter);
+        }
         return Some(format!("Ref:{width}:{signed_label}[{symbol}]"));
     }
     if root == "Const" {
@@ -3025,7 +3225,7 @@ fn slang_expression_fingerprint(expression: &SlangExpressionSummary) -> Option<S
     let operands = expression
         .operands
         .iter()
-        .map(slang_expression_fingerprint)
+        .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters))
         .collect::<Option<Vec<_>>>()?;
     Some(format!(
         "{}:{width}:{signed_label}[{}]",
@@ -3038,7 +3238,7 @@ fn slang_expression_fingerprint(expression: &SlangExpressionSummary) -> Option<S
     ))
 }
 
-fn simple_type_width(type_name: &str) -> Option<usize> {
+fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     let type_name = type_name.trim();
     if type_name.contains('$')
         || type_name.contains('{')
@@ -3048,16 +3248,15 @@ fn simple_type_width(type_name: &str) -> Option<usize> {
         return None;
     }
 
-    let (base, range) = if let Some(start) = type_name.rfind('[') {
-        let range = type_name.get(start + 1..type_name.len().saturating_sub(1))?;
-        (type_name[..start].trim(), Some(range))
-    } else {
-        (type_name, None)
-    };
+    let base = type_name.split('[').next()?.trim();
     let element_width = if base.contains("logic") || base.contains("reg") || base.contains("bit") {
         1
     } else {
-        match base {
+        let data_type = base
+            .split_whitespace()
+            .rev()
+            .find(|token| !matches!(*token, "signed" | "unsigned"))?;
+        match data_type {
             "byte" => 8,
             "shortint" => 16,
             "int" | "integer" => 32,
@@ -3065,15 +3264,56 @@ fn simple_type_width(type_name: &str) -> Option<usize> {
             _ => return None,
         }
     };
-    match range {
-        Some(range) => {
-            let (left, right) = range.split_once(':')?;
-            let left = left.trim().parse::<i64>().ok()?;
-            let right = right.trim().parse::<i64>().ok()?;
-            Some(((left as i128 - right as i128).unsigned_abs()) as usize + 1)
-        }
-        None => Some(element_width),
+    let ranges = explicit_type_ranges(type_name)?;
+    let mut width: usize = element_width;
+    for (left, right) in &ranges {
+        let range_width =
+            usize::try_from(((*left as i128) - (*right as i128)).unsigned_abs() + 1).ok()?;
+        width = width.checked_mul(range_width)?;
     }
+    let bounds = match ranges.as_slice() {
+        [] => Some((width as i64 - 1, 0)),
+        [only] => Some(*only),
+        _ => None,
+    };
+    Some(AstTypeShape { width, bounds })
+}
+
+fn explicit_type_ranges(type_name: &str) -> Option<Vec<(i64, i64)>> {
+    let mut ranges = Vec::new();
+    let bytes = type_name.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'[' {
+            let end = (index + 1..bytes.len()).find(|position| bytes[*position] == b']')?;
+            let range = type_name.get(index + 1..end)?;
+            if range.contains('[') || range.contains(']') {
+                return None;
+            }
+            let (left, right) = range.split_once(':')?;
+            ranges.push((
+                left.trim().parse::<i64>().ok()?,
+                right.trim().parse::<i64>().ok()?,
+            ));
+            index = end + 1;
+        } else if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if index > 0 && ranges.is_empty() {
+            // The text before the first bracket is the base type and has
+            // already been validated by `simple_type_shape`.
+            index += 1;
+        } else if index > 0 && !ranges.is_empty() && bytes[index].is_ascii_alphanumeric() {
+            // Allow only whitespace between packed dimensions.
+            return None;
+        } else {
+            index += 1;
+        }
+    }
+    Some(ranges)
+}
+
+fn simple_type_width(type_name: &str) -> Option<usize> {
+    simple_type_shape(type_name).map(|shape| shape.width)
 }
 
 fn collect_kinds(value: &Value, kinds: &mut std::collections::BTreeSet<String>) {

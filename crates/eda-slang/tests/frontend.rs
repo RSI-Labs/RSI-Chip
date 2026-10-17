@@ -2048,6 +2048,255 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_preserves_continuous_assignment_delay() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-delay");
+    let source_path = root.join("delay.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module delay(input logic a, output logic y);
+  assign #5 y = a;
+endmodule
+"#,
+    )
+    .expect("write delayed assignment source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("delay"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower delayed continuous assignment");
+    assert_eq!(design.assigns.len(), 1);
+    assert_eq!(design.assigns[0].delay, 5);
+
+    let mut simulator = Simulator::new(&design).expect("create delayed simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .expect("set delayed input");
+    simulator.run_until(4).expect("run before delay");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+    simulator.run_until(5).expect("run to delay");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_fork_join_modes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    for (name, join) in [("join_any.sv", "join_any"), ("join_none.sv", "join_none")] {
+        let root = temporary_directory("direct-ast-fork");
+        let source_path = root.join(name);
+        std::fs::write(
+            &source_path,
+            format!(
+                r#"
+module fork_mode(input logic a, output logic y);
+  initial fork y = a; {join} endmodule
+"#
+            ),
+        )
+        .expect("write fork source");
+        let error = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("fork_mode"),
+                &PreprocessOptions::default(),
+            )
+            .expect_err("fork concurrency must not be treated as sequential");
+        assert!(
+            error.contains("does not support concurrency block kind"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_multi_packed_width() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-multi-packed");
+    let source_path = root.join("multi_packed.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module multi_packed(
+  input logic [3:0][7:0] a,
+  output logic [31:0] y
+);
+  assign y = a;
+endmodule
+"#,
+    )
+    .expect("write multi-packed source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("multi_packed"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower multi-packed declaration");
+    assert_eq!(design.n_nets, 64);
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "a")
+            .expect("multi-packed input")
+            .width,
+        32
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create multi-packed simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(32, 0x1234_5678))
+        .expect("set multi-packed input");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0x1234_5678));
+
+    let selected_path = root.join("multi_packed_select.sv");
+    std::fs::write(
+        &selected_path,
+        r#"
+module multi_packed_select(
+  input logic [3:0][7:0] a,
+  output logic [7:0] y
+);
+  assign y = a[3];
+endmodule
+"#,
+    )
+    .expect("write multi-packed select source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&selected_path),
+            Some("multi_packed_select"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("multi-packed dimension selects must not be flattened to one bit");
+    assert!(
+        error.contains("multi-packed selects require dimension-aware lowering"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_resolves_elaborated_parameters() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-parameters");
+    let source_path = root.join("parameters.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module parameters(output logic [7:0] byte_value, output logic [15:0] word_value);
+  parameter logic [7:0] BYTE = 8'hA5;
+  localparam logic [15:0] WORD = 16'h1234;
+  assign byte_value = BYTE;
+  assign word_value = WORD;
+endmodule
+"#,
+    )
+    .expect("write parameter source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("parameters"),
+            &PreprocessOptions::default(),
+        )
+        .expect("resolve elaborated parameters");
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create parameter simulator");
+    simulator
+        .run_until(1)
+        .expect("settle parameter assignments");
+    assert_eq!(simulator.read("byte_value").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(simulator.read("word_value").unwrap().to_u64(), Some(0x1234));
+}
+
+#[test]
+fn slang_ast_direct_lowering_reduces_logical_not_to_one_bit() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-logical-not");
+    let source_path = root.join("logical_not.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module logical_not(input logic [7:0] a, output logic y);
+  assign y = !a;
+endmodule
+"#,
+    )
+    .expect("write logical-not source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("logical_not"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower logical reduction");
+
+    let mut simulator = Simulator::new(&design).expect("create logical-not simulator");
+    for (input, expected) in [(0_u64, 1_u64), (1, 0), (0x80, 0), (0xff, 0)] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(8, input))
+            .expect("set logical-not input");
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(expected));
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_ascending_packed_selects() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-ascending");
+    let source_path = root.join("ascending.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module ascending(
+  input logic [0:7] a,
+  output logic bit0,
+  output logic [3:0] high
+);
+  assign bit0 = a[0];
+  assign high = a[0:3];
+endmodule
+"#,
+    )
+    .expect("write ascending packed source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("ascending"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower ascending packed declaration");
+    assert_eq!(design.n_nets, 13);
+
+    let mut simulator = Simulator::new(&design).expect("create ascending simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 0xf0))
+        .expect("set ascending input");
+    assert_eq!(simulator.read("bit0").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("high").unwrap().to_u64(), Some(0xf));
+}
+
+#[test]
 fn slang_ast_json_contains_elaborated_module_symbols() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
