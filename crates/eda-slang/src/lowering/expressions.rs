@@ -424,6 +424,9 @@ impl super::SlangAstLowerer {
                 Err("streaming expressions require a sized conversion context".to_string())
             }
             "Inside" => self.lower_inside(value),
+            "SimpleAssignmentPattern" | "StructuredAssignmentPattern" => {
+                self.lower_struct_assignment_pattern(value)
+            }
             "ConditionalOp" => {
                 let conditions = value
                     .get("conditions")
@@ -736,6 +739,103 @@ impl super::SlangAstLowerer {
         let field = self.struct_field_for_type(selected, &member)?;
         let base = self.lower_expression(selected)?;
         Ok((base, field.offset + field.width - 1, field.offset))
+    }
+
+    pub(super) fn lower_struct_assignment_pattern(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        let type_name = string_field(value, "type").unwrap_or_default();
+        let alias_name = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        let definition = self.type_aliases.get(alias_name).ok_or_else(|| {
+            format!("assignment pattern requires a packed struct type, found '{type_name}'")
+        })?;
+        let mut fields = definition.fields.values().copied().collect::<Vec<_>>();
+        fields.sort_by(|left, right| right.offset.cmp(&left.offset));
+
+        let mut elements_by_field = std::collections::BTreeMap::new();
+        match string_field(value, "kind").as_deref() {
+            Some("SimpleAssignmentPattern") => {
+                let elements = value
+                    .get("elements")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "simple assignment pattern has no elements".to_string())?;
+                if elements.len() != fields.len() {
+                    return Err(format!(
+                        "packed struct assignment pattern has {} elements, expected {}",
+                        elements.len(),
+                        fields.len()
+                    ));
+                }
+                let mut positional_fields = fields.clone();
+                positional_fields.sort_by(|left, right| left.field_index.cmp(&right.field_index));
+                for (field, element) in positional_fields.iter().zip(elements) {
+                    elements_by_field.insert(field.offset, element);
+                }
+            }
+            Some("StructuredAssignmentPattern") => {
+                let setters = value
+                    .get("memberSetters")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| {
+                        "structured assignment pattern has no member setters".to_string()
+                    })?;
+                let mut seen = std::collections::BTreeSet::new();
+                for setter in setters {
+                    let member = string_field(setter, "member")
+                        .and_then(|member| {
+                            member.split_whitespace().next_back().map(str::to_string)
+                        })
+                        .ok_or_else(|| "structured assignment pattern has no member".to_string())?;
+                    let field = definition.fields.get(&member).ok_or_else(|| {
+                        format!("packed struct has no assignment-pattern member '{member}'")
+                    })?;
+                    let expression = setter
+                        .get("expr")
+                        .ok_or_else(|| "assignment-pattern member has no expression".to_string())?;
+                    if !seen.insert(member) {
+                        return Err("duplicate assignment-pattern member".into());
+                    }
+                    elements_by_field.insert(field.offset, expression);
+                }
+            }
+            _ => return Err("unsupported packed struct assignment pattern".into()),
+        }
+
+        let mut parts = Vec::with_capacity(fields.len());
+        let mut expected_lsb = definition.width;
+        for field in fields {
+            if field.offset + field.width != expected_lsb {
+                return Err(
+                    "packed struct assignment patterns with padding are not supported".into(),
+                );
+            }
+            expected_lsb = field.offset;
+            let element = elements_by_field
+                .get(&field.offset)
+                .ok_or_else(|| "packed struct assignment pattern is missing a field".to_string())?;
+            let expression = self.lower_expression(element)?;
+            if expression.width() != field.width {
+                return Err(format!(
+                    "packed struct assignment-pattern field width {} does not match field width {}",
+                    expression.width(),
+                    field.width
+                ));
+            }
+            parts.push(expression);
+        }
+        if expected_lsb != 0 {
+            return Err("packed struct assignment patterns with padding are not supported".into());
+        }
+        Ok(Expr::Concat(parts))
     }
 
     pub(super) fn lower_struct_member_lvalue(

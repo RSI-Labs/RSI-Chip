@@ -2410,6 +2410,61 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_packed_struct_assignment_patterns() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-struct-patterns");
+    let source_path = root.join("struct_patterns.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module struct_patterns(
+  input logic [3:0] a,
+  input logic [3:0] b,
+  output logic [7:0] positional,
+  output logic [7:0] named
+);
+  typedef struct packed {
+    logic [3:0] high;
+    logic [3:0] low;
+  } pair_t;
+
+  pair_t positional_value;
+  pair_t named_value;
+  always_comb begin
+    positional_value = '{a, b};
+    named_value = '{high: b, low: a};
+  end
+  assign positional = positional_value;
+  assign named = named_value;
+endmodule
+"#,
+    )
+    .expect("write packed struct assignment-pattern source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("struct_patterns"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower packed struct assignment patterns");
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create assignment-pattern simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0xa))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(4, 0x5))
+        .unwrap();
+    assert_eq!(simulator.read("positional").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(simulator.read("named").unwrap().to_u64(), Some(0x5a));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

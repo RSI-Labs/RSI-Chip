@@ -57,6 +57,7 @@ struct AstLoweredSymbol {
 struct AstStructField {
     offset: usize,
     width: usize,
+    field_index: usize,
 }
 
 #[derive(Clone)]

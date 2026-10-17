@@ -35,6 +35,13 @@ impl SlangAstLowerer {
                 .ok_or_else(|| {
                     format!("packed struct field '{name}.{field_name}' has no bit offset")
                 })?;
+            let field_index = field
+                .get("fieldIndex")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    format!("packed struct field '{name}.{field_name}' has no field index")
+                })?;
             let field_type = field
                 .get("type")
                 .ok_or_else(|| format!("packed struct field '{name}.{field_name}' has no type"))?;
@@ -50,6 +57,7 @@ impl SlangAstLowerer {
                 AstStructField {
                     offset,
                     width: field_width,
+                    field_index,
                 },
             );
         }
