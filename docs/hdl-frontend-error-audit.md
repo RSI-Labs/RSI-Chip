@@ -21,7 +21,7 @@ The serious frontend failures are structural, not isolated typos:
 10. Direct slang-AST lowering now expands inline multidimensional sparse-memory `SimpleAssignmentPattern` initializers into time-zero sparse blocking writes and validates them in simulation.
 11. Both direct and bounded elaboration now infer RAM/ROM behavior and technology-independent timing templates. Runtime writes mark the canonical alias group RAM; initializer-only memories become ROM. Port timing maps to AsyncRom, SyncRom, MixedRom, AsyncRam, SyncRam, or MixedRam. Vendor macro selection remains future work.
 12. The simulator VCD writer now dynamically declares sparse-memory words only when elements are initialized or written, preserving sparse output even for 1 MiB memories.
-13. Memory elaboration now records conservative runtime write masks and aligned byte-enable lanes. Whole-element writes set the full mask; statically bounded part writes OR their exact field masks; aligned 8-bit fields also produce byte lanes. Sub-byte/cross-byte writes and dynamic or out-of-range starts remain bit-mask conservative or suppress typed byte-enable metadata. ROMs have no runtime write mask.
+13. Memory elaboration now records conservative runtime write masks, aligned byte-enable lanes, and logical banking. Multidimensional memories use the outer unpacked dimension as contiguous logical banks; one-dimensional memories have one bank. Whole-element writes set the full mask; statically bounded part writes OR their exact field masks; aligned 8-bit fields also produce byte lanes. Sub-byte/cross-byte writes and dynamic or out-of-range starts remain bit-mask conservative or suppress typed byte-enable metadata. ROMs have no runtime write mask.
 14. Both direct slang-AST and bounded paths resolve relative two-to-four-argument `readmem`/`writemem` calls with constant bounds against the statement source file. Reads strip comments, support `@address`, map physical addresses to multidimensional logical indexes, and expand touched entries into sparse blocking writes; runtime dumps write the selected canonical sparse-memory window as hex or binary tokens.
 
 Current automated status at the time of this audit:
@@ -33,7 +33,7 @@ Current automated status at the time of this audit:
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 84 passed, including touched-element sparse-memory VCD dumping |
 | `cargo test -p eda-sim frontend_regressions -- --nocapture` | 14 passed |
 | `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 24 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 138.83 s after the bounded memory-file follow-up |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 130.61 s after the bounded memory-file follow-up |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
@@ -59,7 +59,7 @@ Remaining memory limitations:
 
 - indexed part-select reads and writes work on large sparse memories, including runtime starts, reversed packed elements, continuous lvalues, and disjoint NBA-field merging;
 - sparse-memory operations are not synthesizable to RAM macros yet;
-- direct large `inout` memory ports share a parent sparse-memory object, but input/output aggregate-port contracts, explicit user-specified byte-enable/mask contracts, banks, initialization files, and memory macros are not yet first-class;
+- direct large `inout` memory ports share a parent sparse-memory object, but input/output aggregate-port contracts, explicit user-specified byte-enable/mask contracts, physical bank mapping/conflict policy, initialization files, and memory macros are not yet first-class;
 - multidimensional and small compatibility arrays still use flat representation;
 - VCD memory visualization is not yet implemented;
 - the sparse element cap is currently 16,777,216 elements, not unbounded host memory.
@@ -127,7 +127,7 @@ This closes the original dense-storage blocker for whole-element and indexed par
 | HF-G25 | P0 | Coverage | No SystemVerilog `covergroup`, coverpoints, crosses, bins, illegal/ignore bins, per-instance coverage, or coverage sampling semantics in the HDL frontend. |
 | HF-G26 | P0 | Elaboration lint | No `unique`/`priority` enforcement, full case-overlap analysis, full always kind checking, unused/conflicting name diagnostics, or elaboration-policy waivers. |
 | HF-G27 | P1 | System tasks/functions | Only a selected display/format/control subset. No complete file I/O, math/random conversion, assertion control, PLI/VPI/DPI tasks, or vendor-task policy. |
-| HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, indexed part-select IR, simulator storage, RAM/ROM timing-template, conservative write-mask, and aligned byte-enable inference now exist for large one-dimensional module memories. Vendor memory macro selection, explicit byte-enable contracts, banks, hierarchical memory contracts, advanced initialization/dump policy controls, sparse-memory synthesis, general input/output aggregate ports, and hierarchical VCD scopes remain; touched-element sparse-memory VCD words are now emitted; direct inline multidimensional `SimpleAssignmentPattern` initializers and two-to-four-argument constant-bounded `$readmemh`/`$readmemb` and `$writememh`/`$writememb` subsets now lower to sparse initialization writes or runtime dumps. |
+| HF-G28 | P0 | Memory architecture | Foundational sparse `MemoryDecl`, whole-element, indexed part-select IR, simulator storage, RAM/ROM timing-template, conservative write-mask, aligned byte-enable, and logical-banking inference now exist for large one-dimensional module memories. Vendor memory macro selection, explicit byte-enable contracts, physical bank mapping/conflict policy, hierarchical memory contracts, advanced initialization/dump policy controls, sparse-memory synthesis, general input/output aggregate ports, and hierarchical VCD scopes remain; touched-element sparse-memory VCD words are now emitted; direct inline multidimensional `SimpleAssignmentPattern` initializers and two-to-four-argument constant-bounded `$readmemh`/`$readmemb` and `$writememh`/`$writememb` subsets now lower to sparse initialization writes or runtime dumps. |
 | HF-G29 | P1 | Literal limits | Packed literals/types are capped at 4096 bits; string literals at 64 bytes. Valid larger constructs are rejected rather than represented. |
 | HF-G30 | P1 | Elaboration bounds | Generate loops stop at 131072 steps, function loops at 256 iterations, class composition at eight levels, hierarchy at 64 levels. These are safety caps, not language semantics. |
 | HF-G31 | P0 | slang integration | Full slang elaborated AST to repository IR lowering remains absent. The normal `compile_files` path validates with slang, serializes an include/macro-aware structural summary, preprocesses to one text unit, invokes the bounded parser, and compares the result with slang. A new explicit `compile_files_via_ast` path directly lowers a small ports/nets/continuous-expression/parameter-constant/procedural/recursive-hierarchy/generated-member/sparse-memory/shared-memory-port subset without preprocessed reparsing; unsupported constructs such as mixed edge/level sensitivity fail closed. |
@@ -219,6 +219,6 @@ The following probe set was first accepted by local slang 12.0.0; the unchanged 
 - Full slang or equivalent standard frontend is the parser/type/elaboration authority.
 - No valid input is silently transformed into a different hierarchy, direction, type, width, or driver structure.
 - Every unsupported construct has a precise, source-located diagnostic.
-- Whole-element one-dimensional sparse memories do not require dense allocation; extend the direct `inout` shared-memory-port guarantee to general input/output port contracts, banks and aggregates; inferred runtime write masks and aligned byte-enable lanes now exist.
+- Whole-element one-dimensional sparse memories do not require dense allocation; extend the direct `inout` shared-memory-port guarantee to general input/output port contracts and physical bank mapping; inferred runtime write masks, aligned byte-enable lanes, and logical banking now exist.
 - Parser, type checker, elaborator, linter, and simulator use one typed source-span-carrying representation.
 - Official UVM execution, if claimed, is validated against a documented behavioral reference, not merely slang elaboration.

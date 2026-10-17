@@ -1646,6 +1646,7 @@ impl<'a> Elaborator<'a> {
             template: MemoryTemplate::Unmapped,
             write_mask: None,
             byte_enable: None,
+            banking: MemoryBanking::default(),
         });
         memory
     }

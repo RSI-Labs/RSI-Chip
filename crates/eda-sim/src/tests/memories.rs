@@ -42,6 +42,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
             template: eda_core::ir::MemoryTemplate::Unmapped,
             write_mask: None,
             byte_enable: None,
+            banking: eda_core::ir::MemoryBanking::default(),
         }],
         memory_connections: Vec::new(),
         n_nets: 8,

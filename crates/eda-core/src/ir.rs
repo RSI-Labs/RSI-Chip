@@ -155,6 +155,51 @@ impl MemoryByteEnable {
     }
 }
 
+/// Logical banking derived from the outer unpacked-array dimension.
+///
+/// This is not a vendor macro selection. It records the natural contiguous
+/// partitions already present in the source shape so synthesis can evaluate
+/// conflict, mapping, and implementation choices without flattening that
+/// structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryBanking {
+    /// Number of logical banks; one for a one-dimensional memory.
+    pub count: u64,
+    /// Contiguous elements retained by each logical bank.
+    pub depth: u64,
+}
+
+impl MemoryBanking {
+    pub fn from_dimensions(dimensions: &[MemoryDimension], flat_length: u64) -> Self {
+        let count = if dimensions.len() > 1 {
+            dimensions
+                .first()
+                .map_or(1, |dimension| dimension.length as u64)
+        } else {
+            1
+        }
+        .max(1);
+        let depth = if flat_length == 0 || count == 0 {
+            0
+        } else {
+            flat_length / count
+        };
+        Self { count, depth }
+    }
+
+    pub fn bank_of_physical(&self, physical_index: u64) -> Option<u64> {
+        if self.depth == 0 || physical_index >= self.count * self.depth {
+            return None;
+        }
+        Some(physical_index / self.depth)
+    }
+
+    pub fn offset_in_bank(&self, physical_index: u64) -> Option<u64> {
+        self.bank_of_physical(physical_index)
+            .map(|_| physical_index % self.depth)
+    }
+}
+
 /// A sparse unpacked-array object.
 ///
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
@@ -177,6 +222,8 @@ pub struct MemoryDecl {
     pub write_mask: Option<MemoryWriteMask>,
     /// Aligned byte-lane contract derived from `write_mask`.
     pub byte_enable: Option<MemoryByteEnable>,
+    /// Logical banking metadata inferred from the source shape.
+    pub banking: MemoryBanking,
 }
 
 /// Aliases a child instance's memory object to the parent memory supplied on
@@ -706,8 +753,10 @@ impl Design {
             let write_mask = accesses.write_mask(root, memory.element_width);
             let byte_enable =
                 MemoryByteEnable::from_write_mask(write_mask.as_ref(), memory.element_width);
+            let banking = MemoryBanking::from_dimensions(&memory.dimensions, memory.flat_length);
             memory.write_mask = write_mask;
             memory.byte_enable = byte_enable;
+            memory.banking = banking;
         }
     }
 
@@ -1083,6 +1132,7 @@ mod tests {
             template: MemoryTemplate::Unmapped,
             write_mask: None,
             byte_enable: None,
+            banking: MemoryBanking::default(),
         };
         assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
         assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
@@ -1091,6 +1141,13 @@ mod tests {
         assert_eq!(memory.physical_index(&[-3, 3]), None);
         assert_eq!(memory.physical_index(&[0, 1]), None);
         assert_eq!(memory.physical_index(&[0]), None);
+        let banking = MemoryBanking::from_dimensions(&memory.dimensions, memory.flat_length);
+        assert_eq!(banking.count, 4);
+        assert_eq!(banking.depth, 2);
+        assert_eq!(banking.bank_of_physical(0), Some(0));
+        assert_eq!(banking.bank_of_physical(3), Some(1));
+        assert_eq!(banking.offset_in_bank(3), Some(1));
+        assert_eq!(banking.bank_of_physical(8), None);
     }
 
     #[test]
@@ -1110,11 +1167,17 @@ mod tests {
             template: MemoryTemplate::Unmapped,
             write_mask: None,
             byte_enable: None,
+            banking: MemoryBanking::default(),
         };
         assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
         assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));
         assert_eq!(memory.element_part_offsets(4, 4, false), Some((3, 6)));
         assert_eq!(memory.element_part_offsets(8, 1, true), None);
         assert_eq!(memory.element_part_offsets(0, 9, true), None);
+        let banking = MemoryBanking::from_dimensions(&memory.dimensions, memory.flat_length);
+        assert_eq!(banking.count, 1);
+        assert_eq!(banking.depth, 513);
+        assert_eq!(banking.bank_of_physical(512), Some(0));
+        assert_eq!(banking.offset_in_bank(512), Some(512));
     }
 }

@@ -791,6 +791,10 @@ endmodule
     assert_eq!(direct.memories.len(), 1);
     assert_eq!(direct.memories[0].dimensions.len(), 2);
     assert_eq!(direct.memories[0].flat_length, 4);
+    assert_eq!(
+        direct.memories[0].banking,
+        eda_core::ir::MemoryBanking { count: 2, depth: 2 }
+    );
     assert_eq!(direct.n_nets, 27);
 
     let mut direct_simulator = Simulator::new(&direct).expect("create direct 2D simulator");
@@ -1097,6 +1101,10 @@ endmodule
     );
     assert_eq!(design.memories[0].write_mask, None);
     assert_eq!(design.memories[0].byte_enable, None);
+    assert_eq!(
+        design.memories[0].banking,
+        eda_core::ir::MemoryBanking { count: 2, depth: 3 }
+    );
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create initializer simulator");
@@ -1178,6 +1186,13 @@ endmodule
         design.memories[1].template,
         eda_core::ir::MemoryTemplate::AsyncRom
     );
+    assert_eq!(
+        design.memories[0].banking,
+        eda_core::ir::MemoryBanking {
+            count: 1,
+            depth: 4097
+        }
+    );
     assert_eq!(design.initials.len(), 1);
     assert_eq!(reference.memories.len(), 2);
     assert_eq!(reference.memories[0].kind, eda_core::ir::MemoryKind::Rom);
@@ -1189,6 +1204,13 @@ endmodule
     assert_eq!(
         reference.memories[1].template,
         eda_core::ir::MemoryTemplate::AsyncRom
+    );
+    assert_eq!(
+        reference.memories[1].banking,
+        eda_core::ir::MemoryBanking {
+            count: 1,
+            depth: 2049
+        }
     );
     assert_eq!(reference.initials.len(), 1);
 
