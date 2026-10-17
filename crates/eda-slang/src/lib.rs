@@ -485,11 +485,6 @@ impl SlangAstLowerer {
             symbols: std::collections::BTreeMap::new(),
         };
         child.lower_body(body)?;
-        if !child.design.hierarchy.is_empty() {
-            return Err(
-                "direct slang-AST lowering does not yet support nested module hierarchy".into(),
-            );
-        }
         if !child.design.memories.is_empty() || !child.design.memory_connections.is_empty() {
             return Err(
                 "direct slang-AST lowering does not yet support child sparse memories".into(),
@@ -522,6 +517,8 @@ impl SlangAstLowerer {
             remap_process(&mut process, offset);
             self.design.processes.push(process);
         }
+
+        let nested_hierarchy = child.design.hierarchy;
 
         let mut connections = std::collections::BTreeMap::new();
         let empty_connections = Vec::new();
@@ -612,6 +609,25 @@ impl SlangAstLowerer {
                 net_end: self.design.n_nets,
                 ports,
             });
+        let child_path = format!("{}.{}", self.design.name, instance_name);
+        for mut nested in nested_hierarchy {
+            nested.path = rewrite_hierarchy_path(&nested.path, &child_path);
+            if let Some(parent) = nested.parent.as_deref() {
+                nested.parent = Some(rewrite_hierarchy_path(parent, &child_path));
+            }
+            nested.depth += 1;
+            nested.net_start += offset;
+            nested.net_end += offset;
+            for port in &mut nested.ports {
+                port.base += offset;
+                port.connections = port
+                    .connections
+                    .iter()
+                    .map(|connection| connection.map(|net| net + offset))
+                    .collect();
+            }
+            self.design.hierarchy.push(nested);
+        }
         Ok(())
     }
 
@@ -1213,6 +1229,17 @@ fn range_parent_bits(net: usize, range: &eda_core::ir::Range) -> Option<Vec<Opti
             }
             Some((*lsb..=*msb).map(|index| Some(net + index)).collect())
         }
+    }
+}
+
+fn rewrite_hierarchy_path(path: &str, prefix: &str) -> String {
+    if path.is_empty() {
+        return prefix.to_string();
+    }
+    if path.starts_with('.') {
+        format!("{prefix}{path}")
+    } else {
+        format!("{prefix}.{path}")
     }
 }
 

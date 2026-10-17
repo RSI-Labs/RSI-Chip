@@ -56,7 +56,7 @@ integer-literal values, simple type width/signedness, and direct/generated
 instance inventory against the slang AST. `compile_files_via_ast`
 additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
-if/case control flow, single posedge/negedge sensitivity, and one-level
+if/case control flow, single posedge/negedge sensitivity, and recursive
 parameterized module hierarchy with port connections directly from slang's
 elaborated AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate

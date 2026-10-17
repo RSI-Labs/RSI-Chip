@@ -20,7 +20,7 @@ frontend. It uses slang for:
    leaves, unary and binary operators, concatenation, conditional expressions,
    constant selects, initial/always procedures, blocking/non-blocking
    assignments, blocks, if/case control flow, and single posedge/negedge
-   sensitivity, plus one-level parameterized module hierarchy and port
+   sensitivity, plus recursive parameterized module hierarchy and port
    connections.
 
 The adapter deliberately reports slang diagnostics instead of silently

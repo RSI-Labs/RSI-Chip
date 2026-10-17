@@ -346,17 +346,53 @@ module top(input logic a, output logic y); middle u (.a(a), .y(y)); endmodule
 "#,
     )
     .expect("write nested hierarchy source");
-    let error = slang
+    let nested_design = slang
         .compile_files_via_ast(
             std::slice::from_ref(&nested_path),
             Some("top"),
             &PreprocessOptions::default(),
         )
-        .expect_err("nested hierarchy must fail closed");
+        .expect("directly lower nested hierarchy");
+    let nested_reference = slang
+        .compile_files(
+            std::slice::from_ref(&nested_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower nested hierarchy through the preprocessed path");
+    assert_eq!(nested_design.n_nets, 6);
+    assert_eq!(nested_design.assigns.len(), 5);
+    assert_eq!(nested_design.hierarchy.len(), 3);
     assert!(
-        error.contains("does not yet support nested module hierarchy"),
-        "unexpected error: {error}"
+        nested_design
+            .hierarchy
+            .iter()
+            .any(|instance| instance.path == "top.u.u"),
+        "unexpected hierarchy: {:?}",
+        nested_design.hierarchy
     );
+    assert_eq!(
+        format!("{:?}", nested_reference.net_decls),
+        format!("{:?}", nested_design.net_decls)
+    );
+    assert_eq!(
+        format!("{:?}", nested_reference.assigns),
+        format!("{:?}", nested_design.assigns)
+    );
+    assert_eq!(
+        format!("{:?}", nested_reference.hierarchy),
+        format!("{:?}", nested_design.hierarchy)
+    );
+
+    let mut nested_simulator = Simulator::new(&nested_design).expect("create nested simulator");
+    nested_simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .expect("set nested input");
+    assert_eq!(nested_simulator.read("y").unwrap().to_u64(), Some(1));
+    nested_simulator
+        .set_input("a", &LogicWord::from_u64(1, 0))
+        .expect("update nested input");
+    assert_eq!(nested_simulator.read("y").unwrap().to_u64(), Some(0));
 }
 
 #[test]
