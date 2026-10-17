@@ -1,8 +1,14 @@
 //! Straight-line function inlining from slang's elaborated AST.
 
 use super::{declaration_name, SlangAstLowerer};
-use crate::ast_util::{expression_symbol, string_field};
+use crate::ast_util::{bool_field, expression_symbol, string_field};
 use serde_json::{json, Value};
+
+#[derive(Clone)]
+struct TaskLocal {
+    type_name: String,
+    initializer: Option<Value>,
+}
 
 impl SlangAstLowerer {
     pub(super) fn collect_subroutine(&mut self, member: &Value) -> Result<(), String> {
@@ -149,6 +155,7 @@ impl SlangAstLowerer {
         }
 
         let mut environment = std::collections::BTreeMap::new();
+        let locals = collect_task_locals(definition);
         for (formal, actual) in formals.iter().zip(arguments) {
             let formal_name = formal
                 .get("name")
@@ -206,11 +213,14 @@ impl SlangAstLowerer {
                 }
             }
         }
+        self.initialize_task_locals(&locals, &mut environment)?;
 
         let body = definition
             .get("body")
             .ok_or_else(|| format!("task '{task_name}' has no body"))?;
-        let body = substitute_named_values(body, &environment);
+        let body = self
+            .inline_task_body(body, &mut environment, &locals)?
+            .unwrap_or_else(|| json!({"kind": "Block", "blockKind": "Sequential"}));
         {
             let mut stack = self.inline_stack.borrow_mut();
             if stack.iter().any(|name| name == &task_name) {
@@ -221,6 +231,124 @@ impl SlangAstLowerer {
         let result = self.lower_statement(&body);
         self.inline_stack.borrow_mut().pop();
         result.map(Some)
+    }
+
+    fn initialize_task_locals(
+        &self,
+        locals: &std::collections::BTreeMap<String, TaskLocal>,
+        environment: &mut std::collections::BTreeMap<String, Value>,
+    ) -> Result<(), String> {
+        for (name, local) in locals {
+            let (shape, _, _) = self.net_type(&local.type_name)?;
+            let width = shape.width.max(1);
+            let initializer = local.initializer.clone().unwrap_or_else(|| {
+                let two_state = ["bit", "byte", "shortint", "int", "longint"]
+                    .iter()
+                    .any(|type_name| local.type_name.contains(type_name));
+                let digits = if two_state {
+                    format!("{width}'d0")
+                } else {
+                    format!("{width}'b{}", "x".repeat(width))
+                };
+                json!({
+                    "kind": "IntegerLiteral",
+                    "type": local.type_name,
+                    "value": digits,
+                })
+            });
+            environment.insert(
+                name.clone(),
+                json!({
+                    "kind": "Conversion",
+                    "type": local.type_name,
+                    "operand": initializer,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn inline_task_body(
+        &self,
+        value: &Value,
+        environment: &mut std::collections::BTreeMap<String, Value>,
+        locals: &std::collections::BTreeMap<String, TaskLocal>,
+    ) -> Result<Option<Value>, String> {
+        match string_field(value, "kind").as_deref() {
+            Some("List") => {
+                let mut statements = Vec::new();
+                if let Some(items) = value.get("list").and_then(Value::as_array) {
+                    for item in items {
+                        if let Some(statement) = self.inline_task_body(item, environment, locals)? {
+                            statements.push(statement);
+                        }
+                    }
+                }
+                Ok(Some(json!({
+                    "kind": "List",
+                    "list": statements,
+                })))
+            }
+            Some("Block") => {
+                let Some(body) = value.get("body") else {
+                    return Ok(Some(json!({
+                        "kind": "Block",
+                        "blockKind": "Sequential",
+                    })));
+                };
+                self.inline_task_body(body, environment, locals)
+            }
+            Some("VariableDeclaration") => Ok(None),
+            Some("ExpressionStatement") => {
+                let Some(expression) = value.get("expr") else {
+                    return Err("task expression statement has no expression".into());
+                };
+                let lowered =
+                    self.inline_task_body(expression, environment, locals)?
+                        .map(|expression| {
+                            json!({
+                                "kind": "ExpressionStatement",
+                                "expr": expression,
+                            })
+                        });
+                Ok(lowered)
+            }
+            Some("Assignment") => {
+                let target = value
+                    .get("left")
+                    .and_then(expression_symbol)
+                    .ok_or_else(|| "task assignment has no named target".to_string())?;
+                let rhs = value
+                    .get("right")
+                    .ok_or_else(|| "task assignment has no right side".to_string())?;
+                let rhs = substitute_named_values(rhs, environment);
+                if let Some(local) = locals.get(&target) {
+                    environment.insert(
+                        target,
+                        json!({
+                            "kind": "Conversion",
+                            "type": local.type_name,
+                            "operand": rhs,
+                        }),
+                    );
+                    return Ok(None);
+                }
+                let mut assignment = substitute_named_values(value, environment);
+                if let Some(object) = assignment.get_mut("right") {
+                    *object = rhs;
+                }
+                Ok(Some(assignment))
+            }
+            Some(kind) => {
+                if task_contains_local_assignment(value, locals) {
+                    return Err(format!(
+                        "direct task inlining does not support local assignment inside '{kind}'"
+                    ));
+                }
+                Ok(Some(substitute_named_values(value, environment)))
+            }
+            None => Err("task statement has no kind".into()),
+        }
     }
 
     fn lower_enum_next_prev(
@@ -638,6 +766,58 @@ fn substitute_named_values(
             .collect::<Vec<_>>()
             .into(),
         scalar => scalar.clone(),
+    }
+}
+
+fn collect_task_locals(value: &Value) -> std::collections::BTreeMap<String, TaskLocal> {
+    let mut locals = std::collections::BTreeMap::new();
+    if let Value::Object(fields) = value {
+        if string_field(value, "kind").as_deref() == Some("Variable") && !bool_field(value, "flags")
+        {
+            if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
+                let type_name = string_field(value, "type").unwrap_or_default();
+                let initializer = value.get("initializer").cloned();
+                locals.insert(
+                    name,
+                    TaskLocal {
+                        type_name,
+                        initializer,
+                    },
+                );
+            }
+        }
+        for nested in fields.values() {
+            locals.extend(collect_task_locals(nested));
+        }
+    } else if let Value::Array(values) = value {
+        for nested in values {
+            locals.extend(collect_task_locals(nested));
+        }
+    }
+    locals
+}
+
+fn task_contains_local_assignment(
+    value: &Value,
+    locals: &std::collections::BTreeMap<String, TaskLocal>,
+) -> bool {
+    match value {
+        Value::Object(fields) => {
+            if string_field(value, "kind").as_deref() == Some("Assignment") {
+                if let Some(target) = value.get("left").and_then(expression_symbol) {
+                    if locals.contains_key(&target) {
+                        return true;
+                    }
+                }
+            }
+            fields
+                .values()
+                .any(|nested| task_contains_local_assignment(nested, locals))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|nested| task_contains_local_assignment(nested, locals)),
+        _ => false,
     }
 }
 

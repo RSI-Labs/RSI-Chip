@@ -3568,6 +3568,49 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_task_local_variables() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-locals");
+    let source_path = root.join("task_locals.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_locals(
+  input int a,
+  output int y
+);
+  task automatic compute(input int x, output int result);
+    int initialized = 10;
+    int accumulated;
+    accumulated = initialized + x;
+    result = accumulated * 2;
+  endtask
+
+  always_comb compute(a, y);
+endmodule
+"#,
+    )
+    .expect("write task-local source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_locals"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task with local variables");
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create task-local simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(32, 5))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(30));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_recursive_tasks() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
