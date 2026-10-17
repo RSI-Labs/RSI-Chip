@@ -335,12 +335,41 @@ fn physical_to_logical(memory: &eda_core::ir::MemoryDecl, physical_index: u64) -
     Some(indexes)
 }
 
+fn part_value_index(
+    memory: &eda_core::ir::MemoryDecl,
+    target: &DistributedRamPartTarget,
+    physical_bit: usize,
+) -> Option<usize> {
+    if physical_bit < target.low || physical_bit > target.high {
+        return None;
+    }
+    Some(if memory.element_is_reversed() {
+        target.high - physical_bit
+    } else {
+        physical_bit - target.low
+    })
+}
+
 #[derive(Clone)]
 struct DistributedRamWrite {
     memory: usize,
     condition: Option<Expr>,
     indexes: Vec<Expr>,
     value: Expr,
+    part: Option<DistributedRamWritePart>,
+}
+
+#[derive(Clone)]
+struct DistributedRamWritePart {
+    start: Expr,
+    width: usize,
+    ascending: bool,
+}
+
+struct DistributedRamPartTarget {
+    low: usize,
+    high: usize,
+    start_select: Option<NetId>,
 }
 
 impl<'a> Synth<'a> {
@@ -529,6 +558,35 @@ impl<'a> Synth<'a> {
                 condition: None,
                 indexes: indexes.clone(),
                 value: (*e).clone(),
+                part: None,
+            }),
+            Stmt::MemoryBlPart {
+                memory,
+                indexes,
+                start,
+                width,
+                ascending,
+                e,
+                ..
+            }
+            | Stmt::MemoryNBlPart {
+                memory,
+                indexes,
+                start,
+                width,
+                ascending,
+                e,
+                ..
+            } => Some(DistributedRamWrite {
+                memory: *memory,
+                condition: None,
+                indexes: indexes.clone(),
+                value: (*e).clone(),
+                part: Some(DistributedRamWritePart {
+                    start: (**start).clone(),
+                    width: *width,
+                    ascending: *ascending,
+                }),
             }),
             Stmt::If { c, t, f: None, .. } => {
                 let write = self.distributed_ram_write(t)?;
@@ -576,7 +634,16 @@ impl<'a> Synth<'a> {
             Some(condition) => Some(self.blast(condition, 1)?[0]),
             None => None,
         };
-        let value = self.blast(&write.value, memory.element_width)?;
+        let value_width = write
+            .part
+            .as_ref()
+            .map(|part| part.width)
+            .unwrap_or(memory.element_width);
+        let value = self.blast(&write.value, value_width)?;
+        let part_targets = match &write.part {
+            Some(part) => Some(self.distributed_ram_part_targets(&memory, part)?),
+            None => None,
+        };
         let old_state = self
             .ram_state
             .get(&write.memory)
@@ -591,7 +658,26 @@ impl<'a> Synth<'a> {
             }
             let mut updated = Vec::with_capacity(memory.element_width);
             for (bit, old) in old_bits.iter().enumerate() {
-                let next = self.mux(select, value[bit], *old);
+                let mut next = *old;
+                match &part_targets {
+                    None => {
+                        next = self.mux(select, value[bit], next);
+                    }
+                    Some(targets) => {
+                        for target in targets {
+                            let Some(value_index) = part_value_index(&memory, target, bit) else {
+                                continue;
+                            };
+                            let bit_select = match target.start_select {
+                                Some(start_select) => {
+                                    self.combine(CellKind::And, select, start_select)
+                                }
+                                None => select,
+                            };
+                            next = self.mux(bit_select, value[value_index], next);
+                        }
+                    }
+                }
                 self.add_cell("dxff", CellKind::Dff { posedge }, vec![clock, next], *old);
                 updated.push(*old);
             }
@@ -600,6 +686,82 @@ impl<'a> Synth<'a> {
         self.ram_state.insert(write.memory, next_state);
         self.lowered_memories.insert(write.memory);
         Ok(())
+    }
+
+    fn distributed_ram_part_targets(
+        &mut self,
+        memory: &eda_core::ir::MemoryDecl,
+        part: &DistributedRamWritePart,
+    ) -> Result<Vec<DistributedRamPartTarget>, String> {
+        if part.width == 0 || part.width > memory.element_width {
+            return Err(format!(
+                "memory '{}' has an invalid distributed-RAM part-select width {}",
+                memory.name, part.width
+            ));
+        }
+        if let Some(start) = constant_word(&part.start)
+            .and_then(|word| word.to_u64())
+            .map(|start| start as i64)
+        {
+            let (low, high) = memory
+                .element_part_offsets(start, part.width, part.ascending)
+                .ok_or_else(|| {
+                    format!(
+                        "memory '{}' distributed-RAM part select start {start} is out of range",
+                        memory.name
+                    )
+                })?;
+            return Ok(vec![DistributedRamPartTarget {
+                low,
+                high,
+                start_select: None,
+            }]);
+        }
+
+        let start_width = part.start.width().max(1);
+        let lower = memory.element_msb.min(memory.element_lsb);
+        let upper = memory.element_msb.max(memory.element_lsb);
+        let first = if part.ascending {
+            lower
+        } else {
+            lower + part.width as i64 - 1
+        };
+        let last = if part.ascending {
+            upper - part.width as i64 + 1
+        } else {
+            upper
+        };
+        let mut targets: Vec<DistributedRamPartTarget> = Vec::new();
+        for logical_start in first..=last {
+            let Some((low, high)) =
+                memory.element_part_offsets(logical_start, part.width, part.ascending)
+            else {
+                continue;
+            };
+            if targets.iter().any(|target| target.low == low) {
+                continue;
+            }
+            let target = Expr::Const(LogicWord::from_u64(start_width, logical_start as u64));
+            let equal = self.blast_bin(BinOp::Eq, &part.start, &target)?;
+            let Some(equal) = equal.first() else {
+                return Err(format!(
+                    "memory '{}' distributed-RAM part-select comparison produced no select",
+                    memory.name
+                ));
+            };
+            targets.push(DistributedRamPartTarget {
+                low,
+                high,
+                start_select: Some(*equal),
+            });
+        }
+        if targets.is_empty() {
+            return Err(format!(
+                "memory '{}' distributed-RAM part select has no legal starts",
+                memory.name
+            ));
+        }
+        Ok(targets)
     }
 
     fn drivers_list(&self) -> Vec<(NetId, NetId)> {
@@ -1928,6 +2090,84 @@ endmodule
                 rtl_sim.read("q").unwrap(),
                 gate_sim.read("q").unwrap(),
                 "read address {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn distributed_ram_byte_enable_write_preserves_other_lanes() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let source_path = std::env::temp_dir().join(format!(
+            "eda-synth-byte-enable-ram-{}-{}.sv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &source_path,
+            r#"
+module byte_enable_ram(
+  input logic clk,
+  input logic write,
+  input logic [1:0] address,
+  input logic [7:0] din,
+  output logic [31:0] q
+);
+  logic [31:0] memory [0:3];
+  always @(posedge clk) begin
+    if (write) memory[address][23:16] <= din;
+  end
+  assign q = memory[address];
+endmodule
+"#,
+        )
+        .expect("write byte-enable RAM source");
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("byte_enable_ram"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("directly lower byte-enable RAM");
+        assert_eq!(rtl.memories[0].write_mask.as_ref().unwrap().bits.len(), 32);
+        assert_eq!(
+            rtl.memories[0].byte_enable.as_ref().unwrap().lanes,
+            [false, false, true, false].to_vec()
+        );
+        let result =
+            synthesize(&rtl, &SynthOptions::default()).expect("lower byte-enable distributed RAM");
+        assert_eq!(result.netlist.stats().seq, 128);
+
+        let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+        let mut rtl_sim = Simulator::new(&rtl).unwrap();
+        let mut gate_sim = Simulator::new(&gate).unwrap();
+        for sim in [&mut rtl_sim, &mut gate_sim] {
+            sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+            sim.set_input("write", &LogicWord::from_u64(1, 1)).unwrap();
+        }
+        for (address, lane_value) in [(0_u64, 0x12), (1, 0x34), (2, 0x56), (3, 0x78)] {
+            for sim in [&mut rtl_sim, &mut gate_sim] {
+                sim.set_input("address", &LogicWord::from_u64(2, address))
+                    .unwrap();
+                sim.set_input("din", &LogicWord::from_u64(8, lane_value))
+                    .unwrap();
+                sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+                sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+            }
+            let rtl_q = rtl_sim.read("q").unwrap();
+            let gate_q = gate_sim.read("q").unwrap();
+            assert_eq!(rtl_q, gate_q, "write address {address}");
+            assert!(gate_q.to_hex_str().len() >= 8);
+            assert_eq!(
+                (0..8).map(|bit| gate_q.bit(16 + bit)).collect::<Vec<_>>(),
+                {
+                    let expected = LogicWord::from_u64(8, lane_value);
+                    (0..8).map(|bit| expected.bit(bit)).collect::<Vec<_>>()
+                }
             );
         }
     }

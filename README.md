@@ -80,7 +80,7 @@ inference marks runtime-written canonical alias groups as RAM and
 initializer-only memories as ROM, then assigns technology-independent timing
 templates (`AsyncRom`, `SyncRom`, `MixedRom`, `AsyncRam`, `SyncRam`, or
 `MixedRam`) plus conservative runtime write-mask, aligned byte-lane, and logical-bank
-contracts. Synthesis now emits technology-independent distributed/block macro candidate plans from these contracts; vendor mapping and block-macro netlist lowering remain future work; small deterministic DistributedRom objects and clocked DistributedRam objects now lower to gates/registers. Sparse-memory VCD output dynamically declares only touched words rather than expanding a 1 MiB memory. Direct slang-AST
+contracts. Synthesis now emits technology-independent distributed/block macro candidate plans from these contracts; vendor mapping and block-macro netlist lowering remain future work; small deterministic DistributedRom objects and clocked DistributedRam objects now lower to gates/registers, including aligned byte-enable part writes. Sparse-memory VCD output dynamically declares only touched words rather than expanding a 1 MiB memory. Direct slang-AST
 lowering supports inline multidimensional sparse-memory initializers and
 compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps. The bounded path expands
 two-to-four-argument memory-file loads/dumps with constant bounds relative to the first source file and accepts
