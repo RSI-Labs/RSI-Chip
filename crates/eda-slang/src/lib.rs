@@ -509,15 +509,22 @@ impl SlangAstLowerer {
             symbols: std::collections::BTreeMap::new(),
         };
         child.lower_body(body)?;
-        if !child.design.memories.is_empty() || !child.design.memory_connections.is_empty() {
-            return Err(
-                "direct slang-AST lowering does not yet support child sparse memories".into(),
-            );
-        }
 
         let offset = self.design.n_nets;
+        let memory_offset = self.design.memories.len();
         let child_net_start = offset;
         let child_ports = child.design.ports.clone();
+        let child_memories = child.design.memories.clone();
+        for memory in &child.design.memories {
+            let mut memory = memory.clone();
+            memory.name = format!("{instance_name}.{}", memory.name);
+            self.design.memories.push(memory);
+        }
+        for mut connection in child.design.memory_connections {
+            connection.child += memory_offset;
+            connection.parent += memory_offset;
+            self.design.memory_connections.push(connection);
+        }
         for declaration in &child.design.net_decls {
             self.design.net_decls.push(eda_core::ir::NetDecl {
                 name: format!("{instance_name}.{}", declaration.name),
@@ -531,14 +538,17 @@ impl SlangAstLowerer {
 
         for mut assignment in child.design.assigns {
             remap_assignment(&mut assignment, offset);
+            remap_expression_memory_ids(&mut assignment.e, memory_offset);
             self.design.assigns.push(assignment);
         }
         for mut statement in child.design.initials {
             remap_statement(&mut statement, offset);
+            remap_statement_memory_ids(&mut statement, memory_offset);
             self.design.initials.push(statement);
         }
         for mut process in child.design.processes {
             remap_process(&mut process, offset);
+            remap_statement_memory_ids(&mut process.body, memory_offset);
             self.design.processes.push(process);
         }
 
@@ -546,6 +556,24 @@ impl SlangAstLowerer {
 
         let mut connections = std::collections::BTreeMap::new();
         let empty_connections = Vec::new();
+        let memory_ports: std::collections::BTreeMap<String, usize> = body
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_connections)
+            .iter()
+            .filter_map(|port| {
+                let name = string_field(port, "name")?;
+                let is_inout_memory = string_field(port, "direction").as_deref() == Some("InOut")
+                    && memory_type(&string_field(port, "type").unwrap_or_default()).is_some();
+                if !is_inout_memory {
+                    return None;
+                }
+                let local_index = child_memories
+                    .iter()
+                    .position(|memory| memory.name == name)?;
+                Some((name, local_index))
+            })
+            .collect();
         for connection in member
             .get("connections")
             .and_then(serde_json::Value::as_array)
@@ -563,6 +591,41 @@ impl SlangAstLowerer {
             let expression = connection
                 .get("expr")
                 .ok_or_else(|| "instance connection has no expression".to_string())?;
+            if let Some(local_memory) = memory_ports.get(&port_name).copied() {
+                let parent_target = expression
+                    .get("left")
+                    .ok_or_else(|| "inout memory connection has no parent target".to_string())?;
+                let parent_name = expression_symbol(parent_target).ok_or_else(|| {
+                    format!("inout memory connection '{port_name}' has no parent symbol")
+                })?;
+                let parent_symbol = self
+                    .symbols
+                    .get(&parent_name)
+                    .ok_or_else(|| format!("unknown inout memory parent '{parent_name}'"))?;
+                let parent_memory = parent_symbol.memory.ok_or_else(|| {
+                    format!("inout memory port '{port_name}' must connect to a sparse memory")
+                })?;
+                let child_memory = memory_offset + local_memory;
+                let child = &self.design.memories[child_memory];
+                let parent = &self.design.memories[parent_memory];
+                if child.element_width != parent.element_width
+                    || child.element_msb != parent.element_msb
+                    || child.element_lsb != parent.element_lsb
+                    || child.dimensions != parent.dimensions
+                    || child.flat_length != parent.flat_length
+                {
+                    return Err(format!(
+                        "instance '{instance_name}' inout memory port '{port_name}' shape does not match parent memory '{parent_name}'"
+                    ));
+                }
+                self.design
+                    .memory_connections
+                    .push(eda_core::ir::MemoryConnection {
+                        child: child_memory,
+                        parent: parent_memory,
+                    });
+                continue;
+            }
             if string_field(expression, "kind").as_deref() == Some("EmptyArgument") {
                 continue;
             }
@@ -657,6 +720,9 @@ impl SlangAstLowerer {
 
     fn lower_port(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "Port")?;
+        if memory_type(&string_field(member, "type").unwrap_or_default()).is_some() {
+            return self.lower_memory_port(member, &name);
+        }
         let direction = match string_field(member, "direction").as_deref() {
             Some("In") => eda_core::ir::Dir::In,
             Some("Out") => eda_core::ir::Dir::Out,
@@ -677,6 +743,30 @@ impl SlangAstLowerer {
             )?;
             self.push_assignment(name, rhs);
         }
+        Ok(())
+    }
+
+    fn lower_memory_port(&mut self, member: &serde_json::Value, name: &str) -> Result<(), String> {
+        if string_field(member, "direction").as_deref() != Some("InOut") {
+            return Err(format!(
+                "direct slang-AST lowering supports only inout sparse-memory ports for '{name}'"
+            ));
+        }
+        if !self.design.name.is_empty() {
+            return Err(format!(
+                "top-level inout sparse-memory port '{name}' is not supported"
+            ));
+        }
+        self.lower_memory_declaration(member, name)?;
+        let symbol = self.symbols[name];
+        // Child PortDecl uses In only as internal connection metadata. The
+        // actual storage contract is represented by MemoryConnection.
+        self.design.ports.push(eda_core::ir::PortDecl {
+            name: name.to_string(),
+            dir: eda_core::ir::Dir::In,
+            base: symbol.base,
+            width: 1,
+        });
         Ok(())
     }
 
@@ -701,11 +791,27 @@ impl SlangAstLowerer {
         member: &serde_json::Value,
         name: &str,
     ) -> Result<(), String> {
-        if self.symbols.contains_key(name) {
-            return Err(format!("duplicate sparse-memory declaration '{name}'"));
-        }
         let memory = memory_type(&string_field(member, "type").unwrap_or_default())
             .ok_or_else(|| format!("cannot parse sparse-memory type for '{name}'"))?;
+        if let Some(existing) = self.symbols.get(name) {
+            let Some(memory_index) = existing.memory else {
+                return Err(format!("conflicting memory/net declaration '{name}'"));
+            };
+            let declared = &self.design.memories[memory_index];
+            let matches = existing.width == memory.element_width
+                && existing.signed == memory.signed
+                && declared.element_width == memory.element_width
+                && declared.element_msb == memory.element_msb
+                && declared.element_lsb == memory.element_lsb
+                && declared.dimensions == memory.dimensions
+                && declared.flat_length == memory.flat_length;
+            if !matches {
+                return Err(format!(
+                    "conflicting sparse-memory declarations for '{name}'"
+                ));
+            }
+            return Ok(());
+        }
         if member.get("initializer").is_some() {
             return Err(format!(
                 "direct slang-AST lowering does not yet support sparse-memory initializer '{name}'"
@@ -804,6 +910,15 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "continuous assignment has no right side".to_string())?;
+        if self.memory_element_select(left)?.is_some() || self.memory_range_select(left)?.is_some()
+        {
+            let body = self.lower_assignment(assignment)?;
+            self.design.processes.push(eda_core::ir::Process {
+                sens: eda_core::ir::Sens::Comb,
+                body,
+            });
+            return Ok(());
+        }
         let lv = self.lower_lvalue(left)?;
         let rhs = self.lower_expression(right)?;
         self.design.assigns.push(eda_core::ir::Assign {
@@ -1687,6 +1802,122 @@ fn remap_process(process: &mut eda_core::ir::Process, offset: usize) {
     }
     remap_sensitivity(&mut process.sens, offset);
     remap_statement(&mut process.body, offset);
+}
+
+fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, offset: usize) {
+    use eda_core::ir::Expr;
+    match expression {
+        Expr::Const(_) => {}
+        Expr::Ref { .. } => {}
+        Expr::Un { a, .. } => remap_expression_memory_ids(a, offset),
+        Expr::Bin { a, b, .. } => {
+            remap_expression_memory_ids(a, offset);
+            remap_expression_memory_ids(b, offset);
+        }
+        Expr::Cond { c, t, f } => {
+            remap_expression_memory_ids(c, offset);
+            remap_expression_memory_ids(t, offset);
+            remap_expression_memory_ids(f, offset);
+        }
+        Expr::Concat(parts) => parts
+            .iter_mut()
+            .for_each(|part| remap_expression_memory_ids(part, offset)),
+        Expr::Repeat { e, .. } | Expr::Signed { e, .. } => remap_expression_memory_ids(e, offset),
+        Expr::MemoryRead {
+            memory, indexes, ..
+        } => {
+            *memory += offset;
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression_memory_ids(index, offset));
+        }
+        Expr::MemoryReadPart {
+            memory,
+            indexes,
+            start,
+            ..
+        } => {
+            *memory += offset;
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression_memory_ids(index, offset));
+            remap_expression_memory_ids(start, offset);
+        }
+        Expr::Index { e, .. } => remap_expression_memory_ids(e, offset),
+    }
+}
+
+fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, offset: usize) {
+    use eda_core::ir::Stmt;
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter_mut()
+            .for_each(|statement| remap_statement_memory_ids(statement, offset)),
+        Stmt::Forever(body) => remap_statement_memory_ids(body, offset),
+        Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => remap_expression_memory_ids(e, offset),
+        Stmt::MemoryBl {
+            memory, indexes, e, ..
+        }
+        | Stmt::MemoryNBl {
+            memory, indexes, e, ..
+        } => {
+            *memory += offset;
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression_memory_ids(index, offset));
+            remap_expression_memory_ids(e, offset);
+        }
+        Stmt::MemoryBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        }
+        | Stmt::MemoryNBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        } => {
+            *memory += offset;
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression_memory_ids(index, offset));
+            remap_expression_memory_ids(start, offset);
+            remap_expression_memory_ids(e, offset);
+        }
+        Stmt::BlIndexed { start, e, .. } | Stmt::NBlIndexed { start, e, .. } => {
+            remap_expression_memory_ids(start, offset);
+            remap_expression_memory_ids(e, offset);
+        }
+        Stmt::If { c, t, f } => {
+            remap_expression_memory_ids(c, offset);
+            remap_statement_memory_ids(t, offset);
+            if let Some(f) = f {
+                remap_statement_memory_ids(f, offset);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            remap_expression_memory_ids(e, offset);
+            for (expression, _) in arms {
+                remap_expression_memory_ids(expression, offset);
+            }
+            if let Some(statement) = dflt {
+                remap_statement_memory_ids(statement, offset);
+            }
+        }
+        Stmt::Delay { body, .. } => remap_statement_memory_ids(body, offset),
+        Stmt::Display { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| remap_expression_memory_ids(argument, offset));
+        }
+        Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+            remap_expression_memory_ids(cond, offset)
+        }
+        Stmt::Finish => {}
+    }
 }
 
 fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::BinOp, String> {

@@ -834,6 +834,160 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_uses_multidimensional_indexed_part_writes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory2d-parts");
+    let source_path = root.join("memory2d-parts.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory2d_parts(
+  input logic clk,
+  input logic [1:0] x,
+  input logic [2:0] y,
+  input logic [2:0] start,
+  input logic [7:0] wdata,
+  output logic [7:0] q,
+  output logic [3:0] p
+);
+  logic [7:0] mem [0:1][2:3];
+  initial begin
+    mem[1][3] = 8'h34;
+  end
+  assign q = mem[x][y];
+  assign p = mem[x][y][start +: 4];
+  always @(posedge clk) mem[x][y][start +: 4] <= wdata[3:0];
+endmodule
+"#,
+    )
+    .expect("write multidimensional indexed part-write source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional indexed part write");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower multidimensional indexed part write through bounded path");
+    assert_eq!(direct.memories.len(), 1);
+    assert_eq!(direct.memories[0].dimensions.len(), 2);
+
+    let mut direct_simulator = Simulator::new(&direct).expect("create direct part-write simulator");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize direct clock");
+    direct_simulator
+        .set_input("x", &LogicWord::from_u64(2, 1))
+        .expect("set direct first index");
+    direct_simulator
+        .set_input("y", &LogicWord::from_u64(3, 3))
+        .expect("set direct second index");
+    direct_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set direct part start");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    direct_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x0a))
+        .expect("set direct part data");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create direct posedge");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0xa4));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0xa));
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create bounded part-write simulator");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize bounded clock");
+    reference_simulator
+        .set_input("x", &LogicWord::from_u64(2, 1))
+        .expect("set bounded first index");
+    reference_simulator
+        .set_input("y", &LogicWord::from_u64(3, 3))
+        .expect("set bounded second index");
+    reference_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set bounded part start");
+    assert_eq!(reference_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(reference_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    reference_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x0a))
+        .expect("set bounded part data");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create bounded posedge");
+    assert_eq!(reference_simulator.read("q").unwrap().to_u64(), Some(0xa4));
+    assert_eq!(reference_simulator.read("p").unwrap().to_u64(), Some(0xa));
+}
+
+#[test]
+fn slang_ast_direct_lowering_shares_child_sparse_memory_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-port");
+    let source_path = root.join("memory-port.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(
+  inout wire logic [7:0] memory [0:3],
+  output logic [7:0] q
+);
+  assign q = memory[2];
+endmodule
+
+module top(
+  input logic [7:0] din,
+  output logic [7:0] child_q,
+  output logic [7:0] parent_q
+);
+  wire logic [7:0] memory [0:3];
+  child u (
+    .memory(memory),
+    .q(child_q)
+  );
+  assign memory[2] = din;
+  assign parent_q = memory[2];
+endmodule
+"#,
+    )
+    .expect("write shared sparse-memory port source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower shared sparse-memory port");
+    let mut direct_simulator =
+        Simulator::new(&direct).expect("create direct shared-memory simulator");
+    direct_simulator
+        .set_input("din", &LogicWord::from_u64(8, 0xa7))
+        .expect("set direct shared data");
+    assert_eq!(
+        direct_simulator.read("child_q").unwrap().to_u64(),
+        Some(0xa7)
+    );
+    assert_eq!(
+        direct_simulator.read("parent_q").unwrap().to_u64(),
+        Some(0xa7)
+    );
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
