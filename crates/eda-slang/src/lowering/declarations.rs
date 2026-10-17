@@ -28,7 +28,9 @@ impl SlangAstLowerer {
                 return Ok(());
             }
         }
-        if string_field(target, "kind").as_deref() != Some("PackedStructType") {
+        let target_kind = string_field(target, "kind").unwrap_or_default();
+        let is_union = target_kind == "PackedUnionType";
+        if !matches!(target_kind.as_str(), "PackedStructType" | "PackedUnionType") {
             return Err(format!(
                 "direct slang-AST lowering does not support type alias '{name}' target"
             ));
@@ -36,7 +38,7 @@ impl SlangAstLowerer {
         let fields = target
             .get("members")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("packed struct type '{name}' has no fields"))?;
+            .ok_or_else(|| format!("packed aggregate type '{name}' has no fields"))?;
         let mut struct_fields = std::collections::BTreeMap::new();
         let mut width = 0_usize;
         for field in fields {
@@ -68,6 +70,11 @@ impl SlangAstLowerer {
                 self.net_type(&type_name)?.0.width
             };
             width = width.max(offset.saturating_add(field_width));
+            if is_union && offset != 0 {
+                return Err(format!(
+                    "packed union '{name}' member '{field_name}' does not start at bit zero"
+                ));
+            }
             struct_fields.insert(
                 field_name.to_string(),
                 AstStructField {
@@ -77,10 +84,16 @@ impl SlangAstLowerer {
                 },
             );
         }
+        if is_union && struct_fields.values().any(|field| field.width != width) {
+            return Err(format!(
+                "packed union '{name}' members must all have the same width"
+            ));
+        }
         let definition = AstStructType {
             width,
             signed: bool_field(target, "isSigned"),
             fields: struct_fields,
+            is_union,
         };
         self.type_aliases.insert(name, definition);
         Ok(())

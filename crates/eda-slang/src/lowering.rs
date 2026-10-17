@@ -65,6 +65,7 @@ struct AstStructType {
     width: usize,
     signed: bool,
     fields: std::collections::BTreeMap<String, AstStructField>,
+    is_union: bool,
 }
 
 #[derive(Clone)]

@@ -761,6 +761,9 @@ impl super::SlangAstLowerer {
         let definition = self.type_aliases.get(alias_name).ok_or_else(|| {
             format!("assignment pattern requires a packed struct type, found '{type_name}'")
         })?;
+        if definition.is_union {
+            return Err("packed union assignment patterns are not supported".into());
+        }
         let mut fields = definition.fields.values().copied().collect::<Vec<_>>();
         fields.sort_by(|left, right| right.offset.cmp(&left.offset));
 
@@ -1389,6 +1392,25 @@ impl super::SlangAstLowerer {
         let selected = value
             .get("value")
             .ok_or_else(|| "range select has no value".to_string())?;
+        if self.direct_packed_symbol(selected)?.is_none()
+            && string_field(selected, "kind").as_deref() == Some("MemberAccess")
+        {
+            let left = value
+                .get("left")
+                .ok_or_else(|| "range select has no left bound".to_string())?;
+            let right = value
+                .get("right")
+                .ok_or_else(|| "range select has no right bound".to_string())?;
+            let (left, right) = (constant_i64(left)?, constant_i64(right)?);
+            if left < right {
+                return Err("range selects on struct members must use descending bounds".into());
+            }
+            let base = self.lower_expression(selected)?;
+            if left >= base.width() as i64 || right < 0 {
+                return Err("range select is out of range for struct member".into());
+            }
+            return Ok((base, left as usize, right as usize));
+        }
         let (msb, lsb) = self.declared_range_indices(value)?;
         let base = self.lower_expression(selected)?;
         Ok((base, msb, lsb))

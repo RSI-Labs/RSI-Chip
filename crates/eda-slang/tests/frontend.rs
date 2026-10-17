@@ -2410,6 +2410,83 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_packed_union_types() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-packed-union");
+    let source_path = root.join("packed_union.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module packed_union(
+  input logic [7:0] byte_value,
+  input logic [15:0] word_value,
+  input logic select_word,
+  output logic [15:0] word_view,
+  output logic [7:0] byte_view,
+  output logic [15:0] whole
+);
+  typedef union packed {
+    logic [15:0] word;
+    logic [15:0] raw;
+  } value_t;
+
+  value_t value;
+  always_comb begin
+    if (select_word) value.word = word_value;
+    else value.raw = {8'h00, byte_value};
+  end
+  assign word_view = value.word;
+  assign byte_view = value.raw[7:0];
+  assign whole = value;
+endmodule
+"#,
+    )
+    .expect("write packed-union source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("packed_union"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower packed union");
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 3);
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "value")
+            .expect("packed union declaration")
+            .width,
+        16
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create packed-union simulator");
+    simulator
+        .set_input("byte_value", &LogicWord::from_u64(8, 0xa5))
+        .unwrap();
+    simulator
+        .set_input("select_word", &LogicWord::from_u64(1, 0))
+        .unwrap();
+    assert_eq!(simulator.read("whole").unwrap().to_u64(), Some(0x00a5));
+    assert_eq!(simulator.read("word_view").unwrap().to_u64(), Some(0x00a5));
+    assert_eq!(simulator.read("byte_view").unwrap().to_u64(), Some(0xa5));
+
+    simulator
+        .set_input("word_value", &LogicWord::from_u64(16, 0x1234))
+        .unwrap();
+    simulator
+        .set_input("select_word", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("whole").unwrap().to_u64(), Some(0x1234));
+    assert_eq!(simulator.read("word_view").unwrap().to_u64(), Some(0x1234));
+    assert_eq!(simulator.read("byte_view").unwrap().to_u64(), Some(0x34));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_packed_struct_assignment_patterns() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
