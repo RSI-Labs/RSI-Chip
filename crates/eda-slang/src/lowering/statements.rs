@@ -1,12 +1,14 @@
 //! Procedural block, statement, assignment, and memory-file lowering.
 
-use super::expressions::continuous_assignment_delay;
+use super::expressions::{constant_i64, continuous_assignment_delay};
 use super::hierarchy::full_range;
 use super::SlangAstLowerer;
 use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
     slang_constant_u64, string_field,
 };
+use crate::types::AstPackedDimension;
+use eda_core::logic::LogicWord;
 use serde_json::Value;
 
 impl SlangAstLowerer {
@@ -341,6 +343,9 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "assignment has no right side".to_string())?;
+        if let Some(statement) = self.dynamic_packed_element_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
         if let Some((memory, indexes)) = self.memory_element_select(left)? {
             let expression = self.lower_expression(right)?;
             return Ok(if bool_field(assignment, "isNonBlocking") {
@@ -386,6 +391,120 @@ impl SlangAstLowerer {
         } else {
             Ok(Stmt::Bl { lv, e: expression })
         }
+    }
+
+    fn dynamic_packed_element_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        use eda_core::ir::{LValue, Stmt};
+
+        if string_field(left, "kind").as_deref() != Some("ElementSelect")
+            || self.memory_element_select(left)?.is_some()
+        {
+            return Ok(None);
+        }
+        let selected = left
+            .get("value")
+            .ok_or_else(|| "packed assignment select has no selected value".to_string())?;
+        let selector = left
+            .get("selector")
+            .ok_or_else(|| "packed assignment select has no selector".to_string())?;
+        let Some(symbol) = self.direct_packed_symbol(selected)? else {
+            return Ok(None);
+        };
+        let Some(dimension) = symbol.dimensions.first() else {
+            return Ok(None);
+        };
+        if constant_i64(selector).is_ok() {
+            return Ok(None);
+        }
+
+        self.lower_dynamic_packed_group(symbol.width, dimension, selector, selected, right)
+            .map(|expression| {
+                let lv = LValue {
+                    net: symbol.base,
+                    decl_width: symbol.width,
+                    range: full_range(symbol.width),
+                };
+                if bool_field(assignment, "isNonBlocking") {
+                    Stmt::NBl { lv, e: expression }
+                } else {
+                    Stmt::Bl { lv, e: expression }
+                }
+            })
+            .map(Some)
+    }
+
+    fn lower_dynamic_packed_group(
+        &self,
+        base_width: usize,
+        dimension: &AstPackedDimension,
+        selector: &serde_json::Value,
+        selected: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let group_width = dimension.element_width;
+        let value = self.lower_expression(right)?;
+        if value.width() != group_width {
+            return Err(format!(
+                "dynamic packed assignment width {} does not match selected dimension width {group_width}",
+                value.width()
+            ));
+        }
+        let selector_width = string_field(selector, "type")
+            .and_then(|type_name| crate::types::simple_type_width(&type_name))
+            .unwrap_or(32)
+            .max(1);
+        let selector_value = self.lower_expression(selector)?;
+        let old_value = self.lower_expression(selected)?;
+        let mut physical_bits = vec![None; base_width];
+
+        for coordinate in 0..dimension.length {
+            let logical_index = if dimension.msb >= dimension.lsb {
+                dimension.lsb + coordinate as i64
+            } else {
+                dimension.lsb - coordinate as i64
+            };
+            let condition = Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(selector_value.clone()),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    selector_width,
+                    logical_index as u64,
+                ))),
+            };
+            for bit in 0..group_width {
+                let physical_bit = coordinate * group_width + bit;
+                let updated = Expr::Index {
+                    e: Box::new(value.clone()),
+                    msb: bit,
+                    lsb: bit,
+                };
+                let old = Expr::Index {
+                    e: Box::new(old_value.clone()),
+                    msb: physical_bit,
+                    lsb: physical_bit,
+                };
+                physical_bits[physical_bit] = Some(Expr::Cond {
+                    c: Box::new(condition.clone()),
+                    t: Box::new(updated),
+                    f: Box::new(old),
+                });
+            }
+        }
+
+        let mut bits = Vec::with_capacity(base_width);
+        for bit in physical_bits.into_iter().rev() {
+            bits.push(bit.ok_or_else(|| {
+                "dynamic packed assignment did not cover a physical bit".to_string()
+            })?);
+        }
+        Ok(Expr::Concat(bits))
     }
 
     pub(super) fn push_assignment(&mut self, name: String, rhs: eda_core::ir::Expr) {

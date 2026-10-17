@@ -94,6 +94,9 @@ pub struct SlangAssignmentSummary {
     pub target_names: Vec<String>,
     pub rhs: SlangExpressionSummary,
     pub nonblocking: bool,
+    /// Dynamic packed selects are canonicalized into whole-vector update
+    /// expressions by direct lowering, so exact RHS equivalence is deferred.
+    pub dynamic_packed_lvalue: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

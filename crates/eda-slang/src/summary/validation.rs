@@ -183,7 +183,9 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
-                        let shape = if legacy_array_targets.contains(target) {
+                        let shape = if legacy_array_targets.contains(target)
+                            || assignment.dynamic_packed_lvalue
+                        {
                             // Small arrays still use the legacy bounded
                             // per-element expansion, whose expression tree is
                             // intentionally not structurally equivalent to the

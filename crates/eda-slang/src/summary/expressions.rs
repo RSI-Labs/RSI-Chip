@@ -124,10 +124,17 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
     let mut assignments = Vec::new();
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
+            let dynamic_packed_lvalue = string_field(left, "kind").as_deref()
+                == Some("ElementSelect")
+                && left.get("selector").is_some_and(|selector| {
+                    integer_literal_word(selector).is_none()
+                        && string_field(selector, "constant").is_none()
+                });
             assignments.push(SlangAssignmentSummary {
                 target_names: expression_target_names(left),
                 rhs: expression_summary(right),
                 nonblocking: bool_field(value, "isNonBlocking"),
+                dynamic_packed_lvalue,
             });
         }
     }

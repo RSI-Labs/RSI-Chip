@@ -345,6 +345,9 @@ impl super::SlangAstLowerer {
                         ascending,
                     });
                 }
+                if let Some(selected) = self.lower_dynamic_indexed_range_select(value)? {
+                    return Ok(selected);
+                }
                 let (base, msb, lsb) = self.lower_constant_range(value)?;
                 Ok(Expr::Index {
                     e: Box::new(base),
@@ -392,6 +395,85 @@ impl super::SlangAstLowerer {
         let base = self.lower_expression(selected)?;
         self.select_packed_dimension(&symbol, &selectors, 0, base)
             .map(Some)
+    }
+
+    pub(super) fn lower_dynamic_indexed_range_select(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        if string_field(value, "kind").as_deref() != Some("RangeSelect") {
+            return Ok(None);
+        }
+        let selection_kind = string_field(value, "selectionKind").unwrap_or_default();
+        if !matches!(selection_kind.as_str(), "IndexedUp" | "IndexedDown") {
+            return Ok(None);
+        }
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "indexed packed select has no selected value".to_string())?;
+        let Some(symbol) = self.direct_packed_symbol(selected)? else {
+            return Ok(None);
+        };
+        let start_value = value
+            .get("left")
+            .ok_or_else(|| "indexed packed select has no start".to_string())?;
+        let width_value = value
+            .get("right")
+            .ok_or_else(|| "indexed packed select has no width".to_string())?;
+        let width = constant_index(width_value)?;
+        if width == 0 || width > symbol.width {
+            return Err(format!(
+                "indexed packed select width {width} exceeds declaration width {}",
+                symbol.width
+            ));
+        }
+
+        let start = self.lower_expression(start_value)?;
+        let start_width = start.width().max(1);
+        let mut selected_expression = Expr::Const(LogicWord::xes(width));
+        let starts = if selection_kind == "IndexedUp" {
+            0..=symbol.width - width
+        } else {
+            width - 1..=symbol.width - 1
+        };
+        for physical_start in starts {
+            let (msb, lsb) = if selection_kind == "IndexedUp" {
+                (physical_start + width - 1, physical_start)
+            } else {
+                (physical_start, physical_start + 1 - width)
+            };
+            let candidate = Expr::Index {
+                e: Box::new(self.lower_expression(selected)?),
+                msb,
+                lsb,
+            };
+            if constant_i64(start_value).is_ok() {
+                let constant_start = constant_i64(start_value)?;
+                if constant_start == physical_start as i64 {
+                    return Ok(Some(candidate));
+                }
+                continue;
+            }
+            let condition = Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(start.clone()),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    start_width,
+                    physical_start as u64,
+                ))),
+            };
+            selected_expression = Expr::Cond {
+                c: Box::new(condition),
+                t: Box::new(candidate),
+                f: Box::new(selected_expression),
+            };
+        }
+        if constant_i64(start_value).is_ok() {
+            return Err("constant indexed packed select start is out of range".to_string());
+        }
+        Ok(Some(selected_expression))
     }
 
     fn select_packed_dimension(

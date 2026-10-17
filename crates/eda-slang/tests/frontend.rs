@@ -2290,6 +2290,105 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_dynamic_packed_lvalues() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-packed-lvalue");
+    let source_path = root.join("dynamic_lvalue.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_lvalue(
+  input logic clk,
+  input logic [2:0] selector,
+  input logic value,
+  output logic [7:0] q
+);
+  always_ff @(posedge clk) q[selector] <= value;
+endmodule
+"#,
+    )
+    .expect("write dynamic packed-lvalue source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_lvalue"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower dynamic packed lvalue");
+    assert_eq!(design.initials.len(), 0);
+    assert_eq!(design.processes.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic lvalue simulator");
+    let mut expected = 0_u64;
+    for selector in 0..8_u64 {
+        let value = selector % 2;
+        expected |= value << selector;
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 0))
+            .unwrap();
+        simulator
+            .set_input("selector", &LogicWord::from_u64(3, selector))
+            .unwrap();
+        simulator
+            .set_input("value", &LogicWord::from_u64(1, value))
+            .unwrap();
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .unwrap();
+    }
+    assert_eq!(simulator.read("q").unwrap().to_u64(), Some(expected));
+
+    let packed_path = root.join("dynamic_packed_lvalue.sv");
+    std::fs::write(
+        &packed_path,
+        r#"
+module dynamic_packed_lvalue(
+  input logic clk,
+  input logic [1:0] selector,
+  input logic [7:0] value,
+  output logic [3:0][7:0] q
+);
+  always_ff @(posedge clk) q[selector] <= value;
+endmodule
+"#,
+    )
+    .expect("write dynamic multi-packed lvalue source");
+    let packed = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&packed_path),
+            Some("dynamic_packed_lvalue"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower dynamic multi-packed lvalue");
+    let mut packed_simulator = Simulator::new(&packed).expect("create packed lvalue simulator");
+    let mut bytes = [0_u64; 4];
+    for selector in 0..4_u64 {
+        let value = 0x10 + selector;
+        bytes[selector as usize] = value;
+        packed_simulator
+            .set_input("clk", &LogicWord::from_u64(1, 0))
+            .unwrap();
+        packed_simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        packed_simulator
+            .set_input("value", &LogicWord::from_u64(8, value))
+            .unwrap();
+        packed_simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .unwrap();
+    }
+    let expected = bytes
+        .iter()
+        .rev()
+        .fold(0_u64, |acc, byte| (acc << 8) | byte);
+    assert_eq!(packed_simulator.read("q").unwrap().to_u64(), Some(expected));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_arithmetic_shifts() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -2348,6 +2447,63 @@ endmodule
             Some(expected_right),
             "shift right {shift}"
         );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_indexed_packed_part_selects() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-indexed-packed");
+    let source_path = root.join("indexed_packed.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module indexed_packed(
+  input logic [15:0] a,
+  input logic [3:0] start,
+  output logic [7:0] up,
+  output logic [7:0] down
+);
+  assign up = a[start +: 8];
+  assign down = a[start -: 8];
+endmodule
+"#,
+    )
+    .expect("write indexed packed select source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("indexed_packed"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower indexed packed selects");
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create indexed select simulator");
+    for (start, expected_up, expected_down) in [
+        (0_u64, 0x34_u64, 0),
+        (4, 0x23, 0),
+        (7, 0x24, 0x34),
+        (8, 0x12, 0x1a),
+    ] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(16, 0x1234))
+            .unwrap();
+        simulator
+            .set_input("start", &LogicWord::from_u64(4, start))
+            .unwrap();
+        assert_eq!(simulator.read("up").unwrap().to_u64(), Some(expected_up));
+        if start >= 7 {
+            assert_eq!(
+                simulator.read("down").unwrap().to_u64(),
+                Some(expected_down)
+            );
+        } else {
+            assert!(simulator.read("down").unwrap().to_u64().is_none());
+        }
     }
 }
 
