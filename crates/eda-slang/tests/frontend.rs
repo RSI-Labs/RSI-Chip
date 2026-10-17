@@ -396,6 +396,138 @@ module top(input logic a, output logic y); middle u (.a(a), .y(y)); endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_uses_sparse_memory_operations() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory");
+    let source_path = root.join("memory.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory(
+  input logic clk,
+  input logic write,
+  input logic [1:0] addr,
+  input logic [7:0] wdata,
+  output logic [7:0] rdata
+);
+  logic [7:0] mem [0:3];
+  initial begin
+    mem[0] = 8'h11;
+    mem[1] = 8'h22;
+  end
+  always_comb rdata = mem[addr];
+  always @(posedge clk) begin
+    if (write) mem[addr] <= wdata;
+  end
+endmodule
+"#,
+    )
+    .expect("write sparse-memory source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse memory");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("memory"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower sparse memory through the preprocessed path");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].name, "mem");
+    assert_eq!(design.memories[0].element_width, 8);
+    assert_eq!(design.memories[0].flat_length, 4);
+    assert!(reference.memories.is_empty());
+    assert_eq!(
+        format!("{:?}", reference.ports),
+        format!("{:?}", design.ports)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create sparse-memory simulator");
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize clk");
+    simulator
+        .set_input("write", &LogicWord::from_u64(1, 0))
+        .expect("initialize write");
+    simulator
+        .set_input("addr", &LogicWord::from_u64(2, 0))
+        .expect("select initialized element");
+    assert_eq!(simulator.read("rdata").unwrap().to_u64(), Some(0x11));
+
+    simulator
+        .set_input("addr", &LogicWord::from_u64(2, 2))
+        .expect("select write element");
+    simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0xaa))
+        .expect("set write data");
+    simulator
+        .set_input("write", &LogicWord::from_u64(1, 1))
+        .expect("request write");
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create sparse-memory posedge");
+    assert_eq!(simulator.read("rdata").unwrap().to_u64(), Some(0xaa));
+
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("reset clk");
+    simulator
+        .set_input("addr", &LogicWord::from_u64(2, 1))
+        .expect("select another initialized element");
+    assert_eq!(simulator.read("rdata").unwrap().to_u64(), Some(0x22));
+
+    simulator
+        .set_input("addr", &LogicWord::from_u64(2, 2))
+        .expect("select overwritten element");
+    assert_eq!(simulator.read("rdata").unwrap().to_u64(), Some(0xaa));
+
+    simulator
+        .set_input("addr", &LogicWord::from_u64(2, 3))
+        .expect("select out-of-range element");
+    assert_eq!(simulator.read("rdata").unwrap().to_u64(), None);
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create legacy-array simulator");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize legacy clk");
+    reference_simulator
+        .set_input("write", &LogicWord::from_u64(1, 0))
+        .expect("initialize legacy write");
+    reference_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 0))
+        .expect("select initialized legacy element");
+    assert_eq!(
+        reference_simulator.read("rdata").unwrap().to_u64(),
+        Some(0x11)
+    );
+    reference_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 2))
+        .expect("select legacy write element");
+    reference_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0xaa))
+        .expect("set legacy write data");
+    reference_simulator
+        .set_input("write", &LogicWord::from_u64(1, 1))
+        .expect("request legacy write");
+    reference_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create legacy posedge");
+    assert_eq!(
+        reference_simulator.read("rdata").unwrap().to_u64(),
+        Some(0xaa)
+    );
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

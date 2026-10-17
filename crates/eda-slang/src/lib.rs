@@ -390,6 +390,16 @@ struct AstLoweredSymbol {
     base: usize,
     width: usize,
     signed: bool,
+    memory: Option<usize>,
+}
+
+struct AstMemoryType {
+    element_width: usize,
+    element_msb: i64,
+    element_lsb: i64,
+    dimensions: Vec<eda_core::ir::MemoryDimension>,
+    flat_length: u64,
+    signed: bool,
 }
 
 struct SlangAstLowerer {
@@ -673,12 +683,61 @@ impl SlangAstLowerer {
     fn lower_declaration(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
+        if memory_type(&string_field(member, "type").unwrap_or_default()).is_some() {
+            self.lower_memory_declaration(member, &name)?;
+            return Ok(());
+        }
         let symbol = self.declare_net(member, &name, &kind)?;
         if let Some(initializer) = member.get("initializer") {
             let rhs = self.lower_expression(initializer)?;
             let _ = symbol;
             self.push_assignment(name, rhs);
         }
+        Ok(())
+    }
+
+    fn lower_memory_declaration(
+        &mut self,
+        member: &serde_json::Value,
+        name: &str,
+    ) -> Result<(), String> {
+        if self.symbols.contains_key(name) {
+            return Err(format!("duplicate sparse-memory declaration '{name}'"));
+        }
+        let memory = memory_type(&string_field(member, "type").unwrap_or_default())
+            .ok_or_else(|| format!("cannot parse sparse-memory type for '{name}'"))?;
+        if member.get("initializer").is_some() {
+            return Err(format!(
+                "direct slang-AST lowering does not yet support sparse-memory initializer '{name}'"
+            ));
+        }
+        let base = self.design.n_nets;
+        self.design.n_nets += 1;
+        self.design.net_decls.push(eda_core::ir::NetDecl {
+            name: name.to_string(),
+            width: 1,
+            is_reg: true,
+            is_signed: memory.signed,
+            base,
+        });
+        let memory_index = self.design.memories.len();
+        self.design.memories.push(eda_core::ir::MemoryDecl {
+            name: name.to_string(),
+            element_width: memory.element_width,
+            element_msb: memory.element_msb,
+            element_lsb: memory.element_lsb,
+            dimensions: memory.dimensions,
+            flat_length: memory.flat_length,
+        });
+        self.symbols.insert(
+            name.to_string(),
+            AstLoweredSymbol {
+                base,
+                width: memory.element_width,
+                signed: memory.signed,
+                memory: Some(memory_index),
+            },
+        );
         Ok(())
     }
 
@@ -721,6 +780,7 @@ impl SlangAstLowerer {
             base,
             width,
             signed,
+            memory: None,
         };
         self.design.n_nets += width;
         self.design.net_decls.push(eda_core::ir::NetDecl {
@@ -803,6 +863,9 @@ impl SlangAstLowerer {
     }
 
     fn lower_sensitivity(&self, timing: &serde_json::Value) -> Result<eda_core::ir::Sens, String> {
+        if string_field(timing, "kind").as_deref() == Some("ImplicitEvent") {
+            return Ok(eda_core::ir::Sens::Comb);
+        }
         if string_field(timing, "kind").as_deref() != Some("SignalEvent") {
             return Err(
                 "direct slang-AST lowering supports only a single signal event sensitivity".into(),
@@ -933,6 +996,22 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "assignment has no right side".to_string())?;
+        if let Some((memory, indexes)) = self.memory_element_select(left)? {
+            let expression = self.lower_expression(right)?;
+            return Ok(if bool_field(assignment, "isNonBlocking") {
+                Stmt::MemoryNBl {
+                    memory,
+                    indexes,
+                    e: expression,
+                }
+            } else {
+                Stmt::MemoryBl {
+                    memory,
+                    indexes,
+                    e: expression,
+                }
+            });
+        }
         let lv = self.lower_lvalue(left)?;
         let expression = self.lower_expression(right)?;
         if bool_field(assignment, "isNonBlocking") {
@@ -977,6 +1056,11 @@ impl SlangAstLowerer {
                 self.lower_lvalue(operand)
             }
             Some("ElementSelect") => {
+                if self.memory_element_select(value)?.is_some() {
+                    return Err(
+                        "sparse-memory selects require the memory assignment lowering path".into(),
+                    );
+                }
                 let (lv, index) = self.lower_constant_select_lvalue(value)?;
                 Ok(eda_core::ir::LValue {
                     net: lv.net,
@@ -1119,6 +1203,22 @@ impl SlangAstLowerer {
                 })
             }
             "ElementSelect" => {
+                if let Some((memory, indexes)) = self.memory_element_select(value)? {
+                    let symbol = self.design.memories[memory].clone();
+                    let signed = self
+                        .design
+                        .net_decls
+                        .iter()
+                        .find(|declaration| declaration.name == symbol.name)
+                        .map(|declaration| declaration.is_signed)
+                        .unwrap_or(false);
+                    return Ok(Expr::MemoryRead {
+                        memory,
+                        indexes,
+                        width: symbol.element_width,
+                        signed,
+                    });
+                }
                 let (base, index) = self.lower_constant_select(value)?;
                 Ok(Expr::Index {
                     e: Box::new(base),
@@ -1153,6 +1253,33 @@ impl SlangAstLowerer {
         let index = constant_index(selector)?;
         let base = self.lower_expression(selected)?;
         Ok((base, index))
+    }
+
+    fn memory_element_select(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<(usize, Vec<eda_core::ir::Expr>)>, String> {
+        if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+            return Ok(None);
+        }
+        let selected = value
+            .get("value")
+            .ok_or_else(|| "element select has no value".to_string())?;
+        if string_field(selected, "kind").as_deref() != Some("NamedValue") {
+            return Ok(None);
+        }
+        let name = expression_symbol(selected)
+            .ok_or_else(|| "memory element select has no symbol".to_string())?;
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        let selector = value
+            .get("selector")
+            .ok_or_else(|| "memory element select has no selector".to_string())?;
+        Ok(Some((memory, vec![self.lower_expression(selector)?])))
     }
 
     fn lower_constant_select_lvalue(
@@ -1221,6 +1348,47 @@ fn declaration_name(member: &serde_json::Value, kind: &str) -> Result<String, St
 fn simple_type_signed(type_name: &str) -> Option<bool> {
     simple_type_width(type_name)
         .map(|_| type_name.split_whitespace().any(|token| token == "signed"))
+}
+
+fn parse_type_range(text: &str) -> Option<(i64, i64)> {
+    let text = text.trim();
+    let start = text.rfind('[')?;
+    if !text.ends_with(']') || start + 1 >= text.len() - 1 {
+        return None;
+    }
+    let (left, right) = text[start + 1..text.len() - 1].split_once(':')?;
+    Some((
+        left.trim().parse::<i64>().ok()?,
+        right.trim().parse::<i64>().ok()?,
+    ))
+}
+
+fn memory_type(type_name: &str) -> Option<AstMemoryType> {
+    let separator = type_name.find('$')?;
+    let element_type = type_name[..separator].trim();
+    let dimension_type = type_name[separator + 1..].trim();
+    if dimension_type.contains('$') {
+        return None;
+    }
+    let element_width = simple_type_width(element_type)?;
+    let (element_msb, element_lsb) =
+        parse_type_range(element_type).unwrap_or((element_width as i64 - 1, 0));
+    if (element_msb - element_lsb).unsigned_abs() as usize + 1 != element_width {
+        return None;
+    }
+    let (base, last) = parse_type_range(dimension_type)?;
+    let step = if base <= last { 1 } else { -1 };
+    let length = usize::try_from((base as i128 - last as i128).unsigned_abs() + 1).ok()?;
+    let mut flat_length = 1_u64;
+    flat_length = flat_length.checked_mul(u64::try_from(length).ok()?)?;
+    Some(AstMemoryType {
+        element_width,
+        element_msb,
+        element_lsb,
+        dimensions: vec![eda_core::ir::MemoryDimension { base, step, length }],
+        flat_length,
+        signed: simple_type_signed(element_type)?,
+    })
 }
 
 fn full_range(width: usize) -> eda_core::ir::Range {
@@ -1772,17 +1940,37 @@ impl SlangAstSummary {
             .collect();
         let mut expected_procedural_targets: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
+        let legacy_array_targets: std::collections::BTreeSet<String> = self
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.type_name.contains('$')
+                    && !design
+                        .memories
+                        .iter()
+                        .any(|memory| memory.name == declaration.name)
+            })
+            .map(|declaration| declaration.name.clone())
+            .collect();
         for block in &self.procedural_blocks {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
+                        let shape = if legacy_array_targets.contains(target) {
+                            // Small arrays still use the legacy bounded
+                            // per-element expansion, whose expression tree is
+                            // intentionally not structurally equivalent to the
+                            // slang source. Preserve assignment-count checking
+                            // without guessing an equivalence.
+                            "?".to_string()
+                        } else {
+                            slang_expression_fingerprint(&assignment.rhs)
+                                .unwrap_or_else(|| "?".to_string())
+                        };
                         expected_procedural_targets
                             .entry(target.clone())
                             .or_default()
-                            .push(
-                                slang_expression_fingerprint(&assignment.rhs)
-                                    .unwrap_or_else(|| "?".to_string()),
-                            );
+                            .push(shape);
                     }
                 }
             }
@@ -1949,6 +2137,14 @@ fn expression_target_names(value: &Value) -> Vec<String> {
         } else {
             vec![name.to_string()]
         }
+    } else if matches!(
+        string_field(value, "kind").as_deref(),
+        Some("ElementSelect" | "RangeSelect")
+    ) {
+        value
+            .get("value")
+            .map(expression_target_names)
+            .unwrap_or_default()
     } else {
         value
             .as_object()

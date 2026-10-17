@@ -57,9 +57,9 @@ instance inventory against the slang AST. `compile_files_via_ast`
 additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
 if/case control flow, single posedge/negedge sensitivity, recursive
-parameterized module hierarchy with port connections, and generated members
-directly from slang's
-elaborated AST—without preprocessing and reparsing—and reports
+parameterized module hierarchy with port connections, generated members, and
+one-dimensional sparse-memory reads/writes directly from slang's elaborated
+AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate
 the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
 reference source with `UVM_NO_DPI`. This establishes a full-language validation
