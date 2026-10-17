@@ -1439,6 +1439,7 @@ impl<'d> Simulator<'d> {
                     None => LogicWord::xes(8),
                 }
             }
+            Expr::StringCase { e, upper } => change_string_case(&self.eval(e), *upper),
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1644,6 +1645,25 @@ fn packed_string_byte(word: &LogicWord, index: usize) -> LogicWord {
     word.slice(index * 8 + 7, index * 8)
 }
 
+fn change_string_case(word: &LogicWord, upper: bool) -> LogicWord {
+    let Some(length) = ascii_string_length(word) else {
+        return LogicWord::xes(word.width());
+    };
+    let mut bytes = Vec::with_capacity(length);
+    for byte in 0..length {
+        let value = packed_string_byte(word, byte);
+        let Some(value) = value.to_u64().map(|value| value as u8) else {
+            return LogicWord::xes(word.width());
+        };
+        bytes.push(if upper {
+            value.to_ascii_uppercase()
+        } else {
+            value.to_ascii_lowercase()
+        });
+    }
+    LogicWord::from_bytes_le(word.width(), &bytes)
+}
+
 fn concat_packed_strings(
     left: &LogicWord,
     left_length: usize,
@@ -1741,6 +1761,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(e, out);
             walk_expr(index, out);
         }
+        Expr::StringCase { e, .. } => walk_expr(e, out),
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1788,6 +1809,7 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(e, out);
             walk_expr_memories(index, out);
         }
+        Expr::StringCase { e, .. } => walk_expr_memories(e, out),
         Expr::MemoryReadPart {
             memory,
             indexes,

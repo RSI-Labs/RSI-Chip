@@ -136,6 +136,9 @@ impl<'a> Synth<'a> {
             Expr::StringGetByte { .. } => {
                 return Err("bounded string indexing is not synthesizable yet".into())
             }
+            Expr::StringCase { .. } => {
+                return Err("bounded string case conversion is not synthesizable yet".into())
+            }
         })
     }
 

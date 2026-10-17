@@ -33,6 +33,7 @@ impl SlangAstLowerer {
             "name" => return self.lower_enum_name(value),
             "len" => return self.lower_string_len(value),
             "getc" => return self.lower_string_getc(value),
+            "toupper" | "tolower" => return self.lower_string_case(value, subroutine == "toupper"),
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -666,6 +667,30 @@ impl SlangAstLowerer {
             return Err("string getc receiver is not a string".into());
         }
         self.lower_string_get_byte(receiver, index)
+    }
+
+    fn lower_string_case(&self, value: &Value, upper: bool) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string case call has no receiver".to_string())?;
+        if arguments.len() != 1 {
+            return Err("string case conversion expects one string receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string case call has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string case receiver is not a string".into());
+        }
+        let receiver = self.lower_expression(receiver)?;
+        if receiver.width() != crate::types::STRING_WIDTH {
+            return Err("string case conversion requires a 512-bit string".into());
+        }
+        Ok(eda_core::ir::Expr::StringCase {
+            e: Box::new(receiver),
+            upper,
+        })
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {

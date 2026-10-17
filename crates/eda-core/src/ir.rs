@@ -412,6 +412,11 @@ pub enum Expr {
         e: Box<Expr>,
         index: Box<Expr>,
     },
+    /// Converts bounded ASCII string bytes to upper or lower case.
+    StringCase {
+        e: Box<Expr>,
+        upper: bool,
+    },
 }
 
 impl Expr {
@@ -450,6 +455,7 @@ impl Expr {
             Expr::StringLength { .. } => 32,
             Expr::StringConcat { left, .. } => left.width(),
             Expr::StringGetByte { .. } => 8,
+            Expr::StringCase { e, .. } => e.width(),
         }
     }
 
@@ -486,6 +492,7 @@ impl Expr {
             Expr::StringLength { .. } => true,
             Expr::StringConcat { .. } => false,
             Expr::StringGetByte { .. } => false,
+            Expr::StringCase { .. } => false,
         }
     }
 }
@@ -1072,6 +1079,7 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             collect_memory_expr_reads(e, synchronous, accesses);
             collect_memory_expr_reads(index, synchronous, accesses);
         }
+        Expr::StringCase { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
     }
 }
 

@@ -2917,6 +2917,7 @@ module strings(
   input logic [1:0] selector,
   input string left,
   input string right,
+  input string mixed,
   input int byte_index,
   output string literal_value,
   output string joined,
@@ -2929,7 +2930,9 @@ module strings(
   output byte constant_byte,
   output byte dynamic_byte,
   output byte method_byte,
-  output byte out_of_range
+  output byte out_of_range,
+  output string upper_value,
+  output string lower_value
 );
   typedef enum logic [1:0] {
     A = 2'b00,
@@ -2953,6 +2956,8 @@ module strings(
   assign invalid_name = state_t'(2'b11).name();
   assign left_length = left.len();
   assign right_length = right.len();
+  assign upper_value = mixed.toupper();
+  assign lower_value = mixed.tolower();
 endmodule
 "#,
     )
@@ -2966,7 +2971,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 8);
+    assert_eq!(design.assigns.len(), 10);
     assert_eq!(
         design
             .net_decls
@@ -2990,6 +2995,9 @@ endmodule
             .unwrap();
         simulator
             .set_input("right", &LogicWord::from_bytes_le(512, b"-STATE"))
+            .unwrap();
+        simulator
+            .set_input("mixed", &LogicWord::from_bytes_le(512, b"aBcD"))
             .unwrap();
         simulator
             .set_input("byte_index", &LogicWord::from_u64(32, selector))
@@ -3056,6 +3064,20 @@ endmodule
             Some(expected_byte)
         );
         assert_eq!(simulator.read("out_of_range").unwrap().to_u64(), Some(0));
+        assert_eq!(
+            simulator
+                .read("upper_value")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "ABCD"
+        );
+        assert_eq!(
+            simulator
+                .read("lower_value")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "abcd"
+        );
     }
 }
 
