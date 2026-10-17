@@ -921,10 +921,14 @@ pub(super) fn subst_stmt(stmt: &ast::Stmt, var: &str, value: i64) -> ast::Stmt {
             radix,
             path,
             memory,
+            start,
+            finish,
         } => ast::Stmt::ReadMem {
             radix: *radix,
             path: path.clone(),
             memory: memory.clone(),
+            start: start.as_ref().map(|start| subst_expr(start, var, value)),
+            finish: finish.as_ref().map(|finish| subst_expr(finish, var, value)),
         },
     }
 }

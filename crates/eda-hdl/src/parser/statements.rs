@@ -242,18 +242,26 @@ impl Parser {
                 };
                 self.expect_punct(",")?;
                 let memory = self.ident()?;
-                if self.eat_punct(",") {
-                    return Err(format!(
-                        "line {}: bounded {s} supports only (file, memory)",
-                        line
-                    ));
+                let mut bounds = Vec::new();
+                while self.eat_punct(",") {
+                    if bounds.len() == 2 {
+                        return Err(format!(
+                            "line {}: {s} supports at most (file, memory, start, finish)",
+                            line
+                        ));
+                    }
+                    bounds.push(self.parse_expr()?);
                 }
                 self.expect_punct(")")?;
                 self.expect_punct(";")?;
+                let start = bounds.first().cloned();
+                let finish = bounds.get(1).cloned();
                 return Ok(Stmt::ReadMem {
                     radix,
                     path,
                     memory,
+                    start,
+                    finish,
                 });
             }
             if s == "$display"

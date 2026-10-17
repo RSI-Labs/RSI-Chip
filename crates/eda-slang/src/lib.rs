@@ -1125,10 +1125,11 @@ impl SlangAstLowerer {
             .get("arguments")
             .and_then(Value::as_array)
             .ok_or_else(|| "memory-file call has no arguments".to_string())?;
-        if arguments.len() != 2 {
-            return Err(
-                "direct slang-AST lowering supports only two-argument $readmemh/$readmemb".into(),
-            );
+        if arguments.len() < 2 || arguments.len() > 4 {
+            return Err(format!(
+                "direct slang-AST lowering supports two to four arguments for $readmem tasks, got {}",
+                arguments.len()
+            ));
         }
         let raw_path = string_field(&arguments[0], "literal")
             .ok_or_else(|| "memory-file call requires a string literal path".to_string())?;
@@ -1144,10 +1145,17 @@ impl SlangAstLowerer {
         let memory = symbol
             .memory
             .ok_or_else(|| format!("memory-file target '{name}' is not a sparse memory"))?;
+        let start = arguments.get(2).map(slang_constant_u64).transpose()?;
+        let finish = arguments.get(3).map(slang_constant_u64).transpose()?;
         let declaration = &self.design.memories[memory];
         let path = resolve_memory_file_path(&raw_path, statement);
-        let values =
-            eda_core::memory_file::read_memory_file(&path, radix, declaration.element_width)?;
+        let values = eda_core::memory_file::read_memory_file(
+            &path,
+            radix,
+            declaration.element_width,
+            start,
+        )?;
+        let values = eda_core::memory_file::filter_memory_file_finish(values, start, finish)?;
         let mut statements = Vec::with_capacity(values.len());
         for physical_index in values.keys().copied().collect::<Vec<_>>() {
             let logical_indexes =
@@ -2660,6 +2668,14 @@ fn constant_json_word(value: &serde_json::Value) -> Option<eda_core::logic::Logi
     let type_name = string_field(value, "type")?;
     let raw = string_field(value, "constant")?;
     literal_word(&type_name, &raw)
+}
+
+fn slang_constant_u64(value: &serde_json::Value) -> Result<u64, String> {
+    integer_literal_word(value)
+        .or_else(|| named_constant_word(value))
+        .or_else(|| constant_json_word(value))
+        .and_then(|word| word.to_u64())
+        .ok_or_else(|| "memory-file start/finish bounds must be integer constants".to_string())
 }
 
 fn memory_initializer_statements(

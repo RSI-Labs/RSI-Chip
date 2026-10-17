@@ -1155,6 +1155,65 @@ endmodule
 }
 
 #[test]
+fn slang_and_bounded_memory_file_ranges_load_the_same_elements() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-readmem-range");
+    let source_path = root.join("readmem-range.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module readmem_range(
+  output logic [7:0] first,
+  output logic [7:0] second,
+  output logic [7:0] third,
+  output logic [7:0] after
+);
+  logic [7:0] mem [0:4096];
+  initial $readmemh("range.hex", mem, 2, 4);
+  assign first = mem[2];
+  assign second = mem[3];
+  assign third = mem[4];
+  assign after = mem[5];
+endmodule
+"#,
+    )
+    .expect("write ranged memory-file source");
+    std::fs::write(root.join("range.hex"), "01 02 03 04 05\n").expect("write range data");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("readmem_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower ranged memory file");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("readmem_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower ranged memory file through bounded path");
+    assert_eq!(direct.memories.len(), 1);
+    assert_eq!(bounded.memories.len(), 1);
+    assert_eq!(direct.initials.len(), 1);
+    assert_eq!(bounded.initials.len(), 1);
+
+    for design in [&direct, &bounded] {
+        let mut simulator = Simulator::new(design).expect("create ranged memory simulator");
+        simulator
+            .run_until(0)
+            .expect("settle ranged memory initializer");
+        assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("second").unwrap().to_u64(), Some(2));
+        assert_eq!(simulator.read("third").unwrap().to_u64(), Some(3));
+        assert_eq!(simulator.read("after").unwrap().to_u64(), None);
+    }
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

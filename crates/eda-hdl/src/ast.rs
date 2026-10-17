@@ -532,6 +532,8 @@ pub enum Stmt {
         radix: u32,
         path: String,
         memory: String,
+        start: Option<Expr>,
+        finish: Option<Expr>,
     },
     Finish,
 }

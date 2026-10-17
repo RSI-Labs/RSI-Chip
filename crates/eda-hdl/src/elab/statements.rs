@@ -795,9 +795,11 @@ impl<'a> Elaborator<'a> {
             radix,
             path,
             memory,
+            start,
+            finish,
         } = s
         {
-            return self.memory_file_statement(*radix, path, memory, env);
+            return self.memory_file_statement(*radix, path, memory, start, finish, env);
         }
         Ok(match s {
             ast::Stmt::Block(v) => StmtIR::Block(
@@ -914,7 +916,9 @@ impl<'a> Elaborator<'a> {
                 radix,
                 path,
                 memory,
-            } => return self.memory_file_statement(*radix, path, memory, env),
+                start,
+                finish,
+            } => return self.memory_file_statement(*radix, path, memory, start, finish, env),
         })
     }
 
@@ -923,6 +927,8 @@ impl<'a> Elaborator<'a> {
         radix: u32,
         path: &str,
         memory_name: &str,
+        start: &Option<ast::Expr>,
+        finish: &Option<ast::Expr>,
         env: &Env<'_>,
     ) -> Result<StmtIR, String> {
         let entry = env.net(memory_name)?;
@@ -939,11 +945,29 @@ impl<'a> Elaborator<'a> {
                 .map(|source_dir| source_dir.join(&raw_path))
                 .unwrap_or(raw_path)
         };
+        let start = start
+            .as_ref()
+            .map(|start| {
+                let value = self.const_eval(start, env.params, env.module_name)?;
+                u64::try_from(value)
+                    .map_err(|_| format!("negative sparse-memory start address {value}"))
+            })
+            .transpose()?;
+        let finish = finish
+            .as_ref()
+            .map(|finish| {
+                let value = self.const_eval(finish, env.params, env.module_name)?;
+                u64::try_from(value)
+                    .map_err(|_| format!("negative sparse-memory finish address {value}"))
+            })
+            .transpose()?;
         let values = eda_core::memory_file::read_memory_file(
             &resolved_path,
             radix,
             declaration.element_width,
+            start,
         )?;
+        let values = eda_core::memory_file::filter_memory_file_finish(values, start, finish)?;
         let mut statements = Vec::with_capacity(values.len());
         for physical_index in values.keys().copied().collect::<Vec<_>>() {
             let indexes =

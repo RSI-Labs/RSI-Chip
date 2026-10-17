@@ -166,8 +166,25 @@ fn memory_file_tasks_parse_to_readmem_statements() {
                 radix: 16,
                 path,
                 memory,
+                start,
+                finish,
             }
-        } if path == "mem.hex" && memory == "mem"
+        } if path == "mem.hex" && memory == "mem" && start.is_none() && finish.is_none()
+    ));
+
+    let ranged = parse_ok(
+        "module m; logic [7:0] mem [0:7]; initial $readmemb(\"mem.bin\", mem, 2, 4); endmodule",
+    );
+    assert!(matches!(
+        &ranged.modules[0].items[1],
+        Item::Initial {
+            body: Stmt::ReadMem {
+                radix: 2,
+                start: Some(_),
+                finish: Some(_),
+                ..
+            }
+        }
     ));
 }
 

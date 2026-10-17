@@ -9,12 +9,13 @@ pub fn read_memory_file(
     path: &Path,
     radix: u32,
     element_width: usize,
+    start: Option<u64>,
 ) -> Result<BTreeMap<u64, LogicWord>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read sparse-memory file {}: {error}", path.display()))?;
     let text = strip_memory_file_comments(&text);
     let mut values = BTreeMap::new();
-    let mut address = 0_u64;
+    let mut address = start.unwrap_or(0);
     for token in text.split_whitespace() {
         if let Some(address_token) = token.strip_prefix('@') {
             address = u64::from_str_radix(address_token, 16).map_err(|_| {
@@ -39,6 +40,25 @@ pub fn read_memory_file(
             .ok_or_else(|| "sparse-memory file address overflow".to_string())?;
     }
     Ok(values)
+}
+
+pub fn filter_memory_file_finish(
+    values: BTreeMap<u64, LogicWord>,
+    start: Option<u64>,
+    finish: Option<u64>,
+) -> Result<BTreeMap<u64, LogicWord>, String> {
+    if let (Some(start), Some(finish)) = (start, finish) {
+        if finish < start {
+            return Err(format!(
+                "sparse-memory finish address {finish} is below start address {start}"
+            ));
+        }
+    }
+    Ok(values
+        .into_iter()
+        .filter(|(address, _)| start.is_none_or(|start| *address >= start))
+        .filter(|(address, _)| finish.is_none_or(|finish| *address <= finish))
+        .collect())
 }
 
 pub fn strip_memory_file_comments(text: &str) -> String {
