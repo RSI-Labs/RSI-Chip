@@ -111,6 +111,50 @@ impl MemoryWriteMask {
     }
 }
 
+/// Byte-lane write contract derived from a conservative bit-level mask.
+///
+/// This metadata is `None` when writes are narrower than a byte, cross byte
+/// boundaries, or otherwise cannot be represented by aligned byte lanes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryByteEnable {
+    pub lane_width: usize,
+    pub lanes: Vec<bool>,
+}
+
+impl MemoryByteEnable {
+    pub fn full(width: usize) -> Self {
+        let lane_width = 8;
+        Self {
+            lane_width,
+            lanes: vec![true; width / lane_width],
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        !self.lanes.is_empty() && self.lanes.iter().all(|lane| *lane)
+    }
+
+    fn from_write_mask(mask: Option<&MemoryWriteMask>, width: usize) -> Option<Self> {
+        let mask = mask?;
+        if width == 0 || !width.is_multiple_of(8) || mask.width != width || mask.bits.len() != width
+        {
+            return None;
+        }
+        let mut lanes = Vec::with_capacity(width / 8);
+        for lane in mask.bits.chunks_exact(8) {
+            let enabled = lane[0];
+            if lane.iter().any(|bit| *bit != enabled) {
+                return None;
+            }
+            lanes.push(enabled);
+        }
+        Some(Self {
+            lane_width: 8,
+            lanes,
+        })
+    }
+}
+
 /// A sparse unpacked-array object.
 ///
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
@@ -131,6 +175,8 @@ pub struct MemoryDecl {
     pub template: MemoryTemplate,
     /// Inferred runtime write-port mask. `None` for ROM.
     pub write_mask: Option<MemoryWriteMask>,
+    /// Aligned byte-lane contract derived from `write_mask`.
+    pub byte_enable: Option<MemoryByteEnable>,
 }
 
 /// Aliases a child instance's memory object to the parent memory supplied on
@@ -657,7 +703,11 @@ impl Design {
                     MemoryKind::Rom
                 };
             memory.template = accesses.template(root);
-            memory.write_mask = accesses.write_mask(root, memory.element_width);
+            let write_mask = accesses.write_mask(root, memory.element_width);
+            let byte_enable =
+                MemoryByteEnable::from_write_mask(write_mask.as_ref(), memory.element_width);
+            memory.write_mask = write_mask;
+            memory.byte_enable = byte_enable;
         }
     }
 
@@ -1032,6 +1082,7 @@ mod tests {
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
             write_mask: None,
+            byte_enable: None,
         };
         assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
         assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
@@ -1058,6 +1109,7 @@ mod tests {
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
             write_mask: None,
+            byte_enable: None,
         };
         assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
         assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));

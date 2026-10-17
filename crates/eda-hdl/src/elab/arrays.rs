@@ -1645,6 +1645,7 @@ impl<'a> Elaborator<'a> {
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
             write_mask: None,
+            byte_enable: None,
         });
         memory
     }

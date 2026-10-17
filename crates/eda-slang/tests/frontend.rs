@@ -454,6 +454,10 @@ endmodule
         .as_ref()
         .expect("runtime memory write mask")
         .is_full());
+    assert_eq!(
+        design.memories[0].byte_enable,
+        Some(eda_core::ir::MemoryByteEnable::full(8))
+    );
     assert!(reference.memories.is_empty());
     assert_eq!(
         format!("{:?}", reference.ports),
@@ -1092,6 +1096,7 @@ endmodule
         eda_core::ir::MemoryTemplate::AsyncRom
     );
     assert_eq!(design.memories[0].write_mask, None);
+    assert_eq!(design.memories[0].byte_enable, None);
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create initializer simulator");
@@ -1329,6 +1334,54 @@ endmodule
                 .to_vec()
             })
         );
+        assert_eq!(design.memories[0].byte_enable, None);
+    }
+}
+
+#[test]
+fn slang_and_bounded_paths_infer_aligned_byte_enables() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("aligned-byte-enable");
+    let source_path = root.join("byte-enable.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module byte_enable(
+  input logic clk,
+  input logic [7:0] din,
+  output logic [31:0] q
+);
+  logic [31:0] mem [0:4095];
+  always @(posedge clk) mem[0][23:16] <= din;
+  assign q = mem[0];
+endmodule
+"#,
+    )
+    .expect("write aligned byte-enable source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("byte_enable"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower aligned byte enable");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("byte_enable"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower aligned byte enable through bounded path");
+    let expected = eda_core::ir::MemoryByteEnable {
+        lane_width: 8,
+        lanes: [false, false, true, false].to_vec(),
+    };
+    for design in [&direct, &bounded] {
+        assert_eq!(design.memories.len(), 1);
+        assert_eq!(design.memories[0].byte_enable, Some(expected.clone()));
     }
 }
 
