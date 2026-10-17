@@ -48,6 +48,27 @@ pub enum CellKind {
         bit_index: usize,
         contents: std::sync::Arc<Vec<LogicWord>>,
     },
+    /// One bit of a synchronous block-RAM write port.
+    ///
+    /// Inputs are `[clock, write_enable, address LSB-first..., data_bit]`.
+    /// The output is an internal state-preserving net; `netlist_to_design`
+    /// groups all bits with the same `macro_id` into one sparse-RAM process.
+    BlockRamWrite {
+        macro_id: usize,
+        address_width: usize,
+        bit_index: usize,
+        initial: std::sync::Arc<Vec<LogicWord>>,
+        posedge: bool,
+    },
+    /// One output bit of a block-RAM read port. Inputs are address bits in
+    /// LSB-first order and refer to the mutable storage created by the matching
+    /// [`CellKind::BlockRamWrite`] cells.
+    BlockRamRead {
+        macro_id: usize,
+        address_width: usize,
+        bit_index: usize,
+        initial: std::sync::Arc<Vec<LogicWord>>,
+    },
     /// Standard-cell instance; behaviour comes from the [`CellLibrary`].
     Lib(LibCellId),
 }
@@ -547,7 +568,10 @@ impl Netlist {
     /// Is this net a sequential cell (using the library when needed)?
     pub fn cell_is_sequential(&self, kind: &CellKind) -> bool {
         match kind {
-            CellKind::Dff { .. } | CellKind::DffR { .. } => true,
+            CellKind::Dff { .. }
+            | CellKind::DffR { .. }
+            | CellKind::BlockRamWrite { .. }
+            | CellKind::BlockRamRead { .. } => true,
             CellKind::Lib(id) => self
                 .lib_cache
                 .as_ref()
@@ -588,6 +612,7 @@ impl Netlist {
             ..Default::default()
         };
         let mut block_rom_macros = HashSet::<(usize, Vec<NetId>, usize)>::new();
+        let mut block_ram_macros = HashSet::<usize>::new();
         for c in &self.cells {
             match &c.kind {
                 CellKind::Const(_) => s.consts += 1,
@@ -603,6 +628,10 @@ impl Netlist {
                         *address_width,
                     ));
                 }
+                CellKind::BlockRamWrite { macro_id, .. }
+                | CellKind::BlockRamRead { macro_id, .. } => {
+                    block_ram_macros.insert(*macro_id);
+                }
                 CellKind::Lib(id) => {
                     s.lib_cells += 1;
                     if self
@@ -616,7 +645,7 @@ impl Netlist {
                 _ => s.comb += 1,
             }
         }
-        s.memory_macros = block_rom_macros.len();
+        s.memory_macros = block_rom_macros.len() + block_ram_macros.len();
         s
     }
 }
@@ -777,5 +806,60 @@ mod tests {
         let stats = nl.stats();
         assert_eq!(stats.memory_macros, 1);
         assert_eq!(stats.cells, 2);
+    }
+
+    #[test]
+    fn block_ram_cells_form_one_stateful_macro() {
+        let initial = Arc::new(vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+            LogicWord::from_u64(2, 0b00),
+        ]);
+        let write_kind = |bit_index| CellKind::BlockRamWrite {
+            macro_id: 7,
+            address_width: 2,
+            bit_index,
+            initial: initial.clone(),
+            posedge: true,
+        };
+        let read_kind = |bit_index| CellKind::BlockRamRead {
+            macro_id: 7,
+            address_width: 2,
+            bit_index,
+            initial: initial.clone(),
+        };
+
+        let mut nl = Netlist::new("ram");
+        let clock = nl.add_net("clock");
+        let write_enable = nl.add_net("write_enable");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        let data0 = nl.add_net("data0");
+        let data1 = nl.add_net("data1");
+        for (bit_index, data) in [(0, data0), (1, data1)] {
+            let state = nl.add_net(format!("state{bit_index}"));
+            nl.add_cell(Cell {
+                name: format!("ram_write_bit{bit_index}"),
+                kind: write_kind(bit_index),
+                inputs: vec![clock, write_enable, address0, address1, data],
+                output: state,
+            });
+        }
+        for bit_index in 0..2 {
+            let output = nl.add_net(format!("q{bit_index}"));
+            nl.add_cell(Cell {
+                name: format!("ram_read_bit{bit_index}"),
+                kind: read_kind(bit_index),
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+
+        let stats = nl.stats();
+        assert_eq!(stats.memory_macros, 1);
+        assert_eq!(stats.cells, 4);
+        assert!(nl.cell_is_sequential(&write_kind(0)));
+        assert!(nl.cell_is_sequential(&read_kind(0)));
     }
 }

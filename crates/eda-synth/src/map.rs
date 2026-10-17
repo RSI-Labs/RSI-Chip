@@ -193,8 +193,10 @@ impl<'a> Mapper<'a> {
                         output: out,
                     });
                 }
-                CellKind::BlockRom { .. } => {
-                    // Keep the macro boundary intact. A block ROM is deliberately
+                CellKind::BlockRom { .. }
+                | CellKind::BlockRamWrite { .. }
+                | CellKind::BlockRamRead { .. } => {
+                    // Keep memory macro boundaries intact. They are deliberately
                     // not exploded into standard-cell logic during mapping.
                     self.out.add_cell(Cell {
                         name: c.name.clone(),

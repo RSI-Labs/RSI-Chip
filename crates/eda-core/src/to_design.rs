@@ -5,7 +5,7 @@ use crate::ir;
 use crate::library::LibFunc;
 use crate::logic::LogicWord;
 use crate::netlist::{self, CellKind, Netlist};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 type BlockRomKey = (usize, Vec<netlist::NetId>, usize);
@@ -15,6 +15,16 @@ struct ReconstructedBlockRom {
     address_width: usize,
     element_width: usize,
     memory: usize,
+}
+
+struct ReconstructedBlockRam {
+    memory: usize,
+    element_width: usize,
+}
+
+struct ReconstructedBlockRamReadPort {
+    address_base: usize,
+    address_width: usize,
 }
 
 pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
@@ -193,6 +203,295 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
         }
     }
 
+    // Group the per-bit write cells emitted by synthesis into one sparse RAM
+    // object and one clocked write process.
+    let mut block_ram_write_groups = BTreeMap::<usize, Vec<&netlist::Cell>>::new();
+    for c in nl.cells() {
+        if let CellKind::BlockRamWrite { macro_id, .. } = &c.kind {
+            block_ram_write_groups.entry(*macro_id).or_default().push(c);
+        }
+    }
+    let mut block_ram_groups = HashMap::<usize, ReconstructedBlockRam>::new();
+    for (macro_id, cells) in block_ram_write_groups {
+        let Some(first_cell) = cells.first() else {
+            continue;
+        };
+        let CellKind::BlockRamWrite {
+            address_width,
+            initial,
+            posedge,
+            ..
+        } = &first_cell.kind
+        else {
+            continue;
+        };
+        let Some(first_word) = initial.first() else {
+            continue;
+        };
+        let element_width = first_word.width();
+        if element_width == 0
+            || cells.len() != element_width
+            || !initial.iter().all(|word| word.width() == element_width)
+        {
+            continue;
+        }
+
+        let mut bits = vec![None; element_width];
+        let mut valid = true;
+        for cell in &cells {
+            let CellKind::BlockRamWrite {
+                address_width: cell_address_width,
+                bit_index,
+                initial: cell_initial,
+                posedge: cell_posedge,
+                ..
+            } = &cell.kind
+            else {
+                valid = false;
+                break;
+            };
+            let expected_prefix = 2 + address_width;
+            if cell_address_width != address_width
+                || cell_initial.as_ptr() != initial.as_ptr()
+                || cell_posedge != posedge
+                || cell.inputs.len() != expected_prefix + 1
+                || cell.inputs[..expected_prefix] != first_cell.inputs[..expected_prefix]
+                || *bit_index >= element_width
+                || bits[*bit_index].is_some()
+            {
+                valid = false;
+                break;
+            }
+            bits[*bit_index] = Some((cell.inputs[expected_prefix], cell.inputs[0], cell.inputs[1]));
+        }
+        if !valid {
+            continue;
+        }
+        // All cells were validated to have the same control/address prefix.
+        let clock_source = bits[0].expect("validated write bit").1;
+        let enable_source = bits[0].expect("validated write bit").2;
+
+        let clock_base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("block_ram_{macro_id}_clock"),
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base: clock_base,
+        });
+        d.n_nets += 1;
+        d.assigns.push(ir::Assign {
+            lv: ir::LValue {
+                net: clock_base,
+                decl_width: 1,
+                range: ir::Range::Bit(0),
+            },
+            e: bit(clock_source),
+            delay: 0,
+        });
+
+        let enable_base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("block_ram_{macro_id}_write_enable"),
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base: enable_base,
+        });
+        d.n_nets += 1;
+        d.assigns.push(ir::Assign {
+            lv: ir::LValue {
+                net: enable_base,
+                decl_width: 1,
+                range: ir::Range::Bit(0),
+            },
+            e: bit(enable_source),
+            delay: 0,
+        });
+
+        let write_address_base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("block_ram_{macro_id}_write_address"),
+            width: *address_width,
+            is_reg: false,
+            is_signed: false,
+            base: write_address_base,
+        });
+        d.n_nets += address_width;
+        for (address_bit, source) in first_cell.inputs[2..2 + address_width].iter().enumerate() {
+            d.assigns.push(ir::Assign {
+                lv: ir::LValue {
+                    net: write_address_base + address_bit,
+                    decl_width: 1,
+                    range: ir::Range::Bit(0),
+                },
+                e: bit(*source),
+                delay: 0,
+            });
+        }
+
+        let write_data_base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("block_ram_{macro_id}_write_data"),
+            width: element_width,
+            is_reg: false,
+            is_signed: false,
+            base: write_data_base,
+        });
+        d.n_nets += element_width;
+        for (bit_index, source) in bits
+            .iter()
+            .map(|bit| bit.expect("validated write bit").0)
+            .enumerate()
+        {
+            d.assigns.push(ir::Assign {
+                lv: ir::LValue {
+                    net: write_data_base + bit_index,
+                    decl_width: 1,
+                    range: ir::Range::Bit(0),
+                },
+                e: bit(source),
+                delay: 0,
+            });
+        }
+
+        let memory = d.memories.len();
+        d.memories.push(ir::MemoryDecl {
+            name: format!("block_ram_{macro_id}_ram"),
+            element_width,
+            element_msb: element_width as i64 - 1,
+            element_lsb: 0,
+            dimensions: vec![ir::MemoryDimension {
+                base: 0,
+                step: 1,
+                length: initial.len(),
+            }],
+            flat_length: initial.len() as u64,
+            kind: ir::MemoryKind::Ram,
+            template: ir::MemoryTemplate::SyncRam,
+            write_mask: Some(ir::MemoryWriteMask::full(element_width)),
+            byte_enable: None,
+            banking: ir::MemoryBanking {
+                count: 1,
+                depth: initial.len() as u64,
+            },
+        });
+        let initialization = initial
+            .iter()
+            .enumerate()
+            .map(|(address, word)| ir::Stmt::MemoryBl {
+                memory,
+                indexes: vec![ir::Expr::Const(LogicWord::from_u64(
+                    32,
+                    u64::try_from(address).unwrap_or(u64::MAX),
+                ))],
+                e: ir::Expr::Const(word.clone()),
+            })
+            .collect();
+        d.initials.push(ir::Stmt::Block(initialization));
+
+        let write = ir::Stmt::MemoryNBl {
+            memory,
+            indexes: vec![ir::Expr::Ref {
+                net: write_address_base,
+                decl_width: *address_width,
+                range: if *address_width == 1 {
+                    ir::Range::Bit(0)
+                } else {
+                    ir::Range::Span {
+                        msb: *address_width - 1,
+                        lsb: 0,
+                    }
+                },
+                signed: false,
+            }],
+            e: ir::Expr::Ref {
+                net: write_data_base,
+                decl_width: element_width,
+                range: if element_width == 1 {
+                    ir::Range::Bit(0)
+                } else {
+                    ir::Range::Span {
+                        msb: element_width - 1,
+                        lsb: 0,
+                    }
+                },
+                signed: false,
+            },
+        };
+        d.processes.push(ir::Process {
+            sens: edge_sens(*posedge, clock_base),
+            body: ir::Stmt::If {
+                c: ir::Expr::Ref {
+                    net: enable_base,
+                    decl_width: 1,
+                    range: ir::Range::Bit(0),
+                    signed: false,
+                },
+                t: Box::new(write),
+                f: None,
+            },
+        });
+        block_ram_groups.insert(
+            macro_id,
+            ReconstructedBlockRam {
+                memory,
+                element_width,
+            },
+        );
+    }
+
+    // Reconstruct one address vector per distinct read port, shared by every
+    // output-bit cell on that port.
+    let mut block_ram_read_ports =
+        HashMap::<(usize, Vec<netlist::NetId>), ReconstructedBlockRamReadPort>::new();
+    for c in nl.cells() {
+        if let CellKind::BlockRamRead {
+            macro_id,
+            address_width,
+            ..
+        } = &c.kind
+        {
+            if !block_ram_groups.contains_key(macro_id) || c.inputs.len() != *address_width {
+                continue;
+            }
+            let key = (*macro_id, c.inputs.clone());
+            if block_ram_read_ports.contains_key(&key) {
+                continue;
+            }
+            let address_base = d.n_nets;
+            d.net_decls.push(ir::NetDecl {
+                name: format!(
+                    "block_ram_{macro_id}_read_address_{}",
+                    block_ram_read_ports.len()
+                ),
+                width: *address_width,
+                is_reg: false,
+                is_signed: false,
+                base: address_base,
+            });
+            d.n_nets += address_width;
+            for (address_bit, source) in c.inputs.iter().enumerate() {
+                d.assigns.push(ir::Assign {
+                    lv: ir::LValue {
+                        net: address_base + address_bit,
+                        decl_width: 1,
+                        range: ir::Range::Bit(0),
+                    },
+                    e: bit(*source),
+                    delay: 0,
+                });
+            }
+            block_ram_read_ports.insert(
+                key,
+                ReconstructedBlockRamReadPort {
+                    address_base,
+                    address_width: *address_width,
+                },
+            );
+        }
+    }
+
     // Cells: combinational become continuous assigns, flops become clocked
     // processes.
     for c in nl.cells() {
@@ -322,6 +621,62 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
                             } else {
                                 ir::Range::Span {
                                     msb: group.address_width - 1,
+                                    lsb: 0,
+                                }
+                            },
+                            signed: false,
+                        }],
+                        width: group.element_width,
+                        signed: false,
+                    };
+                    d.assigns.push(ir::Assign {
+                        lv: lv_out,
+                        e: ir::Expr::Index {
+                            e: Box::new(read),
+                            msb: *bit_index,
+                            lsb: *bit_index,
+                        },
+                        delay: 0,
+                    });
+                } else {
+                    d.assigns.push(ir::Assign {
+                        lv: lv_out,
+                        e: ir::Expr::Const(LogicWord::xes(1)),
+                        delay: 0,
+                    });
+                }
+            }
+            CellKind::BlockRamWrite { .. } => {
+                // Reconstructed above as part of one sparse-memory write port.
+            }
+            CellKind::BlockRamRead {
+                macro_id,
+                address_width,
+                bit_index,
+                ..
+            } => {
+                let key = (*macro_id, c.inputs.clone());
+                let group = block_ram_groups.get(macro_id);
+                let port = block_ram_read_ports.get(&key);
+                if let (Some(group), Some(port)) = (group, port) {
+                    if port.address_width != *address_width || *bit_index >= group.element_width {
+                        d.assigns.push(ir::Assign {
+                            lv: lv_out,
+                            e: ir::Expr::Const(LogicWord::xes(1)),
+                            delay: 0,
+                        });
+                        continue;
+                    }
+                    let read = ir::Expr::MemoryRead {
+                        memory: group.memory,
+                        indexes: vec![ir::Expr::Ref {
+                            net: port.address_base,
+                            decl_width: port.address_width,
+                            range: if port.address_width == 1 {
+                                ir::Range::Bit(0)
+                            } else {
+                                ir::Range::Span {
+                                    msb: port.address_width - 1,
                                     lsb: 0,
                                 }
                             },
@@ -591,5 +946,72 @@ mod tests {
             &design.initials[0],
             ir::Stmt::Block(statements) if statements.len() == 3
         ));
+    }
+
+    #[test]
+    fn block_ram_write_and_read_cells_share_one_sparse_process() {
+        let initial = Arc::new(vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+            LogicWord::from_u64(2, 0b00),
+        ]);
+        let mut nl = Netlist::new("ram");
+        let clock = nl.add_net("clock");
+        let write_enable = nl.add_net("write_enable");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        let data0 = nl.add_net("data0");
+        let data1 = nl.add_net("data1");
+        for (bit_index, data) in [(0, data0), (1, data1)] {
+            let state = nl.add_net(format!("state{bit_index}"));
+            nl.add_cell(Cell {
+                name: format!("ram_write_bit{bit_index}"),
+                kind: CellKind::BlockRamWrite {
+                    macro_id: 7,
+                    address_width: 2,
+                    bit_index,
+                    initial: initial.clone(),
+                    posedge: true,
+                },
+                inputs: vec![clock, write_enable, address0, address1, data],
+                output: state,
+            });
+        }
+        for bit_index in 0..2 {
+            let output = nl.add_net(format!("q{bit_index}"));
+            nl.add_cell(Cell {
+                name: format!("ram_read_bit{bit_index}"),
+                kind: CellKind::BlockRamRead {
+                    macro_id: 7,
+                    address_width: 2,
+                    bit_index,
+                    initial: initial.clone(),
+                },
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+        nl.add_port("clock", netlist::Dir::In, vec![clock]);
+        nl.add_port("write_enable", netlist::Dir::In, vec![write_enable]);
+        nl.add_port("address", netlist::Dir::In, vec![address1, address0]);
+        nl.add_port("din", netlist::Dir::In, vec![data1, data0]);
+        nl.add_port("q0", netlist::Dir::Out, vec![nl.net_by_name("q0").unwrap()]);
+        nl.add_port("q1", netlist::Dir::Out, vec![nl.net_by_name("q1").unwrap()]);
+
+        let design = netlist_to_design(&nl);
+        assert_eq!(design.memories.len(), 1);
+        assert_eq!(design.memories[0].flat_length, 4);
+        assert_eq!(design.memories[0].kind, ir::MemoryKind::Ram);
+        assert_eq!(design.memories[0].template, ir::MemoryTemplate::SyncRam);
+        assert_eq!(design.processes.len(), 1);
+        assert!(matches!(&design.processes[0].body, ir::Stmt::If { .. }));
+        assert!(matches!(&design.initials[0], ir::Stmt::Block(_)));
+        let memory_reads = design
+            .assigns
+            .iter()
+            .filter(|assignment| matches!(assignment.e, ir::Expr::Index { .. }))
+            .count();
+        assert_eq!(memory_reads, 2);
     }
 }

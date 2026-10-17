@@ -171,6 +171,12 @@ impl<'a> NetlistEncoder<'a> {
                     out,
                 );
             }
+            CellKind::BlockRamWrite { .. } => {
+                return Err("BlockRam write port in combinational cone".to_string());
+            }
+            CellKind::BlockRamRead { .. } => {
+                return Err("BlockRam read port is state-dependent".to_string());
+            }
             CellKind::Lib(lid) => {
                 let lib = self
                     .nl

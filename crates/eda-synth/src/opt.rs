@@ -86,7 +86,13 @@ fn is_commutative(kind: &CellKind) -> bool {
 }
 
 fn is_comb(kind: &CellKind) -> bool {
-    !matches!(kind, CellKind::Dff { .. } | CellKind::DffR { .. })
+    !matches!(
+        kind,
+        CellKind::Dff { .. }
+            | CellKind::DffR { .. }
+            | CellKind::BlockRamWrite { .. }
+            | CellKind::BlockRamRead { .. }
+    )
 }
 
 /// Constant folding: any combinational cell whose inputs are all constants

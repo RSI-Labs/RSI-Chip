@@ -220,6 +220,7 @@ struct Synth<'a> {
     flat2net: Vec<NetId>,
     rom_contents: HashMap<usize, RomContents>,
     ram_state: HashMap<usize, Vec<Vec<NetId>>>,
+    block_ram_state: HashMap<usize, BlockRamLowering>,
     lowered_memories: HashSet<usize>,
     skipped_processes: HashSet<usize>,
     sym: HashMap<usize, Vec<NetId>>,
@@ -235,6 +236,12 @@ struct Synth<'a> {
 struct RomContents {
     values: BTreeMap<Vec<i64>, LogicWord>,
     deterministic: bool,
+}
+
+#[derive(Clone)]
+struct BlockRamLowering {
+    address_width: usize,
+    initial: Arc<Vec<LogicWord>>,
 }
 
 impl RomContents {
@@ -401,6 +408,7 @@ impl<'a> Synth<'a> {
             flat2net,
             rom_contents: rom_contents_from_design(design),
             ram_state: HashMap::new(),
+            block_ram_state: HashMap::new(),
             lowered_memories: HashSet::new(),
             skipped_processes: HashSet::new(),
             sym: HashMap::new(),
@@ -413,6 +421,7 @@ impl<'a> Synth<'a> {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        self.lower_block_ram_processes()?;
         self.lower_distributed_ram_processes()?;
         for a in &self.design.assigns {
             self.reset_sym();
@@ -515,6 +524,193 @@ impl<'a> Synth<'a> {
             }
         }
         Ok(())
+    }
+
+    fn lower_block_ram_processes(&mut self) -> Result<(), String> {
+        for process_index in 0..self.design.processes.len() {
+            let process = self.design.processes[process_index].clone();
+            let (clock, posedge) = match &process.sens {
+                Sens::Posedge(net) => (*net, true),
+                Sens::Negedge(net) => (*net, false),
+                _ => continue,
+            };
+            let Some(write) = self.distributed_ram_write(&process.body) else {
+                continue;
+            };
+            if !self.is_block_ram(write.memory) {
+                continue;
+            }
+            if self.block_ram_state.contains_key(&write.memory) {
+                return Err(format!(
+                    "memory '{}' has multiple clocked write ports, which the current BlockRam model does not support",
+                    self.design.memories[write.memory].name
+                ));
+            }
+            self.lower_block_ram_process(clock, posedge, write)?;
+            self.skipped_processes.insert(process_index);
+        }
+        Ok(())
+    }
+
+    fn is_block_ram(&self, memory_index: usize) -> bool {
+        let Some(memory) = self.design.memories.get(memory_index) else {
+            return false;
+        };
+        memory.kind == MemoryKind::Ram
+            && macro_candidate(
+                memory.template,
+                u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0),
+            ) == MemoryMacroCandidate::BlockRam
+    }
+
+    fn lower_block_ram_process(
+        &mut self,
+        clock_flat: usize,
+        posedge: bool,
+        write: DistributedRamWrite,
+    ) -> Result<(), String> {
+        let memory = self.design.memories[write.memory].clone();
+        let flat_length = usize::try_from(memory.flat_length).map_err(|_| {
+            format!(
+                "memory '{}' is too large for the current BlockRam model",
+                memory.name
+            )
+        })?;
+        if flat_length == 0 {
+            return Err(format!(
+                "memory '{}' has an empty BlockRam address space",
+                memory.name
+            ));
+        }
+        if write.indexes.len() != 1
+            || memory.dimensions.len() != 1
+            || memory.dimensions[0].base != 0
+            || memory.dimensions[0].step != 1
+            || memory.dimensions[0].length as u64 != memory.flat_length
+        {
+            return Err(format!(
+                "memory '{}' requires one normalized one-dimensional BlockRam address index",
+                memory.name
+            ));
+        }
+        if write.part.is_some()
+            || !memory
+                .write_mask
+                .as_ref()
+                .is_some_and(MemoryWriteMask::is_full)
+            || memory.banking.count != 1
+        {
+            return Err(format!(
+                "memory '{}' uses a partial-write or banked contract that the current BlockRam model does not support",
+                memory.name
+            ));
+        }
+
+        let address_width = flat_length.max(2).next_power_of_two().trailing_zeros() as usize;
+        if address_width == 0 || address_width > u32::BITS as usize {
+            return Err(format!(
+                "memory '{}' has an invalid BlockRam address width",
+                memory.name
+            ));
+        }
+        let initial = self.block_ram_initial_contents(write.memory, flat_length)?;
+
+        self.reset_sym();
+        let clock = self.flat2net_of(clock_flat)?;
+        let enable = match &write.condition {
+            Some(condition) => self.blast(condition, 1)?[0],
+            None => self.const_net(LogicValue::One),
+        };
+        let mut address = Vec::with_capacity(address_width);
+        for index in &write.indexes {
+            address.extend(self.blast(index, address_width)?);
+        }
+        if address.len() != address_width {
+            return Err(format!(
+                "memory '{}' BlockRam write address width mismatch",
+                memory.name
+            ));
+        }
+        let data = self.blast(&write.value, memory.element_width)?;
+        if data.len() != memory.element_width {
+            return Err(format!(
+                "memory '{}' BlockRam write data width mismatch",
+                memory.name
+            ));
+        }
+
+        for (bit_index, data_bit) in data.into_iter().enumerate() {
+            let state_bit = self.new_tmp("block_ram_w");
+            let mut inputs = Vec::with_capacity(2 + address_width + 1);
+            inputs.extend([clock, enable]);
+            inputs.extend(address.iter().copied());
+            inputs.push(data_bit);
+            self.add_cell(
+                "block_ram_w",
+                CellKind::BlockRamWrite {
+                    macro_id: write.memory,
+                    address_width,
+                    bit_index,
+                    initial: initial.clone(),
+                    posedge,
+                },
+                inputs,
+                state_bit,
+            );
+        }
+        self.block_ram_state.insert(
+            write.memory,
+            BlockRamLowering {
+                address_width,
+                initial,
+            },
+        );
+        self.lowered_memories.insert(write.memory);
+        Ok(())
+    }
+
+    fn block_ram_initial_contents(
+        &self,
+        memory_index: usize,
+        flat_length: usize,
+    ) -> Result<Arc<Vec<LogicWord>>, String> {
+        let memory = &self.design.memories[memory_index];
+        let Some(contents) = self.rom_contents.get(&memory_index) else {
+            return Ok(Arc::new(vec![
+                LogicWord::xes(memory.element_width);
+                flat_length
+            ]));
+        };
+        if !contents.deterministic {
+            return Err(format!(
+                "memory '{}' has conditional BlockRam initialization",
+                memory.name
+            ));
+        }
+        let mut words = vec![LogicWord::xes(memory.element_width); flat_length];
+        for (logical, word) in &contents.values {
+            let Some(&logical_index) = logical.first() else {
+                return Err(format!(
+                    "memory '{}' has invalid BlockRam index",
+                    memory.name
+                ));
+            };
+            if logical.len() != 1 {
+                return Err(format!(
+                    "memory '{}' has invalid BlockRam index rank {}",
+                    memory.name,
+                    logical.len()
+                ));
+            }
+            let Some(physical) = memory.physical_index(&[logical_index]) else {
+                return Err(format!(
+                    "memory '{}' has an out-of-range BlockRam initialization index",
+                    memory.name
+                ));
+            };
+            words[physical as usize] = word.clone();
+        }
+        Ok(Arc::new(words))
     }
 
     fn lower_distributed_ram_processes(&mut self) -> Result<(), String> {
@@ -1025,6 +1221,48 @@ impl<'a> Synth<'a> {
         let total_bits =
             u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
         if memory.kind == MemoryKind::Ram {
+            if macro_candidate(memory.template, total_bits) == MemoryMacroCandidate::BlockRam {
+                let Some(state) = self.block_ram_state.get(&memory_index).cloned() else {
+                    return Err(format!(
+                        "memory '{}' has no lowered BlockRam write port",
+                        memory.name
+                    ));
+                };
+                if indexes.len() != 1 {
+                    return Err(format!(
+                        "memory '{}' requires exactly one BlockRam read index, got {}",
+                        memory.name,
+                        indexes.len()
+                    ));
+                }
+                let mut address = Vec::with_capacity(state.address_width);
+                for index in indexes {
+                    address.extend(self.blast(index, state.address_width)?);
+                }
+                if address.len() != state.address_width {
+                    return Err(format!(
+                        "memory '{}' BlockRam read address width mismatch",
+                        memory.name
+                    ));
+                }
+                let mut output = Vec::with_capacity(memory.element_width);
+                for bit_index in 0..memory.element_width {
+                    let out = self.new_tmp("block_ram_q");
+                    self.add_cell(
+                        "block_ram_r",
+                        CellKind::BlockRamRead {
+                            macro_id: memory_index,
+                            address_width: state.address_width,
+                            bit_index,
+                            initial: state.initial.clone(),
+                        },
+                        address.clone(),
+                        out,
+                    );
+                    output.push(out);
+                }
+                return Ok(output);
+            }
             if macro_candidate(memory.template, total_bits) != MemoryMacroCandidate::DistributedRam
             {
                 return Err(format!(
@@ -2216,6 +2454,225 @@ endmodule
 
         let _ = std::fs::remove_file(&source_path);
         let _ = std::fs::remove_file(&image_path);
+    }
+
+    #[test]
+    fn block_ram_preserves_one_writable_macro_and_matches_direct_ast_semantics() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source_path = std::env::temp_dir().join(format!("eda-synth-block-ram-{unique}.sv"));
+        let image_path = std::env::temp_dir().join(format!("eda-synth-block-ram-{unique}.hex"));
+        let mut image = String::new();
+        for address in 0..4096_u64 {
+            let value = (address.wrapping_mul(11).wrapping_add(5) & 0xff) as u8;
+            image.push_str(&format!("{value:02x}\n"));
+        }
+        std::fs::write(&image_path, image).expect("write BlockRam image");
+        std::fs::write(
+            &source_path,
+            format!(
+                r#"
+module block_ram(
+  input logic clk,
+  input logic write,
+  input logic [11:0] address,
+  input logic [7:0] din,
+  output logic [7:0] q
+);
+  logic [7:0] memory [0:4095];
+  initial $readmemh("{}", memory);
+  always @(posedge clk) if (write) memory[address] <= din;
+  assign q = memory[address];
+endmodule
+"#,
+                image_path.display()
+            ),
+        )
+        .expect("write BlockRam source");
+
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("block_ram"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("directly lower BlockRam source");
+        let result = synthesize(&rtl, &SynthOptions::default())
+            .expect("lower large synchronous RAM to one BlockRam macro");
+        assert_eq!(result.memory_plans.len(), 1);
+        assert_eq!(
+            result.memory_plans[0].candidate,
+            MemoryMacroCandidate::BlockRam
+        );
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no synthesis lowering")));
+
+        let stats = result.netlist.stats();
+        assert_eq!(stats.memory_macros, 1);
+        assert_eq!(
+            result
+                .netlist
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell.kind, CellKind::BlockRamWrite { .. }))
+                .count(),
+            8
+        );
+        assert_eq!(
+            result
+                .netlist
+                .cells()
+                .iter()
+                .filter(|cell| matches!(cell.kind, CellKind::BlockRamRead { .. }))
+                .count(),
+            8
+        );
+
+        let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+        assert_eq!(gate.memories.len(), 1);
+        assert_eq!(gate.memories[0].flat_length, 4096);
+        assert_eq!(gate.memories[0].kind, MemoryKind::Ram);
+        assert_eq!(gate.memories[0].template, MemoryTemplate::SyncRam);
+        assert_eq!(gate.processes.len(), 1);
+        assert_eq!(gate.initials.len(), 1);
+
+        let mut rtl_sim = Simulator::new(&rtl).unwrap();
+        let mut gate_sim = Simulator::new(&gate).unwrap();
+        let expected = |address: u64| address.wrapping_mul(11).wrapping_add(5) & 0xff;
+        for simulator in [&mut rtl_sim, &mut gate_sim] {
+            simulator
+                .set_input("clk", &LogicWord::from_u64(1, 0))
+                .unwrap();
+        }
+        for (address, value) in [
+            (0_u64, 0xa5_u64),
+            (1, 0x3c),
+            (255, 0x81),
+            (2048, 0x5a),
+            (4095, 0xc3),
+        ] {
+            for simulator in [&mut rtl_sim, &mut gate_sim] {
+                simulator
+                    .set_input("write", &LogicWord::from_u64(1, 1))
+                    .unwrap();
+                simulator
+                    .set_input("address", &LogicWord::from_u64(12, address))
+                    .unwrap();
+                simulator
+                    .set_input("din", &LogicWord::from_u64(8, value))
+                    .unwrap();
+                simulator
+                    .set_input("clk", &LogicWord::from_u64(1, 1))
+                    .unwrap();
+                simulator
+                    .set_input("clk", &LogicWord::from_u64(1, 0))
+                    .unwrap();
+            }
+            assert_eq!(rtl_sim.read("q").unwrap(), gate_sim.read("q").unwrap());
+            assert_eq!(gate_sim.read("q").unwrap().to_u64(), Some(value));
+        }
+        for (address, value) in [
+            (0_u64, 0xa5_u64),
+            (1, 0x3c),
+            (255, 0x81),
+            (2048, 0x5a),
+            (4095, 0xc3),
+        ] {
+            for simulator in [&mut rtl_sim, &mut gate_sim] {
+                simulator
+                    .set_input("write", &LogicWord::from_u64(1, 0))
+                    .unwrap();
+                simulator
+                    .set_input("address", &LogicWord::from_u64(12, address))
+                    .unwrap();
+            }
+            assert_eq!(rtl_sim.read("q").unwrap(), gate_sim.read("q").unwrap());
+            assert_eq!(gate_sim.read("q").unwrap().to_u64(), Some(value));
+        }
+        for address in [2_u64, 256, 4094] {
+            for simulator in [&mut rtl_sim, &mut gate_sim] {
+                simulator
+                    .set_input("write", &LogicWord::from_u64(1, 0))
+                    .unwrap();
+                simulator
+                    .set_input("address", &LogicWord::from_u64(12, address))
+                    .unwrap();
+            }
+            assert_eq!(rtl_sim.read("q").unwrap(), gate_sim.read("q").unwrap());
+            assert_eq!(
+                gate_sim.read("q").unwrap().to_u64(),
+                Some(expected(address))
+            );
+        }
+
+        let verilog = crate::writer::write_verilog(&result.netlist, result.library.as_ref());
+        assert_eq!(
+            verilog
+                .matches("  reg [7:0] block_ram_0 [0:4095];\n")
+                .count(),
+            1
+        );
+        assert_eq!(verilog.matches("block_ram_1").count(), 0);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&image_path);
+    }
+
+    #[test]
+    fn block_ram_partial_writes_are_rejected_explicitly() {
+        let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+            return;
+        };
+        let source_path = std::env::temp_dir().join(format!(
+            "eda-synth-block-ram-partial-{}-{}.sv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &source_path,
+            r#"
+module block_ram(
+  input logic clk,
+  input logic write,
+  input logic [11:0] address,
+  input logic [7:0] din,
+  output logic [15:0] q
+);
+  logic [15:0] memory [0:4095];
+  always @(posedge clk) if (write) memory[address][15:8] <= din;
+  assign q = memory[address];
+endmodule
+"#,
+        )
+        .expect("write partial-write BlockRam source");
+        let rtl = slang
+            .compile_files_via_ast(
+                std::slice::from_ref(&source_path),
+                Some("block_ram"),
+                &eda_slang::PreprocessOptions::default(),
+            )
+            .expect("slang accepts partial-write RAM source");
+        let error = synthesize(&rtl, &SynthOptions::default())
+            .expect_err("partial-write BlockRam must not be silently widened");
+        assert!(
+            error.contains("current BlockRam model does not support"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(&source_path);
     }
 
     #[test]

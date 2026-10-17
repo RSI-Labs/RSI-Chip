@@ -4,7 +4,7 @@
 use eda_core::library::CellLibrary;
 use eda_core::logic::LogicWord;
 use eda_core::netlist::{CellKind, Dir, NetId, Netlist};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 struct BlockRomGroup<'a> {
     name: String,
@@ -12,10 +12,50 @@ struct BlockRomGroup<'a> {
     contents: &'a [LogicWord],
 }
 
+struct BlockRamGroup<'a> {
+    name: String,
+    address_width: usize,
+    initial: &'a [LogicWord],
+    posedge: bool,
+    clock: NetId,
+    enable: NetId,
+    address: Vec<NetId>,
+    data: Vec<NetId>,
+}
+
 type BlockRomKey = (usize, Vec<NetId>, usize);
 
 fn block_rom_key(address_width: usize, contents: &[LogicWord], inputs: &[NetId]) -> BlockRomKey {
     (contents.as_ptr() as usize, inputs.to_vec(), address_width)
+}
+
+fn port_net_name(nl: &Netlist, net: NetId) -> String {
+    for port in &nl.ports {
+        if let Some(msb) = port.bits.iter().position(|candidate| *candidate == net) {
+            let logical_bit = port.bits.len() - 1 - msb;
+            return if port.bits.len() == 1 {
+                port.name.clone()
+            } else {
+                format!("{}[{}]", port.name, logical_bit)
+            };
+        }
+    }
+    nl.nets()[net].name.clone()
+}
+
+fn concatenated_bits(nl: &Netlist, bits: &[NetId]) -> String {
+    if bits.len() == 1 {
+        port_net_name(nl, bits[0])
+    } else {
+        format!(
+            "{{{}}}",
+            bits.iter()
+                .rev()
+                .map(|net| port_net_name(nl, *net))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 /// Emit one behavioral model module per library cell used by the netlist so
@@ -127,6 +167,83 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
             }
         }
     }
+
+    let mut block_ram_write_cells = BTreeMap::<usize, Vec<&eda_core::netlist::Cell>>::new();
+    for c in nl.cells() {
+        if let CellKind::BlockRamWrite { macro_id, .. } = &c.kind {
+            block_ram_write_cells.entry(*macro_id).or_default().push(c);
+        }
+    }
+    let mut block_ram_groups = Vec::<BlockRamGroup>::new();
+    let mut block_ram_group_ids = HashMap::<usize, usize>::new();
+    for (macro_id, cells) in block_ram_write_cells {
+        let Some(first) = cells.first().copied() else {
+            continue;
+        };
+        let CellKind::BlockRamWrite {
+            address_width,
+            initial,
+            posedge,
+            ..
+        } = &first.kind
+        else {
+            continue;
+        };
+        let Some(first_word) = initial.first() else {
+            continue;
+        };
+        let element_width = first_word.width();
+        let mut data_bits = vec![None; element_width];
+        let mut valid = element_width != 0
+            && cells.len() == element_width
+            && initial.iter().all(|word| word.width() == element_width);
+        for cell in &cells {
+            let CellKind::BlockRamWrite {
+                address_width: cell_address_width,
+                bit_index,
+                initial: cell_initial,
+                posedge: cell_posedge,
+                ..
+            } = &cell.kind
+            else {
+                valid = false;
+                break;
+            };
+            let prefix = 2 + address_width;
+            if !valid
+                || cell_address_width != address_width
+                || cell_initial.as_ptr() != initial.as_ptr()
+                || cell_posedge != posedge
+                || cell.inputs.len() != prefix + 1
+                || cell.inputs[..prefix] != first.inputs[..prefix]
+                || *bit_index >= element_width
+                || data_bits[*bit_index].is_some()
+            {
+                valid = false;
+                break;
+            }
+            data_bits[*bit_index] = Some(cell.inputs[prefix]);
+        }
+        if !valid || data_bits.iter().any(Option::is_none) {
+            continue;
+        }
+        let index = block_ram_groups.len();
+        block_ram_group_ids.insert(macro_id, index);
+        block_ram_groups.push(BlockRamGroup {
+            name: format!("block_ram_{index}"),
+            address_width: *address_width,
+            initial,
+            posedge: *posedge,
+            clock: first.inputs[0],
+            enable: first.inputs[1],
+            address: first.inputs[2..2 + address_width].to_vec(),
+            data: data_bits
+                .into_iter()
+                .map(|bit| bit.expect("validated BlockRam data bit"))
+                .collect(),
+        });
+    }
+
     let mut block_rom_models = String::new();
     for group in &block_rom_groups {
         let Some(first) = group.contents.first() else {
@@ -151,6 +268,40 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
         }
         block_rom_models.push_str("  end\n");
     }
+    let mut block_ram_models = String::new();
+    for group in &block_ram_groups {
+        let Some(first) = group.initial.first() else {
+            continue;
+        };
+        let element_width = first.width();
+        block_ram_models.push_str(&format!(
+            "  reg [{}:0] {} [0:{}];\n",
+            element_width.saturating_sub(1),
+            group.name,
+            group.initial.len() - 1
+        ));
+        block_ram_models.push_str("  initial begin\n");
+        for (address, word) in group.initial.iter().enumerate() {
+            block_ram_models.push_str(&format!(
+                "    {}[{}] = {}'b{};\n",
+                group.name,
+                address,
+                element_width,
+                word.to_bin_str()
+            ));
+        }
+        block_ram_models.push_str("  end\n");
+        let edge = if group.posedge { "posedge" } else { "negedge" };
+        block_ram_models.push_str(&format!(
+            "  always @({} {}) if ({}) {}[{}] <= {};\n",
+            edge,
+            port_net_name(nl, group.clock),
+            port_net_name(nl, group.enable),
+            group.name,
+            concatenated_bits(nl, &group.address),
+            concatenated_bits(nl, &group.data)
+        ));
+    }
     s.push_str(&format!("module {}(", nl.name));
     let port_names: Vec<String> = nl.ports.iter().map(|p| p.name.clone()).collect();
     s.push_str(&port_names.join(", "));
@@ -164,6 +315,7 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
         }
     }
     s.push_str(&block_rom_models);
+    s.push_str(&block_ram_models);
     // internal wires
     let port_nets: Vec<usize> = nl
         .ports
@@ -266,6 +418,43 @@ pub fn write_verilog(nl: &Netlist, lib: &CellLibrary) -> String {
                 } else {
                     s.push_str(&format!(
                         "  assign {} = 1'bx; // invalid BlockRom cell\n",
+                        netname(c.output)
+                    ));
+                }
+            }
+            CellKind::BlockRamWrite { .. } => {
+                // Emitted once as a shared behavioral write port above.
+            }
+            CellKind::BlockRamRead {
+                macro_id,
+                address_width,
+                bit_index,
+                ..
+            } => {
+                let valid = block_ram_group_ids
+                    .get(macro_id)
+                    .and_then(|index| block_ram_groups.get(*index))
+                    .is_some_and(|group| {
+                        c.inputs.len() == group.address_width
+                            && *address_width == group.address_width
+                            && group
+                                .initial
+                                .first()
+                                .is_some_and(|word| *bit_index < word.width())
+                    });
+                if valid {
+                    let index = block_ram_group_ids[macro_id];
+                    s.push_str(&format!(
+                        "  assign {} = block_ram_{}[{}][{}:{}];\n",
+                        netname(c.output),
+                        index,
+                        concatenated_bits(nl, &c.inputs),
+                        bit_index,
+                        bit_index
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "  assign {} = 1'bx; // invalid BlockRam read cell\n",
                         netname(c.output)
                     ));
                 }
@@ -434,5 +623,98 @@ mod tests {
                 Some((expected >> 1) & 1)
             );
         }
+    }
+
+    #[test]
+    fn writes_one_behavioral_model_per_block_ram_macro() {
+        let lib = CellLibrary::std();
+        let initial = std::sync::Arc::new(vec![
+            LogicWord::from_u64(2, 0b01),
+            LogicWord::from_u64(2, 0b10),
+            LogicWord::from_u64(2, 0b11),
+            LogicWord::from_u64(2, 0b00),
+        ]);
+        let mut nl = Netlist::new("ram");
+        let clock = nl.add_net("clock");
+        let write_enable = nl.add_net("write_enable");
+        let address0 = nl.add_net("address0");
+        let address1 = nl.add_net("address1");
+        let data0 = nl.add_net("data0");
+        let data1 = nl.add_net("data1");
+        for (bit_index, data) in [(0, data0), (1, data1)] {
+            let state = nl.add_net(format!("state{bit_index}"));
+            nl.add_cell(eda_core::netlist::Cell {
+                name: format!("ram_write_bit{bit_index}"),
+                kind: CellKind::BlockRamWrite {
+                    macro_id: 7,
+                    address_width: 2,
+                    bit_index,
+                    initial: initial.clone(),
+                    posedge: true,
+                },
+                inputs: vec![clock, write_enable, address0, address1, data],
+                output: state,
+            });
+        }
+        for bit_index in 0..2 {
+            let output = nl.add_net(format!("q{bit_index}"));
+            nl.add_cell(eda_core::netlist::Cell {
+                name: format!("ram_read_bit{bit_index}"),
+                kind: CellKind::BlockRamRead {
+                    macro_id: 7,
+                    address_width: 2,
+                    bit_index,
+                    initial: initial.clone(),
+                },
+                inputs: vec![address0, address1],
+                output,
+            });
+        }
+        nl.add_port("clock", Dir::In, vec![clock]);
+        nl.add_port("write_enable", Dir::In, vec![write_enable]);
+        nl.add_port("address", Dir::In, vec![address1, address0]);
+        nl.add_port("din", Dir::In, vec![data1, data0]);
+        nl.add_port("q0", Dir::Out, vec![nl.net_by_name("q0").unwrap()]);
+        nl.add_port("q1", Dir::Out, vec![nl.net_by_name("q1").unwrap()]);
+
+        let text = write_verilog(&nl, &lib);
+        assert_eq!(
+            text.matches("  reg [1:0] block_ram_0 [0:3];\n").count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains(
+            "always @(posedge clock) if (write_enable) block_ram_0[{address[1], address[0]}] <= {din[1], din[0]};"
+        ));
+        assert!(text.contains("assign q0 = block_ram_0[{address[1], address[0]}][0:0];"));
+        assert!(text.contains("assign q1 = block_ram_0[{address[1], address[0]}][1:1];"));
+        assert!(!text.contains("block_ram_1"));
+
+        let reparsed = eda_hdl::compile(&text, Some("ram")).expect("reparse BlockRam model");
+        let mut simulator = eda_sim::Simulator::new(&reparsed).unwrap();
+        for (address, expected) in [(0_u64, 0b01), (1, 0b10), (2, 0b11), (3, 0b00)] {
+            simulator
+                .set_input("address", &LogicWord::from_u64(2, address))
+                .unwrap();
+            assert_eq!(simulator.read("q0").unwrap().to_u64(), Some(expected & 1));
+            assert_eq!(
+                simulator.read("q1").unwrap().to_u64(),
+                Some((expected >> 1) & 1)
+            );
+        }
+        simulator
+            .set_input("write_enable", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        simulator
+            .set_input("address", &LogicWord::from_u64(2, 2))
+            .unwrap();
+        simulator
+            .set_input("din", &LogicWord::from_u64(2, 0b10))
+            .unwrap();
+        simulator
+            .set_input("clock", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("q0").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("q1").unwrap().to_u64(), Some(1));
     }
 }
