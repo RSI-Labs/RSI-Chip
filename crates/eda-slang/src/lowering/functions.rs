@@ -36,10 +36,11 @@ impl SlangAstLowerer {
             ));
         }
 
+        let empty_arguments = Vec::new();
         let arguments = value
             .get("arguments")
             .and_then(Value::as_array)
-            .ok_or_else(|| format!("function call '{subroutine_name}' has no arguments"))?;
+            .unwrap_or(&empty_arguments);
         let formals = definition
             .get("arguments")
             .and_then(Value::as_array)
@@ -70,6 +71,7 @@ impl SlangAstLowerer {
                 }),
             );
         }
+        load_variable_initializers(definition, &mut environment);
 
         let function_name = declaration_name(definition, "Subroutine")?;
         {
@@ -147,22 +149,105 @@ impl SlangAstLowerer {
                 self.inline_function_statement(expression, environment)
             }
             Some("Assignment") => {
-                let target = value
-                    .get("left")
-                    .and_then(expression_symbol)
-                    .ok_or_else(|| "function assignment has no named target".to_string())?;
-                let rhs = value
-                    .get("right")
-                    .ok_or_else(|| "function assignment has no right side".to_string())?;
-                let rhs = substitute_named_values(rhs, environment);
-                environment.insert(target, rhs);
+                apply_function_assignment(value, environment)?;
                 Ok(None)
+            }
+            Some("Conditional") => {
+                if string_field(value, "check").as_deref() != Some("None") {
+                    return Err(
+                        "direct function inlining does not support unique/priority conditionals"
+                            .into(),
+                    );
+                }
+                let conditions = value
+                    .get("conditions")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "function conditional has no conditions".to_string())?;
+                if conditions.len() != 1 {
+                    return Err(
+                        "direct function inlining supports one unqualified condition".into(),
+                    );
+                }
+                let condition = conditions
+                    .first()
+                    .and_then(|condition| condition.get("expr"))
+                    .ok_or_else(|| "function conditional has no expression".to_string())?;
+                let condition = substitute_named_values(condition, environment);
+                let true_statement = value
+                    .get("ifTrue")
+                    .ok_or_else(|| "function conditional has no true branch".to_string())?;
+                let mut true_environment = environment.clone();
+                let true_result =
+                    self.inline_function_statement(true_statement, &mut true_environment)?;
+                let mut false_environment = environment.clone();
+                let false_result = match value.get("ifFalse") {
+                    Some(statement) => {
+                        self.inline_function_statement(statement, &mut false_environment)?
+                    }
+                    None => None,
+                };
+
+                match (true_result, false_result) {
+                    (Some(true_value), Some(false_value)) => Ok(Some(json!({
+                        "kind": "ConditionalOp",
+                        "type": string_field(&true_value, "type").unwrap_or_default(),
+                        "conditions": [{"expr": condition}],
+                        "left": true_value,
+                        "right": false_value,
+                    }))),
+                    (Some(_), None) | (None, Some(_)) => Err(
+                        "direct function inlining does not support mixed return and fall-through branches"
+                            .into(),
+                    ),
+                    (None, None) => {
+                        merge_conditional_environment(
+                            environment,
+                            true_environment,
+                            false_environment,
+                            condition,
+                        )?;
+                        Ok(None)
+                    }
+                }
             }
             Some("Return") => {
                 let expression = value
                     .get("expr")
                     .ok_or_else(|| "function return has no expression".to_string())?;
                 Ok(Some(substitute_named_values(expression, environment)))
+            }
+            Some("ForLoop") => {
+                const MAX_INLINE_FUNCTION_LOOP_STEPS: usize = 256;
+                if let Some(initializers) = value.get("initializers").and_then(Value::as_array) {
+                    for initializer in initializers {
+                        self.inline_function_statement(initializer, environment)?;
+                    }
+                }
+                let stop = value
+                    .get("stopExpr")
+                    .ok_or_else(|| "function for-loop has no stop expression".to_string())?;
+                let body = value
+                    .get("body")
+                    .ok_or_else(|| "function for-loop has no body".to_string())?;
+                let steps = value
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "function for-loop has no steps".to_string())?;
+                for _ in 0..=MAX_INLINE_FUNCTION_LOOP_STEPS {
+                    let stop = substitute_named_values(stop, environment);
+                    let stop_value = constant_ast_i64(&stop)
+                        .map_err(|_| "function for-loop stop must be an inline integer constant")?;
+                    if stop_value == 0 {
+                        return Ok(None);
+                    }
+                    if let Some(result) = self.inline_function_statement(body, environment)? {
+                        return Ok(Some(result));
+                    }
+                    for step in steps {
+                        self.inline_function_statement(step, environment)?;
+                    }
+                }
+                Err("function for-loop exceeds the 256-iteration inlining limit".into())
             }
             Some(kind) => Err(format!(
                 "direct function inlining does not support statement kind '{kind}'"
@@ -172,9 +257,87 @@ impl SlangAstLowerer {
     }
 }
 
-fn substitute_named_values(
+fn apply_function_assignment(
     value: &Value,
     environment: &mut std::collections::BTreeMap<String, Value>,
+) -> Result<(), String> {
+    let target = value
+        .get("left")
+        .and_then(expression_symbol)
+        .ok_or_else(|| "function assignment has no named target".to_string())?;
+    let rhs = value
+        .get("right")
+        .ok_or_else(|| "function assignment has no right side".to_string())?;
+    let rhs = substitute_named_values(rhs, environment);
+    environment.insert(target, rhs);
+    Ok(())
+}
+
+fn load_variable_initializers(
+    value: &Value,
+    environment: &mut std::collections::BTreeMap<String, Value>,
+) {
+    if let Value::Object(fields) = value {
+        if matches!(
+            string_field(value, "kind").as_deref(),
+            Some("Variable" | "StatementBlock")
+        ) {
+            if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
+                if let Some(initializer) = value.get("initializer") {
+                    environment.insert(name, substitute_named_values(initializer, environment));
+                }
+            }
+        }
+        for nested in fields.values() {
+            load_variable_initializers(nested, environment);
+        }
+    } else if let Value::Array(values) = value {
+        for nested in values {
+            load_variable_initializers(nested, environment);
+        }
+    }
+}
+
+fn merge_conditional_environment(
+    environment: &mut std::collections::BTreeMap<String, Value>,
+    true_environment: std::collections::BTreeMap<String, Value>,
+    false_environment: std::collections::BTreeMap<String, Value>,
+    condition: Value,
+) -> Result<(), String> {
+    let mut names = std::collections::BTreeSet::new();
+    names.extend(true_environment.keys().cloned());
+    names.extend(false_environment.keys().cloned());
+    for name in names {
+        let (true_value, false_value) =
+            match (true_environment.get(&name), false_environment.get(&name)) {
+                (Some(true_value), Some(false_value)) => (true_value, false_value),
+                _ => {
+                    return Err(format!(
+                        "function conditional does not define local '{name}' on both branches"
+                    ))
+                }
+            };
+        if true_value == false_value {
+            environment.insert(name, true_value.clone());
+        } else {
+            environment.insert(
+                name,
+                json!({
+                    "kind": "ConditionalOp",
+                    "type": string_field(true_value, "type").unwrap_or_default(),
+                    "conditions": [{"expr": condition.clone()}],
+                    "left": true_value,
+                    "right": false_value,
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn substitute_named_values(
+    value: &Value,
+    environment: &std::collections::BTreeMap<String, Value>,
 ) -> Value {
     match value {
         Value::Object(fields) => {
@@ -198,4 +361,97 @@ fn substitute_named_values(
             .into(),
         scalar => scalar.clone(),
     }
+}
+
+fn constant_ast_i64(value: &Value) -> Result<i64, String> {
+    if let Some(word) = crate::ast_util::integer_literal_word(value)
+        .or_else(|| crate::ast_util::constant_json_word(value))
+    {
+        return word_i64(&word, &string_field(value, "type").unwrap_or_default());
+    }
+
+    match string_field(value, "kind").as_deref() {
+        Some("Conversion") => value
+            .get("operand")
+            .ok_or_else(|| "conversion constant has no operand".to_string())
+            .and_then(constant_ast_i64),
+        Some("UnaryOp") => {
+            let operand = value
+                .get("operand")
+                .ok_or_else(|| "unary constant has no operand".to_string())
+                .and_then(constant_ast_i64)?;
+            match string_field(value, "op").as_deref() {
+                Some("Plus") => Ok(operand),
+                Some("Minus") => operand
+                    .checked_neg()
+                    .ok_or_else(|| "unary constant negation overflows".to_string()),
+                _ => Err("unsupported unary constant operator".into()),
+            }
+        }
+        Some("BinaryOp") => {
+            let left = value
+                .get("left")
+                .ok_or_else(|| "binary constant has no left operand".to_string())
+                .and_then(constant_ast_i64)?;
+            let right = value
+                .get("right")
+                .ok_or_else(|| "binary constant has no right operand".to_string())
+                .and_then(constant_ast_i64)?;
+            let result = match string_field(value, "op").as_deref() {
+                Some("Add") => left.checked_add(right),
+                Some("Subtract") => left.checked_sub(right),
+                Some("Multiply") => left.checked_mul(right),
+                Some("Divide") if right != 0 => Some(left.wrapping_div(right)),
+                Some("Mod") if right != 0 => Some(left.wrapping_rem(right)),
+                Some("LessThan") => Some((left < right) as i64),
+                Some("LessThanEqual") => Some((left <= right) as i64),
+                Some("GreaterThan") => Some((left > right) as i64),
+                Some("GreaterThanEqual") => Some((left >= right) as i64),
+                Some("Equality") => Some((left == right) as i64),
+                Some("Inequality") => Some((left != right) as i64),
+                Some("LogicalAnd") => Some((left != 0 && right != 0) as i64),
+                Some("LogicalOr") => Some((left != 0 || right != 0) as i64),
+                _ => return Err("unsupported binary constant operator".into()),
+            };
+            result.ok_or_else(|| "binary constant operation overflows".to_string())
+        }
+        Some("ConditionalOp") => {
+            let condition = value
+                .get("conditions")
+                .and_then(Value::as_array)
+                .and_then(|conditions| conditions.first())
+                .and_then(|condition| condition.get("expr"))
+                .ok_or_else(|| "conditional constant has no condition".to_string())
+                .and_then(constant_ast_i64)?;
+            let selected = if condition != 0 { "left" } else { "right" };
+            value
+                .get(selected)
+                .ok_or_else(|| "conditional constant has no selected value".to_string())
+                .and_then(constant_ast_i64)
+        }
+        _ => Err("expression is not an inline integer constant".into()),
+    }
+}
+
+fn word_i64(word: &eda_core::logic::LogicWord, type_name: &str) -> Result<i64, String> {
+    if word.width() == 0 || word.width() > u64::BITS as usize {
+        return Err("inline integer constant width is out of range".into());
+    }
+    if !word.is_fully_known() {
+        return Err("inline integer constant is unknown".into());
+    }
+    let mut magnitude = 0_i128;
+    for (bit, value) in word.bits.iter().enumerate() {
+        if value.as_bool() == Some(true) {
+            magnitude |= 1_i128 << bit;
+        }
+    }
+    let signed = crate::types::simple_type_signed(type_name).unwrap_or(false);
+    let sign_bit = 1_i128 << (word.width() - 1);
+    let signed_value = if signed && magnitude & sign_bit != 0 {
+        magnitude - (1_i128 << word.width())
+    } else {
+        magnitude
+    };
+    i64::try_from(signed_value).map_err(|_| "inline integer constant is out of range".to_string())
 }

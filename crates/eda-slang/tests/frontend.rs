@@ -2794,7 +2794,10 @@ module functions(
   output int sum,
   output int constant,
   output int nested,
-  output int initial_sum
+  output int initial_sum,
+  output int selected,
+  output int assigned,
+  output int loop_sum
 );
   function automatic int add(int x, int y);
     int result;
@@ -2808,10 +2811,30 @@ module functions(
     return add(x, x);
   endfunction
 
+  function automatic int pick(int x, int y);
+    if (x < y) return x;
+    else return y;
+  endfunction
+
+  function automatic int cond_assign(int x, int y);
+    int result = x;
+    if (x < y) result = y;
+    return result;
+  endfunction
+
+  function automatic int sum_four();
+    int result = 0;
+    for (int i = 0; i < 4; i = i + 1) result = result + i;
+    return result;
+  endfunction
+
   assign sum = add(a, b);
   assign constant = add(2, 3);
   assign nested = twice(b);
   initial initial_sum = add(7, 8);
+  assign selected = pick(a, b);
+  assign assigned = cond_assign(a, b);
+  assign loop_sum = sum_four();
 endmodule
 "#,
     )
@@ -2824,7 +2847,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower function calls");
-    assert_eq!(design.assigns.len(), 3);
+    assert_eq!(design.assigns.len(), 6);
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create function simulator");
@@ -2838,6 +2861,18 @@ endmodule
     assert_eq!(simulator.read("constant").unwrap().to_u64(), Some(5));
     assert_eq!(simulator.read("nested").unwrap().to_u64(), Some(8));
     assert_eq!(simulator.read("initial_sum").unwrap().to_u64(), Some(15));
+    assert_eq!(
+        simulator.read("selected").unwrap().to_u64(),
+        Some(0xffff_ffff)
+    );
+    assert_eq!(simulator.read("assigned").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("loop_sum").unwrap().to_u64(), Some(6));
+
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 5))
+        .unwrap();
+    assert_eq!(simulator.read("selected").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("assigned").unwrap().to_u64(), Some(5));
 }
 
 #[test]
@@ -2869,6 +2904,39 @@ endmodule
         )
         .expect_err("unbounded recursive function inlining must be rejected");
     assert!(error.contains("recursive function"), "{error}");
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_excessive_function_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-excessive-function-loop");
+    let source_path = root.join("excessive_function_loop.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module excessive_function_loop(output int y);
+  function automatic int sum();
+    int result = 0;
+    for (int i = 0; i < 257; i = i + 1) result = result + 1;
+    return result;
+  endfunction
+
+  assign y = sum();
+endmodule
+"#,
+    )
+    .expect("write excessive-function-loop source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("excessive_function_loop"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("excessive function-loop inlining must be bounded");
+    assert!(error.contains("256-iteration"), "{error}");
 }
 
 #[test]
