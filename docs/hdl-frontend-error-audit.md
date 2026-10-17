@@ -17,17 +17,18 @@ The serious frontend failures are structural, not isolated typos:
 6. Concurrent `compile_source` calls previously generated temporary filenames from only process ID plus nanosecond time and could collide during parallel tests. The adapter now adds a process-local atomic counter; the new default-parallel frontend suite exercises the fix.
 7. The bounded parser now preserves and lowers `mem[i][msb:lsb]`; both direct slang-AST and preprocessed bounded paths pass a behavioral differential test.
 8. The first AST-summary implementation recursively collected every named symbol under an assignment LHS, so `mem[addr]` incorrectly reported both `mem` and `addr` as assignment targets. Target extraction now follows only the selected base value. Legacy small-array procedural assignments still use bounded per-element expansion; their slang comparison preserves assignment-count checking without pretending that the expanded expression tree has source-level shape equivalence.
+9. The bounded parser now accepts combined net/data type spellings such as `wire logic`. Together with the existing sparse `inout` memory-port model, both direct slang-AST and preprocessed bounded paths execute the same 4 KiB shared-memory differential.
 
 Current automated status at the time of this audit:
 
 | Gate | Result |
 |---|---|
-| `cargo test -p eda-hdl --all-targets -- --nocapture` | 87 passed after array-element range-select remediation |
+| `cargo test -p eda-hdl --all-targets -- --nocapture` | 88 passed after combined net/data-type remediation |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 23 passed, including multidimensional and reversed-element sparse-memory index/bounds tests |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 83 passed, including consecutive sparse whole/part-write tests |
 | `cargo test -p eda-sim frontend_regressions -- --nocapture` | 14 passed |
 | `SLANG_BIN=/tmp/slang-build/bin/slang UVM_HOME=/tmp/uvm-core cargo test -p eda-slang --all-targets -- --nocapture` | 17 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 131.54 s after the direct-AST follow-up |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green -- --nocapture` | Passed in 130.01 s after the combined net/data-type follow-up |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
@@ -88,6 +89,7 @@ This closes the original dense-storage blocker for whole-element and indexed par
 | HF-C22 | P1 | Port checking | Width/truncation/extension and signedness mismatch diagnostics are incomplete. | Connections are lowered without a full port type/width contract. | Implement implicit port conversion rules and issue required warnings/errors. | Open |
 | HF-C23 | P1 | Assertions | Concurrent assertion coverage semantics merge overlapping attempts for some repetition forms. | The current implementation documents that goto attempts sharing a count bucket are merged; assertion/assumption behavior is preserved but distinct cover attempts are not. | Track individual attempts or define and validate a conservative cover model. | Open |
 | HF-C24 | P1 | Arrays/parser | The internal parser rejected a simple range select of an unpacked-array element, such as `mem[i][msb:lsb]`. | slang accepted the syntax while the bounded parser reported `expected ']', found ':'`; there was no array-element range AST node. | Add an array-element range-select AST node and lower it to indexed `MemoryReadPart`/`MemoryBlPart` semantics. | Fixed in current worktree |
+| HF-C25 | P1 | Lexer/parser types | Combined net/data type spellings such as `inout wire logic [7:0]` and module declarations such as `wire logic [3:0]` were rejected after `wire`. | The parser consumed only one type keyword, then treated `logic` as the expected identifier. slang accepts both spellings. | Parse a net keyword followed by an optional data type, preserve net semantics (`is_variable=false`), and continue with range/name elaboration. | Fixed in current worktree |
 
 ## B. Language and semantic coverage gaps
 

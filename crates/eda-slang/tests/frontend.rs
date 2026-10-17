@@ -942,7 +942,7 @@ fn slang_ast_direct_lowering_shares_child_sparse_memory_ports() {
         &source_path,
         r#"
 module child(
-  inout wire logic [7:0] memory [0:3],
+  inout wire logic [7:0] memory [0:4095],
   output logic [7:0] q
 );
   assign q = memory[2];
@@ -953,7 +953,7 @@ module top(
   output logic [7:0] child_q,
   output logic [7:0] parent_q
 );
-  wire logic [7:0] memory [0:3];
+  wire logic [7:0] memory [0:4095];
   child u (
     .memory(memory),
     .q(child_q)
@@ -972,6 +972,19 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower shared sparse-memory port");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower shared sparse-memory port through bounded path");
+    assert_eq!(direct.memories.len(), 2);
+    assert_eq!(direct.memory_connections.len(), 1);
+    assert_eq!(direct.memory_connections[0].child, 1);
+    assert_eq!(direct.memory_connections[0].parent, 0);
+    assert_eq!(reference.memories.len(), 2);
+    assert_eq!(reference.memory_connections.len(), 1);
     let mut direct_simulator =
         Simulator::new(&direct).expect("create direct shared-memory simulator");
     direct_simulator
@@ -983,6 +996,20 @@ endmodule
     );
     assert_eq!(
         direct_simulator.read("parent_q").unwrap().to_u64(),
+        Some(0xa7)
+    );
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create bounded shared-memory simulator");
+    reference_simulator
+        .set_input("din", &LogicWord::from_u64(8, 0xa7))
+        .expect("set bounded shared data");
+    assert_eq!(
+        reference_simulator.read("child_q").unwrap().to_u64(),
+        Some(0xa7)
+    );
+    assert_eq!(
+        reference_simulator.read("parent_q").unwrap().to_u64(),
         Some(0xa7)
     );
 }

@@ -170,6 +170,31 @@ impl Parser {
             _ => return None,
         };
         self.bump();
+        let is_net = matches!(name.as_str(), "wire" | "tri");
+        let name = if is_net {
+            match self.peek() {
+                Tok::Ident(data_type)
+                    if matches!(
+                        data_type.as_str(),
+                        "reg"
+                            | "logic"
+                            | "bit"
+                            | "byte"
+                            | "shortint"
+                            | "int"
+                            | "integer"
+                            | "longint"
+                    ) =>
+                {
+                    let data_type = data_type.clone();
+                    self.bump();
+                    data_type
+                }
+                _ => name,
+            }
+        } else {
+            name
+        };
         let trailing_signed = self.eat_kw("signed");
         let trailing_unsigned = self.eat_kw("unsigned");
         let is_signed =
@@ -212,7 +237,14 @@ impl Parser {
             },
             _ => return None,
         };
-        Some(info)
+        Some(if is_net {
+            NetTypeInfo {
+                is_variable: false,
+                ..info
+            }
+        } else {
+            info
+        })
     }
 
     pub(super) fn net_range(

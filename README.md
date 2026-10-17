@@ -68,14 +68,17 @@ explicit about constructs the bounded IR can represent.
 The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
 `compile_sources` for deterministic named multi-unit compilation with parser
 errors mapped back to their originating file and line.
-One-dimensional module unpacked arrays now support whole-element reads and
-writes. Large memories lower to first-class sparse `MemoryDecl` objects with
-explicit read, blocking-write, and NBA-write operations; a natural 4 KiB byte
-array uses 30 flat bits rather than 32,797, and the sparse-memory regression
-extends to 1 MiB-by-8. Small compatibility arrays retain bounded flat storage. Sparse memories
+Module unpacked arrays now support whole-element reads and writes, including
+fixed multidimensional selections. Large memories lower to first-class sparse
+`MemoryDecl` objects with explicit read, blocking-write, and NBA-write
+operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
+and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
-direct large `inout` memory-port sharing through the hierarchy.
+large `inout` memory-port sharing through the hierarchy. The bounded parser
+also accepts combined net/data declarations such as `wire logic`, allowing the
+preprocessed and direct slang paths to share the same sparse-memory-port
+differential.
 
 The data-driven regression target currently contains **15,159 unique named
 cases**. It is not a collection of three or four broad assertions: every case

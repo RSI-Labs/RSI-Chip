@@ -131,6 +131,31 @@ endmodule
 }
 
 #[test]
+fn net_type_keyword_can_combine_with_data_type() {
+    let file = parse_ok(
+        "module m(inout wire logic [7:0] p); wire logic [3:0] n; assign n = 4'b0; endmodule",
+    );
+    let port = file.modules[0]
+        .items
+        .iter()
+        .find(|item| {
+            matches!(item, Item::Port { names, .. }
+                if names.iter().any(|name| name == "p"))
+        })
+        .expect("combined net-type port");
+    assert!(matches!(port, Item::Port { is_reg: false, .. }));
+    let net = file.modules[0]
+        .items
+        .iter()
+        .find(|item| {
+            matches!(item, Item::Net { names, .. }
+                if names.iter().any(|(name, _)| name == "n"))
+        })
+        .expect("combined net-type declaration");
+    assert!(matches!(net, Item::Net { is_reg: false, .. }));
+}
+
+#[test]
 fn conditional_and_concat() {
     let f = parse_ok("module m(s,a,b,y); assign y = s ? {a, b[3:0]} : 4'b0; endmodule");
     if let Item::Assign { e, .. } = &f.modules[0].items[4] {
