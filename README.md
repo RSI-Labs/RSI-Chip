@@ -58,7 +58,7 @@ additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
 if/case control flow, single posedge/negedge sensitivity, recursive
 parameterized module hierarchy with port connections, generated members, and
-multidimensional sparse-memory whole/part-select operations and direct inout child-memory sharing directly from slang's elaborated
+multidimensional sparse-memory whole/part-select operations, inline initializers, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate
 the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
@@ -75,7 +75,7 @@ operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
-large `inout` memory-port sharing through the hierarchy. The bounded parser
+large `inout` memory-port sharing through the hierarchy. Direct slang-AST lowering also supports inline multidimensional sparse-memory initializers. The bounded parser
 also accepts combined net/data declarations such as `wire logic`, allowing the
 preprocessed and direct slang paths to share the same sparse-memory-port
 differential.

@@ -812,11 +812,7 @@ impl SlangAstLowerer {
             }
             return Ok(());
         }
-        if member.get("initializer").is_some() {
-            return Err(format!(
-                "direct slang-AST lowering does not yet support sparse-memory initializer '{name}'"
-            ));
-        }
+        let initializer = member.get("initializer");
         let base = self.design.n_nets;
         self.design.n_nets += 1;
         self.design.net_decls.push(eda_core::ir::NetDecl {
@@ -844,6 +840,13 @@ impl SlangAstLowerer {
                 memory: Some(memory_index),
             },
         );
+        if let Some(initializer) = initializer {
+            let dimensions = self.design.memories[memory_index].dimensions.clone();
+            let statements = memory_initializer_statements(memory_index, &dimensions, initializer)?;
+            self.design
+                .initials
+                .push(eda_core::ir::Stmt::Block(statements));
+        }
         Ok(())
     }
 
@@ -2585,6 +2588,80 @@ fn literal_word(type_name: &str, raw: &str) -> Option<eda_core::logic::LogicWord
     let signed_value = digits.parse::<i128>().ok()?;
     let value = u64::try_from(signed_value).unwrap_or(signed_value as u128 as u64);
     Some(eda_core::logic::LogicWord::from_u64(width, value))
+}
+
+fn constant_json_word(value: &serde_json::Value) -> Option<eda_core::logic::LogicWord> {
+    let type_name = string_field(value, "type")?;
+    let raw = string_field(value, "constant")?;
+    literal_word(&type_name, &raw)
+}
+
+fn memory_initializer_statements(
+    memory: usize,
+    dimensions: &[eda_core::ir::MemoryDimension],
+    pattern: &serde_json::Value,
+) -> Result<Vec<eda_core::ir::Stmt>, String> {
+    fn visit(
+        memory: usize,
+        dimensions: &[eda_core::ir::MemoryDimension],
+        pattern: &serde_json::Value,
+        indexes: &mut Vec<i64>,
+        statements: &mut Vec<eda_core::ir::Stmt>,
+    ) -> Result<(), String> {
+        if indexes.len() == dimensions.len() {
+            let word = constant_json_word(pattern).ok_or_else(|| {
+                "sparse-memory initializer elements must be integer constants".to_string()
+            })?;
+            statements.push(eda_core::ir::Stmt::MemoryBl {
+                memory,
+                indexes: indexes
+                    .iter()
+                    .map(|index| {
+                        eda_core::ir::Expr::Const(eda_core::logic::LogicWord::from_u64(
+                            32,
+                            *index as u64,
+                        ))
+                    })
+                    .collect(),
+                e: eda_core::ir::Expr::Const(word),
+            });
+            return Ok(());
+        }
+        if string_field(pattern, "kind").as_deref() != Some("SimpleAssignmentPattern") {
+            return Err(
+                "direct slang-AST lowering supports only simple sparse-memory initializers".into(),
+            );
+        }
+        let elements = pattern
+            .get("elements")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "sparse-memory initializer has no elements".to_string())?;
+        let dimension = dimensions[indexes.len()];
+        if elements.len() != dimension.length {
+            return Err(format!(
+                "sparse-memory initializer dimension has {} elements, expected {}",
+                elements.len(),
+                dimension.length
+            ));
+        }
+        for (position, element) in elements.iter().enumerate() {
+            let logical_index = dimension.base + dimension.step * position as i64;
+            if logical_index < 0 {
+                return Err(
+                    "negative sparse-memory initializer indexes are not yet lowered".into(),
+                );
+            }
+            indexes.push(logical_index);
+            visit(memory, dimensions, element, indexes, statements)?;
+            indexes.pop();
+        }
+        Ok(())
+    }
+
+    let mut statements = Vec::new();
+    let mut indexes = Vec::new();
+    visit(memory, dimensions, pattern, &mut indexes, &mut statements)?;
+    Ok(statements)
 }
 
 fn integer_literal_word(value: &serde_json::Value) -> Option<eda_core::logic::LogicWord> {

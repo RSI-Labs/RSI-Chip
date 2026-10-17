@@ -21,7 +21,7 @@ frontend. It uses slang for:
    constant selects, initial/always procedures, blocking/non-blocking
    assignments, blocks, if/case control flow, and single posedge/negedge
    sensitivity, plus recursive parameterized module hierarchy, port
-   connections, generated members, and multidimensional sparse-memory whole/part-select operations and direct inout child-memory sharing.
+   connections, generated members, and multidimensional sparse-memory whole/part-select operations, inline initializers, and direct inout child-memory sharing.
 
 The adapter deliberately reports slang diagnostics instead of silently
 bypassing them. If the downstream elaborator cannot represent a construct, that

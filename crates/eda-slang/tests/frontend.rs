@@ -1015,6 +1015,54 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_initializes_multidimensional_sparse_memory() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-init");
+    let source_path = root.join("memory-init.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory_init(
+  output logic [7:0] first,
+  output logic [7:0] middle,
+  output logic [7:0] last
+);
+  logic [7:0] mem [0:1][0:2] = '{
+    '{8'h01, 8'h02, 8'h03},
+    '{8'h04, 8'h05, 8'h06}
+  };
+  assign first = mem[0][0];
+  assign middle = mem[0][2];
+  assign last = mem[1][2];
+endmodule
+"#,
+    )
+    .expect("write sparse-memory initializer source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_init"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory initializer");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].dimensions.len(), 2);
+    assert_eq!(design.memories[0].flat_length, 6);
+    assert_eq!(design.initials.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create initializer simulator");
+    simulator
+        .run_until(0)
+        .expect("settle sparse-memory initializers");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("middle").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("last").unwrap().to_u64(), Some(6));
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
