@@ -38,6 +38,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
                 length: 4,
             }],
             flat_length: 4,
+            kind: eda_core::ir::MemoryKind::Ram,
         }],
         memory_connections: Vec::new(),
         n_nets: 8,

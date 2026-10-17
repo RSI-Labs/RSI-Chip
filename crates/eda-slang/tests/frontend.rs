@@ -444,6 +444,7 @@ endmodule
     assert_eq!(design.memories[0].name, "mem");
     assert_eq!(design.memories[0].element_width, 8);
     assert_eq!(design.memories[0].flat_length, 4);
+    assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Ram);
     assert!(reference.memories.is_empty());
     assert_eq!(
         format!("{:?}", reference.ports),
@@ -985,6 +986,10 @@ endmodule
     assert_eq!(direct.memory_connections[0].parent, 0);
     assert_eq!(reference.memories.len(), 2);
     assert_eq!(reference.memory_connections.len(), 1);
+    assert_eq!(direct.memories[0].kind, eda_core::ir::MemoryKind::Ram);
+    assert_eq!(direct.memories[1].kind, eda_core::ir::MemoryKind::Ram);
+    assert_eq!(reference.memories[0].kind, eda_core::ir::MemoryKind::Ram);
+    assert_eq!(reference.memories[1].kind, eda_core::ir::MemoryKind::Ram);
     let mut direct_simulator =
         Simulator::new(&direct).expect("create direct shared-memory simulator");
     direct_simulator
@@ -1051,6 +1056,7 @@ endmodule
     assert_eq!(design.memories.len(), 1);
     assert_eq!(design.memories[0].dimensions.len(), 2);
     assert_eq!(design.memories[0].flat_length, 6);
+    assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create initializer simulator");
@@ -1122,8 +1128,12 @@ endmodule
         )
         .expect("lower memory files through the bounded path");
     assert_eq!(design.memories.len(), 2);
+    assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(design.memories[1].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(design.initials.len(), 1);
     assert_eq!(reference.memories.len(), 2);
+    assert_eq!(reference.memories[0].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(reference.memories[1].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(reference.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create memory-file simulator");

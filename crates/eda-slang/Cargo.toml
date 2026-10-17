@@ -10,4 +10,5 @@ eda-hdl = { path = "../eda-hdl" }
 serde_json = "1"
 
 [dev-dependencies]
+eda-core = { path = "../eda-core" }
 eda-sim = { path = "../eda-sim" }

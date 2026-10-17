@@ -1642,6 +1642,7 @@ impl<'a> Elaborator<'a> {
                 })
                 .collect(),
             flat_length: array.length as u64,
+            kind: MemoryKind::Ram,
         });
         memory
     }

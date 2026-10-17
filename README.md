@@ -75,7 +75,9 @@ operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
-large `inout` memory-port sharing through the hierarchy. Direct slang-AST
+large `inout` memory-port sharing through the hierarchy. Post-elaboration
+inference marks runtime-written canonical alias groups as RAM and
+initializer-only memories as ROM. Direct slang-AST
 lowering supports inline multidimensional sparse-memory initializers and
 compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps. The bounded path expands
 two-to-four-argument memory-file loads/dumps with constant bounds relative to the first source file and accepts

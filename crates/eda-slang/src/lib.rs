@@ -310,7 +310,8 @@ impl SlangFrontend {
     /// Directly lowers the current simple-module AST subset into `Design`.
     pub fn lower_ast_json(&self, json: &str) -> Result<Design, String> {
         let root = parse_ast_root(json)?;
-        let design = SlangAstLowerer::lower(&root)?;
+        let mut design = SlangAstLowerer::lower(&root)?;
+        design.infer_memory_kinds();
         let authoritative = SlangAstSummary::parse(json)?;
         authoritative.validate_against_design(&design)?;
         Ok(design)
@@ -831,6 +832,7 @@ impl SlangAstLowerer {
             element_lsb: memory.element_lsb,
             dimensions: memory.dimensions,
             flat_length: memory.flat_length,
+            kind: eda_core::ir::MemoryKind::Ram,
         });
         self.symbols.insert(
             name.to_string(),

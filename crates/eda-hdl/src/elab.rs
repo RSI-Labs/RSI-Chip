@@ -5,8 +5,8 @@ use crate::ast;
 use crate::parser;
 use eda_core::ir::{
     Assign, BinOp, Design, Dir, DispPart as DispPartIR, Expr as ExprIR, HierarchicalInstance,
-    HierarchicalPort, LValue, MemoryConnection, MemoryDecl, MemoryDimension, NetDecl, PortDecl,
-    Process, Range, Sens as SensIR, Stmt as StmtIR, UnOp,
+    HierarchicalPort, LValue, MemoryConnection, MemoryDecl, MemoryDimension, MemoryKind, NetDecl,
+    PortDecl, Process, Range, Sens as SensIR, Stmt as StmtIR, UnOp,
 };
 use eda_core::logic::{LogicValue, LogicWord};
 use std::collections::{HashMap, HashSet};
@@ -191,6 +191,7 @@ pub fn elaborate_with_source_dir(
         next_object_id: 1,
     };
     el.elab_module(&top_name, "", &HashMap::new(), &HashMap::new())?;
+    el.design.infer_memory_kinds();
     el.design
         .hierarchy
         .sort_by_key(|instance| (instance.depth, instance.path.clone()));

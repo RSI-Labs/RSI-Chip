@@ -57,6 +57,17 @@ pub struct MemoryDimension {
     pub length: usize,
 }
 
+/// Coarse storage contract inferred after elaboration.
+///
+/// This is not yet a vendor macro mapping, but it separates read-only storage
+/// from runtime-writable storage before synthesis and physical mapping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryKind {
+    #[default]
+    Ram,
+    Rom,
+}
+
 /// A sparse unpacked-array object.
 ///
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
@@ -71,6 +82,8 @@ pub struct MemoryDecl {
     pub dimensions: Vec<MemoryDimension>,
     /// Product of all dimension lengths.
     pub flat_length: u64,
+    /// Inferred storage contract. RAM is the conservative default.
+    pub kind: MemoryKind,
 }
 
 /// Aliases a child instance's memory object to the parent memory supplied on
@@ -567,6 +580,45 @@ impl Design {
             .min_by_key(|instance| instance.net_end - instance.net_start)
     }
 
+    /// Infer whether each sparse-memory object needs runtime write ports.
+    ///
+    /// Initializers and `$readmem` loads are treated as ROM initialization.
+    /// Any procedural write in a non-initial process makes the canonical
+    /// memory (including hierarchy aliases) a RAM.
+    pub fn infer_memory_kinds(&mut self) {
+        let mut runtime_writes = std::collections::HashSet::new();
+        for process in &self.processes {
+            collect_memory_writes(&process.body, &mut runtime_writes);
+        }
+        let aliases = self.memory_alias_roots();
+        let runtime_writes = runtime_writes
+            .into_iter()
+            .map(|memory| aliases.get(memory).copied().unwrap_or(memory))
+            .collect::<std::collections::HashSet<_>>();
+        for (index, memory) in self.memories.iter_mut().enumerate() {
+            let root = aliases.get(index).copied().unwrap_or(index);
+            memory.kind = if runtime_writes.contains(&root) {
+                MemoryKind::Ram
+            } else {
+                MemoryKind::Rom
+            };
+        }
+    }
+
+    fn memory_alias_roots(&self) -> Vec<usize> {
+        let mut aliases = (0..self.memories.len()).collect::<Vec<_>>();
+        for _ in 0..self.memories.len() {
+            for connection in &self.memory_connections {
+                if let Some(parent) = aliases.get(connection.parent).copied() {
+                    if let Some(alias) = aliases.get_mut(connection.child) {
+                        *alias = parent;
+                    }
+                }
+            }
+        }
+        aliases
+    }
+
     /// Human-readable elaborated hierarchy summary.
     pub fn hierarchy_report(&self) -> String {
         let mut out = format!("hierarchy: {} instance(s)\n", self.hierarchy.len());
@@ -582,6 +634,45 @@ impl Design {
             ));
         }
         out
+    }
+}
+
+fn collect_memory_writes(statement: &Stmt, writes: &mut std::collections::HashSet<usize>) {
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter()
+            .for_each(|statement| collect_memory_writes(statement, writes)),
+        Stmt::Forever(body) | Stmt::Delay { body, .. } => collect_memory_writes(body, writes),
+        Stmt::MemoryBl { memory, .. } | Stmt::MemoryNBl { memory, .. } => {
+            writes.insert(*memory);
+        }
+        Stmt::MemoryBlPart { memory, .. } | Stmt::MemoryNBlPart { memory, .. } => {
+            writes.insert(*memory);
+        }
+        Stmt::If { t, f, .. } => {
+            collect_memory_writes(t, writes);
+            if let Some(f) = f {
+                collect_memory_writes(f, writes);
+            }
+        }
+        Stmt::Case { arms, dflt, .. } => {
+            for (_, body) in arms {
+                collect_memory_writes(body, writes);
+            }
+            if let Some(body) = dflt {
+                collect_memory_writes(body, writes);
+            }
+        }
+        Stmt::NBl { .. }
+        | Stmt::Bl { .. }
+        | Stmt::BlIndexed { .. }
+        | Stmt::NBlIndexed { .. }
+        | Stmt::Display { .. }
+        | Stmt::WriteMem { .. }
+        | Stmt::Assert { .. }
+        | Stmt::Assume { .. }
+        | Stmt::Cover { .. }
+        | Stmt::Finish => {}
     }
 }
 
@@ -666,6 +757,7 @@ mod tests {
                 },
             ],
             flat_length: 8,
+            kind: MemoryKind::Ram,
         };
         assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
         assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
@@ -689,6 +781,7 @@ mod tests {
                 length: 513,
             }],
             flat_length: 513,
+            kind: MemoryKind::Ram,
         };
         assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
         assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));
