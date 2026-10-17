@@ -455,6 +455,10 @@ impl SlangAstLowerer {
             .get("members")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| "slang AST InstanceBody has no members".to_string())?;
+        self.lower_members(members)
+    }
+
+    fn lower_members(&mut self, members: &[serde_json::Value]) -> Result<(), String> {
         for member in members {
             let kind = string_field(member, "kind").unwrap_or_default();
             match kind.as_str() {
@@ -464,6 +468,16 @@ impl SlangAstLowerer {
                 "ContinuousAssign" => self.lower_continuous_assignment(member)?,
                 "ProceduralBlock" => self.lower_procedural_block(member)?,
                 "Instance" => self.lower_instance(member)?,
+                generate_kind if generate_kind.starts_with("GenerateBlock") => {
+                    if bool_field(member, "isUninstantiated") {
+                        continue;
+                    }
+                    let members = member
+                        .get("members")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| "slang GenerateBlock has no members".to_string())?;
+                    self.lower_members(members)?;
+                }
                 _ => {
                     return Err(format!(
                         "direct slang-AST lowering does not support member kind '{kind}'"

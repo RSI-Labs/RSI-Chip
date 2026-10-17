@@ -856,6 +856,66 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_accepts_generated_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let source = r#"
+module child(input logic a, output logic y);
+  assign y = a;
+endmodule
+
+module top(input logic a, output logic y, output logic z);
+  generate
+    if (1) begin : selected
+      child u(.a(a), .y(y));
+      assign z = ~a;
+    end
+  endgenerate
+endmodule
+"#;
+    let root = temporary_directory("direct-ast-generate");
+    let source_path = root.join("generate.sv");
+    std::fs::write(&source_path, source).expect("write generate source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower generated members");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower generated members through the preprocessed path");
+    assert_eq!(design.n_nets, 5);
+    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(
+        format!("{:?}", reference.net_decls),
+        format!("{:?}", design.net_decls)
+    );
+    assert_eq!(
+        format!("{:?}", reference.assigns),
+        format!("{:?}", design.assigns)
+    );
+    assert_eq!(
+        format!("{:?}", reference.hierarchy),
+        format!("{:?}", design.hierarchy)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create generate simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .expect("set generate input");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(0));
+}
+
+#[test]
 fn slang_ast_json_contains_elaborated_module_symbols() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
