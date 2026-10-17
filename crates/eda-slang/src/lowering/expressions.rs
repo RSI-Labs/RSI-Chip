@@ -3,7 +3,7 @@
 use crate::ast_util::{expression_symbol, integer_literal_word, named_constant_word, string_field};
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
-use eda_core::logic::LogicWord;
+use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
 use super::hierarchy::full_range;
@@ -242,6 +242,19 @@ impl super::SlangAstLowerer {
                 })
             }
             "BinaryOp" => {
+                if matches!(
+                    string_field(value, "op").as_deref(),
+                    Some("WildcardEquality" | "WildcardInequality")
+                ) {
+                    let equality = self.lower_wildcard_equality(value)?;
+                    if string_field(value, "op").as_deref() == Some("WildcardInequality") {
+                        return Ok(Expr::Un {
+                            op: UnOp::Not,
+                            a: Box::new(equality),
+                        });
+                    }
+                    return Ok(equality);
+                }
                 let op = binary_operator(string_field(value, "op").as_deref())?;
                 let left = value
                     .get("left")
@@ -280,6 +293,7 @@ impl super::SlangAstLowerer {
                     e: Box::new(self.lower_expression(concat)?),
                 })
             }
+            "Inside" => self.lower_inside(value),
             "ConditionalOp" => {
                 let conditions = value
                     .get("conditions")
@@ -474,6 +488,131 @@ impl super::SlangAstLowerer {
             return Err("constant indexed packed select start is out of range".to_string());
         }
         Ok(Some(selected_expression))
+    }
+
+    pub(super) fn lower_wildcard_equality(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let left = value
+            .get("left")
+            .ok_or_else(|| "wildcard equality has no left operand".to_string())?;
+        let right = value
+            .get("right")
+            .ok_or_else(|| "wildcard equality has no right operand".to_string())?;
+        let width = string_field(left, "type")
+            .and_then(|type_name| simple_type_width(&type_name))
+            .ok_or_else(|| "wildcard equality has unresolved width".to_string())?;
+        let pattern = integer_literal_word(right)
+            .or_else(|| named_constant_word(right))
+            .ok_or_else(|| {
+                "wildcard equality requires an integer constant pattern operand".to_string()
+            })?;
+        if pattern.width() != width {
+            return Err(format!(
+                "wildcard equality pattern width {} does not match expression width {width}",
+                pattern.width()
+            ));
+        }
+
+        let mask_bits = pattern
+            .bits
+            .iter()
+            .map(|bit| {
+                if bit.is_unknown() {
+                    LogicValue::Zero
+                } else {
+                    LogicValue::One
+                }
+            })
+            .collect();
+        let expected_bits = pattern
+            .bits
+            .iter()
+            .map(|bit| {
+                if bit.is_unknown() {
+                    LogicValue::Zero
+                } else {
+                    *bit
+                }
+            })
+            .collect();
+        let value = self.lower_expression(left)?;
+        let masked = Expr::Bin {
+            op: BinOp::And,
+            a: Box::new(value),
+            b: Box::new(Expr::Const(LogicWord { bits: mask_bits })),
+        };
+        Ok(Expr::Bin {
+            op: BinOp::Eq,
+            a: Box::new(masked),
+            b: Box::new(Expr::Const(LogicWord {
+                bits: expected_bits,
+            })),
+        })
+    }
+
+    pub(super) fn lower_inside(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let left = value
+            .get("left")
+            .ok_or_else(|| "inside expression has no left operand".to_string())?;
+        let ranges = value
+            .get("rangeList")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "inside expression has no range list".to_string())?;
+        let left = self.lower_expression(left)?;
+        let mut result = Expr::Const(LogicWord::zero(1));
+        for range in ranges {
+            let item = if string_field(range, "kind").as_deref() == Some("ValueRange") {
+                if string_field(range, "rangeKind").as_deref() != Some("Simple") {
+                    return Err(
+                        "direct slang-AST lowering supports only simple inside value ranges"
+                            .to_string(),
+                    );
+                }
+                let lower = range
+                    .get("left")
+                    .ok_or_else(|| "inside value range has no lower bound".to_string())?;
+                let upper = range
+                    .get("right")
+                    .ok_or_else(|| "inside value range has no upper bound".to_string())?;
+                let lower = self.lower_expression(lower)?;
+                let upper = self.lower_expression(upper)?;
+                Expr::Bin {
+                    op: BinOp::LogAnd,
+                    a: Box::new(Expr::Bin {
+                        op: BinOp::Ge,
+                        a: Box::new(left.clone()),
+                        b: Box::new(lower),
+                    }),
+                    b: Box::new(Expr::Bin {
+                        op: BinOp::Le,
+                        a: Box::new(left.clone()),
+                        b: Box::new(upper),
+                    }),
+                }
+            } else {
+                let candidate = self.lower_expression(range)?;
+                Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(left.clone()),
+                    b: Box::new(candidate),
+                }
+            };
+            result = Expr::Bin {
+                op: BinOp::LogOr,
+                a: Box::new(result),
+                b: Box::new(item),
+            };
+        }
+        Ok(result)
     }
 
     fn select_packed_dimension(

@@ -2618,6 +2618,103 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_wildcard_equality() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-wildcard-equality");
+    let source_path = root.join("wildcard_equality.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module wildcard_equality(
+  input logic [7:0] a,
+  output logic equal,
+  output logic unequal
+);
+  assign equal = (a ==? 8'b1010??01);
+  assign unequal = (a !=? 8'b1010??01);
+endmodule
+"#,
+    )
+    .expect("write wildcard-equality source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("wildcard_equality"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower wildcard equality");
+    assert_eq!(design.assigns.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create wildcard simulator");
+    for (value, expected) in [(0xa5_u64, true), (0xa1, true), (0x85, false), (0xa4, false)] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(8, value))
+            .unwrap();
+        assert_eq!(
+            simulator.read("equal").unwrap().to_u64(),
+            Some(expected as u64)
+        );
+        assert_eq!(
+            simulator.read("unequal").unwrap().to_u64(),
+            Some((!expected) as u64)
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_inside() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-inside");
+    let source_path = root.join("inside.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module inside_expr(input logic [7:0] a, output logic y);
+  assign y = a inside {8'h00, [8'h0a:8'h0f], 8'hf0};
+endmodule
+"#,
+    )
+    .expect("write inside source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("inside_expr"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower inside expression");
+    assert_eq!(design.assigns.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create inside simulator");
+    for (value, expected) in [
+        (0x00_u64, true),
+        (0x01, false),
+        (0x09, false),
+        (0x0a, true),
+        (0x0d, true),
+        (0x0f, true),
+        (0x10, false),
+        (0xef, false),
+        (0xf0, true),
+        (0xf1, false),
+    ] {
+        simulator
+            .set_input("a", &LogicWord::from_u64(8, value))
+            .unwrap();
+        assert_eq!(
+            simulator.read("y").unwrap().to_u64(),
+            Some(expected as u64),
+            "value {value:#04x}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_json_contains_elaborated_module_symbols() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
