@@ -268,6 +268,98 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_flattens_simple_hierarchy() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-hierarchy");
+    let source_path = root.join("hierarchy.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child #(parameter W = 4)
+    (input logic [W-1:0] a, output logic [W-1:0] y, output logic held);
+  assign y = ~a;
+  initial held = 1'b1;
+endmodule
+
+module top(input logic [3:0] a, output logic [3:0] y, output logic held);
+  child #(.W(4)) u (.a(a), .y(y), .held(held));
+endmodule
+"#,
+    )
+    .expect("write hierarchy source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simple hierarchy");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower hierarchy through the preprocessed path");
+    assert_eq!(
+        design.n_nets, 18,
+        "direct declarations: {:?}; reference declarations: {:?}",
+        design.net_decls, reference.net_decls
+    );
+    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(design.initials.len(), 1);
+    assert_eq!(design.hierarchy.len(), 2);
+    assert_eq!(
+        format!("{:?}", reference.net_decls),
+        format!("{:?}", design.net_decls)
+    );
+    assert_eq!(
+        format!("{:?}", reference.assigns),
+        format!("{:?}", design.assigns)
+    );
+    assert_eq!(
+        format!("{:?}", reference.initials),
+        format!("{:?}", design.initials)
+    );
+    assert_eq!(
+        format!("{:?}", reference.hierarchy),
+        format!("{:?}", design.hierarchy)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create hierarchy simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0b1010))
+        .expect("set hierarchy input");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0b0101));
+    assert_eq!(simulator.read("held").unwrap().to_u64(), Some(1));
+
+    let nested_path = root.join("nested.sv");
+    std::fs::write(
+        &nested_path,
+        r#"
+module leaf(input logic a, output logic y); assign y = a; endmodule
+module middle(input logic a, output logic y); leaf u (.a(a), .y(y)); endmodule
+module top(input logic a, output logic y); middle u (.a(a), .y(y)); endmodule
+"#,
+    )
+    .expect("write nested hierarchy source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&nested_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("nested hierarchy must fail closed");
+    assert!(
+        error.contains("does not yet support nested module hierarchy"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

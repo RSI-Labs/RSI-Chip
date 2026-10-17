@@ -410,11 +410,47 @@ impl SlangAstLowerer {
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
         let mut lowerer = Self {
             design: Design {
-                name: top_name,
+                name: top_name.clone(),
                 ..Design::default()
             },
             symbols: std::collections::BTreeMap::new(),
         };
+        let root_hierarchy_index = lowerer.design.hierarchy.len();
+        lowerer
+            .design
+            .hierarchy
+            .push(eda_core::ir::HierarchicalInstance {
+                path: top_name.clone(),
+                module: top_name.clone(),
+                parent: None,
+                depth: 0,
+                net_start: 0,
+                net_end: 0,
+                ports: Vec::new(),
+            });
+        lowerer.lower_body(body)?;
+        let top_ports = lowerer
+            .design
+            .ports
+            .iter()
+            .map(|port| eda_core::ir::HierarchicalPort {
+                name: port.name.clone(),
+                direction: port.dir,
+                base: port.base,
+                width: port.width,
+                connections: vec![None; port.width],
+            })
+            .collect::<Vec<_>>();
+        let root = &mut lowerer.design.hierarchy[root_hierarchy_index];
+        root.net_end = lowerer.design.n_nets;
+        root.ports = top_ports;
+        Ok(lowerer.design)
+    }
+
+    fn lower_body(&mut self, body: &serde_json::Value) -> Result<(), String> {
+        if string_field(body, "kind").as_deref() != Some("InstanceBody") {
+            return Err("slang AST Instance body has unexpected kind".into());
+        }
         let members = body
             .get("members")
             .and_then(serde_json::Value::as_array)
@@ -422,19 +458,161 @@ impl SlangAstLowerer {
         for member in members {
             let kind = string_field(member, "kind").unwrap_or_default();
             match kind.as_str() {
-                "Port" => lowerer.lower_port(member)?,
-                "Net" | "Variable" => lowerer.lower_declaration(member)?,
+                "Port" => self.lower_port(member)?,
+                "Net" | "Variable" => self.lower_declaration(member)?,
                 "Parameter" => continue,
-                "ContinuousAssign" => lowerer.lower_continuous_assignment(member)?,
-                "ProceduralBlock" => lowerer.lower_procedural_block(member)?,
+                "ContinuousAssign" => self.lower_continuous_assignment(member)?,
+                "ProceduralBlock" => self.lower_procedural_block(member)?,
+                "Instance" => self.lower_instance(member)?,
                 _ => {
                     return Err(format!(
-                        "direct slang-AST lowering does not yet support top member kind '{kind}'"
+                        "direct slang-AST lowering does not support member kind '{kind}'"
                     ))
                 }
             }
         }
-        Ok(lowerer.design)
+        Ok(())
+    }
+
+    fn lower_instance(&mut self, member: &serde_json::Value) -> Result<(), String> {
+        let instance_name = declaration_name(member, "Instance")?;
+        let body = member
+            .get("body")
+            .ok_or_else(|| "slang AST Instance has no body".to_string())?;
+        let definition_name = string_field(body, "name").unwrap_or_default();
+        let mut child = Self {
+            design: Design::default(),
+            symbols: std::collections::BTreeMap::new(),
+        };
+        child.lower_body(body)?;
+        if !child.design.hierarchy.is_empty() {
+            return Err(
+                "direct slang-AST lowering does not yet support nested module hierarchy".into(),
+            );
+        }
+        if !child.design.memories.is_empty() || !child.design.memory_connections.is_empty() {
+            return Err(
+                "direct slang-AST lowering does not yet support child sparse memories".into(),
+            );
+        }
+
+        let offset = self.design.n_nets;
+        let child_net_start = offset;
+        let child_ports = child.design.ports.clone();
+        for declaration in &child.design.net_decls {
+            self.design.net_decls.push(eda_core::ir::NetDecl {
+                name: format!("{instance_name}.{}", declaration.name),
+                width: declaration.width,
+                is_reg: declaration.is_reg,
+                is_signed: declaration.is_signed,
+                base: declaration.base + offset,
+            });
+        }
+        self.design.n_nets += child.design.n_nets;
+
+        for mut assignment in child.design.assigns {
+            remap_assignment(&mut assignment, offset);
+            self.design.assigns.push(assignment);
+        }
+        for mut statement in child.design.initials {
+            remap_statement(&mut statement, offset);
+            self.design.initials.push(statement);
+        }
+        for mut process in child.design.processes {
+            remap_process(&mut process, offset);
+            self.design.processes.push(process);
+        }
+
+        let mut connections = std::collections::BTreeMap::new();
+        let empty_connections = Vec::new();
+        for connection in member
+            .get("connections")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_connections)
+        {
+            let port_name = connection
+                .get("port")
+                .and_then(|port| string_field(port, "name"))
+                .ok_or_else(|| "instance connection has no port".to_string())?;
+            let Some(port) = child_ports.iter().find(|port| port.name == port_name) else {
+                return Err(format!(
+                    "instance '{instance_name}' connects unknown child port '{port_name}'"
+                ));
+            };
+            let expression = connection
+                .get("expr")
+                .ok_or_else(|| "instance connection has no expression".to_string())?;
+            if string_field(expression, "kind").as_deref() == Some("EmptyArgument") {
+                continue;
+            }
+            match port.dir {
+                eda_core::ir::Dir::In => {
+                    let rhs = self.lower_expression(expression)?;
+                    if let Some(parent_bits) = expression_parent_bits(&rhs) {
+                        connections.insert(port_name.to_string(), parent_bits);
+                    }
+                    self.design.assigns.push(eda_core::ir::Assign {
+                        lv: eda_core::ir::LValue {
+                            net: port.base + offset,
+                            decl_width: port.width,
+                            range: full_range(port.width),
+                        },
+                        e: rhs,
+                        delay: 0,
+                    });
+                }
+                eda_core::ir::Dir::Out => {
+                    if string_field(expression, "kind").as_deref() != Some("Assignment") {
+                        return Err(format!(
+                            "instance '{instance_name}' output port '{port_name}' has no parent assignment"
+                        ));
+                    }
+                    let parent_target = expression
+                        .get("left")
+                        .ok_or_else(|| "output connection has no parent target".to_string())?;
+                    let target = self.lower_lvalue(parent_target)?;
+                    if let Some(parent_bits) = lvalue_parent_bits(&target) {
+                        connections.insert(port_name.to_string(), parent_bits);
+                    }
+                    self.design.assigns.push(eda_core::ir::Assign {
+                        lv: target,
+                        e: eda_core::ir::Expr::Ref {
+                            net: port.base + offset,
+                            decl_width: port.width,
+                            range: full_range(port.width),
+                            signed: false,
+                        },
+                        delay: 0,
+                    });
+                }
+            }
+        }
+
+        let ports = child_ports
+            .iter()
+            .map(|port| eda_core::ir::HierarchicalPort {
+                name: port.name.clone(),
+                direction: port.dir,
+                base: port.base + offset,
+                width: port.width,
+                connections: connections
+                    .get(&port.name)
+                    .cloned()
+                    .unwrap_or_else(|| vec![None; port.width]),
+            })
+            .collect::<Vec<_>>();
+        self.design
+            .hierarchy
+            .push(eda_core::ir::HierarchicalInstance {
+                path: format!("{}.{}", self.design.name, instance_name),
+                module: definition_name,
+                parent: Some(self.design.name.clone()),
+                depth: 1,
+                net_start: child_net_start,
+                net_end: self.design.n_nets,
+                ports,
+            });
+        Ok(())
     }
 
     fn lower_port(&mut self, member: &serde_json::Value) -> Result<(), String> {
@@ -1024,6 +1202,145 @@ fn full_range(width: usize) -> eda_core::ir::Range {
             lsb: 0,
         }
     }
+}
+
+fn range_parent_bits(net: usize, range: &eda_core::ir::Range) -> Option<Vec<Option<usize>>> {
+    match range {
+        eda_core::ir::Range::Bit(index) => Some(vec![Some(net + index)]),
+        eda_core::ir::Range::Span { msb, lsb } => {
+            if msb < lsb {
+                return None;
+            }
+            Some((*lsb..=*msb).map(|index| Some(net + index)).collect())
+        }
+    }
+}
+
+fn expression_parent_bits(expression: &eda_core::ir::Expr) -> Option<Vec<Option<usize>>> {
+    match expression {
+        eda_core::ir::Expr::Ref { net, range, .. } => range_parent_bits(*net, range),
+        _ => None,
+    }
+}
+
+fn lvalue_parent_bits(lvalue: &eda_core::ir::LValue) -> Option<Vec<Option<usize>>> {
+    range_parent_bits(lvalue.net, &lvalue.range)
+}
+
+fn remap_assignment(assignment: &mut eda_core::ir::Assign, offset: usize) {
+    assignment.lv.net += offset;
+    remap_expression(&mut assignment.e, offset);
+}
+
+fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usize) {
+    use eda_core::ir::Expr;
+    match expression {
+        Expr::Const(_) => {}
+        Expr::Ref { net, .. } => *net += offset,
+        Expr::Un { a, .. } => remap_expression(a, offset),
+        Expr::Bin { a, b, .. } => {
+            remap_expression(a, offset);
+            remap_expression(b, offset);
+        }
+        Expr::Cond { c, t, f } => {
+            remap_expression(c, offset);
+            remap_expression(t, offset);
+            remap_expression(f, offset);
+        }
+        Expr::Concat(parts) => parts
+            .iter_mut()
+            .for_each(|part| remap_expression(part, offset)),
+        Expr::Repeat { e, .. } | Expr::Signed { e, .. } => remap_expression(e, offset),
+        Expr::MemoryRead { indexes, .. } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression(index, offset));
+        }
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression(index, offset));
+            remap_expression(start, offset);
+        }
+        Expr::Index { e, .. } => remap_expression(e, offset),
+    }
+}
+
+fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize) {
+    use eda_core::ir::Stmt;
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter_mut()
+            .for_each(|statement| remap_statement(statement, offset)),
+        Stmt::Forever(body) => remap_statement(body, offset),
+        Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
+            lv.net += offset;
+            remap_expression(e, offset);
+        }
+        Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression(index, offset));
+            remap_expression(e, offset);
+        }
+        Stmt::MemoryBlPart {
+            indexes, start, e, ..
+        }
+        | Stmt::MemoryNBlPart {
+            indexes, start, e, ..
+        } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| remap_expression(index, offset));
+            remap_expression(start, offset);
+            remap_expression(e, offset);
+        }
+        Stmt::BlIndexed { net, start, e, .. } | Stmt::NBlIndexed { net, start, e, .. } => {
+            *net += offset;
+            remap_expression(start, offset);
+            remap_expression(e, offset);
+        }
+        Stmt::If { c, t, f } => {
+            remap_expression(c, offset);
+            remap_statement(t, offset);
+            if let Some(f) = f {
+                remap_statement(f, offset);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            remap_expression(e, offset);
+            for (expression, _) in arms {
+                remap_expression(expression, offset);
+            }
+            if let Some(statement) = dflt {
+                remap_statement(statement, offset);
+            }
+        }
+        Stmt::Delay { body, .. } => remap_statement(body, offset),
+        Stmt::Display { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| remap_expression(argument, offset));
+        }
+        Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+            remap_expression(cond, offset)
+        }
+        Stmt::Finish => {}
+    }
+}
+
+fn remap_process(process: &mut eda_core::ir::Process, offset: usize) {
+    use eda_core::ir::Sens;
+    fn remap_sensitivity(sensitivity: &mut Sens, offset: usize) {
+        match sensitivity {
+            Sens::Comb => {}
+            Sens::Posedge(net) | Sens::Negedge(net) => *net += offset,
+            Sens::List(list) => list
+                .iter_mut()
+                .for_each(|item| remap_sensitivity(item, offset)),
+        }
+    }
+    remap_sensitivity(&mut process.sens, offset);
+    remap_statement(&mut process.body, offset);
 }
 
 fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::BinOp, String> {
