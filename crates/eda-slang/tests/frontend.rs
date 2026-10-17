@@ -2451,6 +2451,54 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_power_operator() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-power");
+    let source_path = root.join("power.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module power(input logic [7:0] base, input logic [7:0] exponent, output logic [7:0] y);
+  assign y = base ** exponent;
+endmodule
+"#,
+    )
+    .expect("write power source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("power"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower power operator");
+    assert_eq!(design.assigns.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create power simulator");
+    for (base, exponent, expected) in [
+        (2_u64, 3_u64, 8_u64),
+        (3, 4, 81),
+        (17, 2, 33),
+        (5, 0, 1),
+        (0, 0, 1),
+    ] {
+        simulator
+            .set_input("base", &LogicWord::from_u64(8, base))
+            .unwrap();
+        simulator
+            .set_input("exponent", &LogicWord::from_u64(8, exponent))
+            .unwrap();
+        assert_eq!(
+            simulator.read("y").unwrap().to_u64(),
+            Some(expected),
+            "{base} ** {exponent}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_indexed_packed_part_selects() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

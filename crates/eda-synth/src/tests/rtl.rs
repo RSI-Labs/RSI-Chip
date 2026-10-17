@@ -554,3 +554,52 @@ fn conditional_and_logical_ops() {
         }
     }
 }
+
+#[test]
+fn power_operator_synthesizes_and_matches_direct_ast_semantics() {
+    let Some(slang) = eda_slang::SlangFrontend::discover_optional() else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!(
+        "eda-synth-power-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        r#"
+module power(input logic [3:0] base, input logic [3:0] exponent, output logic [3:0] y);
+  assign y = base ** exponent;
+endmodule
+"#,
+    )
+    .expect("write power source");
+    let rtl = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&path),
+            Some("power"),
+            &eda_slang::PreprocessOptions::default(),
+        )
+        .expect("directly lower power");
+    let result = synthesize(&rtl, &SynthOptions::default()).expect("synthesize power");
+    let gate = eda_core::to_design::netlist_to_design(&result.netlist);
+    let mut rtl_sim = Simulator::new(&rtl).unwrap();
+    let mut gate_sim = Simulator::new(&gate).unwrap();
+    for (base, exponent) in [(2_u64, 3_u64), (3, 2), (3, 4), (5, 0), (0, 0)] {
+        for sim in [&mut rtl_sim, &mut gate_sim] {
+            sim.set_input("base", &LogicWord::from_u64(4, base))
+                .unwrap();
+            sim.set_input("exponent", &LogicWord::from_u64(4, exponent))
+                .unwrap();
+        }
+        assert_eq!(
+            rtl_sim.read("y").unwrap(),
+            gate_sim.read("y").unwrap(),
+            "{base} ** {exponent}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}

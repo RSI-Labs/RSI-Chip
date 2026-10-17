@@ -1272,6 +1272,7 @@ impl<'d> Simulator<'d> {
                             _ => av.mul(&bv),
                         }
                     }
+                    BinOp::Pow => av.pow(&bv, b.is_signed()),
                     BinOp::Shl => av.shl(&bv),
                     BinOp::Shr if a.is_signed() => {
                         if !bv.is_fully_known() {

@@ -261,25 +261,46 @@ impl<'a> Synth<'a> {
                 let w = wa.max(wb);
                 let av = self.blast(a, w)?;
                 let bv = self.blast(b, w)?;
-                let mut acc: Vec<NetId> =
-                    (0..w).map(|_| self.const_net(LogicValue::Zero)).collect();
-                for (i, bbit) in bv.iter().enumerate() {
-                    if i >= w {
-                        break;
-                    }
-                    let mut partial: Vec<NetId> = Vec::with_capacity(w);
-                    for k in 0..w {
-                        if k >= i {
-                            partial.push(self.combine(CellKind::And, av[k - i], *bbit));
-                        } else {
-                            partial.push(self.const_net(LogicValue::Zero));
-                        }
-                    }
-                    let zero = self.const_net(LogicValue::Zero);
-                    let (sum, _) = self.adder(&acc, &partial, zero);
-                    acc = sum;
+                Ok(self.multiply_nets(&av, &bv, w))
+            }
+            BinOp::Pow => {
+                let w = wa.max(wb);
+                if w > 16 {
+                    return Err("synthesis supports power operators only up to 16 bits".to_string());
                 }
-                Ok(acc)
+                let base = self.blast(a, w)?;
+                let exponent = self.blast(b, w)?;
+                let mut result: Vec<NetId> = (0..w)
+                    .map(|bit| {
+                        if bit == 0 {
+                            self.const_net(LogicValue::One)
+                        } else {
+                            self.const_net(LogicValue::Zero)
+                        }
+                    })
+                    .collect();
+                let mut power = base;
+                for (bit_index, exponent_bit) in exponent.iter().enumerate() {
+                    let product = self.multiply_nets(&result, &power, w);
+                    let mut selected = Vec::with_capacity(w);
+                    for bit in 0..w {
+                        selected.push(self.mux(*exponent_bit, product[bit], result[bit]));
+                    }
+                    result = selected;
+                    if bit_index + 1 < exponent.len() {
+                        power = self.multiply_nets(&power, &power, w);
+                    }
+                }
+                if b.is_signed() {
+                    let negative = exponent[w - 1];
+                    let zero = self.const_net(LogicValue::Zero);
+                    let mut truncated = Vec::with_capacity(w);
+                    for bit in result {
+                        truncated.push(self.mux(negative, zero, bit));
+                    }
+                    result = truncated;
+                }
+                Ok(result)
             }
             BinOp::Shl | BinOp::Shr => {
                 let av = self.blast(a, wa)?;
@@ -388,6 +409,27 @@ impl<'a> Synth<'a> {
                 Ok(vec![self.combine(kind, av[0], bv[0])])
             }
         }
+    }
+
+    fn multiply_nets(&mut self, av: &[NetId], bv: &[NetId], w: usize) -> Vec<NetId> {
+        let mut acc: Vec<NetId> = (0..w).map(|_| self.const_net(LogicValue::Zero)).collect();
+        for (i, bbit) in bv.iter().enumerate() {
+            if i >= w {
+                break;
+            }
+            let mut partial: Vec<NetId> = Vec::with_capacity(w);
+            for k in 0..w {
+                if k >= i {
+                    partial.push(self.combine(CellKind::And, av[k - i], *bbit));
+                } else {
+                    partial.push(self.const_net(LogicValue::Zero));
+                }
+            }
+            let zero = self.const_net(LogicValue::Zero);
+            let (sum, _) = self.adder(&acc, &partial, zero);
+            acc = sum;
+        }
+        acc
     }
 
     pub(crate) fn not(&mut self, n: NetId) -> NetId {

@@ -16,6 +16,7 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
         Some("Multiply") => Ok(eda_core::ir::BinOp::Mul),
         Some("Divide") => Ok(eda_core::ir::BinOp::Div),
         Some("Modulus") => Ok(eda_core::ir::BinOp::Mod),
+        Some("Power") => Ok(eda_core::ir::BinOp::Pow),
         Some("BinaryAnd") => Ok(eda_core::ir::BinOp::And),
         Some("BinaryOr") => Ok(eda_core::ir::BinOp::Or),
         Some("BitwiseXor") => Ok(eda_core::ir::BinOp::Xor),
@@ -254,6 +255,21 @@ impl super::SlangAstLowerer {
                         });
                     }
                     return Ok(equality);
+                }
+                if string_field(value, "op").as_deref() == Some("Power") {
+                    let too_wide = ["left", "right"].iter().any(|field| {
+                        value
+                            .get(field)
+                            .and_then(|operand| string_field(operand, "type"))
+                            .and_then(|type_name| simple_type_width(&type_name))
+                            .is_some_and(|width| width > u64::BITS as usize)
+                    });
+                    if too_wide {
+                        return Err(
+                            "direct slang-AST lowering supports power operands only up to 64 bits"
+                                .to_string(),
+                        );
+                    }
                 }
                 let op = binary_operator(string_field(value, "op").as_deref())?;
                 let left = value

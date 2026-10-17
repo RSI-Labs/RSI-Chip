@@ -442,6 +442,39 @@ impl LogicWord {
         LogicWord::from_u64(w, av.wrapping_mul(bv))
     }
 
+    /// Integer power modulo the result width. A signed negative exponent is
+    /// truncated to zero, matching integral SystemVerilog semantics.
+    pub fn pow(&self, exponent: &LogicWord, exponent_signed: bool) -> LogicWord {
+        let width = self.width().max(exponent.width());
+        if !self.is_fully_known() || !exponent.is_fully_known() {
+            return LogicWord::xes(width);
+        }
+        if width > u64::BITS as usize {
+            // Existing packed arithmetic is deliberately built around 64-bit
+            // integer evaluation. Fail closed rather than silently truncating
+            // a wider exponent or result.
+            return LogicWord::xes(width);
+        }
+        if exponent_signed && exponent.bit(exponent.width() - 1) == LogicValue::One {
+            return LogicWord::zero(width);
+        }
+        let Some(mut remaining) = exponent.to_u64() else {
+            return LogicWord::xes(width);
+        };
+        let mut result = LogicWord::from_u64(width, 1);
+        let mut power = self.sized(width);
+        while remaining != 0 {
+            if remaining & 1 == 1 {
+                result = result.mul(&power);
+            }
+            remaining >>= 1;
+            if remaining != 0 {
+                power = power.mul(&power);
+            }
+        }
+        result
+    }
+
     pub fn shl(&self, o: &LogicWord) -> LogicWord {
         if !o.is_fully_known() {
             return LogicWord::xes(self.width());
@@ -541,6 +574,19 @@ mod tests {
         assert_eq!(c.mul(&c).to_u64(), Some(1)); // 15*15=225 truncated to 4 bits
         let x = LogicWord::xes(4);
         assert!(!x.add(&c).is_fully_known());
+    }
+
+    #[test]
+    fn word_power() {
+        let base = LogicWord::from_u64(8, 3);
+        let exponent = LogicWord::from_u64(8, 4);
+        assert_eq!(base.pow(&exponent, false).to_u64(), Some(81));
+        assert_eq!(base.pow(&LogicWord::zero(8), false).to_u64(), Some(1));
+        assert_eq!(
+            base.pow(&LogicWord::from_u64(8, 0xff), true).to_u64(),
+            Some(0)
+        );
+        assert!(!base.pow(&LogicWord::xes(8), false).is_fully_known());
     }
 
     #[test]

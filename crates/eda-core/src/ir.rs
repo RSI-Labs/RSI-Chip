@@ -323,6 +323,7 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Pow,
     And,
     Or,
     Xor,
@@ -410,7 +411,7 @@ impl Expr {
                 UnOp::AndR | UnOp::OrR | UnOp::XorR => 1,
             },
             Expr::Bin { op, a, b } => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
                     a.width().max(b.width())
                 }
                 BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::Shr => a.width(),
@@ -448,6 +449,7 @@ impl Expr {
                 | BinOp::Mul
                 | BinOp::Div
                 | BinOp::Mod
+                | BinOp::Pow
                 | BinOp::And
                 | BinOp::Or
                 | BinOp::Xor
