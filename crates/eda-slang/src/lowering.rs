@@ -73,6 +73,7 @@ struct AstEnumType {
     width: usize,
     signed: bool,
     values: Vec<LogicWord>,
+    names: Vec<String>,
 }
 
 pub(super) struct SlangAstLowerer {

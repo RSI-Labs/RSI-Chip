@@ -2,6 +2,8 @@
 
 use eda_core::ir::MemoryDimension;
 
+pub(super) const STRING_WIDTH: usize = 64 * 8;
+
 #[derive(Clone, Copy)]
 pub(super) struct AstPackedDimension {
     pub msb: i64,
@@ -129,6 +131,12 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     let base = type_name.split('[').next()?.trim();
     let element_width = if base.contains("logic") || base.contains("reg") || base.contains("bit") {
         1
+    } else if base == "string" {
+        return Some(AstTypeShape {
+            width: STRING_WIDTH,
+            bounds: Some((STRING_WIDTH as i64 - 1, 0)),
+            dimensions: Vec::new(),
+        });
     } else {
         let data_type = base
             .split_whitespace()

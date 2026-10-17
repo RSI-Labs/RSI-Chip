@@ -2903,6 +2903,95 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_string_literals_and_enum_names() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-strings");
+    let source_path = root.join("strings.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module strings(
+  input logic [1:0] selector,
+  output string literal_value,
+  output string state_name,
+  output string constant_name,
+  output string invalid_name
+);
+  typedef enum logic [1:0] {
+    A = 2'b00,
+    B = 2'b01,
+    C = 2'b10
+  } state_t;
+
+  state_t state;
+  always_comb state = state_t'(selector);
+  assign literal_value = "READY";
+  assign state_name = state.name();
+  assign constant_name = B.name();
+  assign invalid_name = state_t'(2'b11).name();
+endmodule
+"#,
+    )
+    .expect("write string and enum-name source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("strings"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower strings and enum names");
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "literal_value")
+            .expect("string output declaration")
+            .width,
+        512
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create string simulator");
+    for (selector, name) in [(0, "A"), (1, "B"), (2, "C")] {
+        simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        assert_eq!(
+            simulator
+                .read("literal_value")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "READY"
+        );
+        assert_eq!(
+            simulator
+                .read("state_name")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            name
+        );
+        assert_eq!(
+            simulator
+                .read("constant_name")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "B"
+        );
+        assert_eq!(
+            simulator
+                .read("invalid_name")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            ""
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -30,6 +30,7 @@ impl SlangAstLowerer {
             }
             "first" | "last" => return self.lower_enum_first_last(value, subroutine == "first"),
             "num" => return self.lower_enum_num(value),
+            "name" => return self.lower_enum_name(value),
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -594,6 +595,37 @@ impl SlangAstLowerer {
             e: Box::new(eda_core::ir::Expr::Const(word)),
             signed: true,
         })
+    }
+
+    fn lower_enum_name(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let definition = self.enum_method_definition(value)?;
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "enum name call has no receiver".to_string())?;
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "enum name call has no receiver".to_string())?;
+        let receiver = self.lower_expression(receiver)?;
+        let mut result = Expr::Const(eda_core::logic::LogicWord::zero(crate::types::STRING_WIDTH));
+        for (value, name) in definition.values.iter().zip(&definition.names) {
+            let rendered = Expr::Const(eda_core::logic::LogicWord::from_bytes_le(
+                crate::types::STRING_WIDTH,
+                name.as_bytes(),
+            ));
+            result = Expr::Cond {
+                c: Box::new(Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(receiver.clone()),
+                    b: Box::new(Expr::Const(value.clone())),
+                }),
+                t: Box::new(rendered),
+                f: Box::new(result),
+            };
+        }
+        Ok(result)
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {

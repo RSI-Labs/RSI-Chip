@@ -235,6 +235,22 @@ impl super::SlangAstLowerer {
                     Ok(Expr::Const(word))
                 }
             }
+            "StringLiteral" => {
+                let literal = string_field(value, "literal")
+                    .ok_or_else(|| "string literal has no value".to_string())?;
+                let bytes = literal.as_bytes();
+                let width = string_field(value, "type")
+                    .and_then(|type_name| simple_type_width(&type_name))
+                    .ok_or_else(|| "string literal has unresolved width".to_string())?;
+                if bytes.len() * 8 > width {
+                    return Err(format!(
+                        "string literal length {} exceeds its {}-bit packed representation",
+                        bytes.len(),
+                        width
+                    ));
+                }
+                Ok(Expr::Const(LogicWord::from_bytes_le(width, bytes)))
+            }
             "Call" => self.lower_function_call(value),
             "Conversion" => {
                 let operand = value
