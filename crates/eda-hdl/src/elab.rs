@@ -5,8 +5,8 @@ use crate::ast;
 use crate::parser;
 use eda_core::ir::{
     Assign, BinOp, Design, Dir, DispPart as DispPartIR, Expr as ExprIR, HierarchicalInstance,
-    HierarchicalPort, LValue, MemoryConnection, MemoryDecl, MemoryDimension, MemoryKind, NetDecl,
-    PortDecl, Process, Range, Sens as SensIR, Stmt as StmtIR, UnOp,
+    HierarchicalPort, LValue, MemoryConnection, MemoryDecl, MemoryDimension, MemoryKind,
+    MemoryTemplate, NetDecl, PortDecl, Process, Range, Sens as SensIR, Stmt as StmtIR, UnOp,
 };
 use eda_core::logic::{LogicValue, LogicWord};
 use std::collections::{HashMap, HashSet};

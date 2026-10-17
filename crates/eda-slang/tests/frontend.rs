@@ -445,6 +445,10 @@ endmodule
     assert_eq!(design.memories[0].element_width, 8);
     assert_eq!(design.memories[0].flat_length, 4);
     assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Ram);
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::SyncRam
+    );
     assert!(reference.memories.is_empty());
     assert_eq!(
         format!("{:?}", reference.ports),
@@ -990,6 +994,22 @@ endmodule
     assert_eq!(direct.memories[1].kind, eda_core::ir::MemoryKind::Ram);
     assert_eq!(reference.memories[0].kind, eda_core::ir::MemoryKind::Ram);
     assert_eq!(reference.memories[1].kind, eda_core::ir::MemoryKind::Ram);
+    assert_eq!(
+        direct.memories[0].template,
+        eda_core::ir::MemoryTemplate::AsyncRam
+    );
+    assert_eq!(
+        direct.memories[1].template,
+        eda_core::ir::MemoryTemplate::AsyncRam
+    );
+    assert_eq!(
+        reference.memories[0].template,
+        eda_core::ir::MemoryTemplate::AsyncRam
+    );
+    assert_eq!(
+        reference.memories[1].template,
+        eda_core::ir::MemoryTemplate::AsyncRam
+    );
     let mut direct_simulator =
         Simulator::new(&direct).expect("create direct shared-memory simulator");
     direct_simulator
@@ -1057,6 +1077,10 @@ endmodule
     assert_eq!(design.memories[0].dimensions.len(), 2);
     assert_eq!(design.memories[0].flat_length, 6);
     assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::AsyncRom
+    );
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create initializer simulator");
@@ -1130,10 +1154,26 @@ endmodule
     assert_eq!(design.memories.len(), 2);
     assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(design.memories[1].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::AsyncRom
+    );
+    assert_eq!(
+        design.memories[1].template,
+        eda_core::ir::MemoryTemplate::AsyncRom
+    );
     assert_eq!(design.initials.len(), 1);
     assert_eq!(reference.memories.len(), 2);
     assert_eq!(reference.memories[0].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(reference.memories[1].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(
+        reference.memories[0].template,
+        eda_core::ir::MemoryTemplate::AsyncRom
+    );
+    assert_eq!(
+        reference.memories[1].template,
+        eda_core::ir::MemoryTemplate::AsyncRom
+    );
     assert_eq!(reference.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create memory-file simulator");
@@ -1220,6 +1260,66 @@ endmodule
         assert_eq!(simulator.read("second").unwrap().to_u64(), Some(2));
         assert_eq!(simulator.read("third").unwrap().to_u64(), Some(3));
         assert_eq!(simulator.read("after").unwrap().to_u64(), None);
+    }
+}
+
+#[test]
+fn slang_and_bounded_paths_infer_synchronous_rom_template() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("synchronous-rom-template");
+    let source_path = root.join("sync-rom.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module sync_rom(
+  input logic clk,
+  input logic [11:0] address,
+  output logic [7:0] q
+);
+  logic [7:0] rom [0:4095];
+  initial $readmemh("rom.hex", rom);
+  always @(posedge clk) q <= rom[address];
+endmodule
+"#,
+    )
+    .expect("write synchronous ROM source");
+    std::fs::write(root.join("rom.hex"), "01 22 44 88\n").expect("write ROM data");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("sync_rom"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower synchronous ROM");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("sync_rom"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower synchronous ROM through bounded path");
+    for design in [&direct, &bounded] {
+        assert_eq!(design.memories.len(), 1);
+        assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
+        assert_eq!(
+            design.memories[0].template,
+            eda_core::ir::MemoryTemplate::SyncRom
+        );
+
+        let mut simulator = Simulator::new(design).expect("create synchronous ROM simulator");
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 0))
+            .expect("initialize ROM clock");
+        simulator
+            .set_input("address", &LogicWord::from_u64(12, 2))
+            .expect("select initialized ROM word");
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .expect("create synchronous ROM read edge");
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0x44));
     }
 }
 

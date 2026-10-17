@@ -68,6 +68,24 @@ pub enum MemoryKind {
     Rom,
 }
 
+/// Technology-independent macro candidate inferred from memory port timing.
+///
+/// This does not select a vendor cell. A physical mapping layer can use these
+/// candidates together with depth, width, library, timing, and routing
+/// constraints to choose distributed logic, LUT RAM, block RAM, or a vendor
+/// macro.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryTemplate {
+    #[default]
+    Unmapped,
+    AsyncRom,
+    SyncRom,
+    MixedRom,
+    AsyncRam,
+    SyncRam,
+    MixedRam,
+}
+
 /// A sparse unpacked-array object.
 ///
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
@@ -84,6 +102,8 @@ pub struct MemoryDecl {
     pub flat_length: u64,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
+    /// Inferred technology-independent macro candidate.
+    pub template: MemoryTemplate,
 }
 
 /// Aliases a child instance's memory object to the parent memory supplied on
@@ -586,22 +606,25 @@ impl Design {
     /// Any procedural write in a non-initial process makes the canonical
     /// memory (including hierarchy aliases) a RAM.
     pub fn infer_memory_kinds(&mut self) {
-        let mut runtime_writes = std::collections::HashSet::new();
+        let mut accesses = MemoryAccesses::default();
         for process in &self.processes {
-            collect_memory_writes(&process.body, &mut runtime_writes);
+            let synchronous = process_is_edge_clocked(&process.sens);
+            collect_memory_accesses(&process.body, synchronous, &mut accesses);
+        }
+        for assignment in &self.assigns {
+            collect_memory_expr_reads(&assignment.e, false, &mut accesses);
         }
         let aliases = self.memory_alias_roots();
-        let runtime_writes = runtime_writes
-            .into_iter()
-            .map(|memory| aliases.get(memory).copied().unwrap_or(memory))
-            .collect::<std::collections::HashSet<_>>();
+        let accesses = accesses.canonicalize(&aliases);
         for (index, memory) in self.memories.iter_mut().enumerate() {
             let root = aliases.get(index).copied().unwrap_or(index);
-            memory.kind = if runtime_writes.contains(&root) {
-                MemoryKind::Ram
-            } else {
-                MemoryKind::Rom
-            };
+            memory.kind =
+                if accesses.sync_writes.contains(&root) || accesses.async_writes.contains(&root) {
+                    MemoryKind::Ram
+                } else {
+                    MemoryKind::Rom
+                };
+            memory.template = accesses.template(root);
         }
     }
 
@@ -637,42 +660,190 @@ impl Design {
     }
 }
 
-fn collect_memory_writes(statement: &Stmt, writes: &mut std::collections::HashSet<usize>) {
+#[derive(Default)]
+struct MemoryAccesses {
+    sync_reads: std::collections::HashSet<usize>,
+    async_reads: std::collections::HashSet<usize>,
+    sync_writes: std::collections::HashSet<usize>,
+    async_writes: std::collections::HashSet<usize>,
+}
+
+impl MemoryAccesses {
+    fn canonicalize(self, aliases: &[usize]) -> Self {
+        fn canonicalize_set(
+            values: std::collections::HashSet<usize>,
+            aliases: &[usize],
+        ) -> std::collections::HashSet<usize> {
+            values
+                .into_iter()
+                .map(|memory| aliases.get(memory).copied().unwrap_or(memory))
+                .collect()
+        }
+
+        Self {
+            sync_reads: canonicalize_set(self.sync_reads, aliases),
+            async_reads: canonicalize_set(self.async_reads, aliases),
+            sync_writes: canonicalize_set(self.sync_writes, aliases),
+            async_writes: canonicalize_set(self.async_writes, aliases),
+        }
+    }
+
+    fn template(&self, memory: usize) -> MemoryTemplate {
+        let sync_write = self.sync_writes.contains(&memory);
+        let async_write = self.async_writes.contains(&memory);
+        if sync_write || async_write {
+            return match (sync_write, async_write) {
+                (true, true) => MemoryTemplate::MixedRam,
+                (true, false) => MemoryTemplate::SyncRam,
+                (false, _) => MemoryTemplate::AsyncRam,
+            };
+        }
+
+        let sync_read = self.sync_reads.contains(&memory);
+        let async_read = self.async_reads.contains(&memory);
+        match (sync_read, async_read) {
+            (true, true) => MemoryTemplate::MixedRom,
+            (true, false) => MemoryTemplate::SyncRom,
+            (false, true) => MemoryTemplate::AsyncRom,
+            (false, false) => MemoryTemplate::Unmapped,
+        }
+    }
+}
+
+fn process_is_edge_clocked(sensitivity: &Sens) -> bool {
+    match sensitivity {
+        Sens::Comb => false,
+        Sens::Posedge(_) | Sens::Negedge(_) => true,
+        Sens::List(list) => list
+            .iter()
+            .any(|item| matches!(item, Sens::Posedge(_) | Sens::Negedge(_))),
+    }
+}
+
+fn collect_memory_accesses(statement: &Stmt, synchronous: bool, accesses: &mut MemoryAccesses) {
     match statement {
         Stmt::Block(statements) => statements
             .iter()
-            .for_each(|statement| collect_memory_writes(statement, writes)),
-        Stmt::Forever(body) | Stmt::Delay { body, .. } => collect_memory_writes(body, writes),
-        Stmt::MemoryBl { memory, .. } | Stmt::MemoryNBl { memory, .. } => {
-            writes.insert(*memory);
+            .for_each(|statement| collect_memory_accesses(statement, synchronous, accesses)),
+        Stmt::Forever(body) | Stmt::Delay { body, .. } => {
+            collect_memory_accesses(body, synchronous, accesses)
         }
-        Stmt::MemoryBlPart { memory, .. } | Stmt::MemoryNBlPart { memory, .. } => {
-            writes.insert(*memory);
+        Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
+            for index in indexes {
+                collect_memory_expr_reads(index, synchronous, accesses);
+            }
+            collect_memory_expr_reads(e, synchronous, accesses);
+            if synchronous {
+                accesses.sync_writes.insert(*memory);
+            } else {
+                accesses.async_writes.insert(*memory);
+            }
+        }
+        Stmt::MemoryBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        }
+        | Stmt::MemoryNBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        } => {
+            for index in indexes {
+                collect_memory_expr_reads(index, synchronous, accesses);
+            }
+            collect_memory_expr_reads(start, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, accesses);
+            if synchronous {
+                accesses.sync_writes.insert(*memory);
+            } else {
+                accesses.async_writes.insert(*memory);
+            }
         }
         Stmt::If { t, f, .. } => {
-            collect_memory_writes(t, writes);
+            collect_memory_accesses(t, synchronous, accesses);
             if let Some(f) = f {
-                collect_memory_writes(f, writes);
+                collect_memory_accesses(f, synchronous, accesses);
             }
         }
         Stmt::Case { arms, dflt, .. } => {
             for (_, body) in arms {
-                collect_memory_writes(body, writes);
+                collect_memory_accesses(body, synchronous, accesses);
             }
             if let Some(body) = dflt {
-                collect_memory_writes(body, writes);
+                collect_memory_accesses(body, synchronous, accesses);
             }
         }
-        Stmt::NBl { .. }
-        | Stmt::Bl { .. }
-        | Stmt::BlIndexed { .. }
-        | Stmt::NBlIndexed { .. }
-        | Stmt::Display { .. }
-        | Stmt::WriteMem { .. }
-        | Stmt::Assert { .. }
-        | Stmt::Assume { .. }
-        | Stmt::Cover { .. }
-        | Stmt::Finish => {}
+        Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => {
+            collect_memory_expr_reads(e, synchronous, accesses);
+        }
+        Stmt::BlIndexed { start, e, .. } | Stmt::NBlIndexed { start, e, .. } => {
+            collect_memory_expr_reads(start, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, accesses);
+        }
+        Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+            collect_memory_expr_reads(cond, synchronous, accesses)
+        }
+        Stmt::Display { args, .. } => {
+            for argument in args {
+                collect_memory_expr_reads(argument, synchronous, accesses);
+            }
+        }
+        Stmt::WriteMem { .. } | Stmt::Finish => {}
+    }
+}
+
+fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mut MemoryAccesses) {
+    match expression {
+        Expr::Const(_) | Expr::Ref { .. } => {}
+        Expr::MemoryRead {
+            memory, indexes, ..
+        } => {
+            if synchronous {
+                accesses.sync_reads.insert(*memory);
+            } else {
+                accesses.async_reads.insert(*memory);
+            }
+            for index in indexes {
+                collect_memory_expr_reads(index, synchronous, accesses);
+            }
+        }
+        Expr::MemoryReadPart {
+            memory,
+            indexes,
+            start,
+            ..
+        } => {
+            if synchronous {
+                accesses.sync_reads.insert(*memory);
+            } else {
+                accesses.async_reads.insert(*memory);
+            }
+            for index in indexes {
+                collect_memory_expr_reads(index, synchronous, accesses);
+            }
+            collect_memory_expr_reads(start, synchronous, accesses);
+        }
+        Expr::Un { a, .. } => collect_memory_expr_reads(a, synchronous, accesses),
+        Expr::Bin { a, b, .. } => {
+            collect_memory_expr_reads(a, synchronous, accesses);
+            collect_memory_expr_reads(b, synchronous, accesses);
+        }
+        Expr::Cond { c, t, f } => {
+            collect_memory_expr_reads(c, synchronous, accesses);
+            collect_memory_expr_reads(t, synchronous, accesses);
+            collect_memory_expr_reads(f, synchronous, accesses);
+        }
+        Expr::Concat(parts) => parts
+            .iter()
+            .for_each(|part| collect_memory_expr_reads(part, synchronous, accesses)),
+        Expr::Repeat { e, .. } | Expr::Signed { e, .. } | Expr::Index { e, .. } => {
+            collect_memory_expr_reads(e, synchronous, accesses)
+        }
     }
 }
 
@@ -758,6 +929,7 @@ mod tests {
             ],
             flat_length: 8,
             kind: MemoryKind::Ram,
+            template: MemoryTemplate::Unmapped,
         };
         assert_eq!(memory.physical_index(&[-2, 3]), Some(0));
         assert_eq!(memory.physical_index(&[-2, 2]), Some(1));
@@ -782,6 +954,7 @@ mod tests {
             }],
             flat_length: 513,
             kind: MemoryKind::Ram,
+            template: MemoryTemplate::Unmapped,
         };
         assert_eq!(memory.element_part_offsets(0, 4, true), Some((4, 7)));
         assert_eq!(memory.element_part_offsets(4, 4, true), Some((0, 3)));
