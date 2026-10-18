@@ -3377,6 +3377,84 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_interface_unpacked_struct_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-unpacked-struct");
+    let source_path = root.join("interface_unpacked_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef struct {
+    logic [7:0] value;
+    logic [3:0] tag;
+    logic valid;
+  } packet_t;
+
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer(
+  bus_if.producer bus,
+  input logic [7:0] value,
+  input logic [3:0] tag
+);
+  assign bus.packet.value = value;
+  assign bus.packet.tag = tag;
+  assign bus.packet.valid = 1'b1;
+endmodule
+
+module interface_unpacked_struct_top(
+  input logic clk,
+  input logic [7:0] value,
+  input logic [3:0] tag,
+  output logic [7:0] observed_value,
+  output logic [3:0] observed_tag,
+  output logic observed_valid
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(.bus(bus), .value(value), .tag(tag));
+  assign observed_value = bus.packet.value;
+  assign observed_tag = bus.packet.tag;
+  assign observed_valid = bus.packet.valid;
+endmodule
+"#,
+    )
+    .expect("write interface unpacked-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_unpacked_struct_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface unpacked struct members");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "bus.packet" && declaration.width == 13));
+    let mut simulator = Simulator::new(&design).expect("create unpacked-struct simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0x9c))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(4, 0b0110))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed_value").unwrap().to_u64(),
+        Some(0x9c)
+    );
+    assert_eq!(
+        simulator.read("observed_tag").unwrap().to_u64(),
+        Some(0b0110)
+    );
+    assert_eq!(simulator.read("observed_valid").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_parameterized_interface_specializations() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -3573,6 +3651,64 @@ endmodule
         .set_input("value", &LogicWord::from_u64(6, 0b011011))
         .unwrap();
     assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b011011));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_interface_unpacked_union_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-unpacked-union");
+    let source_path = root.join("interface_unpacked_union.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef union {
+    logic [7:0] wide;
+    logic [3:0] narrow;
+  } packet_t;
+
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer(
+  bus_if.producer bus,
+  input logic [7:0] value
+);
+  assign bus.packet.wide = value;
+endmodule
+
+module interface_unpacked_union_top(
+  input logic clk,
+  input logic [7:0] value,
+  output logic [3:0] observed
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(.bus(bus), .value(value));
+  assign observed = bus.packet.narrow;
+endmodule
+"#,
+    )
+    .expect("write interface unpacked-union source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_unpacked_union_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface unpacked union members");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "bus.packet" && declaration.width == 8));
+    let mut simulator = Simulator::new(&design).expect("create unpacked-union simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0xb7))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x7));
 }
 
 #[test]
@@ -4613,6 +4749,161 @@ endmodule
         );
         assert_eq!(simulator.read("nested_bit").unwrap().to_u64(), Some(1));
     }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_unpacked_aggregate_types() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-unpacked-aggregate");
+    let source_path = root.join("unpacked_aggregate.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module unpacked_aggregate(
+  input logic [7:0] value,
+  input logic [3:0] tag,
+  output logic [7:0] observed_value,
+  output logic [3:0] observed_tag,
+  output logic observed_valid,
+  output logic [3:0] observed_union
+);
+  typedef struct {
+    logic [7:0] value;
+    logic [3:0] tag;
+    logic valid;
+  } packet_t;
+
+  typedef union {
+    logic [7:0] wide;
+    logic [3:0] narrow;
+  } raw_t;
+
+  packet_t packet;
+  raw_t raw;
+
+  assign packet.value = value;
+  assign packet.tag = tag;
+  assign packet.valid = 1'b1;
+  assign observed_value = packet.value;
+  assign observed_tag = packet.tag;
+  assign observed_valid = packet.valid;
+
+  assign raw.wide = value;
+  assign observed_union = raw.narrow;
+endmodule
+"#,
+    )
+    .expect("write unpacked-aggregate source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("unpacked_aggregate"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unpacked aggregates");
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|decl| decl.name == "packet")
+            .map(|decl| decl.width),
+        Some(13)
+    );
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|decl| decl.name == "raw")
+            .map(|decl| decl.width),
+        Some(8)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create unpacked-aggregate simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0xa7))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(4, 0b0101))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed_value").unwrap().to_u64(),
+        Some(0xa7)
+    );
+    assert_eq!(
+        simulator.read("observed_tag").unwrap().to_u64(),
+        Some(0b0101)
+    );
+    assert_eq!(simulator.read("observed_valid").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("observed_union").unwrap().to_u64(),
+        Some(0x7)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unsupported_unpacked_aggregate_forms() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-unpacked-aggregate-invalid");
+    let pattern_path = root.join("unpacked_pattern.sv");
+    std::fs::write(
+        &pattern_path,
+        r#"
+module unpacked_pattern;
+  typedef struct {
+    logic [7:0] wide;
+    logic [3:0] narrow;
+  } packet_t;
+
+  packet_t packet;
+  initial packet = '{8'h12, 4'h3};
+endmodule
+"#,
+    )
+    .expect("write unpacked-pattern source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&pattern_path),
+            Some("unpacked_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unpacked aggregate assignment patterns must fail closed");
+    assert!(
+        error.contains("unpacked aggregate assignment patterns are not supported"),
+        "unexpected unpacked pattern error: {error}"
+    );
+
+    let tagged_path = root.join("tagged_union.sv");
+    std::fs::write(
+        &tagged_path,
+        r#"
+module tagged_union_probe;
+  typedef union tagged {
+    logic [7:0] wide;
+    logic [1:0] narrow;
+  } packet_t;
+
+  packet_t packet;
+  initial packet.wide = 8'h12;
+endmodule
+"#,
+    )
+    .expect("write tagged-union source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&tagged_path),
+            Some("tagged_union_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("tagged unions must fail closed");
+    assert!(
+        error.contains("does not support tagged union 'packet_t'"),
+        "unexpected tagged-union error: {error}"
+    );
 }
 
 #[test]

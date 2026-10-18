@@ -163,7 +163,10 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     {
         return None;
     }
-    let element_width = if base.contains("logic") || base.contains("reg") || base.contains("bit") {
+    let element_width = if base
+        .split_whitespace()
+        .any(|token| matches!(token, "logic" | "reg" | "bit"))
+    {
         1
     } else if base == "event" {
         return Some(AstTypeShape {

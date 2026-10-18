@@ -346,6 +346,7 @@ struct AstStructType {
     signed: bool,
     fields: std::collections::BTreeMap<String, AstStructField>,
     is_union: bool,
+    is_unpacked: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -1055,6 +1055,9 @@ impl super::SlangAstLowerer {
         if definition.is_union {
             return Err("packed union assignment patterns are not supported".into());
         }
+        if definition.is_unpacked {
+            return Err("unpacked aggregate assignment patterns are not supported".into());
+        }
         let mut fields = definition.fields.values().copied().collect::<Vec<_>>();
         fields.sort_by(|left, right| right.offset.cmp(&left.offset));
 

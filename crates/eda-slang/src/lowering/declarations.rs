@@ -104,10 +104,25 @@ impl SlangAstLowerer {
             }
         }
         let target_kind = string_field(target, "kind").unwrap_or_default();
-        let is_union = target_kind == "PackedUnionType";
-        if !matches!(target_kind.as_str(), "PackedStructType" | "PackedUnionType") {
+        let is_union = matches!(
+            target_kind.as_str(),
+            "PackedUnionType" | "UnpackedUnionType"
+        );
+        let is_unpacked = matches!(
+            target_kind.as_str(),
+            "UnpackedStructType" | "UnpackedUnionType"
+        );
+        if !matches!(
+            target_kind.as_str(),
+            "PackedStructType" | "PackedUnionType" | "UnpackedStructType" | "UnpackedUnionType"
+        ) {
             return Err(format!(
                 "direct slang-AST lowering does not support type alias '{name}' target"
+            ));
+        }
+        if bool_field(target, "isTagged") {
+            return Err(format!(
+                "direct slang-AST lowering does not support tagged union '{name}'"
             ));
         }
         let fields = target
@@ -159,7 +174,7 @@ impl SlangAstLowerer {
                 },
             );
         }
-        if is_union && struct_fields.values().any(|field| field.width != width) {
+        if is_union && !is_unpacked && struct_fields.values().any(|field| field.width != width) {
             return Err(format!(
                 "packed union '{name}' members must all have the same width"
             ));
@@ -169,6 +184,7 @@ impl SlangAstLowerer {
             signed: bool_field(target, "isSigned"),
             fields: struct_fields,
             is_union,
+            is_unpacked,
         };
         self.type_aliases.insert(name, definition);
         Ok(())
