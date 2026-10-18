@@ -3122,6 +3122,89 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_multidimensional_unpacked_interface_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-member-2d");
+    let source_path = root.join("interface_array_member_2d.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface multi_memory_if(input logic clk);
+  logic [7:0] data[0:1][0:3];
+  modport producer(output data);
+endinterface
+
+module multidim_array_producer(
+  multi_memory_if.producer bus,
+  input logic row,
+  input logic [1:0] column,
+  input logic [7:0] value
+);
+  always_comb begin
+    bus.data[row][column] = value;
+  end
+endmodule
+
+module multidim_interface_array_top(
+  input logic clk,
+  input logic row,
+  input logic [1:0] column,
+  input logic [7:0] value,
+  output logic [7:0] observed
+);
+  multi_memory_if bus(.clk(clk));
+  multidim_array_producer producer_u(
+    .bus(bus),
+    .row(row),
+    .column(column),
+    .value(value)
+  );
+  assign observed = bus.data[row][column];
+endmodule
+"#,
+    )
+    .expect("write multidimensional unpacked-interface-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("multidim_interface_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional unpacked interface arrays");
+    assert_eq!(design.hierarchy.len(), 3);
+    let interface_memory = design
+        .memories
+        .iter()
+        .find(|memory| memory.name == "bus.data")
+        .expect("interface multidimensional memory");
+    assert_eq!(interface_memory.dimensions.len(), 2);
+    assert_eq!(interface_memory.flat_length, 8);
+    assert_eq!(design.memory_connections.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create 2D interface-array simulator");
+    for (row, column, value) in [
+        (0_u64, 0_u64, 0xA5),
+        (0, 3, 0x3C),
+        (1, 1, 0x5A),
+        (1, 2, 0x96),
+    ] {
+        simulator
+            .set_input("row", &LogicWord::from_u64(1, row))
+            .unwrap();
+        simulator
+            .set_input("column", &LogicWord::from_u64(2, column))
+            .unwrap();
+        simulator
+            .set_input("value", &LogicWord::from_u64(8, value))
+            .unwrap();
+        assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(value));
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
