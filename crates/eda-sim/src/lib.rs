@@ -67,7 +67,7 @@ struct Waiter<'d> {
 }
 
 struct EventWaiter<'d> {
-    net: usize,
+    nets: Vec<usize>,
     continuation: Cont<'d>,
 }
 
@@ -881,7 +881,7 @@ impl<'d> Simulator<'d> {
         let mut ready_events = Vec::new();
         let mut index = 0;
         while index < self.event_waiters.len() {
-            if self.event_waiters[index].net == changed_net {
+            if self.event_waiters[index].nets.contains(&changed_net) {
                 ready_events.push(self.event_waiters.remove(index).continuation);
             } else {
                 index += 1;
@@ -1472,7 +1472,7 @@ impl<'d> Simulator<'d> {
                         return Ok(());
                     }
                 }
-                Stmt::EventWait { net, body } => {
+                Stmt::EventWait { nets, body } => {
                     let mut exec_order: Vec<&Stmt> = vec![&**body];
                     exec_order.extend(work.iter().rev().copied());
                     exec_order.reverse();
@@ -1485,7 +1485,7 @@ impl<'d> Simulator<'d> {
                         self.busy_procs.remove(&process);
                     }
                     self.event_waiters.push(EventWaiter {
-                        net: *net,
+                        nets: nets.clone(),
                         continuation,
                     });
                     return Ok(());
@@ -2715,8 +2715,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
-        Stmt::EventWait { net, body } => {
-            reads.insert(*net);
+        Stmt::EventWait { nets, body } => {
+            reads.extend(nets.iter().copied());
             collect_stmt_access(body, reads, writes);
         }
         Stmt::WaitOrder {
@@ -2817,8 +2817,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(cond, out);
             walk_stmt(body, out)
         }
-        Stmt::EventWait { net, body } => {
-            out.push(*net);
+        Stmt::EventWait { nets, body } => {
+            out.extend(nets.iter().copied());
             walk_stmt(body, out);
         }
         Stmt::WaitOrder {

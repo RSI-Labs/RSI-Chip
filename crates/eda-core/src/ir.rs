@@ -658,7 +658,7 @@ pub enum Stmt {
     /// Suspend until any value change on one explicitly listed scalar event
     /// signal, then execute `body`.
     EventWait {
-        net: usize,
+        nets: Vec<usize>,
         body: Box<Stmt>,
     },
     /// Suspend until scalar named events trigger in `events` order. An event

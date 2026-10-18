@@ -3566,6 +3566,48 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_event_list_controls() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-list");
+    let source_path = root.join("event_list.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_list(input logic go, output logic y);
+  event first;
+  event second;
+  initial begin
+    y = 1'b0;
+    @(first or second);
+    y = 1'b1;
+  end
+
+  initial begin
+    wait (go);
+    ->second;
+  end
+endmodule
+"#,
+    )
+    .expect("write event-list source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_list"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event-list control");
+    let mut simulator = Simulator::new(&design).expect("create event-list simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

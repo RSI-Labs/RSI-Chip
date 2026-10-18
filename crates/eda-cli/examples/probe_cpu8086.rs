@@ -130,8 +130,8 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(cond, reads);
                 walk(body, reads, writes);
             }
-            Stmt::EventWait { net, body } => {
-                reads.insert(*net);
+            Stmt::EventWait { nets, body } => {
+                reads.extend(nets.iter().copied());
                 walk(body, reads, writes);
             }
             Stmt::WaitOrder {

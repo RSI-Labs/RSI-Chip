@@ -388,6 +388,35 @@ impl SlangAstLowerer {
                 let timing = statement
                     .get("timing")
                     .ok_or_else(|| "timed statement has no timing control".to_string())?;
+                if string_field(timing, "kind").as_deref() == Some("EventList") {
+                    let body = statement
+                        .get("stmt")
+                        .ok_or_else(|| "event control has no statement".to_string())?;
+                    let events = timing
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| "event list has no events".to_string())?;
+                    if events.is_empty() {
+                        return Err("event list is empty".into());
+                    }
+                    let mut nets = Vec::with_capacity(events.len());
+                    for event in events {
+                        if string_field(event, "edge").as_deref() != Some("None") {
+                            return Err(
+                                "event-list statement controls support any-edge events".into()
+                            );
+                        }
+                        let expression = event
+                            .get("expr")
+                            .ok_or_else(|| "event list entry has no expression".to_string())?;
+                        let signal = self.lower_lvalue(expression)?;
+                        nets.push(sensitivity_net(&signal)?);
+                    }
+                    return Ok(Stmt::EventWait {
+                        nets,
+                        body: Box::new(self.lower_statement(body)?),
+                    });
+                }
                 if string_field(timing, "kind").as_deref() == Some("SignalEvent") {
                     let body = statement
                         .get("stmt")
@@ -400,10 +429,7 @@ impl SlangAstLowerer {
                         return Err("event control expression must be scalar".into());
                     }
                     return Ok(Stmt::EventWait {
-                        net: lvalue.net + match lvalue.range {
-                            eda_core::ir::Range::Bit(bit) => bit,
-                            _ => 0,
-                        },
+                        nets: vec![sensitivity_net(&lvalue)?],
                         body: Box::new(self.lower_statement(body)?),
                     });
                 }
