@@ -151,10 +151,12 @@ impl super::SlangAstLowerer {
                 return Ok(symbol.clone());
             }
         }
-        self.symbols
-            .get(&display_name)
-            .cloned()
-            .ok_or_else(|| format!("unknown direct-lowering symbol '{display_name}'"))
+        self.symbols.get(&display_name).cloned().ok_or_else(|| {
+            format!(
+                "unknown direct-lowering symbol '{display_name}' ({})",
+                expression_symbol_id(value).unwrap_or_default()
+            )
+        })
     }
 
     pub(super) fn lower_lvalue(
@@ -313,9 +315,12 @@ impl super::SlangAstLowerer {
                         signed: symbol.signed,
                     })
                 } else {
-                    named_constant_word(value)
-                        .map(Expr::Const)
-                        .ok_or_else(|| format!("unknown direct-lowering symbol '{name}'"))
+                    named_constant_word(value).map(Expr::Const).ok_or_else(|| {
+                        format!(
+                            "unknown direct-lowering symbol '{name}' ({})",
+                            expression_symbol_id(value).unwrap_or_default()
+                        )
+                    })
                 }
             }
             "IntegerLiteral" => {

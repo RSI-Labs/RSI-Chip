@@ -197,6 +197,25 @@ fn collect_interface_modport_symbols(
             .signals
             .insert(format!("{synthesized_address} {member_name}"), absolute);
     }
+    if let Some(hierarchical_symbols) = instance
+        .get("eda_hierarchical_symbols")
+        .and_then(|value| value.as_object())
+    {
+        for (symbol_id, member_name) in hierarchical_symbols {
+            let Some(member_name) = member_name.as_str() else {
+                continue;
+            };
+            let Some(symbol) = child_symbols.get(member_name) else {
+                continue;
+            };
+            let mut absolute = symbol.clone();
+            absolute.base += child_offset;
+            if let Some(memory) = absolute.memory.as_mut() {
+                *memory += memory_offset;
+            }
+            result.signals.insert(symbol_id.clone(), absolute);
+        }
+    }
     for member in members {
         if string_field(member, "kind").as_deref() != Some("Modport") {
             continue;
@@ -774,11 +793,22 @@ impl super::SlangAstLowerer {
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
         let empty_connections = Vec::new();
+        let mut lowered_connections = Vec::new();
         for connection in member
             .get("connections")
             .and_then(serde_json::Value::as_array)
             .unwrap_or(&empty_connections)
         {
+            if let Some(elements) = connection
+                .get("eda_interface_array_connections")
+                .and_then(serde_json::Value::as_array)
+            {
+                lowered_connections.extend(elements.iter().cloned());
+            } else {
+                lowered_connections.push(connection.clone());
+            }
+        }
+        for connection in &lowered_connections {
             let (Some(interface_instance), Some(modport)) = (
                 connection
                     .get("ifaceInstance")
@@ -805,35 +835,48 @@ impl super::SlangAstLowerer {
                     .split_whitespace()
                     .next_back()
                     .ok_or_else(|| "interface modport symbol has no name".to_string())?;
+                let external_symbol_id = connection
+                    .get("eda_external_symbols")
+                    .and_then(|symbols| symbols.get(symbol_id))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(symbol_id)
+                    .to_string();
+                let proxy_name = connection
+                    .get("eda_proxy_suffix")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|suffix| format!("__interface_{suffix}_{port_name}"))
+                    .unwrap_or_else(|| format!("__interface_{port_name}"));
                 if let Some(interface_memory_index) = modport_symbol.symbol.memory {
                     let interface_memory = self.design.memories[interface_memory_index].clone();
                     let proxy_base = child.design.n_nets;
                     child.design.n_nets += 1;
                     child.design.net_decls.push(eda_core::ir::NetDecl {
-                        name: format!("__interface_{port_name}"),
+                        name: proxy_name.clone(),
                         width: 1,
                         is_reg: true,
                         is_signed: modport_symbol.symbol.signed,
                         base: proxy_base,
                     });
                     let mut proxy_memory = interface_memory;
-                    proxy_memory.name = format!("__interface_{port_name}");
+                    proxy_memory.name = proxy_name;
                     let proxy_memory_index = child.design.memories.len();
                     child.design.memories.push(proxy_memory);
                     let mut proxy = modport_symbol.symbol.clone();
                     proxy.base = proxy_base;
                     proxy.memory = Some(proxy_memory_index);
-                    child.external_symbols.insert(symbol_id.clone(), proxy);
+                    child
+                        .external_symbols
+                        .insert(external_symbol_id.clone(), proxy);
                     child
                         .external_symbol_directions
-                        .insert(symbol_id.clone(), modport_symbol.direction);
+                        .insert(external_symbol_id, modport_symbol.direction);
                     interface_memory_connections.push((interface_memory_index, proxy_memory_index));
                     continue;
                 }
                 let proxy_base = child.design.n_nets;
                 child.design.n_nets += modport_symbol.symbol.width;
                 child.design.net_decls.push(eda_core::ir::NetDecl {
-                    name: format!("__interface_{port_name}"),
+                    name: proxy_name,
                     width: modport_symbol.symbol.width,
                     is_reg: true,
                     is_signed: modport_symbol.symbol.signed,
@@ -843,10 +886,10 @@ impl super::SlangAstLowerer {
                 proxy.base = proxy_base;
                 child
                     .external_symbols
-                    .insert(symbol_id.clone(), proxy.clone());
+                    .insert(external_symbol_id.clone(), proxy.clone());
                 child
                     .external_symbol_directions
-                    .insert(symbol_id.clone(), modport_symbol.direction);
+                    .insert(external_symbol_id, modport_symbol.direction);
                 interface_proxy_connections.push((
                     modport_symbol.direction,
                     modport_symbol.symbol.clone(),

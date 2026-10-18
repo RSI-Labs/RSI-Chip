@@ -16,7 +16,11 @@ mod lowering;
 mod summary;
 mod types;
 
-use lowering::{parse_ast_root, SlangAstLowerer};
+use lowering::{
+    annotate_interface_array_port_connections, interface_array_port_member_count,
+    interface_array_port_plan_has_members, interface_array_port_scope_paths, lower_root,
+    parse_ast_root, plan_interface_array_port_scopes,
+};
 pub use summary::{
     SlangAssignmentSummary, SlangAstSummary, SlangContinuousTarget, SlangDeclarationSummary,
     SlangExpressionSummary, SlangInstanceSummary, SlangParameterSummary, SlangPortSummary,
@@ -216,15 +220,75 @@ impl SlangFrontend {
         let json = self
             .ast_json_with_options(files, top, &[], options)
             .map_err(|error| error.to_string())?;
-        self.lower_ast_json(&json)
+        self.lower_ast_json_with_interface_array_scopes(&json, files, top, options)
     }
 
     /// Directly lowers the current simple-module AST subset into `Design`.
     pub fn lower_ast_json(&self, json: &str) -> Result<Design, String> {
         let root = parse_ast_root(json)?;
-        let mut design = SlangAstLowerer::lower(&root)?;
+        let mut design = lower_root(&root)?;
         design.infer_memory_kinds();
         let authoritative = SlangAstSummary::parse(json)?;
+        authoritative.validate_against_design(&design)?;
+        Ok(design)
+    }
+
+    fn lower_ast_json_with_interface_array_scopes(
+        &self,
+        json: &str,
+        files: &[PathBuf],
+        top: Option<&str>,
+        options: &PreprocessOptions,
+    ) -> Result<Design, String> {
+        let mut root = parse_ast_root(json)?;
+        let mut plan = plan_interface_array_port_scopes(&root)?;
+        let mut authoritative_json = json.to_string();
+        if interface_array_port_plan_has_members(&plan) {
+            let top_name = top
+                .map(str::to_string)
+                .or_else(|| {
+                    root.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| "slang AST Instance has no name".to_string())?;
+            let mut scopes = vec![top_name];
+            scopes.extend(interface_array_port_scope_paths(&plan));
+            let scoped_json = self
+                .ast_json_with_options(files, top, &scopes, options)
+                .map_err(|error| error.to_string())?;
+            let scoped_objects = parse_concatenated_json_objects(&scoped_json)?;
+            if scoped_objects.len() != scopes.len() {
+                return Err(format!(
+                    "slang emitted {} interface-array AST scopes but {} were expected",
+                    scoped_objects.len(),
+                    scopes.len()
+                ));
+            }
+            let addresses = scoped_objects[1..]
+                .iter()
+                .map(|object| {
+                    object
+                        .get("addr")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            "slang interface-array member scope has no address".to_string()
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let scoped_root_json = scoped_objects[0].to_string();
+            root = parse_ast_root(&scoped_root_json)?;
+            plan = plan_interface_array_port_scopes(&root)?;
+            if scoped_objects.len() - 1 != interface_array_port_member_count(&plan) * 2 {
+                return Err("slang interface-array scope plan changed between invocations".into());
+            }
+            annotate_interface_array_port_connections(&mut root, &plan, &addresses)?;
+            authoritative_json = scoped_root_json;
+        }
+
+        let mut design = lower_root(&root)?;
+        design.infer_memory_kinds();
+        let authoritative = SlangAstSummary::parse(&authoritative_json)?;
         authoritative.validate_against_design(&design)?;
         Ok(design)
     }
@@ -283,6 +347,54 @@ fn add_preprocessor_options(command: &mut Command, options: &PreprocessOptions) 
     for undefine in &options.undefines {
         command.arg("-U").arg(undefine);
     }
+}
+
+fn parse_concatenated_json_objects(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut objects = Vec::new();
+    let mut object_start = None;
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    return Err("slang AST scope output had an unmatched object close".into());
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let start = object_start
+                        .ok_or_else(|| "slang AST scope object had no start".to_string())?;
+                    let object = serde_json::from_str(&text[start..=index])
+                        .map_err(|error| format!("invalid slang AST scope JSON: {error}"))?;
+                    objects.push(object);
+                    object_start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err("slang AST scope output ended inside an object".into());
+    }
+    Ok(objects)
 }
 
 fn which(program: &str) -> Result<PathBuf, String> {

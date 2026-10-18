@@ -3368,6 +3368,365 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_interface_array_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port");
+    let source_path = root.join("interface_array_port.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport producer(output valid);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[2],
+  input logic [1:0] value
+);
+  assign buses[0].valid = value[0];
+  assign buses[1].valid = value[1];
+endmodule
+
+module interface_array_port_top(
+  input logic clk,
+  input logic [1:0] value,
+  output logic [1:0] observed
+);
+  bus_if buses[2] (.clk(clk));
+  producer_array producers (.buses(buses), .value(value));
+  assign observed[0] = buses[0].valid;
+  assign observed[1] = buses[1].valid;
+endmodule
+"#,
+    )
+    .expect("write interface-array-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface array ports");
+    assert_eq!(design.hierarchy.len(), 4);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "interface_array_port_top",
+            "interface_array_port_top.buses[0]",
+            "interface_array_port_top.buses[1]",
+            "interface_array_port_top.producers"
+        ]
+    );
+    for path in ["buses[0].valid", "buses[1].valid"] {
+        assert!(
+            design
+                .net_decls
+                .iter()
+                .any(|declaration| declaration.name == path),
+            "missing interface signal {path}"
+        );
+    }
+
+    let mut simulator = Simulator::new(&design).expect("create interface-array-port simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(2, 0b10))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b10));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_multidimensional_interface_array_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-2d");
+    let source_path = root.join("interface_array_port_2d.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport producer(output valid);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[2][2],
+  input logic [3:0] value
+);
+  assign buses[0][0].valid = value[0];
+  assign buses[0][1].valid = value[1];
+  assign buses[1][0].valid = value[2];
+  assign buses[1][1].valid = value[3];
+endmodule
+
+module interface_array_port_2d_top(
+  input logic clk,
+  input logic [3:0] value,
+  output logic [3:0] observed
+);
+  bus_if buses[2][2] (.clk(clk));
+  producer_array producers (.buses(buses), .value(value));
+  assign observed[0] = buses[0][0].valid;
+  assign observed[1] = buses[0][1].valid;
+  assign observed[2] = buses[1][0].valid;
+  assign observed[3] = buses[1][1].valid;
+endmodule
+"#,
+    )
+    .expect("write multidimensional interface-array-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_2d_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional interface array ports");
+    assert_eq!(design.hierarchy.len(), 6);
+    let mut simulator = Simulator::new(&design).expect("create 2D interface-array-port simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(4, 0b1010))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b1010));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_interface_array_port_vectors() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-vector");
+    let source_path = root.join("interface_array_port_vector.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic [3:0] data;
+  modport producer(output data);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[2],
+  input logic [7:0] value
+);
+  assign buses[0].data = value[3:0];
+  assign buses[1].data = value[7:4];
+endmodule
+
+module interface_array_port_vector_top(
+  input logic clk,
+  input logic [7:0] value,
+  output logic [7:0] observed
+);
+  bus_if buses[2] (.clk(clk));
+  producer_array producers (.buses(buses), .value(value));
+  assign observed[3:0] = buses[0].data;
+  assign observed[7:4] = buses[1].data;
+endmodule
+"#,
+    )
+    .expect("write interface-array-port vector source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_vector_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface array port vectors");
+    let mut simulator =
+        Simulator::new(&design).expect("create interface-array-port vector simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0b1011_0110))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed").unwrap().to_u64(),
+        Some(0b1011_0110)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_shares_interface_array_ports_between_consumers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-shared");
+    let source_path = root.join("interface_array_port_shared.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  logic ready;
+  modport producer(output valid, input ready);
+  modport consumer(input valid, output ready);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[2],
+  input logic [1:0] drive,
+  output logic [1:0] observed_ready
+);
+  assign buses[0].valid = drive[0];
+  assign buses[1].valid = drive[1];
+  assign observed_ready[0] = buses[0].ready;
+  assign observed_ready[1] = buses[1].ready;
+endmodule
+
+module consumer_array(
+  bus_if.consumer buses[2],
+  input logic [1:0] enable,
+  output logic [1:0] observed_valid
+);
+  assign buses[0].ready = enable[0];
+  assign buses[1].ready = enable[1];
+  assign observed_valid[0] = buses[0].valid;
+  assign observed_valid[1] = buses[1].valid;
+endmodule
+
+module interface_array_port_shared_top(
+  input logic clk,
+  input logic [1:0] drive,
+  input logic [1:0] enable,
+  output logic [1:0] observed_valid,
+  output logic [1:0] observed_ready
+);
+  bus_if buses[2] (.clk(clk));
+  producer_array producers (.buses(buses), .drive(drive), .observed_ready(observed_ready));
+  consumer_array consumers (.buses(buses), .enable(enable), .observed_valid(observed_valid));
+endmodule
+"#,
+    )
+    .expect("write shared interface-array-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_shared_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower shared interface array ports");
+    let mut simulator = Simulator::new(&design).expect("create shared interface-array simulator");
+    simulator
+        .set_input("drive", &LogicWord::from_u64(2, 0b10))
+        .unwrap();
+    simulator
+        .set_input("enable", &LogicWord::from_u64(2, 0b01))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed_valid").unwrap().to_u64(),
+        Some(0b10)
+    );
+    assert_eq!(
+        simulator.read("observed_ready").unwrap().to_u64(),
+        Some(0b01)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_interface_array_port_input_writes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-input");
+    let source_path = root.join("interface_array_port_input.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport consumer(input valid);
+endinterface
+
+module consumer_array(
+  bus_if.consumer buses[2],
+  input logic [1:0] value
+);
+  assign buses[0].valid = value[0];
+  assign buses[1].valid = value[1];
+endmodule
+
+module interface_array_port_input_top(
+  input logic clk,
+  input logic [1:0] value
+);
+  bus_if buses[2] (.clk(clk));
+  consumer_array consumers (.buses(buses), .value(value));
+endmodule
+"#,
+    )
+    .expect("write interface-array-port input source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_input_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("interface array port input writes must fail closed");
+    assert!(
+        error.contains("cannot assign to input port 'valid'"),
+        "unexpected interface-array port input error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_interface_array_port_shape_mismatches() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-shape");
+    let source_path = root.join("interface_array_port_shape.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport producer(output valid);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[3],
+  input logic [2:0] value
+);
+  assign buses[0].valid = value[0];
+  assign buses[1].valid = value[1];
+  assign buses[2].valid = value[2];
+endmodule
+
+module interface_array_port_shape_top(
+  input logic clk,
+  input logic [2:0] value
+);
+  bus_if buses[2] (.clk(clk));
+  producer_array producers (.buses(buses), .value(value));
+endmodule
+"#,
+    )
+    .expect("write interface-array-port shape source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_shape_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("interface array port shape mismatches must fail closed");
+    assert!(
+        error.contains("dimensions of connection for port 'buses' do not match"),
+        "unexpected interface-array port shape error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

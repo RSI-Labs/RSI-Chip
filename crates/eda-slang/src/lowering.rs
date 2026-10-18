@@ -10,7 +10,14 @@ mod declarations;
 mod expressions;
 mod functions;
 mod hierarchy;
+mod interface_ports;
 mod statements;
+
+pub(crate) use interface_ports::{
+    annotate_interface_array_port_connections, interface_array_port_member_count,
+    interface_array_port_plan_has_members, interface_array_port_scope_paths,
+    plan_interface_array_port_scopes,
+};
 
 fn collect_compilation_unit_definitions(
     value: &serde_json::Value,
@@ -33,7 +40,7 @@ fn collect_compilation_unit_definitions(
     }
 }
 
-pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let start = json
         .find('{')
         .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
@@ -112,6 +119,10 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
             );
     }
     Ok(root)
+}
+
+pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {
+    SlangAstLowerer::lower(root)
 }
 
 #[derive(Clone)]
