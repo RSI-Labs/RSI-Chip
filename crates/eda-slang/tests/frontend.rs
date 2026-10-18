@@ -347,6 +347,9 @@ module package_types
   output pair_t pair,
   output state_t next_state,
   output state_t previous_state,
+  output state_t first_state,
+  output state_t last_state,
+  output int enum_count,
   output string state_name,
   output logic initialized,
   output logic selected_a
@@ -355,6 +358,9 @@ module package_types
   assign pair = data;
   assign next_state = state.next();
   assign previous_state = state.prev();
+  assign first_state = state.first();
+  assign last_state = state.last();
+  assign enum_count = state.num();
   assign state_name = state.name();
   assign initialized = (INIT == A);
   assign selected_a = (state == A);
@@ -370,7 +376,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower package typedefs and enums");
-    assert_eq!(design.assigns.len(), 7);
+    assert_eq!(design.assigns.len(), 10);
     let mut simulator = Simulator::new(&design).expect("create package-type simulator");
     simulator
         .set_input("selector", &LogicWord::from_u64(2, 0))
@@ -382,6 +388,9 @@ endmodule
     assert_eq!(simulator.read("pair").unwrap().to_u64(), Some(0x5A));
     assert_eq!(simulator.read("next_state").unwrap().to_u64(), Some(2));
     assert_eq!(simulator.read("previous_state").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("first_state").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("last_state").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("enum_count").unwrap().to_u64(), Some(2));
     assert_eq!(
         simulator
             .read("state_name")
@@ -2995,6 +3004,120 @@ endmodule
     assert_eq!(
         simulator.read("outgoing").unwrap().to_u64(),
         Some(0x12345678)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_unpacked_interface_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-member");
+    let source_path = root.join("interface_array_member.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface memory_if(input logic clk);
+  logic [7:0] data[0:3];
+  modport producer(output data);
+endinterface
+
+module array_producer(
+  memory_if.producer bus,
+  input logic [1:0] index,
+  input logic [7:0] value
+);
+  always_comb begin
+    bus.data[index] = value;
+  end
+endmodule
+
+module interface_array_member_top(
+  input logic clk,
+  input logic [1:0] index,
+  input logic [7:0] value,
+  output logic [7:0] observed
+);
+  memory_if bus(.clk(clk));
+  array_producer producer_u(
+    .bus(bus),
+    .index(index),
+    .value(value)
+  );
+  assign observed = bus.data[index];
+endmodule
+"#,
+    )
+    .expect("write unpacked-interface-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_member_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unpacked interface arrays");
+    assert_eq!(design.hierarchy.len(), 3);
+    assert!(design
+        .memories
+        .iter()
+        .any(|memory| memory.name == "bus.data"));
+    assert_eq!(design.memory_connections.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create interface-array simulator");
+    for (index, value) in [(0_u64, 0xA5), (1, 0x3C), (2, 0x5A), (3, 0x96)] {
+        simulator
+            .set_input("index", &LogicWord::from_u64(2, index))
+            .unwrap();
+        simulator
+            .set_input("value", &LogicWord::from_u64(8, value))
+            .unwrap();
+        assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(value));
+    }
+
+    let mut ast = serde_json::from_str::<serde_json::Value>(
+        &slang
+            .ast_json_with_options(
+                std::slice::from_ref(&source_path),
+                Some("interface_array_member_top"),
+                &[],
+                &PreprocessOptions::default(),
+            )
+            .expect("serialize authoritative interface-array AST"),
+    )
+    .expect("parse authoritative interface-array AST");
+    fn make_memory_input(value: &mut serde_json::Value) {
+        if let Some(fields) = value.as_object_mut() {
+            if fields.get("kind").and_then(serde_json::Value::as_str) == Some("Modport")
+                && fields.get("name").and_then(serde_json::Value::as_str) == Some("producer")
+            {
+                if let Some(members) = fields
+                    .get_mut("members")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for member in members {
+                        if member.get("name").and_then(serde_json::Value::as_str) == Some("data") {
+                            member["direction"] = serde_json::Value::String("In".into());
+                        }
+                    }
+                }
+            }
+            for nested in fields.values_mut() {
+                make_memory_input(nested);
+            }
+        } else if let Some(values) = value.as_array_mut() {
+            for nested in values {
+                make_memory_input(nested);
+            }
+        }
+    }
+    make_memory_input(&mut ast);
+    let error = slang
+        .lower_ast_json(&ast.to_string())
+        .expect_err("modport input memory writes must fail closed");
+    assert!(
+        error.contains("modport input variable cannot be assigned directly"),
+        "unexpected interface-memory direction error: {error}"
     );
 }
 

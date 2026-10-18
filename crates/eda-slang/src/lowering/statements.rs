@@ -1724,6 +1724,9 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "assignment has no right side".to_string())?;
+        if self.is_external_input_lvalue(left)? {
+            return Err("modport input variable cannot be assigned directly".into());
+        }
         if let Some(statement) = self.memory_struct_member_assignment(assignment, left, right)? {
             return Ok(statement);
         }

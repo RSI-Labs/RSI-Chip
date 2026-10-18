@@ -117,6 +117,7 @@ fn collect_interface_modport_symbols(
     body: &serde_json::Value,
     child_symbols: &std::collections::BTreeMap<String, AstLoweredSymbol>,
     child_offset: usize,
+    memory_offset: usize,
 ) -> Result<InterfaceSymbols, String> {
     let mut result = InterfaceSymbols {
         modports: std::collections::BTreeMap::new(),
@@ -182,6 +183,9 @@ fn collect_interface_modport_symbols(
             };
             let mut absolute = symbol.clone();
             absolute.base += child_offset;
+            if let Some(memory) = absolute.memory.as_mut() {
+                *memory += memory_offset;
+            }
             result.signals.insert(internal, absolute.clone());
             symbols.insert(
                 format!("{port_address} {port_name}"),
@@ -660,7 +664,9 @@ impl super::SlangAstLowerer {
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
         let definition_name = string_field(body, "name").unwrap_or_default();
         let child_offset = self.design.n_nets;
+        let memory_offset = self.design.memories.len();
         let mut interface_proxy_connections = Vec::new();
+        let mut interface_memory_connections = Vec::new();
         let mut child = Self {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
@@ -707,13 +713,35 @@ impl super::SlangAstLowerer {
                 ));
             };
             for (symbol_id, modport_symbol) in modport_symbols {
-                if modport_symbol.symbol.memory.is_some() {
-                    return Err("sparse-memory interface modports are not supported yet".into());
-                }
                 let port_name = symbol_id
                     .split_whitespace()
                     .next_back()
                     .ok_or_else(|| "interface modport symbol has no name".to_string())?;
+                if let Some(interface_memory_index) = modport_symbol.symbol.memory {
+                    let interface_memory = self.design.memories[interface_memory_index].clone();
+                    let proxy_base = child.design.n_nets;
+                    child.design.n_nets += 1;
+                    child.design.net_decls.push(eda_core::ir::NetDecl {
+                        name: format!("__interface_{port_name}"),
+                        width: 1,
+                        is_reg: true,
+                        is_signed: modport_symbol.symbol.signed,
+                        base: proxy_base,
+                    });
+                    let mut proxy_memory = interface_memory;
+                    proxy_memory.name = format!("__interface_{port_name}");
+                    let proxy_memory_index = child.design.memories.len();
+                    child.design.memories.push(proxy_memory);
+                    let mut proxy = modport_symbol.symbol.clone();
+                    proxy.base = proxy_base;
+                    proxy.memory = Some(proxy_memory_index);
+                    child.external_symbols.insert(symbol_id.clone(), proxy);
+                    child
+                        .external_symbol_directions
+                        .insert(symbol_id.clone(), modport_symbol.direction);
+                    interface_memory_connections.push((interface_memory_index, proxy_memory_index));
+                    continue;
+                }
                 let proxy_base = child.design.n_nets;
                 child.design.n_nets += modport_symbol.symbol.width;
                 child.design.net_decls.push(eda_core::ir::NetDecl {
@@ -740,14 +768,18 @@ impl super::SlangAstLowerer {
         }
         child.lower_body(body)?;
 
-        let interface_symbols =
-            collect_interface_modport_symbols(member, body, &child.symbols, child_offset)?;
+        let interface_symbols = collect_interface_modport_symbols(
+            member,
+            body,
+            &child.symbols,
+            child_offset,
+            memory_offset,
+        )?;
         self.interface_modport_symbols
             .extend(interface_symbols.modports);
         self.external_symbols.extend(interface_symbols.signals);
 
         let offset = child_offset;
-        let memory_offset = self.design.memories.len();
         let child_net_start = offset;
         let child_ports = child.design.ports.clone();
         let child_memories = child.design.memories.clone();
@@ -760,6 +792,14 @@ impl super::SlangAstLowerer {
             connection.child += memory_offset;
             connection.parent += memory_offset;
             self.design.memory_connections.push(connection);
+        }
+        for (parent, child) in interface_memory_connections {
+            self.design
+                .memory_connections
+                .push(eda_core::ir::MemoryConnection {
+                    parent,
+                    child: child + memory_offset,
+                });
         }
         for declaration in &child.design.net_decls {
             self.design.net_decls.push(eda_core::ir::NetDecl {

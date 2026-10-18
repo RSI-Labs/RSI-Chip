@@ -169,6 +169,9 @@ impl super::SlangAstLowerer {
         &self,
         value: &serde_json::Value,
     ) -> Result<eda_core::ir::LValue, String> {
+        if self.is_external_input_lvalue(value)? {
+            return Err("modport input variable cannot be assigned directly".into());
+        }
         match string_field(value, "kind").as_deref() {
             Some("NamedValue" | "HierarchicalValue") => {
                 let symbol = self.named_symbol(value)?;
@@ -223,6 +226,30 @@ impl super::SlangAstLowerer {
                 "direct slang-AST lowering does not support lvalue kind '{kind}'"
             )),
             None => Err("slang lvalue has no kind".into()),
+        }
+    }
+
+    pub(super) fn is_external_input_lvalue(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<bool, String> {
+        match string_field(value, "kind").as_deref() {
+            Some("NamedValue" | "HierarchicalValue") => Ok(expression_symbol_id(value)
+                .and_then(|symbol_id| self.external_symbol_directions.get(&symbol_id))
+                == Some(&eda_core::ir::Dir::In)),
+            Some("ElementSelect" | "RangeSelect") => {
+                let selected = value
+                    .get("value")
+                    .ok_or_else(|| "selected lvalue has no value".to_string())?;
+                self.is_external_input_lvalue(selected)
+            }
+            Some("MemberAccess") => {
+                let selected = value
+                    .get("value")
+                    .ok_or_else(|| "member lvalue has no value".to_string())?;
+                self.is_external_input_lvalue(selected)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -1673,10 +1700,19 @@ impl super::SlangAstLowerer {
             .ok_or_else(|| "memory element select has no selector".to_string())?;
         let selector = self.lower_expression(selector)?;
         match string_field(selected, "kind").as_deref() {
-            Some("NamedValue") => {
+            Some("NamedValue" | "HierarchicalValue") => {
+                let symbol = if let Some(symbol_id) = expression_symbol_id(selected) {
+                    self.external_symbols
+                        .get(&symbol_id)
+                        .or_else(|| self.local_symbols.get(&symbol_id))
+                        .cloned()
+                } else {
+                    None
+                };
                 let name = expression_symbol(selected)
                     .ok_or_else(|| "memory element select has no symbol".to_string())?;
-                let Some(symbol) = self.symbols.get(&name) else {
+                let symbol = symbol.or_else(|| self.symbols.get(&name).cloned());
+                let Some(symbol) = symbol else {
                     return Ok(None);
                 };
                 let Some(memory) = symbol.memory else {
