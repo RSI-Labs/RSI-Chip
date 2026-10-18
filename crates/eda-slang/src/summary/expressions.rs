@@ -654,6 +654,16 @@ pub(crate) fn design_stmt_assignments(
         Stmt::EventWait { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(statement) = success {
+                assignments.extend(design_stmt_assignments(design, statement));
+            }
+            if let Some(statement) = failure {
+                assignments.extend(design_stmt_assignments(design, statement));
+            }
+        }
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| assignments.extend(design_stmt_assignments(design, branch))),

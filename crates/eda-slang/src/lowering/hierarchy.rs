@@ -178,6 +178,19 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             *net += offset;
             remap_statement(body, offset);
         }
+        Stmt::WaitOrder {
+            events,
+            success,
+            failure,
+        } => {
+            events.iter_mut().for_each(|net| *net += offset);
+            if let Some(statement) = success {
+                remap_statement(statement, offset);
+            }
+            if let Some(statement) = failure {
+                remap_statement(statement, offset);
+            }
+        }
         Stmt::Fork { branches, .. } => branches
             .iter_mut()
             .for_each(|branch| remap_statement(branch, offset)),
@@ -368,6 +381,16 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             remap_statement_memory_ids(body, offset);
         }
         Stmt::EventWait { body, .. } => remap_statement_memory_ids(body, offset),
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(statement) = success {
+                remap_statement_memory_ids(statement, offset);
+            }
+            if let Some(statement) = failure {
+                remap_statement_memory_ids(statement, offset);
+            }
+        }
         Stmt::Fork { branches, .. } => branches
             .iter_mut()
             .for_each(|branch| remap_statement_memory_ids(branch, offset)),

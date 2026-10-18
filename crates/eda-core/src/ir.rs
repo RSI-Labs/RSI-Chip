@@ -654,6 +654,13 @@ pub enum Stmt {
         net: usize,
         body: Box<Stmt>,
     },
+    /// Suspend until scalar named events trigger in `events` order. An event
+    /// appearing out of order selects the failure branch.
+    WaitOrder {
+        events: Vec<usize>,
+        success: Option<Box<Stmt>>,
+        failure: Option<Box<Stmt>>,
+    },
     /// Concurrent branches joined with `join`, `join_any`, or `join_none`.
     Fork {
         branches: Vec<Stmt>,
@@ -1035,6 +1042,16 @@ fn collect_memory_accesses(
         }
         Stmt::EventWait { body, .. } => {
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
+        }
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(success) = success {
+                collect_memory_accesses(success, synchronous, memory_widths, accesses);
+            }
+            if let Some(failure) = failure {
+                collect_memory_accesses(failure, synchronous, memory_widths, accesses);
+            }
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             collect_memory_accesses(branch, synchronous, memory_widths, accesses)

@@ -3673,6 +3673,89 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_wait_order() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-wait-order");
+    let ordered_path = root.join("ordered.sv");
+    std::fs::write(
+        &ordered_path,
+        r#"
+module ordered(input logic go, output logic done);
+  event first;
+  event second;
+  initial begin
+    done = 1'b0;
+    wait_order(first, second);
+    done = 1'b1;
+  end
+
+  initial begin
+    wait (go);
+    ->first;
+    #1;
+    ->second;
+  end
+endmodule
+"#,
+    )
+    .expect("write ordered wait_order source");
+    let ordered_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&ordered_path),
+            Some("ordered"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower ordered wait_order");
+    let mut ordered_simulator =
+        Simulator::new(&ordered_design).expect("create ordered wait_order simulator");
+    ordered_simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(ordered_simulator.read("done").unwrap().to_u64(), Some(0));
+    ordered_simulator.run_until(1).unwrap();
+    assert_eq!(ordered_simulator.read("done").unwrap().to_u64(), Some(1));
+
+    let out_of_order_path = root.join("out-of-order.sv");
+    std::fs::write(
+        &out_of_order_path,
+        r#"
+module out_of_order(input logic go, output int status);
+  event first;
+  event second;
+  initial begin
+    status = 0;
+    wait_order(first, second) status = 1; else status = 2;
+  end
+
+  initial begin
+    wait (go);
+    ->second;
+  end
+endmodule
+"#,
+    )
+    .expect("write out-of-order wait_order source");
+    let out_of_order_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&out_of_order_path),
+            Some("out_of_order"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower out-of-order wait_order");
+    let mut out_of_order_simulator =
+        Simulator::new(&out_of_order_design).expect("create out-of-order simulator");
+    out_of_order_simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        out_of_order_simulator.read("status").unwrap().to_u64(),
+        Some(2)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

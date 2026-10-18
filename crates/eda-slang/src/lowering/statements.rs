@@ -519,6 +519,57 @@ impl SlangAstLowerer {
                     body: Box::new(self.lower_statement(body)?),
                 })
             }
+            "WaitOrder" => {
+                let event_values = statement
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "wait_order has no events".to_string())?;
+                if event_values.is_empty() {
+                    return Err("wait_order requires at least one event".into());
+                }
+                let mut events = Vec::with_capacity(event_values.len());
+                for event in event_values {
+                    let target = event
+                        .get("target")
+                        .ok_or_else(|| "wait_order event has no target".to_string())?;
+                    let event_type = target
+                        .get("type")
+                        .ok_or_else(|| "wait_order event target has no type".to_string())?;
+                    let is_event = match event_type {
+                        Value::String(type_name) => type_name == "event",
+                        Value::Object(fields) => {
+                            fields.get("name").and_then(Value::as_str) == Some("event")
+                                || fields.get("kind").and_then(Value::as_str)
+                                    == Some("EventType")
+                        }
+                        _ => false,
+                    };
+                    if !is_event {
+                        return Err("wait_order targets must be events".into());
+                    }
+                    let lvalue = self.lower_lvalue(target)?;
+                    if lvalue.range.width() != 1 {
+                        return Err("wait_order event targets must be scalar".into());
+                    }
+                    let net = lvalue.net
+                        + match lvalue.range {
+                            eda_core::ir::Range::Bit(bit) => bit,
+                            _ => 0,
+                        };
+                    events.push(net);
+                }
+                let lower_action = |action: &str| -> Result<Option<Box<Stmt>>, String> {
+                    match statement.get(action) {
+                        Some(action) => Ok(Some(Box::new(self.lower_statement(action)?))),
+                        None => Ok(None),
+                    }
+                };
+                Ok(Stmt::WaitOrder {
+                    events,
+                    success: lower_action("ifTrue")?,
+                    failure: lower_action("ifFalse")?,
+                })
+            }
             other => Err(format!(
                 "direct slang-AST lowering does not support statement kind '{other}'"
             )),

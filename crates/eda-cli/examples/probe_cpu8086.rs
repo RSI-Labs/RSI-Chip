@@ -131,6 +131,19 @@ fn feedback(s: &Stmt) -> bool {
                 reads.insert(*net);
                 walk(body, reads, writes);
             }
+            Stmt::WaitOrder {
+                events,
+                success,
+                failure,
+            } => {
+                reads.extend(events.iter().copied());
+                if let Some(statement) = success {
+                    walk(statement, reads, writes);
+                }
+                if let Some(statement) = failure {
+                    walk(statement, reads, writes);
+                }
+            }
             Stmt::Fork { branches, .. } => branches
                 .iter()
                 .for_each(|branch| walk(branch, reads, writes)),

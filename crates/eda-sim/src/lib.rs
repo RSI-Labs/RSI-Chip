@@ -71,6 +71,14 @@ struct EventWaiter<'d> {
     continuation: Cont<'d>,
 }
 
+struct OrderedEventWaiter<'d> {
+    events: Vec<usize>,
+    next: usize,
+    success: Option<&'d Stmt>,
+    failure: Option<&'d Stmt>,
+    continuation: Cont<'d>,
+}
+
 struct Monitor<'d> {
     parts: &'d [eda_core::ir::DispPart],
     args: &'d [Expr],
@@ -93,6 +101,7 @@ pub struct Simulator<'d> {
     repeat_remaining: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
     event_waiters: Vec<EventWaiter<'d>>,
+    ordered_event_waiters: Vec<OrderedEventWaiter<'d>>,
     forced_values: HashMap<usize, LogicValue>,
     forced_saved_values: HashMap<usize, LogicValue>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
@@ -208,6 +217,7 @@ impl<'d> Simulator<'d> {
             repeat_remaining: HashMap::new(),
             waiters: Vec::new(),
             event_waiters: Vec::new(),
+            ordered_event_waiters: Vec::new(),
             forced_values: HashMap::new(),
             forced_saved_values: HashMap::new(),
             memory_elements,
@@ -877,6 +887,50 @@ impl<'d> Simulator<'d> {
         for continuation in ready_events {
             self.conts.entry(self.now).or_default().push(continuation);
         }
+
+        let mut ready_ordered = Vec::new();
+        let mut index = 0;
+        while index < self.ordered_event_waiters.len() {
+            let waiter = &mut self.ordered_event_waiters[index];
+            if !waiter.events.contains(&changed_net) {
+                index += 1;
+                continue;
+            }
+            let mut successful_completion = false;
+            let complete_or_failed = if waiter.events[waiter.next] == changed_net {
+                waiter.next += 1;
+                successful_completion = waiter.next == waiter.events.len();
+                successful_completion
+            } else {
+                true
+            };
+            if complete_or_failed {
+                let waiter = self.ordered_event_waiters.remove(index);
+                let action = if successful_completion {
+                    waiter.success
+                } else {
+                    waiter.failure
+                };
+                ready_ordered.push((action, waiter.continuation));
+            } else {
+                index += 1;
+            }
+        }
+        for (action, continuation) in ready_ordered {
+            let continuation = match action {
+                Some(action) => {
+                    let mut work = vec![action];
+                    work.extend(continuation.work);
+                    Cont {
+                        process: continuation.process,
+                        join: continuation.join,
+                        work,
+                    }
+                }
+                None => continuation,
+            };
+            self.conts.entry(self.now).or_default().push(continuation);
+        }
     }
 
     fn wake_memory_waiters(&mut self, changed_memory: usize) {
@@ -1429,6 +1483,28 @@ impl<'d> Simulator<'d> {
                     }
                     self.event_waiters.push(EventWaiter {
                         net: *net,
+                        continuation,
+                    });
+                    return Ok(());
+                }
+                Stmt::WaitOrder {
+                    events,
+                    success,
+                    failure,
+                } => {
+                    let continuation = Cont {
+                        process: c.process,
+                        join: c.join,
+                        work,
+                    };
+                    if let Some(process) = c.process {
+                        self.busy_procs.remove(&process);
+                    }
+                    self.ordered_event_waiters.push(OrderedEventWaiter {
+                        events: events.clone(),
+                        next: 0,
+                        success: success.as_deref(),
+                        failure: failure.as_deref(),
                         continuation,
                     });
                     return Ok(());
@@ -2511,6 +2587,16 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt_memories(body, out)
         }
         Stmt::EventWait { body, .. } => walk_stmt_memories(body, out),
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(success) = success {
+                walk_stmt_memories(success, out);
+            }
+            if let Some(failure) = failure {
+                walk_stmt_memories(failure, out);
+            }
+        }
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| walk_stmt_memories(branch, out)),
@@ -2619,6 +2705,16 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.insert(*net);
             collect_stmt_access(body, reads, writes);
         }
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(success) = success {
+                collect_stmt_access(success, reads, writes);
+            }
+            if let Some(failure) = failure {
+                collect_stmt_access(failure, reads, writes);
+            }
+        }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             let mut branch_reads = HashSet::new();
             let mut branch_writes = HashSet::new();
@@ -2710,6 +2806,20 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::EventWait { net, body } => {
             out.push(*net);
             walk_stmt(body, out);
+        }
+        Stmt::WaitOrder {
+            events,
+            success,
+            failure,
+            ..
+        } => {
+            out.extend(events.iter().copied());
+            if let Some(success) = success {
+                walk_stmt(success, out);
+            }
+            if let Some(failure) = failure {
+                walk_stmt(failure, out);
+            }
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
         Stmt::While { cond, body, steps } => {
