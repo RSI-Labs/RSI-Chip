@@ -3394,13 +3394,17 @@ fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     std::fs::write(
         &source_path,
         r#"
-module delays(input logic a, output logic y, output logic q);
-  initial q = 1'b0;
+module delays(input logic a, output logic y, output logic q, output logic clock);
+  initial begin
+    q = 1'b0;
+    clock = 1'b0;
+  end
   initial begin
     #5 y = a;
     #3 y = ~a;
   end
   always #5 q = ~q;
+  initial forever #5 clock = ~clock;
 endmodule
 "#,
     )
@@ -3420,7 +3424,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower constant delay controls through the bounded path");
-    assert_eq!(design.initials.len(), 2);
+    assert_eq!(design.initials.len(), 3);
     assert_eq!(design.processes.len(), 1);
     assert_eq!(reference.initials.len(), design.initials.len());
     assert_eq!(reference.processes.len(), design.processes.len());
@@ -3432,18 +3436,23 @@ endmodule
             .unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), None);
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(0));
         simulator.run_until(4).unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), None);
         simulator.run_until(5).unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(1));
         simulator.run_until(8).unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(1));
         simulator.run_until(10).unwrap();
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(0));
         simulator.run_until(15).unwrap();
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(1));
     };
     run_delays(&design);
     run_delays(&reference);

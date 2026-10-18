@@ -306,6 +306,12 @@ impl SlangAstLowerer {
                     body: Box::new(self.lower_statement(body)?),
                 })
             }
+            "ForeverLoop" => {
+                let body = statement
+                    .get("body")
+                    .ok_or_else(|| "forever loop has no body".to_string())?;
+                Ok(Stmt::Forever(Box::new(self.lower_statement(body)?)))
+            }
             other => Err(format!(
                 "direct slang-AST lowering does not support statement kind '{other}'"
             )),
