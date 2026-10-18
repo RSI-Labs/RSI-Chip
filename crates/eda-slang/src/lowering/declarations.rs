@@ -344,27 +344,33 @@ impl SlangAstLowerer {
         member: &serde_json::Value,
         name: &str,
     ) -> Result<(), String> {
-        let direction = match string_field(member, "direction").as_deref() {
-            Some("In") => eda_core::ir::Dir::In,
-            Some("Out") => eda_core::ir::Dir::Out,
-            // Core IR has no inout direction; MemoryConnection carries the
-            // bidirectional storage contract.
-            Some("InOut") => eda_core::ir::Dir::In,
+        let memory_direction = match string_field(member, "direction").as_deref() {
+            Some("In") => eda_core::ir::MemoryPortDirection::In,
+            Some("Out") => eda_core::ir::MemoryPortDirection::Out,
+            Some("InOut") => eda_core::ir::MemoryPortDirection::InOut,
             other => {
                 return Err(format!(
                     "sparse-memory port '{name}' has unsupported direction {other:?}"
                 ))
             }
         };
-        if !self.design.name.is_empty() {
-            return Err(format!(
-                "top-level sparse-memory port '{name}' is not supported"
-            ));
-        }
         self.lower_memory_declaration(member, name)?;
         let symbol = self.symbols[name].clone();
-        // The placeholder PortDecl records direction for hierarchy metadata;
-        // the actual storage contract is represented by MemoryConnection.
+        self.design.memory_ports.push(eda_core::ir::MemoryPortDecl {
+            name: name.to_string(),
+            direction: memory_direction,
+            memory: symbol.memory.ok_or_else(|| {
+                format!("sparse-memory port '{name}' does not reference a memory object")
+            })?,
+        });
+        // The placeholder PortDecl keeps scalar port inventory symmetric; the
+        // first-class storage contract is represented by MemoryPortDecl.
+        let direction = match memory_direction {
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut => {
+                eda_core::ir::Dir::In
+            }
+            eda_core::ir::MemoryPortDirection::Out => eda_core::ir::Dir::Out,
+        };
         self.design.ports.push(eda_core::ir::PortDecl {
             name: name.to_string(),
             dir: direction,

@@ -364,6 +364,74 @@ impl<'d> Simulator<'d> {
         self.set_input(port, value)
     }
 
+    /// Set one element of a top-level input or inout sparse-memory port.
+    pub fn set_memory_input(
+        &mut self,
+        port: &str,
+        indexes: &[i64],
+        value: &LogicWord,
+    ) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("simulation cancelled".into());
+        }
+        self.settle()?;
+        let memory_port = self
+            .design
+            .memory_ports
+            .iter()
+            .find(|memory_port| memory_port.name == port)
+            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
+        if !matches!(
+            memory_port.direction,
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!("sparse-memory port '{port}' is not an input"));
+        }
+        let memory = self.canonical_memory(memory_port.memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
+        let physical = declaration
+            .physical_index(indexes)
+            .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))?;
+        self.apply_memory_update(memory, physical, value.clone())?;
+        self.settle()
+    }
+
+    /// Read one element from a top-level output or inout sparse-memory port.
+    pub fn read_memory_output(&mut self, port: &str, indexes: &[i64]) -> Result<LogicWord, String> {
+        self.settle()?;
+        let memory_port = self
+            .design
+            .memory_ports
+            .iter()
+            .find(|memory_port| memory_port.name == port)
+            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
+        if !matches!(
+            memory_port.direction,
+            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!("sparse-memory port '{port}' is not an output"));
+        }
+        let memory = self.canonical_memory(memory_port.memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
+        let physical = declaration
+            .physical_index(indexes)
+            .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))?;
+        Ok(self
+            .memory_elements
+            .get(memory)
+            .and_then(|elements| elements.get(&physical))
+            .cloned()
+            .unwrap_or_else(|| LogicWord::xes(declaration.element_width)))
+    }
+
     /// Read a declaration (any net in the design) by name.
     pub fn read(&self, name: &str) -> Option<LogicWord> {
         let d = self.design.net_decls.iter().find(|d| d.name == name)?;

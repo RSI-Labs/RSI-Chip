@@ -1801,6 +1801,74 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_top_level_sparse_memory_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-top-memory-port");
+    let source_path = root.join("top_memory_port.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module top(
+  input wire logic [7:0] source [0:3],
+  output wire logic [7:0] destination [0:3],
+  output logic [7:0] observed
+);
+  assign observed = source[2];
+  assign destination[3] = source[1];
+endmodule
+"#,
+    )
+    .expect("write top-level sparse-memory port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower top-level sparse-memory ports");
+    assert_eq!(design.memory_ports.len(), 2);
+    assert_eq!(
+        design.memory_ports[0],
+        eda_core::ir::MemoryPortDecl {
+            name: "source".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::In,
+            memory: 0,
+        }
+    );
+    assert_eq!(
+        design.memory_ports[1],
+        eda_core::ir::MemoryPortDecl {
+            name: "destination".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::Out,
+            memory: 1,
+        }
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create top-memory simulator");
+    simulator
+        .set_memory_input("source", &[2], &LogicWord::from_u64(8, 0x42))
+        .expect("set top memory input");
+    simulator
+        .set_memory_input("source", &[1], &LogicWord::from_u64(8, 0x7c))
+        .expect("set second top memory input");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x42));
+    assert_eq!(
+        simulator
+            .read_memory_output("destination", &[3])
+            .expect("read top memory output"),
+        LogicWord::from_u64(8, 0x7c)
+    );
+
+    let error = simulator
+        .read_memory_output("source", &[0])
+        .expect_err("input memory ports cannot be read through the output API");
+    assert!(error.contains("is not an output"));
+}
+
+#[test]
 fn slang_ast_direct_lowering_reads_sparse_memory_files() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

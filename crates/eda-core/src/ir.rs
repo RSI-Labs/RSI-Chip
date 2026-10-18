@@ -234,6 +234,20 @@ pub struct MemoryConnection {
     pub parent: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPortDirection {
+    In,
+    Out,
+    InOut,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryPortDecl {
+    pub name: String,
+    pub direction: MemoryPortDirection,
+    pub memory: usize,
+}
+
 impl MemoryDecl {
     pub fn physical_index(&self, indexes: &[i64]) -> Option<u64> {
         if indexes.len() != self.dimensions.len() {
@@ -830,6 +844,8 @@ pub struct Design {
     pub name: String,
     /// Canonical simulator tick precision as a decimal second exponent.
     pub time_scale: TimeScale,
+    /// First-class top-level sparse-memory port contracts.
+    pub memory_ports: Vec<MemoryPortDecl>,
     pub net_decls: Vec<NetDecl>,
     pub memories: Vec<MemoryDecl>,
     pub memory_connections: Vec<MemoryConnection>,
