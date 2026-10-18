@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-18 (local time)
-Repository state audited: `fix-digital` at `1f4e96a` plus the uncommitted
-final-block changes currently in the worktree.
+Repository state audited: `fix-digital` at `c3d3e0b` plus the uncommitted
+package-import changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -46,10 +46,10 @@ All commands were run against the current worktree:
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 89 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 101 passed |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 102 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 130.86 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 147.72 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -85,7 +85,7 @@ broader tool-flow percentage.
 | ID | Name | Initial requirement | Current state / error | Severity | Progress | Next required evidence |
 | --- | --- | --- | --- | --- | ---: | --- |
 | F-01 | Single authoritative lowering path | Every valid input accepted by the authoritative frontend must either lower through the same semantic model or fail closed with an actionable diagnostic. | `compile_files` validates with slang, preprocesses, then reparses with the bounded parser. `compile_files_via_ast` is the better path but supports only a subset. | P0 architecture | 35% | Make direct slang-AST lowering the only executable path, or formally prove the compatibility fallback for every construct. |
-| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, interfaces, many timing/assertion/checker forms, and many system calls. | P0 | 28% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
+| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, many timing/assertion/checker forms, and many system calls. | P0 | 29% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
 | F-03 | Complete structural/semantic post-check | Slang and repository IR must agree on declarations, types, statements, expressions, hierarchy, and behavior. | Current summary checks top, ports, declarations, assignment shapes, literals, simple width/signedness, processes, and instance inventory. Fingerprints fall back to `"?"` for legacy array expansion and dynamic packed lvalues. | P0 | 45% | Remove all `"?"` equivalence cases and add runtime differential simulation for each construct. |
 | F-04 | Full official UVM execution | Compile and execute the official Accellera UVM library and user environments, including phasing, objections, factory, configuration, sequences, TLM, callbacks, reports, and coverage. | Official UVM 2020.3.1 is only checked/elaborated with `UVM_NO_DPI`. Direct AST lowering rejects `ClassType`. The bounded frontend has a separate UVM-lite subset. | P0 | 10% executable; 0% for full official UVM execution | Run an official UVM example through phasing and objections and compare event/report/coverage outcomes. |
 | F-05 | Full data types | Support integral, real, string, event, chandle, enum, packed/unpacked aggregates, dynamic arrays, queues, associative arrays, classes, virtual interfaces, type parameters, and typed packages. | Direct path supports simple integral vectors, packed arrays, enums, packed structs/unions, bounded strings, sparse memories, scalar named events, and fixed-size event arrays with element triggers/waits/`.triggered`. It rejects real, ordinary unpacked aggregates, dynamic storage, queues, associative arrays, classes, arbitrary event expressions, chandle, and type parameters. | P0 | 31% | Add type-category tests with layout, assignment, comparison, and selected-member semantics. |
@@ -98,7 +98,7 @@ broader tool-flow percentage.
 | F-12 | Net types, strength, and resolution | Preserve net kinds, implicit nets, strengths, tri-state resolution, multi-driver behavior, supply nets, and charge decay. | Basic `wire`/tri-state values work in tested cases. Direct lowering does not preserve a complete strength/net-resolution model; strength qualifiers are not a first-class IR property. | P1 correctness risk | 25% | Systematic multi-driver strength/tri-state truth tables and implicit-net diagnostics. |
 | F-13 | Complete string model | Support dynamic SystemVerilog strings, Unicode/locale behavior where required by methods, mutation, substrings, conversions, formatting, and concatenation overflow. | Current model is a fixed 512-bit, 64-byte NUL-padded ASCII representation. Direct path supports literals, concatenation, length, byte reads/index writes, case conversion, comparison, `putc()`, `substr()`, and decimal/hex/binary radix conversions. Dynamic growth beyond 64 bytes, Unicode behavior, and synthesis remain incomplete/fail closed. | P1 | 55% of bounded string subset; 0% for unbounded strings | String method conformance tests and explicit overflow/unknown/NUL behavior tests. |
 | F-14 | Complete function/task execution model | Support recursive/nonrecursive routines, all argument directions/default values, static/automatic lifetimes, void functions, virtual dispatch, out-of-line calls, loops, jumps, and runtime control flow. | Direct inlining supports many straight-line/control-flow functions/tasks, output/inout/ref arguments, locals, conditionals, and bounded loops. Recursion is rejected; loop unrolling is capped at 256; class/virtual calls and general procedure jumps are absent. | P0 | 35% | Separate compile-time inlining tests from a real runtime subroutine/process model. |
-| F-15 | Package and namespace elaboration | Support packages, imports, exports, scoped references, nested packages, compilation-unit scopes, typedef visibility, and configuration. | Bounded path handles selected package constants/functions and wildcard imports. Direct member lowering rejects `WildcardImport`; package-scope classes/types are not fully executable. | P1 | 30% | Multi-package name-collision/shadowing/order tests. |
+| F-15 | Package and namespace elaboration | Support packages, imports, exports, scoped references, nested packages, compilation-unit scopes, typedef visibility, and configuration. | Bounded path handles selected package constants/functions and wildcard imports. Direct path now imports compilation-unit package constants, functions, typedefs, and enums through wildcard imports. Explicit imports/exports, package classes, nested packages, and collision/shadowing remain incomplete. | P1 | 40% | Multi-package name-collision/shadowing/order tests. |
 | F-16 | Parameterization and elaboration diagnostics | Support integer/string/type parameters, localparams, complex override graphs, default values, parameter ports, defparam, and cycle/dependency diagnostics. | Direct path handles simple elaborated constants and generated parameter values. Type parameters and defparam are unsupported; bounded constant evaluation and diagnostics remain incomplete. | P0 | 40% | Parameter dependency/cycle/override matrix and preserve-overrides metadata in IR. |
 | F-17 | Source diagnostics engine | Every parser/elaboration/lowering error needs file, line, column, range, severity, diagnostic code, notes, related locations, suppression, and multi-error recovery. | Direct errors often include slang spans. Bounded parser diagnostics are mostly line-only; many bounded elaboration errors are plain strings. There is no complete structured diagnostic object or suppression system. | P1 | 30% | Snapshot diagnostics for malformed and unsupported corpora; no raw `Result<_, String>` at public boundaries. |
 | F-18 | Include/preprocess traceability | Diagnostics must point through macros and include stacks to user source. | Slang produces authoritative diagnostics and source spans. The bounded compatibility path loses some preprocessor provenance after single-unit preprocessing; direct spans can print non-normalized relative paths. | P1 | 50% | Include/macro expansion stack snapshots and path normalization tests. |
@@ -123,7 +123,7 @@ versus bounded probe.
 | D-06 | Primitive/UDP instances | Rejects `PrimitiveInstance`. |
 | D-07 | Full instance-array surface | One-, multidimensional, and generate-scoped elaborated instance arrays lower and simulate up to 4,096 total elements. Interface-port arrays and other unsupported child/member forms still fail closed. |
 | D-08 | Type parameters | Rejects `TypeParameter`. |
-| D-09 | Package imports | Rejects `WildcardImport`; package elaboration is incomplete. |
+| D-09 | Full package imports | Wildcard imports can use package constants and inlined functions; typedefs/enums are collected for supported shapes. Explicit imports, exports, nested packages, package classes, and collision/shadowing semantics remain incomplete. |
 | D-10 | Defparam | Unsupported and can fail through instance-connection lowering. |
 | D-11 | Bind directives | No bind member/lowering model. |
 | D-12 | Program blocks | No direct program-block lifetime/scheduling semantics. |

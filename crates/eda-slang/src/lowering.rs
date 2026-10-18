@@ -12,15 +12,37 @@ mod functions;
 mod hierarchy;
 mod statements;
 
+fn collect_compilation_unit_definitions(
+    value: &serde_json::Value,
+    definitions: &mut Vec<serde_json::Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if matches!(
+            fields.get("kind").and_then(serde_json::Value::as_str),
+            Some("Parameter" | "Subroutine" | "TypeAlias" | "EnumType")
+        ) {
+            definitions.push(value.clone());
+        }
+        for nested in fields.values() {
+            collect_compilation_unit_definitions(nested, definitions);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_compilation_unit_definitions(nested, definitions);
+        }
+    }
+}
+
 pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let start = json
         .find('{')
         .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
     let root: serde_json::Value = serde_json::from_str(&json[start..])
         .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
-    let root = root.get("design").unwrap_or(&root);
-    let root = if string_field(root, "kind").as_deref() == Some("Root") {
-        root.get("members")
+    let design = root.get("design").unwrap_or(&root);
+    let root = if string_field(design, "kind").as_deref() == Some("Root") {
+        design
+            .get("members")
             .and_then(serde_json::Value::as_array)
             .and_then(|members| {
                 members
@@ -29,7 +51,7 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
             })
             .ok_or_else(|| "slang AST Root has no elaborated Instance".to_string())?
     } else {
-        root
+        design
     };
     if string_field(root, "kind").as_deref() != Some("Instance") {
         return Err("slang AST root is not an elaborated Instance".into());
@@ -37,6 +59,26 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let mut root = root.clone();
     normalize_instance_bodies(&mut root);
     normalize_detailed_types(&mut root);
+    let mut compilation_unit_members = Vec::new();
+    if let Some(members) = design.get("members").and_then(serde_json::Value::as_array) {
+        for member in members {
+            if string_field(member, "kind").as_deref() == Some("CompilationUnit") {
+                collect_compilation_unit_definitions(member, &mut compilation_unit_members);
+            }
+        }
+    }
+    for member in &mut compilation_unit_members {
+        normalize_instance_bodies(member);
+        normalize_detailed_types(member);
+    }
+    if !compilation_unit_members.is_empty() {
+        root.as_object_mut()
+            .expect("elaborated slang Instance is an object")
+            .insert(
+                "eda_compilation_unit_members".into(),
+                serde_json::Value::Array(compilation_unit_members),
+            );
+    }
     Ok(root)
 }
 
@@ -125,6 +167,33 @@ pub(super) struct SlangAstLowerer {
 }
 
 impl SlangAstLowerer {
+    fn collect_compilation_unit_members(&mut self, root: &serde_json::Value) -> Result<(), String> {
+        let Some(members) = root
+            .get("eda_compilation_unit_members")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(());
+        };
+        for member in members {
+            match string_field(member, "kind").as_deref() {
+                Some("Subroutine") => self
+                    .collect_subroutine(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("TypeAlias") => self
+                    .collect_type_alias(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("EnumType") => self
+                    .collect_enum_type(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("Parameter") => self
+                    .lower_parameter(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn lower(root: &serde_json::Value) -> Result<Design, String> {
         let body = root
             .get("body")
@@ -174,6 +243,7 @@ impl SlangAstLowerer {
                 net_end: 0,
                 ports: Vec::new(),
             });
+        lowerer.collect_compilation_unit_members(root)?;
         lowerer.lower_body(body)?;
         let top_ports = lowerer
             .design
@@ -252,6 +322,7 @@ impl SlangAstLowerer {
                 "EnumType" => {}
                 "StatementBlock" => {}
                 "Modport" => {}
+                "WildcardImport" => {}
                 "ClockingBlock" => self
                     .lower_clocking_block(member)
                     .map_err(|error| with_source_span(member, error))?,

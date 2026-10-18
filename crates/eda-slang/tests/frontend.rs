@@ -164,6 +164,57 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_wildcard_package_imports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-package-import");
+    let source_path = root.join("package_import.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package math_pkg;
+  parameter int WIDTH = 8;
+  localparam int OFFSET = 42;
+
+  function automatic int double(input int value);
+    double = 2 * value;
+  endfunction
+endpackage
+
+module package_import
+  import math_pkg::*;
+#(
+  parameter int EXTRA = 1
+)(
+  input logic [WIDTH-1:0] a,
+  output logic [WIDTH-1:0] y,
+  output int doubled_offset
+);
+  assign y = a + OFFSET;
+  assign doubled_offset = double(OFFSET) + EXTRA;
+endmodule
+"#,
+    )
+    .expect("write package-import source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("package_import"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower wildcard package import");
+    assert_eq!(design.assigns.len(), 2);
+    let mut simulator = Simulator::new(&design).expect("create package-import simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 3))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(45));
+    assert_eq!(simulator.read("doubled_offset").unwrap().to_u64(), Some(85));
+}
+
+#[test]
 fn slang_ast_direct_lowering_compiles_procedural_control_flow() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
