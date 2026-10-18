@@ -116,6 +116,7 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
         }
         Expr::StringToRadix { e, .. } => remap_expression(e, offset),
         Expr::StringFromRadix { value, .. } => remap_expression(value, offset),
+        Expr::EventTriggered { net } => *net += offset,
     }
 }
 
@@ -311,6 +312,7 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         }
         Expr::StringToRadix { e, .. } => remap_expression_memory_ids(e, offset),
         Expr::StringFromRadix { value, .. } => remap_expression_memory_ids(value, offset),
+        Expr::EventTriggered { .. } => {}
     }
 }
 

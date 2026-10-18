@@ -104,6 +104,7 @@ pub struct Simulator<'d> {
     ordered_event_waiters: Vec<OrderedEventWaiter<'d>>,
     forced_values: HashMap<usize, LogicValue>,
     forced_saved_values: HashMap<usize, LogicValue>,
+    net_change_times: HashMap<usize, u64>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
@@ -220,6 +221,7 @@ impl<'d> Simulator<'d> {
             ordered_event_waiters: Vec::new(),
             forced_values: HashMap::new(),
             forced_saved_values: HashMap::new(),
+            net_change_times: HashMap::new(),
             memory_elements,
             memory_aliases,
             memory_nba: Vec::new(),
@@ -667,6 +669,7 @@ impl<'d> Simulator<'d> {
         old: LogicValue,
         newv: LogicValue,
     ) -> Result<(), String> {
+        self.net_change_times.insert(changed_net, self.now);
         let pos = newv == LogicValue::One && old != LogicValue::One;
         let neg = newv == LogicValue::Zero && old != LogicValue::Zero;
         let triggers: Vec<(usize, Edge)> = self
@@ -1931,6 +1934,13 @@ impl<'d> Simulator<'d> {
                 let right = self.eval(right);
                 substring_packed_string(&string, &left, &right)
             }
+            Expr::EventTriggered { net } => LogicWord {
+                bits: vec![LogicValue::bit(
+                    self.net_change_times
+                        .get(net)
+                        .is_some_and(|time| *time == self.now),
+                )],
+            },
             Expr::StringToRadix { e, radix } => {
                 let string = self.eval(e);
                 match parse_packed_string_radix(&string, *radix) {
@@ -2440,6 +2450,9 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(left, out);
             walk_expr(right, out);
         }
+        Expr::EventTriggered { net } => {
+            out.push(*net);
+        }
         Expr::StringToRadix { e, .. } => walk_expr(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr(value, out),
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
@@ -2504,6 +2517,7 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
         }
+        Expr::EventTriggered { .. } => {}
         Expr::StringToRadix { e, .. } => walk_expr_memories(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr_memories(value, out),
         Expr::MemoryReadPart {

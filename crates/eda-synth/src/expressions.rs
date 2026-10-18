@@ -154,6 +154,9 @@ impl<'a> Synth<'a> {
             Expr::StringFromRadix { .. } => {
                 return Err("bounded string radix formatting is not synthesizable yet".into())
             }
+            Expr::EventTriggered { .. } => {
+                return Err("event triggered checks are not synthesizable".into())
+            }
         })
     }
 

@@ -423,6 +423,11 @@ pub enum Expr {
         right: Box<Expr>,
         ignore_case: bool,
     },
+    /// True when a named event was triggered in the current simulation time
+    /// slot. `net` refers to the event's internal scalar state.
+    EventTriggered {
+        net: usize,
+    },
     /// Updates one byte in a bounded string. This is used only as the RHS of
     /// a whole-string assignment when lowering the void `putc()` method.
     StringPutc {
@@ -488,6 +493,7 @@ impl Expr {
             Expr::StringGetByte { .. } => 8,
             Expr::StringCase { e, .. } => e.width(),
             Expr::StringCompare { .. } => 32,
+            Expr::EventTriggered { .. } => 1,
             Expr::StringPutc { e, .. } => e.width(),
             Expr::StringSubstr { e, .. } => e.width(),
             Expr::StringToRadix { .. } => 32,
@@ -530,6 +536,7 @@ impl Expr {
             Expr::StringGetByte { .. } => false,
             Expr::StringCase { .. } => false,
             Expr::StringCompare { .. } => true,
+            Expr::EventTriggered { .. } => false,
             Expr::StringPutc { .. } => false,
             Expr::StringSubstr { .. } => false,
             Expr::StringToRadix { .. } => true,
@@ -1220,6 +1227,7 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             collect_memory_expr_reads(left, synchronous, accesses);
             collect_memory_expr_reads(right, synchronous, accesses);
         }
+        Expr::EventTriggered { .. } => {}
         Expr::StringPutc { e, index, value } => {
             collect_memory_expr_reads(e, synchronous, accesses);
             collect_memory_expr_reads(index, synchronous, accesses);

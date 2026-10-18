@@ -38,6 +38,7 @@ impl SlangAstLowerer {
                 return self.lower_string_compare(value, subroutine == "icompare")
             }
             "substr" => return self.lower_string_substr(value),
+            "triggered" => return self.lower_event_triggered(value),
             "atoi" | "atohex" | "atobin" => {
                 let radix = match subroutine.as_str() {
                     "atohex" => 16,
@@ -881,6 +882,43 @@ impl SlangAstLowerer {
                 radix,
             },
         })
+    }
+
+    fn lower_event_triggered(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "event triggered check has no receiver".to_string())?;
+        if arguments.len() != 1 {
+            return Err("event triggered check expects one event receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "event triggered check has no receiver".to_string())?;
+        let event_type = receiver
+            .get("type")
+            .ok_or_else(|| "event triggered receiver has no type".to_string())?;
+        let is_event = match event_type {
+            Value::String(type_name) => type_name == "event",
+            Value::Object(fields) => {
+                fields.get("name").and_then(Value::as_str) == Some("event")
+                    || fields.get("kind").and_then(Value::as_str) == Some("EventType")
+            }
+            _ => false,
+        };
+        if !is_event {
+            return Err("event triggered receiver must be an event".into());
+        }
+        let lvalue = self.lower_lvalue(receiver)?;
+        if lvalue.range.width() != 1 {
+            return Err("event triggered receiver must be scalar".into());
+        }
+        let net = lvalue.net
+            + match lvalue.range {
+                eda_core::ir::Range::Bit(bit) => bit,
+                _ => 0,
+            };
+        Ok(eda_core::ir::Expr::EventTriggered { net })
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {

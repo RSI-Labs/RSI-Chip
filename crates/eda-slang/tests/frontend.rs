@@ -3756,6 +3756,63 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_event_triggered() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-triggered");
+    let source_path = root.join("event_triggered.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_triggered(
+  input logic go,
+  output logic was_triggered,
+  output logic later_not_triggered
+);
+  event e;
+  initial begin
+    was_triggered = 1'b0;
+    later_not_triggered = 1'b0;
+    @(e);
+    was_triggered = e.triggered;
+    #1;
+    later_not_triggered = !e.triggered;
+  end
+
+  initial begin
+    wait (go);
+    ->e;
+  end
+endmodule
+"#,
+    )
+    .expect("write event-triggered source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_triggered"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event-triggered check");
+    let mut simulator = Simulator::new(&design).expect("create event-triggered simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("was_triggered").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("later_not_triggered").unwrap().to_u64(),
+        Some(0)
+    );
+    simulator.run_until(1).unwrap();
+    assert_eq!(
+        simulator.read("later_not_triggered").unwrap().to_u64(),
+        Some(1)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

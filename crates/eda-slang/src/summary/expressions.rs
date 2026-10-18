@@ -508,6 +508,7 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringSubstr { .. } => "StringSubstr",
         Expr::StringToRadix { .. } => "StringToRadix",
         Expr::StringFromRadix { .. } => "StringFromRadix",
+        Expr::EventTriggered { .. } => "EventTriggered",
     }
 }
 
@@ -600,6 +601,7 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         ],
         Expr::StringToRadix { e, .. } => vec![design_expr_fingerprint(design, e)],
         Expr::StringFromRadix { value, .. } => vec![design_expr_fingerprint(design, value)],
+        Expr::EventTriggered { net } => vec![format!("net:{net}")],
     };
     format!(
         "{}:{}:{}[{}]",

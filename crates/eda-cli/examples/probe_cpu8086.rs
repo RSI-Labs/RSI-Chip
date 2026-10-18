@@ -47,6 +47,9 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         }
         Expr::StringToRadix { e, .. } => expr_nets(e, out),
         Expr::StringFromRadix { value, .. } => expr_nets(value, out),
+        Expr::EventTriggered { net } => {
+            out.insert(*net);
+        }
         Expr::MemoryRead { indexes, .. } => {
             indexes.iter().for_each(|e| expr_nets(e, out));
         }
