@@ -437,6 +437,17 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Parses the valid signed prefix of a bounded string in the given radix.
+    StringToRadix {
+        e: Box<Expr>,
+        radix: u32,
+    },
+    /// Formats an integer as a bounded ASCII string in decimal, hex, or
+    /// binary. Used as the RHS of a whole-string assignment for void methods.
+    StringFromRadix {
+        value: Box<Expr>,
+        radix: u32,
+    },
 }
 
 impl Expr {
@@ -479,6 +490,8 @@ impl Expr {
             Expr::StringCompare { .. } => 32,
             Expr::StringPutc { e, .. } => e.width(),
             Expr::StringSubstr { e, .. } => e.width(),
+            Expr::StringToRadix { .. } => 32,
+            Expr::StringFromRadix { .. } => 512,
         }
     }
 
@@ -519,6 +532,8 @@ impl Expr {
             Expr::StringCompare { .. } => true,
             Expr::StringPutc { .. } => false,
             Expr::StringSubstr { .. } => false,
+            Expr::StringToRadix { .. } => true,
+            Expr::StringFromRadix { .. } => false,
         }
     }
 }
@@ -1119,6 +1134,12 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             collect_memory_expr_reads(e, synchronous, accesses);
             collect_memory_expr_reads(left, synchronous, accesses);
             collect_memory_expr_reads(right, synchronous, accesses);
+        }
+        Expr::StringToRadix { e, .. } => {
+            collect_memory_expr_reads(e, synchronous, accesses);
+        }
+        Expr::StringFromRadix { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, accesses);
         }
     }
 }

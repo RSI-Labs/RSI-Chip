@@ -493,6 +493,8 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringCompare { .. } => "StringCompare",
         Expr::StringPutc { .. } => "StringPutc",
         Expr::StringSubstr { .. } => "StringSubstr",
+        Expr::StringToRadix { .. } => "StringToRadix",
+        Expr::StringFromRadix { .. } => "StringFromRadix",
     }
 }
 
@@ -583,6 +585,8 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             design_expr_fingerprint(design, left),
             design_expr_fingerprint(design, right),
         ],
+        Expr::StringToRadix { e, .. } => vec![design_expr_fingerprint(design, e)],
+        Expr::StringFromRadix { value, .. } => vec![design_expr_fingerprint(design, value)],
     };
     format!(
         "{}:{}:{}[{}]",

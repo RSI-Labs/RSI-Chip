@@ -2920,6 +2920,9 @@ module strings(
   input string mixed,
   input string same,
   input string case_variant,
+  input string decimal_text,
+  input string hex_text,
+  input string binary_text,
   input int byte_index,
   input int substr_left,
   input int substr_right,
@@ -2941,6 +2944,12 @@ module strings(
   output string substr_value,
   output string empty_substr,
   output string out_of_range_substr,
+  output string decimal_string,
+  output string hex_string,
+  output string binary_string,
+  output int decimal_value,
+  output int hex_value,
+  output int binary_value,
   output logic strings_equal,
   output logic strings_less,
   output int compare_result,
@@ -2954,6 +2963,7 @@ module strings(
   } state_t;
 
   string literal_source = "aBcD";
+  int conversion_source = -42;
   state_t state;
   always_comb begin
     state = state_t'(selector);
@@ -2967,6 +2977,9 @@ module strings(
     put_value.putc(1, 8'h5A);
     put_value.putc(64, 8'h21);
     put_value.putc(0, 8'h00);
+    decimal_string.itoa(conversion_source);
+    hex_string.hextoa(conversion_source);
+    binary_string.bintoa(conversion_source);
   end
   assign literal_value = "READY";
   assign joined = {left, right};
@@ -2986,6 +2999,9 @@ module strings(
   assign substr_value = mixed.substr(substr_left, substr_right);
   assign empty_substr = mixed.substr(2, 1);
   assign out_of_range_substr = mixed.substr(0, 64);
+  assign decimal_value = decimal_text.atoi();
+  assign hex_value = hex_text.atohex();
+  assign binary_value = binary_text.atobin();
 endmodule
 "#,
     )
@@ -2999,7 +3015,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 19);
+    assert_eq!(design.assigns.len(), 23);
     assert_eq!(
         design
             .net_decls
@@ -3032,6 +3048,18 @@ endmodule
             .unwrap();
         simulator
             .set_input("case_variant", &LogicWord::from_bytes_le(512, b"AbCd"))
+            .unwrap();
+        simulator
+            .set_input(
+                "decimal_text",
+                &LogicWord::from_bytes_le(512, b"  -042junk"),
+            )
+            .unwrap();
+        simulator
+            .set_input("hex_text", &LogicWord::from_bytes_le(512, b" -2fUVM"))
+            .unwrap();
+        simulator
+            .set_input("binary_text", &LogicWord::from_bytes_le(512, b" +0101uvm"))
             .unwrap();
         simulator
             .set_input("byte_index", &LogicWord::from_u64(32, selector))
@@ -3160,6 +3188,36 @@ endmodule
                 .to_ascii_string_nul_terminated(),
             ""
         );
+        assert_eq!(
+            simulator
+                .read("decimal_string")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "-42"
+        );
+        assert_eq!(
+            simulator
+                .read("hex_string")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "ffffffd6"
+        );
+        assert_eq!(
+            simulator
+                .read("binary_string")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "11111111111111111111111111010110"
+        );
+        assert_eq!(
+            simulator.read("decimal_value").unwrap().to_u64(),
+            Some((-42_i32) as u32 as u64)
+        );
+        assert_eq!(
+            simulator.read("hex_value").unwrap().to_u64(),
+            Some((-47_i32) as u32 as u64)
+        );
+        assert_eq!(simulator.read("binary_value").unwrap().to_u64(), Some(5));
     }
 
     let bounded_source_path = root.join("strings-bounded.sv");

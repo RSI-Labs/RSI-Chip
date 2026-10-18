@@ -1464,6 +1464,17 @@ impl<'d> Simulator<'d> {
                 let right = self.eval(right);
                 substring_packed_string(&string, &left, &right)
             }
+            Expr::StringToRadix { e, radix } => {
+                let string = self.eval(e);
+                match parse_packed_string_radix(&string, *radix) {
+                    Some(value) => LogicWord::from_u64(32, value as u64),
+                    None => LogicWord::xes(32),
+                }
+            }
+            Expr::StringFromRadix { value, radix } => {
+                let value = self.eval(value);
+                format_packed_string_radix(&value, *radix)
+            }
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1769,6 +1780,81 @@ fn substring_packed_string(word: &LogicWord, left: &LogicWord, right: &LogicWord
     LogicWord::from_bytes_le(word.width(), &bytes)
 }
 
+fn parse_packed_string_radix(word: &LogicWord, radix: u32) -> Option<u32> {
+    let length = ascii_string_length(word)?;
+    let mut position = 0_usize;
+    while position < length {
+        let byte = packed_string_byte(word, position)
+            .to_u64()
+            .map(|value| value as u8)?;
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        position += 1;
+    }
+
+    let mut negative = false;
+    if position < length {
+        let byte = packed_string_byte(word, position)
+            .to_u64()
+            .map(|value| value as u8)?;
+        if byte == b'+' || byte == b'-' {
+            negative = byte == b'-';
+            position += 1;
+        }
+    }
+
+    let mut value = 0_u32;
+    let mut digits = 0_usize;
+    while position < length {
+        let byte = packed_string_byte(word, position)
+            .to_u64()
+            .map(|value| value as u8)?;
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'f' if radix == 16 => u32::from(byte - b'a' + 10),
+            b'A'..=b'F' if radix == 16 => u32::from(byte - b'A' + 10),
+            _ => break,
+        };
+        if digit >= radix {
+            break;
+        }
+        value = value.wrapping_mul(radix).wrapping_add(digit);
+        digits += 1;
+        position += 1;
+    }
+
+    if digits == 0 {
+        return Some(0);
+    }
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
+fn format_packed_string_radix(value: &LogicWord, radix: u32) -> LogicWord {
+    let Some(bits) = value.to_u64() else {
+        return LogicWord::xes(512);
+    };
+    let rendered = match radix {
+        10 => {
+            let signed = if value.width() == 64 {
+                bits as i64
+            } else if value.width() > 0 && value.bit(value.width() - 1) == LogicValue::One {
+                bits as i64 - (1_i64 << value.width())
+            } else {
+                bits as i64
+            };
+            signed.to_string()
+        }
+        16 => format!("{:x}", bits as u32),
+        _ => format!("{:b}", bits as u32),
+    };
+    LogicWord::from_bytes_le(512, rendered.as_bytes())
+}
+
 fn concat_packed_strings(
     left: &LogicWord,
     left_length: usize,
@@ -1881,6 +1967,8 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(left, out);
             walk_expr(right, out);
         }
+        Expr::StringToRadix { e, .. } => walk_expr(e, out),
+        Expr::StringFromRadix { value, .. } => walk_expr(value, out),
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1943,6 +2031,8 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
         }
+        Expr::StringToRadix { e, .. } => walk_expr_memories(e, out),
+        Expr::StringFromRadix { value, .. } => walk_expr_memories(value, out),
         Expr::MemoryReadPart {
             memory,
             indexes,

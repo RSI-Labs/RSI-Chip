@@ -38,6 +38,14 @@ impl SlangAstLowerer {
                 return self.lower_string_compare(value, subroutine == "icompare")
             }
             "substr" => return self.lower_string_substr(value),
+            "atoi" | "atohex" | "atobin" => {
+                let radix = match subroutine.as_str() {
+                    "atohex" => 16,
+                    "atobin" => 2,
+                    _ => 10,
+                };
+                return self.lower_string_to_radix(value, radix);
+            }
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -140,6 +148,14 @@ impl SlangAstLowerer {
             .to_string();
         if task_name == "putc" {
             return self.lower_string_putc(value).map(Some);
+        }
+        if matches!(task_name.as_str(), "itoa" | "hextoa" | "bintoa") {
+            let radix = match task_name.as_str() {
+                "hextoa" => 16,
+                "bintoa" => 2,
+                _ => 10,
+            };
+            return self.lower_string_from_radix(value, radix).map(Some);
         }
         let Some(definition) = self.subroutines.get(&task_name) else {
             return Ok(None);
@@ -796,6 +812,73 @@ impl SlangAstLowerer {
                 e: Box::new(receiver),
                 index: Box::new(index),
                 value: Box::new(byte),
+            },
+        })
+    }
+
+    fn lower_string_to_radix(
+        &self,
+        value: &Value,
+        radix: u32,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string radix call has no arguments".to_string())?;
+        if arguments.len() != 1 {
+            return Err("string radix conversion expects one string receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string radix conversion has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string radix conversion receiver is not a string".into());
+        }
+        let receiver = self.lower_expression(receiver)?;
+        if receiver.width() != crate::types::STRING_WIDTH {
+            return Err("string radix conversion requires a 512-bit string".into());
+        }
+        Ok(eda_core::ir::Expr::StringToRadix {
+            e: Box::new(receiver),
+            radix,
+        })
+    }
+
+    fn lower_string_from_radix(
+        &self,
+        value: &Value,
+        radix: u32,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string radix formatting call has no arguments".to_string())?;
+        if arguments.len() != 2 {
+            return Err("string radix formatting expects receiver and integer".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string radix formatting has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string radix formatting receiver is not a string".into());
+        }
+        let integer = arguments
+            .get(1)
+            .ok_or_else(|| "string radix formatting has no integer".to_string())?;
+        let lv = self.lower_lvalue(receiver)?;
+        let receiver = self.lower_expression(receiver)?;
+        if receiver.width() != crate::types::STRING_WIDTH {
+            return Err("string radix formatting requires a 512-bit string".into());
+        }
+        let integer = self.lower_expression(integer)?;
+        if integer.width() > 64 {
+            return Err("string radix formatting integer exceeds 64 bits".into());
+        }
+        Ok(eda_core::ir::Stmt::Bl {
+            lv,
+            e: eda_core::ir::Expr::StringFromRadix {
+                value: Box::new(integer),
+                radix,
             },
         })
     }

@@ -148,6 +148,12 @@ impl<'a> Synth<'a> {
             Expr::StringSubstr { .. } => {
                 return Err("bounded string substrings are not synthesizable yet".into())
             }
+            Expr::StringToRadix { .. } => {
+                return Err("bounded string radix parsing is not synthesizable yet".into())
+            }
+            Expr::StringFromRadix { .. } => {
+                return Err("bounded string radix formatting is not synthesizable yet".into())
+            }
         })
     }
 
