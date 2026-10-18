@@ -445,6 +445,50 @@ impl<'d> Simulator<'d> {
         self.settle()
     }
 
+    /// Set a rectangular range of top-level input or inout sparse-memory
+    /// elements in row-major logical-index order.
+    pub fn set_memory_input_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+        values: &[LogicWord],
+    ) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("simulation cancelled".into());
+        }
+        self.settle()?;
+        let memory_port = self
+            .design
+            .memory_ports
+            .iter()
+            .find(|memory_port| memory_port.name == port)
+            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
+        if !matches!(
+            memory_port.direction,
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!("sparse-memory port '{port}' is not an input"));
+        }
+        let memory = self.canonical_memory(memory_port.memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
+        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
+        if physical.len() != values.len() {
+            return Err(format!(
+                "sparse-memory port '{port}' range has {} elements but {} values were supplied",
+                physical.len(),
+                values.len()
+            ));
+        }
+        for (value, physical) in values.iter().zip(physical) {
+            self.apply_memory_update(memory, physical, value.clone())?;
+        }
+        self.settle()
+    }
+
     /// Read one element from a top-level output or inout sparse-memory port.
     pub fn read_memory_output(&mut self, port: &str, indexes: &[i64]) -> Result<LogicWord, String> {
         self.settle()?;
@@ -511,6 +555,45 @@ impl<'d> Simulator<'d> {
                     .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        Ok(physical
+            .into_iter()
+            .map(|physical| {
+                self.memory_elements
+                    .get(memory)
+                    .and_then(|elements| elements.get(&physical))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
+            })
+            .collect())
+    }
+
+    /// Read a rectangular range of top-level output or inout sparse-memory
+    /// elements in row-major logical-index order.
+    pub fn read_memory_output_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+    ) -> Result<Vec<LogicWord>, String> {
+        self.settle()?;
+        let memory_port = self
+            .design
+            .memory_ports
+            .iter()
+            .find(|memory_port| memory_port.name == port)
+            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
+        if !matches!(
+            memory_port.direction,
+            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!("sparse-memory port '{port}' is not an output"));
+        }
+        let memory = self.canonical_memory(memory_port.memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
+        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
         Ok(physical
             .into_iter()
             .map(|physical| {
@@ -2788,6 +2871,79 @@ fn expr_memories(e: &Expr) -> Vec<usize> {
     let mut out = Vec::new();
     walk_expr_memories(e, &mut out);
     out
+}
+
+fn memory_range_physical_indexes(
+    declaration: &eda_core::ir::MemoryDecl,
+    ranges: &[(i64, i64)],
+    port: &str,
+) -> Result<Vec<u64>, String> {
+    if ranges.len() != declaration.dimensions.len() {
+        return Err(format!(
+            "sparse-memory port '{port}' range has {} dimensions but the memory has {}",
+            ranges.len(),
+            declaration.dimensions.len()
+        ));
+    }
+    if ranges.is_empty() {
+        return Err("sparse-memory ranges cannot be empty".into());
+    }
+
+    let mut expected = 1_usize;
+    for (range, dimension) in ranges.iter().zip(&declaration.dimensions) {
+        let (first, last) = *range;
+        let last_logical = dimension.base + dimension.step * (dimension.length as i64 - 1);
+        let lower = dimension.base.min(last_logical);
+        let upper = dimension.base.max(last_logical);
+        if !(first..=last).all(|index| index >= lower && index <= upper)
+            && !(last..=first).all(|index| index >= lower && index <= upper)
+        {
+            return Err(format!(
+                "sparse-memory port '{port}' range ({first}, {last}) is out of bounds"
+            ));
+        }
+        let span = (i128::from(first) - i128::from(last)).unsigned_abs() + 1;
+        let span = usize::try_from(span)
+            .map_err(|_| format!("sparse-memory port '{port}' range is too large"))?;
+        expected = expected
+            .checked_mul(span)
+            .ok_or_else(|| format!("sparse-memory port '{port}' range is too large"))?;
+    }
+
+    let starts = ranges.iter().map(|range| range.0).collect::<Vec<_>>();
+    let mut current = starts.clone();
+    let mut physical = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        physical.push(
+            declaration
+                .physical_index(&current)
+                .ok_or_else(|| format!("sparse-memory port '{port}' range is out of bounds"))?,
+        );
+        let mut incremented = false;
+        for (dimension, index) in (0..ranges.len()).rev().zip((0..current.len()).rev()) {
+            let (first, last) = ranges[dimension];
+            if current[index] == last {
+                current[index] = first;
+                continue;
+            }
+            let step = if first <= last { 1 } else { -1 };
+            current[index] = current[index]
+                .checked_add(step)
+                .ok_or_else(|| format!("sparse-memory port '{port}' range overflow"))?;
+            incremented = true;
+            break;
+        }
+        if !incremented {
+            break;
+        }
+    }
+    if physical.len() != expected {
+        return Err(format!(
+            "sparse-memory port '{port}' range produced {} elements instead of {expected}",
+            physical.len()
+        ));
+    }
+    Ok(physical)
 }
 
 fn simulation_time_unit(expression: &Expr) -> Option<i8> {

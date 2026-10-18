@@ -1940,6 +1940,93 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_multidimensional_memory_ranges() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-multidimensional-memory-range");
+    let source_path = root.join("multidimensional_memory_range.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module top(
+  inout wire logic [7:0] bus [0:1][0:2],
+  output logic [7:0] observed
+);
+  assign observed = bus[1][2];
+  assign bus[1][1] = bus[0][1];
+endmodule
+"#,
+    )
+    .expect("write multidimensional memory-range source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional memory range");
+    assert_eq!(design.memory_ports.len(), 1);
+    assert_eq!(design.memories[0].dimensions.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create multidimensional-memory simulator");
+    let error = simulator
+        .set_memory_input_range(
+            "bus",
+            &[(0, 1), (1, 99)],
+            &[
+                LogicWord::from_u64(8, 1),
+                LogicWord::from_u64(8, 2),
+                LogicWord::from_u64(8, 3),
+                LogicWord::from_u64(8, 4),
+            ],
+        )
+        .expect_err("multidimensional ranges must validate every bound before writing");
+    assert!(error.contains("range is out of bounds"));
+    assert_eq!(
+        simulator
+            .read_memory_output("bus", &[0, 1])
+            .expect("failed multidimensional range must not write"),
+        LogicWord::xes(8)
+    );
+
+    simulator
+        .set_memory_input_range(
+            "bus",
+            &[(0, 1), (1, 2)],
+            &[
+                LogicWord::from_u64(8, 0x11),
+                LogicWord::from_u64(8, 0x12),
+                LogicWord::from_u64(8, 0x14),
+                LogicWord::from_u64(8, 0x15),
+            ],
+        )
+        .expect("set multidimensional memory range");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x15));
+    let values = simulator
+        .read_memory_output_range("bus", &[(0, 1), (1, 2)])
+        .expect("read multidimensional memory range");
+    let expected = [0x11, 0x12, 0x11, 0x15]
+        .iter()
+        .map(|value| LogicWord::from_u64(8, *value))
+        .collect::<Vec<_>>();
+    assert_eq!(values, expected);
+    assert_eq!(
+        simulator
+            .read_memory_output("bus", &[1, 1])
+            .expect("read aliased multidimensional element"),
+        LogicWord::from_u64(8, 0x11)
+    );
+    assert_eq!(
+        simulator
+            .read_memory_output_range("bus", &[(1, 1), (2, 2)])
+            .expect("read singleton multidimensional range"),
+        vec![LogicWord::from_u64(8, 0x15)]
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_reads_sparse_memory_files() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
