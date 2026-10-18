@@ -161,6 +161,113 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_class_inheritance() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-inheritance");
+    let source_path = root.join("class_inheritance.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  int base_value;
+
+  function new(int b);
+    base_value = b;
+  endfunction
+
+  function int get();
+    return base_value;
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class Derived extends Base;
+  int derived_value;
+
+  function new(int b, int d);
+    super.new(b);
+    derived_value = d;
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+
+  function int sum();
+    return base_value + derived_value;
+  endfunction
+endclass
+
+module inheritance_top(
+  input int b,
+  input int d,
+  output int base_get,
+  output int derived_get,
+  output int derived_sum,
+  output int derived_kind,
+  output int base_kind
+);
+  Base base;
+  Derived derived;
+  initial begin
+    #1;
+    base = new(b);
+    derived = new(b, d);
+    base_get = base.get();
+    derived_get = derived.get();
+    derived_sum = derived.sum();
+    derived_kind = derived.kind();
+    base_kind = base.kind();
+  end
+endmodule
+"#,
+    )
+    .expect("write class-inheritance source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("inheritance_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower class inheritance");
+    for field in [
+        "base.base_value",
+        "derived.base_value",
+        "derived.derived_value",
+    ] {
+        assert!(
+            design
+                .net_decls
+                .iter()
+                .any(|declaration| declaration.name == field && declaration.width == 32),
+            "missing inherited class field {field}"
+        );
+    }
+
+    let mut simulator = Simulator::new(&design).expect("create class-inheritance simulator");
+    simulator
+        .set_input("b", &LogicWord::from_u64(32, 7))
+        .unwrap();
+    simulator
+        .set_input("d", &LogicWord::from_u64(32, 35))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run inheritance initial block");
+    assert_eq!(simulator.read("base_get").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.read("derived_get").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.read("derived_sum").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("derived_kind").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("base_kind").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_compiles_and_simulates_simple_modules() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
