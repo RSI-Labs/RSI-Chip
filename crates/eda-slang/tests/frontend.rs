@@ -4105,6 +4105,76 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_preserves_clocking_blocks_across_hierarchy() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-clocking-hierarchy");
+    let source_path = root.join("clocking_hierarchy.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module clocking_child(
+  input logic clk,
+  input logic sampled_input,
+  output logic driven_output
+);
+  default clocking cb @(posedge clk);
+    input sampled_input;
+    output driven_output;
+  endclocking
+
+  initial begin
+    driven_output = 1'b0;
+    @(cb);
+    cb.driven_output <= cb.sampled_input;
+    ##1 cb.driven_output <= 1'b0;
+  end
+endmodule
+
+module clocking_hierarchy(
+  input logic clk,
+  input logic sampled_input,
+  output logic driven_output
+);
+  clocking_child child(
+    .clk(clk),
+    .sampled_input(sampled_input),
+    .driven_output(driven_output)
+  );
+endmodule
+"#,
+    )
+    .expect("write hierarchical clocking source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("clocking_hierarchy"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower hierarchical clocking block");
+    assert_eq!(design.clocking_blocks.len(), 1);
+    let mut simulator = Simulator::new(&design).expect("create hierarchical clocking simulator");
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("sampled_input", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("driven_output").unwrap().to_u64(), Some(0));
+
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("driven_output").unwrap().to_u64(), Some(1));
+
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("driven_output").unwrap().to_u64(), Some(0));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
