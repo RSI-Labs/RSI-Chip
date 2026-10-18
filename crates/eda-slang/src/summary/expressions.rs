@@ -646,6 +646,9 @@ pub(crate) fn design_stmt_assignments(
         Stmt::Wait { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
+        Stmt::EventWait { body, .. } => {
+            assignments.extend(design_stmt_assignments(design, body));
+        }
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| assignments.extend(design_stmt_assignments(design, branch))),

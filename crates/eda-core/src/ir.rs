@@ -648,6 +648,12 @@ pub enum Stmt {
         cond: Expr,
         body: Box<Stmt>,
     },
+    /// Suspend until any value change on one explicitly listed scalar event
+    /// signal, then execute `body`.
+    EventWait {
+        net: usize,
+        body: Box<Stmt>,
+    },
     /// Concurrent branches joined with `join`, `join_any`, or `join_none`.
     Fork {
         branches: Vec<Stmt>,
@@ -1016,6 +1022,9 @@ fn collect_memory_accesses(
         }
         Stmt::Wait { cond, body } => {
             collect_memory_expr_reads(cond, synchronous, accesses);
+            collect_memory_accesses(body, synchronous, memory_widths, accesses)
+        }
+        Stmt::EventWait { body, .. } => {
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {

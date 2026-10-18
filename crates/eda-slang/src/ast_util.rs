@@ -56,7 +56,7 @@ fn canonical_detailed_type(value: &Value) -> Option<String> {
             let split = element.find('[').unwrap_or(element.len());
             Some(format!("{}{range}{}", &element[..split], &element[split..]))
         }
-        "PredefinedIntegerType" | "FloatingType" | "StringType" => value
+        "PredefinedIntegerType" | "FloatingType" | "StringType" | "EventType" => value
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string),

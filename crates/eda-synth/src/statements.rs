@@ -51,6 +51,7 @@ impl<'a> Synth<'a> {
             }
             Stmt::Forever(_) => Err("forever is not synthesizable".into()),
             Stmt::Wait { .. } => Err("wait statements are not synthesizable".into()),
+            Stmt::EventWait { .. } => Err("event waits are not synthesizable".into()),
             Stmt::Fork { .. } => Err("fork/join blocks are not synthesizable".into()),
             Stmt::While { .. } => Err("while loops are not synthesizable".into()),
             Stmt::Repeat { .. } => Err("repeat loops are not synthesizable".into()),

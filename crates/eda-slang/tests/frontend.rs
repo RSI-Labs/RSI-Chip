@@ -3518,6 +3518,54 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_named_event_triggers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-events");
+    let source_path = root.join("events.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module events(input logic go, output logic [3:0] count, output logic done);
+  event e;
+  initial begin
+    count = 4'd0;
+    @(e);
+    count = count + 1;
+    @(e);
+    count = count + 1;
+    done = 1'b1;
+  end
+
+  initial begin
+    wait (go) ->e;
+    #1 ->e;
+  end
+endmodule
+"#,
+    )
+    .expect("write named-event source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("events"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower named events");
+    let mut simulator = Simulator::new(&design).expect("create named-event simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("done").unwrap().to_u64(), None);
+    simulator.run_until(1).unwrap();
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -131,6 +131,12 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     let base = type_name.split('[').next()?.trim();
     let element_width = if base.contains("logic") || base.contains("reg") || base.contains("bit") {
         1
+    } else if base == "event" {
+        return Some(AstTypeShape {
+            width: 1,
+            bounds: Some((0, 0)),
+            dimensions: Vec::new(),
+        });
     } else if base == "string" {
         return Some(AstTypeShape {
             width: STRING_WIDTH,

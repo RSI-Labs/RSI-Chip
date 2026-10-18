@@ -8,7 +8,7 @@ use crate::ast_util::{
     slang_constant_u64, string_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
-use eda_core::logic::LogicWord;
+use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
 impl SlangAstLowerer {
@@ -365,6 +365,25 @@ impl SlangAstLowerer {
                 let timing = statement
                     .get("timing")
                     .ok_or_else(|| "timed statement has no timing control".to_string())?;
+                if string_field(timing, "kind").as_deref() == Some("SignalEvent") {
+                    let body = statement
+                        .get("stmt")
+                        .ok_or_else(|| "event control has no statement".to_string())?;
+                    let event = timing
+                        .get("expr")
+                        .ok_or_else(|| "event control has no event expression".to_string())?;
+                    let lvalue = self.lower_lvalue(event)?;
+                    if lvalue.range.width() != 1 {
+                        return Err("event control expression must be scalar".into());
+                    }
+                    return Ok(Stmt::EventWait {
+                        net: lvalue.net + match lvalue.range {
+                            eda_core::ir::Range::Bit(bit) => bit,
+                            _ => 0,
+                        },
+                        body: Box::new(self.lower_statement(body)?),
+                    });
+                }
                 let delay = self.lower_delay_control(timing)?;
                 let body = statement
                     .get("stmt")
@@ -463,6 +482,8 @@ impl SlangAstLowerer {
             }
             "Break" => Ok(Stmt::Break),
             "Continue" => Ok(Stmt::Continue),
+            "Empty" => Ok(Stmt::Block(Vec::new())),
+            "EventTrigger" => self.lower_event_trigger(statement),
             "Wait" => {
                 let condition = statement
                     .get("cond")
@@ -499,6 +520,52 @@ impl SlangAstLowerer {
         }
         slang_constant_u64(expression)
             .map_err(|_| "delay control must be an integer constant".to_string())
+    }
+
+    fn lower_event_trigger(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        if bool_field(statement, "isNonBlocking") {
+            return Err("nonblocking event triggers are not supported".into());
+        }
+        let target = statement
+            .get("target")
+            .ok_or_else(|| "event trigger has no target".to_string())?;
+        let event_type = target
+            .get("type")
+            .ok_or_else(|| "event trigger target has no type".to_string())?;
+        let is_event = match event_type {
+            Value::String(type_name) => type_name == "event",
+            Value::Object(fields) => {
+                fields.get("name").and_then(Value::as_str) == Some("event")
+                    || fields.get("kind").and_then(Value::as_str) == Some("EventType")
+            }
+            _ => false,
+        };
+        if !is_event {
+            return Err("event trigger target must be an event".into());
+        }
+        let lvalue = self.lower_lvalue(target)?;
+        let current = self.lower_expression(target)?;
+        let unknown = eda_core::ir::Expr::Const(LogicWord::new_const(1, LogicValue::X));
+        let zero = eda_core::ir::Expr::Const(LogicWord::zero(1));
+        let next = eda_core::ir::Expr::Cond {
+            c: Box::new(eda_core::ir::Expr::Bin {
+                op: eda_core::ir::BinOp::CaseEq,
+                a: Box::new(current.clone()),
+                b: Box::new(unknown),
+            }),
+            t: Box::new(zero),
+            f: Box::new(eda_core::ir::Expr::Un {
+                op: eda_core::ir::UnOp::Not,
+                a: Box::new(current),
+            }),
+        };
+        Ok(eda_core::ir::Stmt::Bl {
+            lv: lvalue,
+            e: next,
+        })
     }
 
     fn lower_increment_statement(

@@ -127,6 +127,10 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(cond, reads);
                 walk(body, reads, writes);
             }
+            Stmt::EventWait { net, body } => {
+                reads.insert(*net);
+                walk(body, reads, writes);
+            }
             Stmt::Fork { branches, .. } => branches
                 .iter()
                 .for_each(|branch| walk(branch, reads, writes)),

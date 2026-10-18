@@ -66,6 +66,11 @@ struct Waiter<'d> {
     continuation: Cont<'d>,
 }
 
+struct EventWaiter<'d> {
+    net: usize,
+    continuation: Cont<'d>,
+}
+
 struct Monitor<'d> {
     parts: &'d [eda_core::ir::DispPart],
     args: &'d [Expr],
@@ -87,6 +92,7 @@ pub struct Simulator<'d> {
     while_iterations: HashMap<usize, u64>,
     repeat_remaining: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
+    event_waiters: Vec<EventWaiter<'d>>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
@@ -199,6 +205,7 @@ impl<'d> Simulator<'d> {
             while_iterations: HashMap::new(),
             repeat_remaining: HashMap::new(),
             waiters: Vec::new(),
+            event_waiters: Vec::new(),
             memory_elements,
             memory_aliases,
             memory_nba: Vec::new(),
@@ -833,6 +840,19 @@ impl<'d> Simulator<'d> {
         for continuation in ready {
             self.conts.entry(self.now).or_default().push(continuation);
         }
+
+        let mut ready_events = Vec::new();
+        let mut index = 0;
+        while index < self.event_waiters.len() {
+            if self.event_waiters[index].net == changed_net {
+                ready_events.push(self.event_waiters.remove(index).continuation);
+            } else {
+                index += 1;
+            }
+        }
+        for continuation in ready_events {
+            self.conts.entry(self.now).or_default().push(continuation);
+        }
     }
 
     fn wake_memory_waiters(&mut self, changed_memory: usize) {
@@ -1314,6 +1334,24 @@ impl<'d> Simulator<'d> {
                         });
                         return Ok(());
                     }
+                }
+                Stmt::EventWait { net, body } => {
+                    let mut exec_order: Vec<&Stmt> = vec![&**body];
+                    exec_order.extend(work.iter().rev().copied());
+                    exec_order.reverse();
+                    let continuation = Cont {
+                        process: c.process,
+                        join: c.join,
+                        work: exec_order,
+                    };
+                    if let Some(process) = c.process {
+                        self.busy_procs.remove(&process);
+                    }
+                    self.event_waiters.push(EventWaiter {
+                        net: *net,
+                        continuation,
+                    });
+                    return Ok(());
                 }
                 Stmt::Display { parts, args, .. } => {
                     let line = self.format_display(parts, args);
@@ -2392,6 +2430,7 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(cond, out);
             walk_stmt_memories(body, out)
         }
+        Stmt::EventWait { body, .. } => walk_stmt_memories(body, out),
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| walk_stmt_memories(branch, out)),
@@ -2494,6 +2533,10 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
+        Stmt::EventWait { net, body } => {
+            reads.insert(*net);
+            collect_stmt_access(body, reads, writes);
+        }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             let mut branch_reads = HashSet::new();
             let mut branch_writes = HashSet::new();
@@ -2579,6 +2622,10 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Wait { cond, body } => {
             walk_expr(cond, out);
             walk_stmt(body, out)
+        }
+        Stmt::EventWait { net, body } => {
+            out.push(*net);
+            walk_stmt(body, out);
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
         Stmt::While { cond, body, steps } => {

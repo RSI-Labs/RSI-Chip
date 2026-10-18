@@ -281,6 +281,9 @@ impl SlangAstLowerer {
     pub(super) fn lower_port(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "Port")?;
         let type_name = string_field(member, "type").unwrap_or_default();
+        if type_name == "event" {
+            return Err(format!("event ports are not supported for '{name}'"));
+        }
         if self.declared_memory_type(&type_name).is_some() {
             return self.lower_memory_port(member, &name);
         }
