@@ -305,6 +305,75 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_simulation_time_functions() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-simulation-time");
+    let source_path = root.join("simulation_time.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module simulation_time(
+  output logic [63:0] now_time,
+  output logic [31:0] now_stime,
+  output logic [63:0] added
+);
+  initial begin
+    #7;
+    now_time = $time;
+    now_stime = $stime;
+    added = $time + 64'd3;
+  end
+endmodule
+"#,
+    )
+    .expect("write simulation-time source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("simulation_time"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simulation time functions");
+    let mut simulator = Simulator::new(&design).expect("create simulation-time simulator");
+    simulator.run_until(7).expect("run to time seven");
+    assert_eq!(simulator.read("now_time").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.read("now_stime").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.read("added").unwrap().to_u64(), Some(10));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-realtime");
+    let source_path = root.join("realtime.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module realtime_probe(output logic [63:0] now_realtime);
+  initial now_realtime = $realtime;
+endmodule
+"#,
+    )
+    .expect("write realtime source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("realtime_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("realtime requires a real type model and must fail closed");
+    assert!(
+        error.contains("unknown function '$realtime'") || error.contains("cannot resolve"),
+        "unexpected realtime error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_wildcard_package_imports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

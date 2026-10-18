@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
     match e {
-        Expr::Const(_) => {}
+        Expr::Const(_) | Expr::SimulationTime { .. } => {}
         Expr::Ref { net, .. } => {
             out.insert(*net);
         }

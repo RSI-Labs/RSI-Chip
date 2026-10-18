@@ -25,6 +25,31 @@ impl SlangAstLowerer {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Err("function call has no subroutine symbol".into());
         };
+        let function_name = subroutine
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default();
+        if matches!(function_name, "$time" | "$stime") {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err(format!("{function_name} does not take arguments"));
+            }
+            return Ok(if function_name == "$time" {
+                eda_core::ir::Expr::SimulationTime {
+                    width: 64,
+                    signed: true,
+                }
+            } else {
+                eda_core::ir::Expr::SimulationTime {
+                    width: 32,
+                    signed: false,
+                }
+            });
+        }
         match subroutine.as_str() {
             "next" | "prev" => {
                 return self.lower_enum_next_prev(value, subroutine == "next");

@@ -428,6 +428,12 @@ pub enum Expr {
     EventTriggered {
         net: usize,
     },
+    /// Current simulation time as an integral value. `$time` uses the signed
+    /// 64-bit `time` type; `$stime` uses its unsigned 32-bit form.
+    SimulationTime {
+        width: usize,
+        signed: bool,
+    },
     /// Updates one byte in a bounded string. This is used only as the RHS of
     /// a whole-string assignment when lowering the void `putc()` method.
     StringPutc {
@@ -494,6 +500,7 @@ impl Expr {
             Expr::StringCase { e, .. } => e.width(),
             Expr::StringCompare { .. } => 32,
             Expr::EventTriggered { .. } => 1,
+            Expr::SimulationTime { width, .. } => *width,
             Expr::StringPutc { e, .. } => e.width(),
             Expr::StringSubstr { e, .. } => e.width(),
             Expr::StringToRadix { .. } => 32,
@@ -537,6 +544,7 @@ impl Expr {
             Expr::StringCase { .. } => false,
             Expr::StringCompare { .. } => true,
             Expr::EventTriggered { .. } => false,
+            Expr::SimulationTime { signed, .. } => *signed,
             Expr::StringPutc { .. } => false,
             Expr::StringSubstr { .. } => false,
             Expr::StringToRadix { .. } => true,
@@ -1201,7 +1209,7 @@ fn collect_memory_accesses(
 
 fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mut MemoryAccesses) {
     match expression {
-        Expr::Const(_) | Expr::Ref { .. } => {}
+        Expr::Const(_) | Expr::Ref { .. } | Expr::SimulationTime { .. } => {}
         Expr::MemoryRead {
             memory, indexes, ..
         } => {

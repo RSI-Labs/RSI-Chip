@@ -2018,6 +2018,7 @@ impl<'d> Simulator<'d> {
                         .is_some_and(|time| *time == self.now),
                 )],
             },
+            Expr::SimulationTime { width, .. } => LogicWord::from_u64(*width, self.now),
             Expr::StringToRadix { e, radix } => {
                 let string = self.eval(e);
                 match parse_packed_string_radix(&string, *radix) {
@@ -2530,6 +2531,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         Expr::EventTriggered { net } => {
             out.push(*net);
         }
+        Expr::SimulationTime { .. } => {}
         Expr::StringToRadix { e, .. } => walk_expr(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr(value, out),
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
@@ -2594,7 +2596,7 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
         }
-        Expr::EventTriggered { .. } => {}
+        Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
         Expr::StringToRadix { e, .. } => walk_expr_memories(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr_memories(value, out),
         Expr::MemoryReadPart {

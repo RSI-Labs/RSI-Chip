@@ -157,6 +157,9 @@ impl<'a> Synth<'a> {
             Expr::EventTriggered { .. } => {
                 return Err("event triggered checks are not synthesizable".into())
             }
+            Expr::SimulationTime { .. } => {
+                return Err("simulation time is not synthesizable".into())
+            }
         })
     }
 

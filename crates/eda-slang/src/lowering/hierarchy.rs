@@ -318,6 +318,7 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             .iter_mut()
             .for_each(|part| remap_expression(part, offset)),
         Expr::Repeat { e, .. } | Expr::Signed { e, .. } => remap_expression(e, offset),
+        Expr::SimulationTime { .. } => {}
         Expr::MemoryRead { indexes, .. } => {
             indexes
                 .iter_mut()
@@ -552,7 +553,7 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         }
         Expr::StringToRadix { e, .. } => remap_expression_memory_ids(e, offset),
         Expr::StringFromRadix { value, .. } => remap_expression_memory_ids(value, offset),
-        Expr::EventTriggered { .. } => {}
+        Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
     }
 }
 

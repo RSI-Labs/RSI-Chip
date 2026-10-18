@@ -2136,7 +2136,7 @@ fn collect_expression_references(
 ) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) | Expr::EventTriggered { .. } => {}
+        Expr::Const(_) | Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
         Expr::Ref { .. } => references.push(expression.clone()),
         Expr::Un { a, .. }
         | Expr::Signed { e: a, .. }

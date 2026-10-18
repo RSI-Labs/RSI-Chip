@@ -521,6 +521,7 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringToRadix { .. } => "StringToRadix",
         Expr::StringFromRadix { .. } => "StringFromRadix",
         Expr::EventTriggered { .. } => "EventTriggered",
+        Expr::SimulationTime { .. } => "SimulationTime",
     }
 }
 
@@ -562,7 +563,10 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         return format!("Repeat:{times}:u[{}]", design_expr_fingerprint(design, e));
     }
     let operands: Vec<String> = match expression {
-        Expr::Const(_) | Expr::Ref { .. } | Expr::MemoryRead { .. } => Vec::new(),
+        Expr::Const(_)
+        | Expr::Ref { .. }
+        | Expr::MemoryRead { .. }
+        | Expr::SimulationTime { .. } => Vec::new(),
         Expr::MemoryReadPart { indexes, start, .. } => indexes
             .iter()
             .chain(std::iter::once(start.as_ref()))
