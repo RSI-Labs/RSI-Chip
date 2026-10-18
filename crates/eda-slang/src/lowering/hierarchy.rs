@@ -834,6 +834,7 @@ impl super::SlangAstLowerer {
             class_object_tags: std::collections::BTreeMap::new(),
             class_object_ids: std::collections::BTreeMap::new(),
             class_object_serial: None,
+            class_static_methods: std::collections::BTreeMap::new(),
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
@@ -975,7 +976,7 @@ impl super::SlangAstLowerer {
                 }
             }
         }
-        child.lower_body(body)?;
+        child.lower_body(body, false)?;
 
         if is_interface {
             let instance_address = member

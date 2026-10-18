@@ -151,6 +151,11 @@ impl super::SlangAstLowerer {
                 return Ok(symbol.clone());
             }
         }
+        if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(symbol) = self.symbols.get(&symbol_id) {
+                return Ok(symbol.clone());
+            }
+        }
         self.symbols.get(&display_name).cloned().ok_or_else(|| {
             format!(
                 "unknown direct-lowering symbol '{display_name}' ({})",
@@ -293,6 +298,16 @@ impl super::SlangAstLowerer {
                 }
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.local_symbols.get(&symbol_id) {
+                        return Ok(Expr::Ref {
+                            net: symbol.base,
+                            decl_width: symbol.width,
+                            range: full_range(symbol.width),
+                            signed: symbol.signed,
+                        });
+                    }
+                }
+                if let Some(symbol_id) = expression_symbol_id(value) {
+                    if let Some(symbol) = self.symbols.get(&symbol_id) {
                         return Ok(Expr::Ref {
                             net: symbol.base,
                             decl_width: symbol.width,

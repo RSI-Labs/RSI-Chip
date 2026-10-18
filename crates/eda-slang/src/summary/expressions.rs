@@ -165,6 +165,7 @@ pub(crate) fn procedural_assignments(
                     rhs: expression_summary(right),
                     nonblocking: bool_field(value, "isNonBlocking"),
                     dynamic_packed_lvalue,
+                    uses_class_static: expression_uses_class_symbol(right, class_handles),
                 });
             }
         }
@@ -189,6 +190,32 @@ pub(crate) fn procedural_assignments(
     assignments
 }
 
+fn expression_uses_class_symbol(
+    value: &Value,
+    class_symbols: &std::collections::BTreeSet<String>,
+) -> bool {
+    if let Some(symbol) = string_field(value, "symbol") {
+        if class_symbols.contains(&symbol) {
+            return true;
+        }
+    }
+    value
+        .as_object()
+        .map(|fields| {
+            fields
+                .values()
+                .any(|nested| expression_uses_class_symbol(nested, class_symbols))
+        })
+        .or_else(|| {
+            value.as_array().map(|values| {
+                values
+                    .iter()
+                    .any(|nested| expression_uses_class_symbol(nested, class_symbols))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn is_class_handle_target(
     value: &Value,
     class_handles: &std::collections::BTreeSet<String>,
@@ -202,10 +229,7 @@ fn is_class_handle_target(
     let Some(symbol) = string_field(value, "symbol") else {
         return false;
     };
-    let Some(handle_name) = symbol.split_whitespace().next_back() else {
-        return false;
-    };
-    class_handles.contains(handle_name)
+    class_handles.contains(&symbol)
 }
 
 pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Option<&'static str> {

@@ -24,11 +24,14 @@ fn collect_class_handle_names(
         let type_name = string_field(value, "type").unwrap_or_default();
         let class_name = type_name.split_whitespace().next_back();
         if class_type_is_selected(value, class_name, class_types) {
-            if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
-                handles.insert(name);
-            } else if let Some(symbol) = string_field(value, "symbol") {
-                if let Some(name) = symbol.split_whitespace().next_back() {
-                    handles.insert(name.to_string());
+            if let Some(symbol) = string_field(value, "symbol").filter(|symbol| !symbol.is_empty())
+            {
+                handles.insert(symbol);
+            } else if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
+                if let Some(address) = value.get("addr").and_then(Value::as_u64) {
+                    handles.insert(format!("{address} {name}"));
+                } else {
+                    handles.insert(name);
                 }
             }
         }
@@ -38,6 +41,40 @@ fn collect_class_handle_names(
     } else if let Some(values) = value.as_array() {
         for nested in values {
             collect_class_handle_names(nested, class_types, handles);
+        }
+    }
+}
+
+fn collect_class_static_property_symbols(
+    value: &Value,
+    symbols: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            let empty_members = Vec::new();
+            let members = value
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            for member in members {
+                if string_field(member, "kind").as_deref() == Some("ClassProperty")
+                    && string_field(member, "lifetime").as_deref() == Some("Static")
+                {
+                    let Some(name) = string_field(member, "name") else {
+                        continue;
+                    };
+                    if let Some(address) = member.get("addr").and_then(Value::as_u64) {
+                        symbols.insert(format!("{address} {name}"));
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_class_static_property_symbols(nested, symbols);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_static_property_symbols(nested, symbols);
         }
     }
 }
@@ -222,6 +259,9 @@ pub struct SlangAssignmentSummary {
     /// Dynamic packed selects are canonicalized into whole-vector update
     /// expressions by direct lowering, so exact RHS equivalence is deferred.
     pub dynamic_packed_lvalue: bool,
+    /// Class static storage uses an internal IR name, so exact RHS symbol
+    /// equivalence is deferred while assignment inventory remains checked.
+    pub uses_class_static: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +334,7 @@ impl SlangAstSummary {
         collect_class_type_names(&document, &mut class_types);
         let mut class_handles = std::collections::BTreeSet::new();
         collect_class_handle_names(root, &class_types, &mut class_handles);
+        collect_class_static_property_symbols(&document, &mut class_handles);
         let mut ports = Vec::new();
         let mut declarations = Vec::new();
         let mut parameters = Vec::new();

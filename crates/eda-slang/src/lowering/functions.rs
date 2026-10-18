@@ -77,6 +77,9 @@ impl SlangAstLowerer {
             }
             _ => {}
         }
+        if let Some(expression) = self.lower_static_class_function_call(value)? {
+            return Ok(expression);
+        }
         if let Some(expression) = self.lower_class_function_call(value)? {
             return Ok(expression);
         }
@@ -230,6 +233,9 @@ impl SlangAstLowerer {
                 _ => 10,
             };
             return self.lower_string_from_radix(value, radix).map(Some);
+        }
+        if let Some(statement) = self.lower_static_class_task_call(value)? {
+            return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_class_task_call(value)? {
             return Ok(Some(statement));

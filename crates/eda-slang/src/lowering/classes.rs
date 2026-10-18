@@ -16,6 +16,118 @@ struct ClassMethodCandidate {
 }
 
 impl SlangAstLowerer {
+    pub(super) fn collect_class_static_members(&mut self) -> Result<(), String> {
+        let definitions = self.class_definitions.clone();
+        let mut initializers = Vec::new();
+        let mut methods = Vec::new();
+        for (class_name, class) in &definitions {
+            let empty_members = Vec::new();
+            let members = class
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            for member in members {
+                match string_field(member, "kind").as_deref() {
+                    Some("ClassProperty")
+                        if string_field(member, "lifetime").as_deref() == Some("Static") =>
+                    {
+                        let property_name = declaration_name(member, "static ClassProperty")
+                            .map_err(|error| super::with_source_span(member, error))?;
+                        let symbol_key = member
+                            .get("addr")
+                            .and_then(Value::as_u64)
+                            .map(|address| format!("{address} {property_name}"))
+                            .ok_or_else(|| {
+                                super::with_source_span(
+                                    member,
+                                    format!("static class property '{class_name}.{property_name}' has no address"),
+                                )
+                            })?;
+                        if self.symbols.contains_key(&symbol_key) {
+                            continue;
+                        }
+                        let property_type = string_field(member, "type").unwrap_or_default();
+                        let (shape, signed, struct_fields) = self
+                            .net_type(&property_type)
+                            .map_err(|error| super::with_source_span(member, error))?;
+                        let base = self.design.n_nets;
+                        self.design.n_nets += shape.width;
+                        self.design.net_decls.push(eda_core::ir::NetDecl {
+                            name: format!("__class_static_{class_name}_{property_name}"),
+                            width: shape.width,
+                            is_reg: true,
+                            is_signed: signed,
+                            base,
+                        });
+                        let symbol = super::AstLoweredSymbol {
+                            base,
+                            width: shape.width,
+                            signed,
+                            bounds: shape.bounds,
+                            dimensions: shape.dimensions,
+                            memory: None,
+                            struct_fields,
+                        };
+                        self.symbols.insert(symbol_key.clone(), symbol);
+                        if let Some(initializer) = member.get("initializer") {
+                            initializers.push((symbol_key, initializer.clone()));
+                        }
+                    }
+                    Some("Subroutine") if method_is_static(member) => {
+                        methods.push((class_name.clone(), member.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for (symbol_key, initializer) in initializers {
+            let symbol = self.symbols[&symbol_key].clone();
+            let expression = self
+                .lower_expression(&initializer)
+                .map_err(|error| super::with_source_span(&initializer, error))?;
+            self.design.initials.push(Stmt::Bl {
+                lv: class_lvalue(&symbol),
+                e: expression,
+            });
+        }
+
+        for (class_name, method) in methods {
+            let method_name = declaration_name(&method, "static class Subroutine")
+                .map_err(|error| super::with_source_span(&method, error))?;
+            let address = method.get("addr").and_then(Value::as_u64).ok_or_else(|| {
+                super::with_source_span(
+                    &method,
+                    format!("static class method '{class_name}.{method_name}' has no address"),
+                )
+            })?;
+            let original_key = format!("{address} {method_name}");
+            let synthetic_key = format!("eda_class_static_{address}_{method_name}");
+            if let Some(existing) = self.subroutines.get(&synthetic_key) {
+                if *existing != method {
+                    return Err(super::with_source_span(
+                        &method,
+                        format!("duplicate static class method '{class_name}.{method_name}'"),
+                    ));
+                }
+            } else {
+                self.subroutines
+                    .insert(synthetic_key.clone(), method.clone());
+            }
+            if method_return_type(&method) == "void" {
+                let mut task_form = method.clone();
+                if let Some(fields) = task_form.as_object_mut() {
+                    fields.insert("subroutineKind".into(), Value::String("Task".into()));
+                }
+                let task_key = format!("{synthetic_key}_task");
+                self.subroutines.insert(task_key, task_form);
+            }
+            self.class_static_methods
+                .insert(original_key, synthetic_key);
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_dynamic_class_sources(&self) -> Result<(), String> {
         let mut reachable = self.constructed_class_objects.clone();
         let mut queue = reachable
@@ -175,15 +287,13 @@ impl SlangAstLowerer {
                     if string_field(property, "kind").as_deref() != Some("ClassProperty") {
                         continue;
                     }
+                    if string_field(property, "lifetime").as_deref() == Some("Static") {
+                        continue;
+                    }
                     let property_name = declaration_name(property, "ClassProperty")?;
                     if property.get("initializer").is_some() {
                         return Err(format!(
                             "class property '{class_name}.{property_name}' initializers are not supported; initialize in new()"
-                        ));
-                    }
-                    if string_field(property, "lifetime").as_deref() == Some("Static") {
-                        return Err(format!(
-                            "static class property '{class_name}.{property_name}' is not supported"
                         ));
                     }
                     let property_address = property
@@ -347,6 +457,51 @@ impl SlangAstLowerer {
             return Ok(Some(statement));
         }
         self.lower_class_method(object_key, call, false).map(Some)
+    }
+
+    pub(super) fn lower_static_class_function_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        let Some(synthetic) = self.class_static_methods.get(&subroutine) else {
+            return Ok(None);
+        };
+        let mut rewritten = value.clone();
+        if let Some(fields) = rewritten.as_object_mut() {
+            fields.insert("subroutine".into(), Value::String(synthetic.clone()));
+        }
+        self.lower_function_call(&rewritten).map(Some)
+    }
+
+    pub(super) fn lower_static_class_task_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        let Some(function_key) = self.class_static_methods.get(&subroutine) else {
+            return Ok(None);
+        };
+        let synthetic = if self
+            .subroutines
+            .get(function_key)
+            .and_then(|method| string_field(method, "subroutineKind"))
+            .as_deref()
+            == Some("Task")
+        {
+            function_key.clone()
+        } else {
+            format!("{function_key}_task")
+        };
+        let mut rewritten = value.clone();
+        if let Some(fields) = rewritten.as_object_mut() {
+            fields.insert("subroutine".into(), Value::String(synthetic));
+        }
+        self.lower_task_call(&rewritten)
     }
 
     pub(super) fn lower_class_function_call(
@@ -896,6 +1051,9 @@ impl SlangAstLowerer {
                 if string_field(property, "kind").as_deref() != Some("ClassProperty") {
                     continue;
                 }
+                if string_field(property, "lifetime").as_deref() == Some("Static") {
+                    continue;
+                }
                 let property_name = declaration_name(property, "ClassProperty")?;
                 let property_address = property
                     .get("addr")
@@ -1099,6 +1257,12 @@ fn method_return_type(method: &Value) -> String {
 fn method_is_virtual(method: &Value) -> bool {
     string_field(method, "flags")
         .map(|flags| flags.split(',').any(|flag| flag.trim() == "virtual"))
+        .unwrap_or(false)
+}
+
+fn method_is_static(method: &Value) -> bool {
+    string_field(method, "flags")
+        .map(|flags| flags.split(',').any(|flag| flag.trim() == "static"))
         .unwrap_or(false)
 }
 

@@ -138,8 +138,14 @@ fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     std::fs::write(
         &source_path,
         r#"
-class StaticCounter;
-  static int shared;
+interface class Interface;
+  pure virtual function int get();
+endclass
+
+class StaticCounter implements Interface;
+  virtual function int get();
+    return 1;
+  endfunction
 endclass
 
 module class_invalid_top;
@@ -154,10 +160,10 @@ endmodule
             Some("class_invalid_top"),
             &PreprocessOptions::default(),
         )
-        .expect_err("static class properties must fail closed");
+        .expect_err("implemented class interfaces must fail closed");
     assert!(
-        error.contains("static class property 'StaticCounter.shared' is not supported"),
-        "unexpected class error: {error}"
+        error.contains("class 'StaticCounter' interfaces are not supported"),
+        "unexpected class-interface error: {error}"
     );
 }
 
@@ -425,6 +431,141 @@ endmodule
         Some(67)
     );
     assert_eq!(simulator.read("second_total").unwrap().to_u64(), Some(33));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_static_class_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-static-class");
+    let source_path = root.join("static_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Registry;
+  static int shared = 3;
+
+  static function void set(int value);
+    shared = value;
+  endfunction
+
+  static function int get();
+    return shared;
+  endfunction
+endclass
+
+class Item;
+  int id;
+  static int count = 0;
+
+  function new(int initial_id);
+    id = initial_id;
+    count = count + 1;
+  endfunction
+
+  function int identity();
+    return id;
+  endfunction
+endclass
+
+module static_class_top(
+  input int replacement,
+  output int initial_shared,
+  output int method_shared,
+  output int direct_shared,
+  output int item_count,
+  output int first_id,
+  output int second_id
+);
+  Item first;
+  Item second;
+
+  initial begin
+    #1;
+    initial_shared = Registry::get();
+
+    first = new(10);
+    second = new(20);
+    item_count = Item::count;
+    first_id = first.identity();
+    second_id = second.identity();
+
+    Registry::set(replacement);
+    method_shared = Registry::get();
+    Registry::shared = replacement + 5;
+    direct_shared = Registry::shared;
+  end
+endmodule
+"#,
+    )
+    .expect("write static-class source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("static_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower static class members");
+    let mut simulator = Simulator::new(&design).expect("create static-class simulator");
+    simulator
+        .set_input("replacement", &LogicWord::from_u64(32, 37))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run static-class initial block");
+
+    assert_eq!(simulator.read("initial_shared").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("method_shared").unwrap().to_u64(), Some(37));
+    assert_eq!(simulator.read("direct_shared").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("item_count").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("first_id").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("second_id").unwrap().to_u64(), Some(20));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_child_static_class_scope_for_now() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-child-static-class");
+    let source_path = root.join("child_static_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Registry;
+  static int shared = 1;
+
+  static function int get();
+    return shared;
+  endfunction
+endclass
+
+module static_class_child(output int result);
+  initial begin
+    #1;
+    result = Registry::get();
+  end
+endmodule
+
+module static_class_hierarchy_top(output int result);
+  static_class_child child(.result(result));
+endmodule
+"#,
+    )
+    .expect("write child static-class source");
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("static_class_hierarchy_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("child static class scope must fail closed until storage is global");
+    assert!(
+        error.contains("unknown direct-lowering function 'get'"),
+        "unexpected child-static error: {error}"
+    );
 }
 
 #[test]

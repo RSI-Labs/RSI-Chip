@@ -226,6 +226,7 @@ impl SlangAstSummary {
                     if declaration_names.contains(target) {
                         let shape = if legacy_array_targets.contains(target)
                             || assignment.dynamic_packed_lvalue
+                            || assignment.uses_class_static
                         {
                             // Small arrays still use the legacy bounded
                             // per-element expansion, whose expression tree is
