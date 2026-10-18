@@ -658,7 +658,7 @@ pub enum Stmt {
     /// Suspend until any value change on one explicitly listed scalar event
     /// signal, then execute `body`.
     EventWait {
-        nets: Vec<usize>,
+        watches: Vec<EventWatch>,
         body: Box<Stmt>,
     },
     /// Suspend until scalar named events trigger in `events` order. An event
@@ -736,6 +736,19 @@ pub enum ForkMode {
     JoinAll,
     JoinAny,
     JoinNone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventEdge {
+    Any,
+    Posedge,
+    Negedge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventWatch {
+    pub net: usize,
+    pub edge: EventEdge,
 }
 
 #[derive(Clone, Debug)]

@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
-Date: 2026-10-17 (local time)
-Repository state audited: `fix-digital` at `13c31b6` plus the uncommitted
-bounded-string-comparison changes currently in the worktree.
+Date: 2026-10-18 (local time)
+Repository state audited: `fix-digital` at `283c24e` plus the uncommitted
+edge-qualified event-list changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -46,10 +46,10 @@ All commands were run against the current worktree:
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 89 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 67 passed |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 82 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 134.44 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 166.44 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -75,7 +75,7 @@ information from re-entering the roadmap.
 | R-07 | Every unpacked array was flattened into at most 4,096 packed bits | Substantially fixed. Large one-dimensional arrays now use first-class sparse memories; 1 MiB-by-8 regressions exist. Multidimensional arrays still have explicit bounded limits (L-06/L-07). |
 | R-08 | Multi-file syntax errors lost source identity | Partially fixed. Named source compilation maps parser line errors to originating files. Full column/range/elaboration spans remain incomplete (F-17/O-07). |
 | R-09 | Direct lowering errors had no source locations | Partially fixed. Many direct AST errors now include slang spans. Not every bounded/elaboration error has one (F-17/O-07). |
-| R-10 | ASCII string ordering was expected incorrectly | Corrected in the current uncommitted tests/implementation. `"a"` is greater than `"-"`, so the comparison result is false/zero. This work is not yet committed. |
+| R-10 | ASCII string ordering was expected incorrectly | Fixed in `b4a2b34`. `"a"` is greater than `"-"`, so `mixed < right` is false/zero for the tested operands. |
 
 ## 4. Current P0 and P1 findings
 
@@ -89,7 +89,7 @@ broader tool-flow percentage.
 | F-03 | Complete structural/semantic post-check | Slang and repository IR must agree on declarations, types, statements, expressions, hierarchy, and behavior. | Current summary checks top, ports, declarations, assignment shapes, literals, simple width/signedness, processes, and instance inventory. Fingerprints fall back to `"?"` for legacy array expansion and dynamic packed lvalues. | P0 | 45% | Remove all `"?"` equivalence cases and add runtime differential simulation for each construct. |
 | F-04 | Full official UVM execution | Compile and execute the official Accellera UVM library and user environments, including phasing, objections, factory, configuration, sequences, TLM, callbacks, reports, and coverage. | Official UVM 2020.3.1 is only checked/elaborated with `UVM_NO_DPI`. Direct AST lowering rejects `ClassType`. The bounded frontend has a separate UVM-lite subset. | P0 | 10% executable; 0% for full official UVM execution | Run an official UVM example through phasing and objections and compare event/report/coverage outcomes. |
 | F-05 | Full data types | Support integral, real, string, event, chandle, enum, packed/unpacked aggregates, dynamic arrays, queues, associative arrays, classes, virtual interfaces, type parameters, and typed packages. | Direct path supports simple integral vectors, packed arrays, enums, packed structs/unions, bounded strings, sparse memories, and scalar named events. It rejects real, unpacked aggregates, dynamic storage, queues, associative arrays, classes, event expressions/arrays, chandle, and type parameters. | P0 | 30% | Add type-category tests with layout, assignment, comparison, and selected-member semantics. |
-| F-06 | Process timing and concurrency | Model delays, event controls, wait, fork/join modes, process lifetime, ordering regions, clocking, and nondeterminism. | Direct procedural lowering supports initial/always subsets, implicit sensitivity, scalar any-edge signals, event lists containing scalar any-edge/posedge/negedge signals, constant procedural delays, delay-driven always generators, delay-bearing `forever` loops, `wait` statements, blocking/nonblocking named-event triggers with scalar/event-list event waits, time-slot `.triggered`, and ordered `wait_order`, runtime `repeat`, `while`, and `do...while` loops with `break`/`continue`, module-scope and initialized automatic procedure-local `for` loops, scalar force/release, and concurrent `fork` branches with `join`, `join_any`, `join_none`, and nested joins. It still rejects process cancellation/disable, named-process termination, jump propagation across fork boundaries, procedural `deassign`, min:typ:max delays, intra-assignment delays, and general event expressions. | P0 | 60% | Golden scheduling traces for active/NBA regions, delays, event races, fork join modes, and clocking blocks. |
+| F-06 | Process timing and concurrency | Model delays, event controls, wait, fork/join modes, process lifetime, ordering regions, clocking, and nondeterminism. | Direct procedural lowering supports initial/always subsets, implicit sensitivity, scalar any-edge signals, event lists containing scalar any-edge/posedge/negedge signals, constant procedural delays, delay-driven always generators, delay-bearing `forever` loops, `wait` statements, blocking/nonblocking named-event triggers with scalar and edge-qualified event-list event waits, time-slot `.triggered`, and ordered `wait_order`, runtime `repeat`, `while`, and `do...while` loops with `break`/`continue`, module-scope and initialized automatic procedure-local `for` loops, scalar force/release, and concurrent `fork` branches with `join`, `join_any`, `join_none`, and nested joins. It still rejects process cancellation/disable, named-process termination, jump propagation across fork boundaries, procedural `deassign`, min:typ:max delays, intra-assignment delays, and general event expressions. | P0 | 61% | Golden scheduling traces for active/NBA regions, delays, event races, fork join modes, and clocking blocks. |
 | F-07 | Full temporal assertions and coverage | Support complete SVA sequences/properties, clocking, disable iff, recursion, local variables, matched/triggered, sampled-value functions, checkers, assumptions, and covergroups. | A bounded module-level temporal subset exists. Direct AST path rejects `ConcurrentAssertion`, checker instances, clocking blocks, and covergroups. | P0 | 10% | Import an external SVA conformance suite and compare pass/fail/cover traces. |
 | F-08 | System task/function surface | Support display/write/read, files, strings, random/stochastic, time, assertions control, coverage, cast, and simulation control semantics. | Direct path supports only `$readmemh`, `$readmemb`, `$writememh`, and `$writememb`. Bounded path has `$display`/finish and string formatting subsets. File IO, random, full formatting, time scale, coverage controls, VPI/PLI, and DPI-C are absent/incomplete. | P0 | 15% | System-task matrix covering formats, unknowns, file handles, errors, and argument checking. |
 | F-09 | Interfaces, programs, checkers, and hierarchy | Support interfaces/modports, program blocks, checkers, generate hierarchy, arrays of instances, binds, configs, libraries, defparams, and primitives. | Direct path handles simple module instances and generated blocks. It rejects interface ports, instance arrays, primitive instances, checker instances, specify blocks, bind, and wildcard imports. Bounded path supports selected interface/module-array subsets but not all forms. | P0 | 25% | Multi-file hierarchy matrix, including port coercion, modports, arrays, config resolution, and generated instance identity. |
@@ -163,7 +163,7 @@ versus bounded probe.
 | D-36 | Multi-packed selects | Remaining dimension-aware/range cases report unsupported. |
 | D-40 | Dynamic string growth/reallocation | Fixed 512-bit representation; no growth model. |
 | D-41 | String synthesis | String operations fail closed in synthesis. |
-| D-42 | Event expressions/triggers | Blocking/nonblocking named-event triggers, scalar event waits, and ordered `wait_order` with success/failure actions, and same-time-slot `.triggered` persistence, and any-edge event-list statement controls are supported; arbitrary event expressions and event arrays remain unsupported. |
+| D-42 | Event expressions/triggers | Blocking/nonblocking named-event triggers, scalar event waits, and ordered `wait_order` with success/failure actions, and same-time-slot `.triggered` persistence, and edge-qualified event-list statement controls are supported; arbitrary event expressions and event arrays remain unsupported. |
 | D-43 | Full sampled-value/past/future functions | Unsupported. |
 
 ### 5.4 Statements and scheduling
@@ -179,7 +179,7 @@ versus bounded probe.
 | D-54 | Procedural `deassign` | Scalar static-lvalue `force` and `release` are supported; procedural variable `deassign` and aggregate/dynamic force targets remain unsupported. |
 | D-55 | `unique`/`priority` if/case | Rejects qualified conditional/case semantics. |
 | D-56 | `casez`/`casex`/`case inside` in direct statements | Rejects non-normal/non-unqualified case forms. |
-| D-58 | General event expressions in sensitivity | Scalar signal references, explicit edges in procedure sensitivity, and any-edge event-list statement controls are supported; arbitrary expressions, wildcard events, edge-qualified statement lists, and dynamic event selectors remain unsupported. |
+| D-58 | General event expressions in sensitivity | Scalar signal references, explicit edges in procedure sensitivity, and edge-qualified event-list statement controls are supported; arbitrary expressions, wildcard events, and dynamic event selectors remain unsupported. |
 | D-59 | Clocking-block event access | Unsupported. |
 | D-60 | Wait ordering/process arbitration | Unsupported. |
 

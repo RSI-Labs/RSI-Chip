@@ -8,7 +8,7 @@
 //! `$display`, `$monitor`, `$finish` and optional VCD dumping.
 
 use eda_core::cancellation::FlowCancellation;
-use eda_core::ir::{Design, Dir, Expr, ForkMode, LValue, Range, Sens, Stmt};
+use eda_core::ir::{Design, Dir, EventEdge, EventWatch, Expr, ForkMode, LValue, Range, Sens, Stmt};
 use eda_core::logic::{LogicValue, LogicWord};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -67,7 +67,7 @@ struct Waiter<'d> {
 }
 
 struct EventWaiter<'d> {
-    nets: Vec<usize>,
+    watches: Vec<EventWatch>,
     continuation: Cont<'d>,
 }
 
@@ -745,7 +745,7 @@ impl<'d> Simulator<'d> {
                 }
             }
         }
-        self.wake_net_waiters(changed_net);
+        self.wake_net_waiters(changed_net, old, newv);
         Ok(())
     }
 
@@ -861,7 +861,7 @@ impl<'d> Simulator<'d> {
         Ok(())
     }
 
-    fn wake_net_waiters(&mut self, changed_net: usize) {
+    fn wake_net_waiters(&mut self, changed_net: usize, old: LogicValue, newv: LogicValue) {
         let mut ready = Vec::new();
         let mut index = 0;
         while index < self.waiters.len() {
@@ -881,7 +881,15 @@ impl<'d> Simulator<'d> {
         let mut ready_events = Vec::new();
         let mut index = 0;
         while index < self.event_waiters.len() {
-            if self.event_waiters[index].nets.contains(&changed_net) {
+            let edge_matches = self.event_waiters[index].watches.iter().any(|watch| {
+                watch.net == changed_net
+                    && match watch.edge {
+                        EventEdge::Any => true,
+                        EventEdge::Posedge => newv == LogicValue::One && old != LogicValue::One,
+                        EventEdge::Negedge => newv == LogicValue::Zero && old != LogicValue::Zero,
+                    }
+            });
+            if edge_matches {
                 ready_events.push(self.event_waiters.remove(index).continuation);
             } else {
                 index += 1;
@@ -1472,7 +1480,7 @@ impl<'d> Simulator<'d> {
                         return Ok(());
                     }
                 }
-                Stmt::EventWait { nets, body } => {
+                Stmt::EventWait { watches, body } => {
                     let mut exec_order: Vec<&Stmt> = vec![&**body];
                     exec_order.extend(work.iter().rev().copied());
                     exec_order.reverse();
@@ -1485,7 +1493,7 @@ impl<'d> Simulator<'d> {
                         self.busy_procs.remove(&process);
                     }
                     self.event_waiters.push(EventWaiter {
-                        nets: nets.clone(),
+                        watches: watches.clone(),
                         continuation,
                     });
                     return Ok(());
@@ -2715,8 +2723,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
-        Stmt::EventWait { nets, body } => {
-            reads.extend(nets.iter().copied());
+        Stmt::EventWait { watches, body } => {
+            reads.extend(watches.iter().map(|watch| watch.net));
             collect_stmt_access(body, reads, writes);
         }
         Stmt::WaitOrder {
@@ -2817,8 +2825,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(cond, out);
             walk_stmt(body, out)
         }
-        Stmt::EventWait { nets, body } => {
-            out.extend(nets.iter().copied());
+        Stmt::EventWait { watches, body } => {
+            out.extend(watches.iter().map(|watch| watch.net));
             walk_stmt(body, out);
         }
         Stmt::WaitOrder {

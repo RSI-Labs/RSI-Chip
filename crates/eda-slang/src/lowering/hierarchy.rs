@@ -175,8 +175,8 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             remap_expression(cond, offset);
             remap_statement(body, offset);
         }
-        Stmt::EventWait { nets, body } => {
-            nets.iter_mut().for_each(|net| *net += offset);
+        Stmt::EventWait { watches, body } => {
+            watches.iter_mut().for_each(|watch| watch.net += offset);
             remap_statement(body, offset);
         }
         Stmt::WaitOrder {

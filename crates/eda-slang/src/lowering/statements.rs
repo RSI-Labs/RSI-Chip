@@ -399,21 +399,12 @@ impl SlangAstLowerer {
                     if events.is_empty() {
                         return Err("event list is empty".into());
                     }
-                    let mut nets = Vec::with_capacity(events.len());
+                    let mut watches = Vec::with_capacity(events.len());
                     for event in events {
-                        if string_field(event, "edge").as_deref() != Some("None") {
-                            return Err(
-                                "event-list statement controls support any-edge events".into()
-                            );
-                        }
-                        let expression = event
-                            .get("expr")
-                            .ok_or_else(|| "event list entry has no expression".to_string())?;
-                        let signal = self.lower_lvalue(expression)?;
-                        nets.push(sensitivity_net(&signal)?);
+                        watches.extend(event_watches(&self.lower_sensitivity(event)?)?);
                     }
                     return Ok(Stmt::EventWait {
-                        nets,
+                        watches,
                         body: Box::new(self.lower_statement(body)?),
                     });
                 }
@@ -428,8 +419,21 @@ impl SlangAstLowerer {
                     if lvalue.range.width() != 1 {
                         return Err("event control expression must be scalar".into());
                     }
+                    let edge = match string_field(timing, "edge").as_deref() {
+                        Some("None") => eda_core::ir::EventEdge::Any,
+                        Some("PosEdge") => eda_core::ir::EventEdge::Posedge,
+                        Some("NegEdge") => eda_core::ir::EventEdge::Negedge,
+                        _ => {
+                            return Err(
+                                "direct slang-AST lowering requires a scalar signal edge".into()
+                            )
+                        }
+                    };
                     return Ok(Stmt::EventWait {
-                        nets: vec![sensitivity_net(&lvalue)?],
+                        watches: vec![eda_core::ir::EventWatch {
+                            net: sensitivity_net(&lvalue)?,
+                            edge,
+                        }],
                         body: Box::new(self.lower_statement(body)?),
                     });
                 }
@@ -1087,5 +1091,35 @@ fn sensitivity_net(signal: &eda_core::ir::LValue) -> Result<usize, String> {
         eda_core::ir::Range::Bit(bit) => Ok(signal.net + bit),
         eda_core::ir::Range::Span { msb, lsb } if msb == lsb => Ok(signal.net + lsb),
         _ => Err("sensitivity expression must be one bit wide".into()),
+    }
+}
+
+fn event_watches(
+    sensitivity: &eda_core::ir::Sens,
+) -> Result<Vec<eda_core::ir::EventWatch>, String> {
+    use eda_core::ir::{EventEdge, EventWatch, Sens};
+
+    match sensitivity {
+        Sens::Comb => Err("event control cannot use implicit @* sensitivity".into()),
+        Sens::Timed => Err("event control cannot use timed-process sensitivity".into()),
+        Sens::Any(net) => Ok(vec![EventWatch {
+            net: *net,
+            edge: EventEdge::Any,
+        }]),
+        Sens::Posedge(net) => Ok(vec![EventWatch {
+            net: *net,
+            edge: EventEdge::Posedge,
+        }]),
+        Sens::Negedge(net) => Ok(vec![EventWatch {
+            net: *net,
+            edge: EventEdge::Negedge,
+        }]),
+        Sens::List(nested) => {
+            let mut watches = Vec::new();
+            for nested in nested {
+                watches.extend(event_watches(nested)?);
+            }
+            Ok(watches)
+        }
     }
 }
