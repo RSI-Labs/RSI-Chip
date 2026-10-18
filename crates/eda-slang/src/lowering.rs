@@ -98,6 +98,9 @@ pub(super) struct SlangAstLowerer {
     type_aliases: std::collections::BTreeMap<String, AstStructType>,
     type_enums: std::collections::BTreeMap<String, AstEnumType>,
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
+    named_block_flags: std::collections::BTreeMap<String, usize>,
+    named_disable_seen: bool,
+    active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
 }
@@ -127,6 +130,9 @@ impl SlangAstLowerer {
             type_aliases: std::collections::BTreeMap::new(),
             type_enums: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
+            named_block_flags: std::collections::BTreeMap::new(),
+            named_disable_seen: false,
+            active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };

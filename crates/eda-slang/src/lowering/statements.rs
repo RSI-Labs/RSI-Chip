@@ -12,6 +12,108 @@ use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
 impl SlangAstLowerer {
+    pub(super) fn collect_named_block_flags(
+        &mut self,
+        statement: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.collect_named_block_flags_inner(statement)
+            .and_then(|()| {
+                if self.named_disable_seen {
+                    self.reject_unsafe_named_control(statement, false)
+                } else {
+                    Ok(())
+                }
+            })
+    }
+
+    fn collect_named_block_flags_inner(
+        &mut self,
+        statement: &serde_json::Value,
+    ) -> Result<(), String> {
+        let kind = string_field(statement, "kind").unwrap_or_default();
+        if kind == "Block" {
+            let named_id =
+                string_field(statement, "block").filter(|symbol| !symbol.trim().is_empty());
+            if let Some(named_id) = &named_id {
+                if !self.named_block_flags.contains_key(named_id) {
+                    let label = named_id.split_whitespace().next_back().unwrap_or("block");
+                    let address = named_id.split_whitespace().next().unwrap_or("0");
+                    let base = self.design.n_nets;
+                    self.design.n_nets += 1;
+                    self.design.net_decls.push(eda_core::ir::NetDecl {
+                        name: format!("__disable_{address}_{label}"),
+                        width: 1,
+                        is_reg: true,
+                        is_signed: false,
+                        base,
+                    });
+                    self.named_block_flags.insert(named_id.clone(), base);
+                }
+            }
+            if let Some(body) = statement.get("body") {
+                self.collect_named_block_flags_inner(body)?;
+            }
+            return Ok(());
+        }
+        if kind == "Disable" {
+            self.named_disable_seen = true;
+        }
+        if let Some(fields) = statement.as_object() {
+            for nested in fields.values() {
+                self.collect_named_block_flags_inner(nested)?;
+            }
+        }
+        if let Some(values) = statement.as_array() {
+            for nested in values {
+                self.collect_named_block_flags_inner(nested)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_unsafe_named_control(
+        &self,
+        statement: &serde_json::Value,
+        inside_named_block: bool,
+    ) -> Result<(), String> {
+        let kind = string_field(statement, "kind").unwrap_or_default();
+        if kind == "Block" {
+            if inside_named_block
+                && matches!(
+                    string_field(statement, "blockKind")
+                        .unwrap_or_default()
+                        .as_str(),
+                    "JoinAll" | "JoinAny" | "JoinNone"
+                )
+            {
+                return Err(
+                    "named blocks containing fork are not supported by direct lowering yet".into(),
+                );
+            }
+            let named = string_field(statement, "block")
+                .filter(|symbol| !symbol.trim().is_empty())
+                .is_some();
+            if let Some(body) = statement.get("body") {
+                self.reject_unsafe_named_control(body, inside_named_block || named)?;
+            }
+            return Ok(());
+        }
+        if inside_named_block && kind == "ForeverLoop" {
+            return Err("named blocks containing forever loops are not supported yet".into());
+        }
+        if let Some(fields) = statement.as_object() {
+            for nested in fields.values() {
+                self.reject_unsafe_named_control(nested, inside_named_block)?;
+            }
+        }
+        if let Some(values) = statement.as_array() {
+            for nested in values {
+                self.reject_unsafe_named_control(nested, inside_named_block)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_continuous_assignment(
         &mut self,
         member: &serde_json::Value,
@@ -56,6 +158,9 @@ impl SlangAstLowerer {
         let body = member
             .get("body")
             .ok_or_else(|| "slang ProceduralBlock has no body".to_string())?;
+        self.named_disable_seen = false;
+        self.collect_named_block_flags(body)?;
+        self.active_named_blocks.borrow_mut().clear();
         match procedure_kind.as_str() {
             "Initial" => {
                 let statement = self.lower_statement(body)?;
@@ -161,6 +266,90 @@ impl SlangAstLowerer {
             .map_err(|error| with_source_span(statement, error))
     }
 
+    fn active_named_block_ids(&self) -> Vec<String> {
+        self.active_named_blocks.borrow().clone()
+    }
+
+    fn named_block_disabled(&self, named_ids: &[String]) -> eda_core::ir::Expr {
+        let mut nets = named_ids.iter().map(|named_id| {
+            let net = self
+                .named_block_flags
+                .get(named_id)
+                .copied()
+                .unwrap_or_default();
+            eda_core::ir::Expr::Ref {
+                net,
+                decl_width: 1,
+                range: full_range(1),
+                signed: false,
+            }
+        });
+        let Some(mut result) = nets.next() else {
+            return eda_core::ir::Expr::Const(LogicWord::zero(1));
+        };
+        for net in nets {
+            result = eda_core::ir::Expr::Bin {
+                op: eda_core::ir::BinOp::LogOr,
+                a: Box::new(result),
+                b: Box::new(net),
+            };
+        }
+        result
+    }
+
+    fn guard_named_block_statement(
+        &self,
+        statement: eda_core::ir::Stmt,
+        named_ids: &[String],
+    ) -> eda_core::ir::Stmt {
+        if named_ids.is_empty() {
+            return statement;
+        }
+        eda_core::ir::Stmt::If {
+            c: self.named_block_disabled(named_ids),
+            t: Box::new(eda_core::ir::Stmt::Block(Vec::new())),
+            f: Some(Box::new(statement)),
+        }
+    }
+
+    fn lower_loop_body(&self, body: &serde_json::Value) -> Result<eda_core::ir::Stmt, String> {
+        let lowered = self.lower_statement(body)?;
+        let active_ids = self.active_named_block_ids();
+        if active_ids.is_empty() {
+            return Ok(lowered);
+        }
+        Ok(eda_core::ir::Stmt::If {
+            c: self.named_block_disabled(&active_ids),
+            t: Box::new(eda_core::ir::Stmt::Break),
+            f: Some(Box::new(lowered)),
+        })
+    }
+
+    fn lower_named_disable(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let target = statement
+            .get("target")
+            .ok_or_else(|| "disable statement has no target".to_string())?;
+        let named_id = string_field(target, "symbol")
+            .filter(|symbol| !symbol.trim().is_empty())
+            .ok_or_else(|| "disable target is not a named block".to_string())?;
+        let net = self
+            .named_block_flags
+            .get(&named_id)
+            .copied()
+            .ok_or_else(|| format!("direct lowering cannot disable target '{named_id}'"))?;
+        Ok(eda_core::ir::Stmt::Bl {
+            lv: eda_core::ir::LValue {
+                net,
+                decl_width: 1,
+                range: full_range(1),
+            },
+            e: eda_core::ir::Expr::Const(LogicWord::from_u64(1, 1)),
+        })
+    }
+
     fn lower_statement_inner(
         &self,
         statement: &serde_json::Value,
@@ -172,6 +361,12 @@ impl SlangAstLowerer {
                 match string_field(statement, "blockKind").as_deref() {
                     None | Some("Sequential") => {}
                     Some(block_kind @ ("JoinAll" | "JoinAny" | "JoinNone")) => {
+                        if self.named_disable_seen && !self.active_named_block_ids().is_empty() {
+                            return Err(
+                                "fork inside a named block is not supported by direct lowering yet"
+                                    .into(),
+                            );
+                        }
                         let body = statement
                             .get("body")
                             .ok_or_else(|| "fork block has no body".to_string())?;
@@ -196,6 +391,12 @@ impl SlangAstLowerer {
                         ));
                     }
                 }
+                let named_id = string_field(statement, "block")
+                    .filter(|symbol| !symbol.trim().is_empty());
+                if let Some(named_id) = &named_id {
+                    self.active_named_blocks.borrow_mut().push(named_id.clone());
+                }
+                let active_ids = self.active_named_block_ids();
                 if let Some(nested) = statement.get("body") {
                     if string_field(nested, "kind").as_deref() == Some("List") {
                         let local_ids = statement
@@ -206,6 +407,21 @@ impl SlangAstLowerer {
                             .cloned()
                             .unwrap_or_default();
                         let mut statements = Vec::new();
+                        if let Some(named_id) = &named_id {
+                            let net = self
+                                .named_block_flags
+                                .get(named_id)
+                                .copied()
+                                .ok_or_else(|| "named block has no disable flag".to_string())?;
+                            statements.push(Stmt::Bl {
+                                lv: eda_core::ir::LValue {
+                                    net,
+                                    decl_width: 1,
+                                    range: full_range(1),
+                                },
+                                e: eda_core::ir::Expr::Const(LogicWord::zero(1)),
+                            });
+                        }
                         for symbol_id in &local_ids {
                             let initializer = self
                                 .local_initializers
@@ -235,20 +451,34 @@ impl SlangAstLowerer {
                             {
                                 continue;
                             }
-                            statements.push(self.lower_statement(item)?);
+                            let lowered = self.lower_statement(item)?;
+                            statements
+                                .push(self.guard_named_block_statement(lowered, &active_ids));
+                        }
+                        if named_id.is_some() {
+                            self.active_named_blocks.borrow_mut().pop();
                         }
                         return Ok(Stmt::Block(statements));
                     }
                     let nested = self.lower_statement(nested)?;
+                    let nested = self.guard_named_block_statement(nested, &active_ids);
+                    if named_id.is_some() {
+                        self.active_named_blocks.borrow_mut().pop();
+                    }
                     return Ok(Stmt::Block(vec![nested]));
+                }
+                if named_id.is_some() {
+                    self.active_named_blocks.borrow_mut().pop();
                 }
                 Ok(Stmt::Block(Vec::new()))
             }
             "List" => {
                 let mut statements = Vec::new();
+                let active_ids = self.active_named_block_ids();
                 if let Some(items) = statement.get("list").and_then(Value::as_array) {
                     for item in items {
-                        statements.push(self.lower_statement(item)?);
+                        let lowered = self.lower_statement(item)?;
+                        statements.push(self.guard_named_block_statement(lowered, &active_ids));
                     }
                 }
                 Ok(Stmt::Block(statements))
@@ -305,6 +535,7 @@ impl SlangAstLowerer {
                 "direct slang-AST procedure locals are not supported; declare loop variables in module scope"
                     .into(),
             ),
+            "Disable" => self.lower_named_disable(statement),
             "Conditional" => {
                 if string_field(statement, "check").as_deref() != Some("None") {
                     let check = string_field(statement, "check").unwrap_or_default();
@@ -464,6 +695,9 @@ impl SlangAstLowerer {
                 let body = statement
                     .get("body")
                     .ok_or_else(|| "forever loop has no body".to_string())?;
+                if self.named_disable_seen && !self.active_named_block_ids().is_empty() {
+                    return Err("forever loops inside named blocks are not supported yet".into());
+                }
                 Ok(Stmt::Forever(Box::new(self.lower_statement(body)?)))
             }
             "RepeatLoop" => {
@@ -475,7 +709,7 @@ impl SlangAstLowerer {
                     .ok_or_else(|| "repeat loop has no body".to_string())?;
                 Ok(Stmt::Repeat {
                     count: self.lower_expression(count)?,
-                    body: Box::new(self.lower_statement(body)?),
+                    body: Box::new(self.lower_loop_body(body)?),
                 })
             }
             "WhileLoop" => {
@@ -487,7 +721,7 @@ impl SlangAstLowerer {
                     .ok_or_else(|| "while loop has no body".to_string())?;
                 Ok(Stmt::While {
                     cond: self.lower_expression(condition)?,
-                    body: Box::new(self.lower_statement(body)?),
+                    body: Box::new(self.lower_loop_body(body)?),
                     steps: Vec::new(),
                 })
             }
@@ -498,10 +732,10 @@ impl SlangAstLowerer {
                 let body = statement
                     .get("body")
                     .ok_or_else(|| "do-while loop has no body".to_string())?;
-                let first_execution = self.lower_statement(body)?;
+                let first_execution = self.lower_loop_body(body)?;
                 let repeated_execution = Stmt::While {
                     cond: self.lower_expression(condition)?,
-                    body: Box::new(self.lower_statement(body)?),
+                    body: Box::new(self.lower_loop_body(body)?),
                     steps: Vec::new(),
                 };
                 Ok(Stmt::Block(vec![first_execution, repeated_execution]))
@@ -535,7 +769,7 @@ impl SlangAstLowerer {
                 for initializer in initializers {
                     statements.push(self.lower_statement(initializer)?);
                 }
-                let loop_body = self.lower_statement(body)?;
+                let loop_body = self.lower_loop_body(body)?;
                 let lowered_steps = steps
                     .iter()
                     .map(|step| self.lower_update_statement(step))

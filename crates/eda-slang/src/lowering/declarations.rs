@@ -19,10 +19,11 @@ impl SlangAstLowerer {
         let Some(block_address) = usize_field(member, "addr") else {
             return Err("procedure-local block has no symbol address".into());
         };
+        let empty_members = Vec::new();
         let variables = member
             .get("members")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "procedure-local block has no members".to_string())?;
+            .unwrap_or(&empty_members);
         let mut symbol_ids = Vec::new();
         for variable in variables {
             if string_field(variable, "kind").as_deref() != Some("Variable") {

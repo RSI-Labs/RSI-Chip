@@ -4536,6 +4536,196 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_lexical_named_block_disable() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-named-disable");
+    let source_path = root.join("named_disable.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module named_disable(
+  input logic go,
+  output logic reached_disable,
+  output logic after_inner,
+  output logic after_outer
+);
+  initial begin : outer
+    reached_disable = 1'b0;
+    after_inner = 1'b0;
+    after_outer = 1'b0;
+    wait (go);
+    begin : inner
+      reached_disable = 1'b1;
+      disable outer;
+      after_inner = 1'b1;
+    end
+    after_outer = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write named-disable source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("named_disable"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower named-block disable");
+    let mut simulator = Simulator::new(&design).expect("create named-disable simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("reached_disable").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("after_inner").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("after_outer").unwrap().to_u64(), Some(0));
+
+    let inner_path = root.join("disable_inner.sv");
+    std::fs::write(
+        &inner_path,
+        r#"
+module disable_inner(output logic skipped, output logic continued);
+  initial begin : outer
+    skipped = 1'b0;
+    continued = 1'b0;
+    begin : inner
+      disable inner;
+      skipped = 1'b1;
+    end
+    continued = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write inner-disable source");
+    let inner = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&inner_path),
+            Some("disable_inner"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower inner named-block disable");
+    let mut inner_simulator = Simulator::new(&inner).expect("create inner-disable simulator");
+    inner_simulator.run_until(0).unwrap();
+    assert_eq!(inner_simulator.read("skipped").unwrap().to_u64(), Some(0));
+    assert_eq!(inner_simulator.read("continued").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_named_block_disable_from_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-named-disable-loop");
+    let source_path = root.join("named_disable_loop.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module named_disable_loop(
+  output logic [3:0] count,
+  output logic unreachable
+);
+  int index;
+  initial begin : outer
+    count = 4'd0;
+    unreachable = 1'b0;
+    index = 0;
+    while (index < 5) begin
+      count = count + 1;
+      index = index + 1;
+      if (index == 2) begin
+        disable outer;
+      end
+    end
+    unreachable = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write named-disable loop source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("named_disable_loop"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower named-block loop disable");
+    let mut simulator = Simulator::new(&design).expect("create named-loop simulator");
+    simulator.run_until(0).unwrap();
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("unreachable").unwrap().to_u64(), Some(0));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_forks_inside_named_blocks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-named-disable-fork");
+    let source_path = root.join("named_disable_fork.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module named_disable_fork(output logic x, output logic y);
+  initial begin : outer
+    fork
+      x = 1'b1;
+      begin : cancellable
+        disable outer;
+        y = 1'b1;
+      end
+    join
+  end
+endmodule
+"#,
+    )
+    .expect("write named-block fork source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("named_disable_fork"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("named-block process cancellation must fail closed");
+    assert!(
+        error.contains("named blocks containing fork are not supported"),
+        "unexpected error: {error}"
+    );
+
+    let safe_path = root.join("named_fork_no_disable.sv");
+    std::fs::write(
+        &safe_path,
+        r#"
+module named_fork_no_disable(output logic x, output logic y);
+  initial begin : outer
+    fork
+      x = 1'b1;
+      y = 1'b1;
+    join
+  end
+endmodule
+"#,
+    )
+    .expect("write named-block fork without disable source");
+    let safe = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&safe_path),
+            Some("named_fork_no_disable"),
+            &PreprocessOptions::default(),
+        )
+        .expect("named blocks without disable still support fork");
+    let mut safe_simulator = Simulator::new(&safe).expect("create named-block fork simulator");
+    safe_simulator.run_until(0).unwrap();
+    assert_eq!(safe_simulator.read("x").unwrap().to_u64(), Some(1));
+    assert_eq!(safe_simulator.read("y").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_runtime_do_while_loops() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
