@@ -2696,6 +2696,79 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_multidimensional_interface_vectors() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-vector-multi");
+    let source_path = root.join("interface_vector_multi.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface multi_vector_if(input logic clk);
+  logic [3:0][7:0] outgoing;
+  logic [3:0][7:0] incoming = 32'h12345678;
+  modport producer(input clk, incoming, output outgoing);
+endinterface
+
+module multi_vector_producer(
+  multi_vector_if.producer bus,
+  input logic [1:0] index,
+  output logic [7:0] captured
+);
+  assign bus.outgoing = bus.incoming;
+  assign captured = bus.incoming[index];
+endmodule
+
+module multidim_interface_top(
+  input logic clk,
+  input logic [1:0] index,
+  output logic [31:0] outgoing,
+  output logic [7:0] captured
+);
+  multi_vector_if bus(.clk(clk));
+  multi_vector_producer producer_u(
+    .bus(bus),
+    .index(index),
+    .captured(captured)
+  );
+  assign outgoing = bus.outgoing;
+endmodule
+"#,
+    )
+    .expect("write multidimensional interface-vector source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("multidim_interface_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional interface vectors");
+    let outgoing = design
+        .net_decls
+        .iter()
+        .find(|declaration| declaration.name == "bus.outgoing")
+        .expect("multidimensional interface vector");
+    assert_eq!(outgoing.width, 32);
+
+    let mut simulator =
+        Simulator::new(&design).expect("create multidimensional interface simulator");
+    simulator
+        .set_input("index", &LogicWord::from_u64(2, 2))
+        .unwrap();
+    assert_eq!(
+        simulator.read("bus.outgoing").unwrap().to_u64(),
+        Some(0x12345678)
+    );
+    assert_eq!(simulator.read("captured").unwrap().to_u64(), Some(0x34));
+    assert_eq!(
+        simulator.read("outgoing").unwrap().to_u64(),
+        Some(0x12345678)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

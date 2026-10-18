@@ -1484,10 +1484,16 @@ impl super::SlangAstLowerer {
         &self,
         value: &serde_json::Value,
     ) -> Result<Option<AstLoweredSymbol>, String> {
-        if string_field(value, "kind").as_deref() != Some("NamedValue") {
+        if !matches!(
+            string_field(value, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) {
             return Ok(None);
         }
         if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(symbol) = self.external_symbols.get(&symbol_id) {
+                return Ok(Some(symbol.clone()));
+            }
             if let Some(symbol) = self.local_symbols.get(&symbol_id) {
                 return Ok(Some(symbol.clone()));
             }
