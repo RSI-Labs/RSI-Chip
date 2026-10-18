@@ -85,6 +85,7 @@ pub struct Simulator<'d> {
     busy_procs: HashSet<usize>,
     fork_joins: Vec<Option<ForkJoin<'d>>>,
     while_iterations: HashMap<usize, u64>,
+    repeat_remaining: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
@@ -196,6 +197,7 @@ impl<'d> Simulator<'d> {
             busy_procs: HashSet::new(),
             fork_joins: Vec::new(),
             while_iterations: HashMap::new(),
+            repeat_remaining: HashMap::new(),
             waiters: Vec::new(),
             memory_elements,
             memory_aliases,
@@ -956,30 +958,82 @@ impl<'d> Simulator<'d> {
                         work.push(body);
                     }
                 }
+                Stmt::Repeat { count, body } => {
+                    const MAX_REPEAT_ITERATIONS: u64 = 65_536;
+                    let key = s as *const Stmt as usize;
+                    if !self.repeat_remaining.contains_key(&key) {
+                        let value = self.eval(count);
+                        if value.width() > u64::BITS as usize {
+                            return Err("runtime repeat count exceeds 64 bits".into());
+                        }
+                        let Some(raw_count) = value.to_u64() else {
+                            return Err("runtime repeat count must be known".into());
+                        };
+                        let iterations = if count.is_signed() {
+                            let signed_count = sext_i64(&value, value.width());
+                            u64::try_from(signed_count).unwrap_or(0)
+                        } else {
+                            raw_count
+                        };
+                        if iterations > MAX_REPEAT_ITERATIONS {
+                            return Err(
+                                "repeat loop exceeds the 65536-iteration execution limit".into()
+                            );
+                        }
+                        if iterations == 0 {
+                            continue;
+                        }
+                        self.repeat_remaining.insert(key, iterations);
+                    }
+
+                    let Some(mut remaining) = self.repeat_remaining.get(&key).copied() else {
+                        unreachable!("active repeat loop must have a remaining count");
+                    };
+                    if remaining == 0 {
+                        self.repeat_remaining.remove(&key);
+                    } else {
+                        remaining -= 1;
+                        self.repeat_remaining.insert(key, remaining);
+                        work.push(s);
+                        work.push(body);
+                    }
+                }
                 Stmt::Break => {
-                    let Some(loop_position) = work
-                        .iter()
-                        .rposition(|statement| matches!(statement, Stmt::While { .. }))
-                    else {
+                    let Some(loop_position) = work.iter().rposition(|statement| {
+                        matches!(statement, Stmt::While { .. } | Stmt::Repeat { .. })
+                    }) else {
                         return Err("break is outside a runtime loop".into());
                     };
+                    if let Stmt::Repeat { .. } = work[loop_position] {
+                        self.repeat_remaining
+                            .remove(&(work[loop_position] as *const Stmt as usize));
+                    }
                     work.truncate(loop_position);
                 }
                 Stmt::Continue => {
-                    let Some(loop_position) = work
-                        .iter()
-                        .rposition(|statement| matches!(statement, Stmt::While { .. }))
-                    else {
+                    let Some(loop_position) = work.iter().rposition(|statement| {
+                        matches!(statement, Stmt::While { .. } | Stmt::Repeat { .. })
+                    }) else {
                         return Err("continue is outside a runtime loop".into());
                     };
                     let loop_statement = work[loop_position];
-                    let steps = match loop_statement {
-                        Stmt::While { steps, .. } => steps,
-                        _ => unreachable!("loop position must point to a While statement"),
-                    };
                     work.truncate(loop_position);
-                    work.push(loop_statement);
-                    work.extend(steps.iter().rev());
+                    match loop_statement {
+                        Stmt::While { steps, .. } => {
+                            work.push(loop_statement);
+                            work.extend(steps.iter().rev());
+                        }
+                        Stmt::Repeat { .. } => {
+                            let key = loop_statement as *const Stmt as usize;
+                            let remaining = self.repeat_remaining.get(&key).copied();
+                            if remaining.is_some_and(|remaining| remaining > 1) {
+                                work.push(loop_statement);
+                            } else {
+                                self.repeat_remaining.remove(&key);
+                            }
+                        }
+                        _ => unreachable!("loop position must point to a runtime loop"),
+                    }
                 }
                 Stmt::Bl { lv, e } => {
                     let v = self.eval(e);
@@ -2346,6 +2400,10 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt_memories(body, out);
             steps.iter().for_each(|step| walk_stmt_memories(step, out));
         }
+        Stmt::Repeat { count, body } => {
+            walk_expr_memories(count, out);
+            walk_stmt_memories(body, out)
+        }
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
@@ -2450,6 +2508,10 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
                 .iter()
                 .for_each(|step| collect_stmt_access(step, reads, writes));
         }
+        Stmt::Repeat { count, body } => {
+            reads.extend(expr_nets(count));
+            collect_stmt_access(body, reads, writes);
+        }
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2523,6 +2585,10 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(cond, out);
             walk_stmt(body, out);
             steps.iter().for_each(|step| walk_stmt(step, out));
+        }
+        Stmt::Repeat { count, body } => {
+            walk_expr(count, out);
+            walk_stmt(body, out)
         }
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),

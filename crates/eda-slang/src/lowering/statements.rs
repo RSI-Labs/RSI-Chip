@@ -342,26 +342,16 @@ impl SlangAstLowerer {
                 Ok(Stmt::Forever(Box::new(self.lower_statement(body)?)))
             }
             "RepeatLoop" => {
-                const MAX_DIRECT_REPEAT_STATEMENTS: usize = 256;
                 let count = statement
                     .get("count")
                     .ok_or_else(|| "repeat loop has no count".to_string())?;
-                let count = slang_constant_u64(count)
-                    .map_err(|_| "direct repeat loops require a constant count".to_string())?;
-                let count = usize::try_from(count)
-                    .map_err(|_| "direct repeat-loop count is negative".to_string())?;
-                if count > MAX_DIRECT_REPEAT_STATEMENTS {
-                    return Err(
-                        "direct repeat-loop exceeds the 256-iteration lowering limit".into(),
-                    );
-                }
                 let body = statement
                     .get("body")
                     .ok_or_else(|| "repeat loop has no body".to_string())?;
-                let statements = (0..count)
-                    .map(|_| self.lower_statement(body))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Stmt::Block(statements))
+                Ok(Stmt::Repeat {
+                    count: self.lower_expression(count)?,
+                    body: Box::new(self.lower_statement(body)?),
+                })
             }
             "WhileLoop" => {
                 let condition = statement

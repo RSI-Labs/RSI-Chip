@@ -3695,7 +3695,7 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_supports_constant_repeat_loops() {
+fn slang_ast_direct_lowering_supports_runtime_repeat_loops() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -3706,9 +3706,11 @@ fn slang_ast_direct_lowering_supports_constant_repeat_loops() {
         r#"
 module repeats(
   input logic a,
+  input int dynamic_count,
   output logic [3:0] y,
   output logic [3:0] immediate,
-  output logic zero
+  output logic zero,
+  output logic [3:0] dynamic
 );
   initial begin
     y = 4'd0;
@@ -3723,6 +3725,11 @@ module repeats(
 
     zero = 1'b0;
     repeat (0) zero = 1'b1;
+  end
+
+  initial begin
+    #1 dynamic = 4'd0;
+    repeat (dynamic_count) dynamic = dynamic + 1;
   end
 endmodule
 "#,
@@ -3742,6 +3749,9 @@ endmodule
         simulator
             .set_input("a", &LogicWord::from_u64(1, 1))
             .unwrap();
+        simulator
+            .set_input("dynamic_count", &LogicWord::from_u64(32, 3))
+            .unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
         assert_eq!(simulator.read("immediate").unwrap().to_u64(), Some(2));
         assert_eq!(simulator.read("zero").unwrap().to_u64(), Some(0));
@@ -3749,6 +3759,7 @@ endmodule
             simulator.run_until(expected).unwrap();
             assert_eq!(simulator.read("y").unwrap().to_u64(), Some(expected));
         }
+        assert_eq!(simulator.read("dynamic").unwrap().to_u64(), Some(3));
     };
     // The bounded compatibility frontend still rejects module-level repeat
     // loops; this regression intentionally covers the authoritative direct AST
@@ -3760,20 +3771,24 @@ endmodule
         &excessive_path,
         r#"
 module excessive(output logic y);
-  initial repeat (257) y = 1'b1;
+  initial repeat (70000) y = 1'b1;
 endmodule
 "#,
     )
     .expect("write excessive repeat source");
-    let error = slang
+    let excessive = slang
         .compile_files_via_ast(
             std::slice::from_ref(&excessive_path),
             Some("excessive"),
             &PreprocessOptions::default(),
         )
+        .expect("lower excessive repeat loop");
+    let mut excessive_simulator = Simulator::new(&excessive).expect("create excessive simulator");
+    let error = excessive_simulator
+        .run_until(0)
         .expect_err("excessive repeat loops must fail closed");
     assert!(
-        error.contains("exceeds the 256-iteration lowering limit"),
+        error.contains("exceeds the 65536-iteration execution limit"),
         "unexpected error: {error}"
     );
 }
@@ -3962,6 +3977,9 @@ fn slang_ast_direct_lowering_supports_runtime_break_and_continue() {
 module jumps(
   output logic [3:0] break_index,
   output logic [3:0] continue_count,
+  output logic [3:0] repeat_break_count,
+  output logic [3:0] repeat_continue_count,
+  output logic [3:0] repeat_late_count,
   output logic [3:0] after_loops
 );
   int i;
@@ -3982,6 +4000,24 @@ module jumps(
       continue_count = continue_count + 1;
     end
 
+    repeat_break_count = 4'd0;
+    repeat (10) begin
+      repeat_break_count = repeat_break_count + 1;
+      if (repeat_break_count == 3) begin
+        break;
+      end
+    end
+
+    repeat_continue_count = 4'd0;
+    repeat_late_count = 4'd0;
+    repeat (6) begin
+      repeat_continue_count = repeat_continue_count + 1;
+      if (repeat_continue_count < 3) begin
+        continue;
+      end
+      repeat_late_count = repeat_late_count + 1;
+    end
+
     after_loops = 4'd1;
   end
 endmodule
@@ -4000,6 +4036,18 @@ endmodule
     simulator.run_until(0).unwrap();
     assert_eq!(simulator.read("break_index").unwrap().to_u64(), Some(3));
     assert_eq!(simulator.read("continue_count").unwrap().to_u64(), Some(4));
+    assert_eq!(
+        simulator.read("repeat_break_count").unwrap().to_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        simulator.read("repeat_continue_count").unwrap().to_u64(),
+        Some(6)
+    );
+    assert_eq!(
+        simulator.read("repeat_late_count").unwrap().to_u64(),
+        Some(4)
+    );
     assert_eq!(simulator.read("after_loops").unwrap().to_u64(), Some(1));
 }
 

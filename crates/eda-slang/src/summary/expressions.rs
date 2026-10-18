@@ -655,6 +655,9 @@ pub(crate) fn design_stmt_assignments(
                 .iter()
                 .for_each(|step| assignments.extend(design_stmt_assignments(design, step)));
         }
+        Stmt::Repeat { body, .. } => {
+            assignments.extend(design_stmt_assignments(design, body));
+        }
         Stmt::Break | Stmt::Continue => {}
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {

@@ -659,6 +659,12 @@ pub enum Stmt {
         body: Box<Stmt>,
         steps: Vec<Stmt>,
     },
+    /// Execute `body` the number of times specified by a count sampled once at
+    /// loop entry.
+    Repeat {
+        count: Expr,
+        body: Box<Stmt>,
+    },
     /// Exit the nearest runtime loop.
     Break,
     /// Start the next iteration of the nearest runtime loop.
@@ -1023,6 +1029,10 @@ fn collect_memory_accesses(
             }
         }
         Stmt::Break | Stmt::Continue => {}
+        Stmt::Repeat { count, body } => {
+            collect_memory_expr_reads(count, synchronous, accesses);
+            collect_memory_accesses(body, synchronous, memory_widths, accesses)
+        }
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, accesses);

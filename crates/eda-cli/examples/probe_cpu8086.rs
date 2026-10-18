@@ -134,6 +134,10 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(cond, reads);
                 walk(body, reads, writes);
             }
+            Stmt::Repeat { count, body } => {
+                expr_nets(count, reads);
+                walk(body, reads, writes);
+            }
             Stmt::Break | Stmt::Continue => {}
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
                 expr_nets(cond, reads)
