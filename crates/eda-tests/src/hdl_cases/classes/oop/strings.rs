@@ -109,7 +109,7 @@ class Named;
   function new();
   endfunction
 endclass
-module top(output int y1, y2, y3, y4, output reg ok1, ok2, ok3, ok4);
+module top(output int y1, y2, y3, y4, output reg ok1, ok2, ok3, ok4, ok5);
   string s;
   string upper;
   string lower;
@@ -121,6 +121,7 @@ module top(output int y1, y2, y3, y4, output reg ok1, ok2, ok3, ok4);
     s.putc(index, 117);   // 'u'
     s.putc(5, 69);        // 'E'
     s.putc(99, 65);       // 越界：不改写
+    s.putc(1, 0);         // NUL byte：按标准不改写
     y1 = s.getc(0);
     y2 = s.getc(5);
     y3 = s.len();
@@ -136,6 +137,7 @@ module top(output int y1, y2, y3, y4, output reg ok1, ok2, ok3, ok4);
     upper = h.name.toupper();
     ok3 = (upper == "DRIVER-0");
     ok4 = (h.name.len() == 8);
+    ok5 = (s.len() == 7) && (s.getc(1) == 118) && (s.getc(6) == 81);
   end
 endmodule
 "#;
@@ -150,6 +152,7 @@ endmodule
         expect_net(&sim, "ok2", 1, "tolower")?;
         expect_net(&sim, "ok3", 1, "class property toupper")?;
         expect_net(&sim, "ok4", 1, "class property length after putc")?;
+        expect_net(&sim, "ok5", 1, "NUL putc is a no-op")?;
         Ok(())
     });
 
@@ -205,7 +208,7 @@ class Named;
     this.name = n;
   endfunction
 endclass
-module top(output reg ok1, ok2, ok3, ok4, ok5, ok6);
+module top(output reg ok1, ok2, ok3, ok4, ok5, ok6, ok7);
   string s;
   string sub;
   Named h;
@@ -225,6 +228,8 @@ module top(output reg ok1, ok2, ok3, ok4, ok5, ok6);
     ok4 = (sub.len() == 0);
     sub = s.substr(-1, 3);             // 负左边界：空
     ok5 = (sub.len() == 0);
+    sub = s.substr(0, 99);             // 右边界越过长度：空
+    ok7 = (sub.len() == 0);
 
     h = new("scoreboard");
     sub = h.name.substr(5, 9);         // "board"
@@ -240,6 +245,7 @@ endmodule
         expect_net(&sim, "ok3", 1, "suffix substring")?;
         expect_net(&sim, "ok4", 1, "reversed bounds empty")?;
         expect_net(&sim, "ok5", 1, "negative left bound empty")?;
+        expect_net(&sim, "ok7", 1, "out-of-range right bound empty")?;
         expect_net(&sim, "ok6", 1, "class property substring")?;
         Ok(())
     });

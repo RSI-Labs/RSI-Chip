@@ -491,6 +491,8 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringGetByte { .. } => "StringGetByte",
         Expr::StringCase { .. } => "StringCase",
         Expr::StringCompare { .. } => "StringCompare",
+        Expr::StringPutc { .. } => "StringPutc",
+        Expr::StringSubstr { .. } => "StringSubstr",
     }
 }
 
@@ -568,6 +570,16 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         ],
         Expr::StringCase { e, .. } => vec![design_expr_fingerprint(design, e)],
         Expr::StringCompare { left, right, .. } => vec![
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right),
+        ],
+        Expr::StringPutc { e, index, value } => vec![
+            design_expr_fingerprint(design, e),
+            design_expr_fingerprint(design, index),
+            design_expr_fingerprint(design, value),
+        ],
+        Expr::StringSubstr { e, left, right } => vec![
+            design_expr_fingerprint(design, e),
             design_expr_fingerprint(design, left),
             design_expr_fingerprint(design, right),
         ],

@@ -142,6 +142,12 @@ impl<'a> Synth<'a> {
             Expr::StringCompare { .. } => {
                 return Err("bounded string comparison is not synthesizable yet".into())
             }
+            Expr::StringPutc { .. } => {
+                return Err("bounded string byte writes are not synthesizable yet".into())
+            }
+            Expr::StringSubstr { .. } => {
+                return Err("bounded string substrings are not synthesizable yet".into())
+            }
         })
     }
 

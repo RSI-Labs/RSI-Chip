@@ -1452,6 +1452,18 @@ impl<'d> Simulator<'d> {
                     None => LogicWord::xes(32),
                 }
             }
+            Expr::StringPutc { e, index, value } => {
+                let string = self.eval(e);
+                let index = self.eval(index);
+                let value = self.eval(value);
+                putc_packed_string(&string, &index, &value)
+            }
+            Expr::StringSubstr { e, left, right } => {
+                let string = self.eval(e);
+                let left = self.eval(left);
+                let right = self.eval(right);
+                substring_packed_string(&string, &left, &right)
+            }
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1704,6 +1716,59 @@ fn compare_packed_strings(left: &LogicWord, right: &LogicWord, ignore_case: bool
     Some((left_length as i64 - right_length as i64).signum() as i32)
 }
 
+fn putc_packed_string(word: &LogicWord, index: &LogicWord, value: &LogicWord) -> LogicWord {
+    let Some(length) = ascii_string_length(word) else {
+        return LogicWord::xes(word.width());
+    };
+    let Some(index) = index.to_u64() else {
+        return LogicWord::xes(word.width());
+    };
+    let Some(value) = value.to_u64().map(|value| value as u8) else {
+        return LogicWord::xes(word.width());
+    };
+    if index >= length as u64 || value == 0 {
+        return word.clone();
+    }
+    let index = index as usize;
+    let mut bytes = Vec::with_capacity(length);
+    for byte in 0..length {
+        let Some(byte_value) = packed_string_byte(word, byte)
+            .to_u64()
+            .map(|value| value as u8)
+        else {
+            return LogicWord::xes(word.width());
+        };
+        bytes.push(if byte == index { value } else { byte_value });
+    }
+    LogicWord::from_bytes_le(word.width(), &bytes)
+}
+
+fn substring_packed_string(word: &LogicWord, left: &LogicWord, right: &LogicWord) -> LogicWord {
+    let Some(length) = ascii_string_length(word) else {
+        return LogicWord::xes(word.width());
+    };
+    let Some(left) = left.to_u64().map(|value| value as i64) else {
+        return LogicWord::xes(word.width());
+    };
+    let Some(right) = right.to_u64().map(|value| value as i64) else {
+        return LogicWord::xes(word.width());
+    };
+    if left < 0 || left > right || right >= length as i64 {
+        return LogicWord::zero(word.width());
+    }
+    let mut bytes = Vec::with_capacity((right - left + 1) as usize);
+    for byte in left as usize..=right as usize {
+        let Some(byte_value) = packed_string_byte(word, byte)
+            .to_u64()
+            .map(|value| value as u8)
+        else {
+            return LogicWord::xes(word.width());
+        };
+        bytes.push(byte_value);
+    }
+    LogicWord::from_bytes_le(word.width(), &bytes)
+}
+
 fn concat_packed_strings(
     left: &LogicWord,
     left_length: usize,
@@ -1806,6 +1871,16 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(left, out);
             walk_expr(right, out);
         }
+        Expr::StringPutc { e, index, value } => {
+            walk_expr(e, out);
+            walk_expr(index, out);
+            walk_expr(value, out);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            walk_expr(e, out);
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1855,6 +1930,16 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         }
         Expr::StringCase { e, .. } => walk_expr_memories(e, out),
         Expr::StringCompare { left, right, .. } => {
+            walk_expr_memories(left, out);
+            walk_expr_memories(right, out);
+        }
+        Expr::StringPutc { e, index, value } => {
+            walk_expr_memories(e, out);
+            walk_expr_memories(index, out);
+            walk_expr_memories(value, out);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            walk_expr_memories(e, out);
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
         }

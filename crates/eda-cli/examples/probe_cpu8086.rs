@@ -35,6 +35,16 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
             expr_nets(left, out);
             expr_nets(right, out);
         }
+        Expr::StringPutc { e, index, value } => {
+            expr_nets(e, out);
+            expr_nets(index, out);
+            expr_nets(value, out);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            expr_nets(e, out);
+            expr_nets(left, out);
+            expr_nets(right, out);
+        }
         Expr::MemoryRead { indexes, .. } => {
             indexes.iter().for_each(|e| expr_nets(e, out));
         }

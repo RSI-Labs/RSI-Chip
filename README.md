@@ -56,7 +56,9 @@ integer-literal values, simple type width/signedness, and direct/generated
 instance inventory against the slang AST. `compile_files_via_ast`
 additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
-if/case control flow, single posedge/negedge sensitivity, recursive
+if/case control flow, bounded string literals, concatenation, byte reads and
+writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
+comparison, and inclusive `substr` extraction, single posedge/negedge sensitivity, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports

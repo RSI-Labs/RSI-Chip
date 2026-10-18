@@ -100,20 +100,7 @@ impl<'a> Elaborator<'a> {
                 if !arguments.is_empty() {
                     return Err("string.len() expects no arguments".to_string());
                 }
-                let byte_count = entry.width / 8;
-                let mut length = ExprIR::Const(LogicWord::from_u64(32, byte_count as u64));
-                for byte in (0..byte_count).rev() {
-                    length = ExprIR::Cond {
-                        c: Box::new(ExprIR::Bin {
-                            op: BinOp::Eq,
-                            a: Box::new(self.string_byte_ref(entry, byte)),
-                            b: Box::new(ExprIR::Const(LogicWord::zero(8))),
-                        }),
-                        t: Box::new(ExprIR::Const(LogicWord::from_u64(32, byte as u64))),
-                        f: Box::new(length),
-                    };
-                }
-                Ok(Some(length))
+                Ok(Some(self.string_length_expression(entry)))
             }
             "getc" => {
                 let Some(index) = arguments.first() else {
@@ -176,6 +163,23 @@ impl<'a> Elaborator<'a> {
         }
     }
 
+    pub(super) fn string_length_expression(&self, entry: &NetEntry) -> ExprIR {
+        let byte_count = entry.width / 8;
+        let mut length = ExprIR::Const(LogicWord::from_u64(32, byte_count as u64));
+        for byte in (0..byte_count).rev() {
+            length = ExprIR::Cond {
+                c: Box::new(ExprIR::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(self.string_byte_ref(entry, byte)),
+                    b: Box::new(ExprIR::Const(LogicWord::zero(8))),
+                }),
+                t: Box::new(ExprIR::Const(LogicWord::from_u64(32, byte as u64))),
+                f: Box::new(length),
+            };
+        }
+        length
+    }
+
     pub(super) fn string_substr_expression(
         &self,
         entry: &NetEntry,
@@ -183,6 +187,7 @@ impl<'a> Elaborator<'a> {
         right: ExprIR,
     ) -> ExprIR {
         let byte_count = entry.width / 8;
+        let length = self.string_length_expression(entry);
         let mut bytes = Vec::with_capacity(byte_count);
         for output in 0..byte_count {
             let source_index = ExprIR::Bin {
@@ -191,16 +196,24 @@ impl<'a> Elaborator<'a> {
                 b: Box::new(ExprIR::Const(LogicWord::from_u64(32, output as u64))),
             };
             let in_range = ExprIR::Bin {
-                op: BinOp::And,
+                op: BinOp::LogAnd,
                 a: Box::new(ExprIR::Bin {
-                    op: BinOp::Ge,
-                    a: Box::new(left.clone()),
-                    b: Box::new(ExprIR::Const(LogicWord::zero(32))),
+                    op: BinOp::LogAnd,
+                    a: Box::new(ExprIR::Bin {
+                        op: BinOp::Ge,
+                        a: Box::new(left.clone()),
+                        b: Box::new(ExprIR::Const(LogicWord::zero(32))),
+                    }),
+                    b: Box::new(ExprIR::Bin {
+                        op: BinOp::Le,
+                        a: Box::new(source_index.clone()),
+                        b: Box::new(right.clone()),
+                    }),
                 }),
                 b: Box::new(ExprIR::Bin {
-                    op: BinOp::Le,
-                    a: Box::new(source_index.clone()),
-                    b: Box::new(right.clone()),
+                    op: BinOp::Lt,
+                    a: Box::new(right.clone()),
+                    b: Box::new(length.clone()),
                 }),
             };
             bytes.push(ExprIR::Cond {
@@ -319,14 +332,33 @@ impl<'a> Elaborator<'a> {
         let index = self.elab_expr(&arguments[0], env)?;
         let value = self.elab_expr(&arguments[1], env)?;
         let byte_count = entry.width / 8;
+        let length = self.string_length_expression(entry);
         let mut statements = Vec::with_capacity(byte_count);
         for byte in 0..byte_count {
             let lsb = byte * 8;
+            let in_string = ExprIR::Bin {
+                op: BinOp::Lt,
+                a: Box::new(ExprIR::Const(LogicWord::from_u64(32, byte as u64))),
+                b: Box::new(length.clone()),
+            };
+            let value_nonzero = ExprIR::Bin {
+                op: BinOp::Ne,
+                a: Box::new(value.clone()),
+                b: Box::new(ExprIR::Const(LogicWord::zero(8))),
+            };
             statements.push(StmtIR::If {
                 c: ExprIR::Bin {
-                    op: BinOp::Eq,
-                    a: Box::new(index.clone()),
-                    b: Box::new(ExprIR::Const(LogicWord::from_u64(32, byte as u64))),
+                    op: BinOp::LogAnd,
+                    a: Box::new(ExprIR::Bin {
+                        op: BinOp::LogAnd,
+                        a: Box::new(in_string),
+                        b: Box::new(value_nonzero),
+                    }),
+                    b: Box::new(ExprIR::Bin {
+                        op: BinOp::Eq,
+                        a: Box::new(index.clone()),
+                        b: Box::new(ExprIR::Const(LogicWord::from_u64(32, byte as u64))),
+                    }),
                 },
                 t: Box::new(StmtIR::Bl {
                     lv: LValue {

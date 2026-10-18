@@ -2921,6 +2921,8 @@ module strings(
   input string same,
   input string case_variant,
   input int byte_index,
+  input int substr_left,
+  input int substr_right,
   output string literal_value,
   output string joined,
   output string literal_joined,
@@ -2935,6 +2937,10 @@ module strings(
   output byte out_of_range,
   output string upper_value,
   output string lower_value,
+  output string put_value,
+  output string substr_value,
+  output string empty_substr,
+  output string out_of_range_substr,
   output logic strings_equal,
   output logic strings_less,
   output int compare_result,
@@ -2947,6 +2953,7 @@ module strings(
     C = 2'b10
   } state_t;
 
+  string literal_source = "aBcD";
   state_t state;
   always_comb begin
     state = state_t'(selector);
@@ -2954,6 +2961,12 @@ module strings(
     dynamic_byte = right[byte_index];
     method_byte = right.getc(byte_index);
     out_of_range = right.getc(100);
+  end
+  initial begin
+    put_value = literal_source;
+    put_value.putc(1, 8'h5A);
+    put_value.putc(64, 8'h21);
+    put_value.putc(0, 8'h00);
   end
   assign literal_value = "READY";
   assign joined = {left, right};
@@ -2970,6 +2983,9 @@ module strings(
   assign compare_result = mixed.compare(case_variant);
   assign case_compare_result = mixed.compare(case_variant);
   assign case_insensitive_compare_result = mixed.icompare(case_variant);
+  assign substr_value = mixed.substr(substr_left, substr_right);
+  assign empty_substr = mixed.substr(2, 1);
+  assign out_of_range_substr = mixed.substr(0, 64);
 endmodule
 "#,
     )
@@ -2983,7 +2999,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 15);
+    assert_eq!(design.assigns.len(), 19);
     assert_eq!(
         design
             .net_decls
@@ -3019,6 +3035,12 @@ endmodule
             .unwrap();
         simulator
             .set_input("byte_index", &LogicWord::from_u64(32, selector))
+            .unwrap();
+        simulator
+            .set_input("substr_left", &LogicWord::from_u64(32, 1))
+            .unwrap();
+        simulator
+            .set_input("substr_right", &LogicWord::from_u64(32, 2))
             .unwrap();
         assert_eq!(
             simulator
@@ -3110,7 +3132,79 @@ endmodule
                 .to_u64(),
             Some(0)
         );
+        assert_eq!(
+            simulator
+                .read("put_value")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "aZcD"
+        );
+        assert_eq!(
+            simulator
+                .read("substr_value")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "Bc"
+        );
+        assert_eq!(
+            simulator
+                .read("empty_substr")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            ""
+        );
+        assert_eq!(
+            simulator
+                .read("out_of_range_substr")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            ""
+        );
     }
+
+    let bounded_source_path = root.join("strings-bounded.sv");
+    std::fs::write(
+        &bounded_source_path,
+        r#"
+module strings_bounded(
+  output string put_value,
+  output string substr_value
+);
+  string literal_source = "aBcD";
+  initial begin
+    substr_value = literal_source.substr(1, 2);
+    literal_source.putc(1, 8'h5A);
+    literal_source.putc(64, 8'h21);
+    literal_source.putc(0, 8'h00);
+    put_value = literal_source;
+  end
+endmodule
+"#,
+    )
+    .expect("write bounded string source");
+    let bounded = slang
+        .compile_files(
+            std::slice::from_ref(&bounded_source_path),
+            Some("strings_bounded"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower strings through the bounded compatibility path");
+    let mut bounded_simulator = Simulator::new(&bounded).expect("create bounded string simulator");
+    bounded_simulator.run_until(0).expect("run bounded strings");
+    assert_eq!(
+        bounded_simulator
+            .read("put_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "aZcD"
+    );
+    assert_eq!(
+        bounded_simulator
+            .read("substr_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "Bc"
+    );
 }
 
 #[test]

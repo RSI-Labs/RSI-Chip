@@ -423,6 +423,20 @@ pub enum Expr {
         right: Box<Expr>,
         ignore_case: bool,
     },
+    /// Updates one byte in a bounded string. This is used only as the RHS of
+    /// a whole-string assignment when lowering the void `putc()` method.
+    StringPutc {
+        e: Box<Expr>,
+        index: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// Returns the inclusive bounded-string substring `[left, right]`, or an
+    /// empty string for invalid bounds.
+    StringSubstr {
+        e: Box<Expr>,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -463,6 +477,8 @@ impl Expr {
             Expr::StringGetByte { .. } => 8,
             Expr::StringCase { e, .. } => e.width(),
             Expr::StringCompare { .. } => 32,
+            Expr::StringPutc { e, .. } => e.width(),
+            Expr::StringSubstr { e, .. } => e.width(),
         }
     }
 
@@ -501,6 +517,8 @@ impl Expr {
             Expr::StringGetByte { .. } => false,
             Expr::StringCase { .. } => false,
             Expr::StringCompare { .. } => true,
+            Expr::StringPutc { .. } => false,
+            Expr::StringSubstr { .. } => false,
         }
     }
 }
@@ -1089,6 +1107,16 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
         }
         Expr::StringCase { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
         Expr::StringCompare { left, right, .. } => {
+            collect_memory_expr_reads(left, synchronous, accesses);
+            collect_memory_expr_reads(right, synchronous, accesses);
+        }
+        Expr::StringPutc { e, index, value } => {
+            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(index, synchronous, accesses);
+            collect_memory_expr_reads(value, synchronous, accesses);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            collect_memory_expr_reads(e, synchronous, accesses);
             collect_memory_expr_reads(left, synchronous, accesses);
             collect_memory_expr_reads(right, synchronous, accesses);
         }

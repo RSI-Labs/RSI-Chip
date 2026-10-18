@@ -37,6 +37,7 @@ impl SlangAstLowerer {
             "compare" | "icompare" => {
                 return self.lower_string_compare(value, subroutine == "icompare")
             }
+            "substr" => return self.lower_string_substr(value),
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -137,6 +138,9 @@ impl SlangAstLowerer {
             .next_back()
             .unwrap_or_default()
             .to_string();
+        if task_name == "putc" {
+            return self.lower_string_putc(value).map(Some);
+        }
         let Some(definition) = self.subroutines.get(&task_name) else {
             return Ok(None);
         };
@@ -715,6 +719,85 @@ impl SlangAstLowerer {
             .get(1)
             .ok_or_else(|| "string compare call has no right receiver".to_string())?;
         self.lower_string_compare_operands(left, right, ignore_case)
+    }
+
+    fn lower_string_substr(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string substr call has no arguments".to_string())?;
+        if arguments.len() != 3 {
+            return Err("string substr expects a receiver and two bounds".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string substr has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string substr receiver is not a string".into());
+        }
+        let left = arguments
+            .get(1)
+            .ok_or_else(|| "string substr has no left bound".to_string())?;
+        let right = arguments
+            .get(2)
+            .ok_or_else(|| "string substr has no right bound".to_string())?;
+        let receiver = self.lower_expression(receiver)?;
+        if receiver.width() != crate::types::STRING_WIDTH {
+            return Err("string substr requires a 512-bit string".into());
+        }
+        let left = self.lower_expression(left)?;
+        let right = self.lower_expression(right)?;
+        if left.width() > 32 || right.width() > 32 {
+            return Err("string substr bounds exceed 32 bits".into());
+        }
+        Ok(eda_core::ir::Expr::StringSubstr {
+            e: Box::new(receiver),
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    fn lower_string_putc(&self, value: &Value) -> Result<eda_core::ir::Stmt, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string putc call has no arguments".to_string())?;
+        if arguments.len() != 3 {
+            return Err("string putc expects receiver, index, and byte".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "string putc has no receiver".to_string())?;
+        if string_field(receiver, "type").as_deref() != Some("string") {
+            return Err("string putc receiver is not a string".into());
+        }
+        let index = arguments
+            .get(1)
+            .ok_or_else(|| "string putc has no index".to_string())?;
+        let byte = arguments
+            .get(2)
+            .ok_or_else(|| "string putc has no byte".to_string())?;
+        let lv = self.lower_lvalue(receiver)?;
+        let receiver = self.lower_expression(receiver)?;
+        if receiver.width() != crate::types::STRING_WIDTH {
+            return Err("string putc requires a 512-bit string".into());
+        }
+        let index = self.lower_expression(index)?;
+        if index.width() > 32 {
+            return Err("string putc index exceeds 32 bits".into());
+        }
+        let byte = self.lower_expression(byte)?;
+        if byte.width() != 8 {
+            return Err("string putc byte must be 8 bits".into());
+        }
+        Ok(eda_core::ir::Stmt::Bl {
+            lv,
+            e: eda_core::ir::Expr::StringPutc {
+                e: Box::new(receiver),
+                index: Box::new(index),
+                value: Box::new(byte),
+            },
+        })
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {
