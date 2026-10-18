@@ -162,14 +162,14 @@ pub(super) struct AstInterfaceModportSymbol {
 pub(super) type InterfaceModportSymbols =
     std::collections::BTreeMap<String, AstInterfaceModportSymbol>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AstStructField {
     offset: usize,
     width: usize,
     field_index: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct AstStructType {
     width: usize,
     signed: bool,
@@ -177,7 +177,7 @@ struct AstStructType {
     is_union: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct AstEnumType {
     width: usize,
     signed: bool,

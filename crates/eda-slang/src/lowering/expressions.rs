@@ -1153,7 +1153,10 @@ impl super::SlangAstLowerer {
     }
 
     fn selected_struct_offset(&self, value: &serde_json::Value) -> Result<usize, String> {
-        if string_field(value, "kind").as_deref() == Some("NamedValue") {
+        if matches!(
+            string_field(value, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) {
             self.direct_packed_symbol(value)?
                 .ok_or_else(|| "struct member access requires a named declaration".to_string())?;
             return Ok(0);
@@ -1178,10 +1181,15 @@ impl super::SlangAstLowerer {
         member: &str,
     ) -> Result<super::AstStructField, String> {
         let type_name = string_field(value, "type").unwrap_or_default();
-        let alias_name = type_name
-            .split_whitespace()
-            .next_back()
-            .unwrap_or_default()
+        let qualified_alias_name = type_name.split_whitespace().next_back().unwrap_or_default();
+        if let Some(definition) = self.type_aliases.get(qualified_alias_name) {
+            return definition
+                .fields
+                .get(member)
+                .copied()
+                .ok_or_else(|| format!("struct type has no member '{member}'"));
+        }
+        let alias_name = qualified_alias_name
             .rsplit(['.', '#'])
             .next()
             .unwrap_or_default();
@@ -1192,7 +1200,10 @@ impl super::SlangAstLowerer {
                 .copied()
                 .ok_or_else(|| format!("struct type has no member '{member}'"));
         }
-        if string_field(value, "kind").as_deref() == Some("NamedValue") {
+        if matches!(
+            string_field(value, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) {
             if let Some(symbol) = self.direct_packed_symbol(value)? {
                 return symbol
                     .struct_fields

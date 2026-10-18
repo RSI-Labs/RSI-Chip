@@ -66,7 +66,7 @@ statements, runtime `repeat`, `while`, and `do...while` loops with
 `break`/`continue`, module-scope and initialized automatic procedure-local
 `for` loops, lexical named-block `disable`, hierarchical clocking blocks with scalar input sampling, no-skew output drives, and `##n` cycle delays, blocking/nonblocking named-event triggers with scalar or edge-qualified event-list waits, fixed event arrays with element triggers/waits/`.triggered`,
 and ordered `wait_order`, scalar `force`/`release`, and concurrent `fork` branches with `join`, `join_any`, and `join_none`, recursive
-parameterized module hierarchy with port connections, scalar, multidimensional packed-vector, and multidimensional unpacked-array interface signals/modports with input-write checks, one-/multidimensional interface array ports, one-/multidimensional, generated, and multidimensional interface instance arrays, and
+parameterized module hierarchy with port connections, scalar, multidimensional packed-vector, packed struct/union including nested packed structs, and multidimensional unpacked-array interface signals/modports with input-write checks, one-/multidimensional interface array ports, one-/multidimensional, generated, and multidimensional interface instance arrays, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports
 unsupported constructs explicitly. Its conformance tests also validate

@@ -2935,6 +2935,276 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_interface_packed_struct_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-packed-struct");
+    let source_path = root.join("interface_packed_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef struct packed {
+    logic [3:0] value;
+    logic [1:0] tag;
+  } packet_t;
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer(
+  bus_if.producer bus,
+  input logic [3:0] value,
+  input logic [1:0] tag
+);
+  assign bus.packet.value = value;
+  assign bus.packet.tag = tag;
+endmodule
+
+module interface_struct_top(
+  input logic clk,
+  input logic [3:0] value,
+  input logic [1:0] tag,
+  output logic [5:0] observed
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(.bus(bus), .value(value), .tag(tag));
+  assign observed = bus.packet;
+endmodule
+"#,
+    )
+    .expect("write interface packed-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_struct_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface packed struct members");
+    let mut simulator = Simulator::new(&design).expect("create interface struct simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(4, 0b1011))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(2, 0b10))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed").unwrap().to_u64(),
+        Some(0b10_1110)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_interface_packed_union_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-packed-union");
+    let source_path = root.join("interface_packed_union.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef union packed {
+    logic [5:0] first;
+    logic [5:0] second;
+  } packet_t;
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer(
+  bus_if.producer bus,
+  input logic [5:0] value
+);
+  assign bus.packet.first = value;
+endmodule
+
+module interface_union_top(
+  input logic clk,
+  input logic [5:0] value,
+  output logic [5:0] observed
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(.bus(bus), .value(value));
+  assign observed = bus.packet.second;
+endmodule
+"#,
+    )
+    .expect("write interface packed-union source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_union_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface packed union members");
+    let mut simulator = Simulator::new(&design).expect("create interface union simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(6, 0b011011))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b011011));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_interface_nested_struct_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-nested-struct");
+    let source_path = root.join("interface_nested_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef struct packed {
+    logic [1:0] low;
+    logic [3:0] high;
+  } inner_t;
+  typedef struct packed {
+    inner_t inner;
+    logic [1:0] tag;
+  } packet_t;
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer(
+  bus_if.producer bus,
+  input logic [1:0] low,
+  input logic [3:0] high,
+  input logic [1:0] tag
+);
+  assign bus.packet.inner.low = low;
+  assign bus.packet.inner.high = high;
+  assign bus.packet.tag = tag;
+endmodule
+
+module interface_nested_struct_top(
+  input logic clk,
+  input logic [1:0] low,
+  input logic [3:0] high,
+  input logic [1:0] tag,
+  output logic [1:0] observed_low,
+  output logic [3:0] observed_high,
+  output logic [1:0] observed_tag
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(
+    .bus(bus),
+    .low(low),
+    .high(high),
+    .tag(tag)
+  );
+  assign observed_low = bus.packet.inner.low;
+  assign observed_high = bus.packet.inner.high;
+  assign observed_tag = bus.packet.tag;
+endmodule
+"#,
+    )
+    .expect("write interface nested-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_nested_struct_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface nested struct members");
+    let mut simulator = Simulator::new(&design).expect("create interface nested-struct simulator");
+    simulator
+        .set_input("low", &LogicWord::from_u64(2, 0b10))
+        .unwrap();
+    simulator
+        .set_input("high", &LogicWord::from_u64(4, 0b0101))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(2, 0b11))
+        .unwrap();
+    assert_eq!(simulator.read("observed_low").unwrap().to_u64(), Some(0b10));
+    assert_eq!(
+        simulator.read("observed_high").unwrap().to_u64(),
+        Some(0b0101)
+    );
+    assert_eq!(simulator.read("observed_tag").unwrap().to_u64(), Some(0b11));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_interface_array_port_struct_members() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-array-port-struct");
+    let source_path = root.join("interface_array_port_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  typedef struct packed {
+    logic [3:0] value;
+    logic [1:0] tag;
+  } packet_t;
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer_array(
+  bus_if.producer buses[2],
+  input logic [7:0] value,
+  input logic [3:0] tag
+);
+  assign buses[0].packet.value = value[3:0];
+  assign buses[1].packet.value = value[7:4];
+  assign buses[0].packet.tag = tag[1:0];
+  assign buses[1].packet.tag = tag[3:2];
+endmodule
+
+module interface_array_port_struct_top(
+  input logic clk,
+  input logic [7:0] value,
+  input logic [3:0] tag,
+  output logic [7:0] observed_value,
+  output logic [3:0] observed_tag
+);
+  bus_if buses[2] (.clk(clk));
+  producer_array producers (.buses(buses), .value(value), .tag(tag));
+  assign observed_value[3:0] = buses[0].packet.value;
+  assign observed_value[7:4] = buses[1].packet.value;
+  assign observed_tag[1:0] = buses[0].packet.tag;
+  assign observed_tag[3:2] = buses[1].packet.tag;
+endmodule
+"#,
+    )
+    .expect("write interface-array-port struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_struct_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface array port struct members");
+    let mut simulator = Simulator::new(&design).expect("create interface-array struct simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0b1100_1011))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(4, 0b01_10))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed_value").unwrap().to_u64(),
+        Some(0b1100_1011)
+    );
+    assert_eq!(
+        simulator.read("observed_tag").unwrap().to_u64(),
+        Some(0b01_10)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_multidimensional_interface_vectors() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

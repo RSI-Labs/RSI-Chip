@@ -897,7 +897,51 @@ impl super::SlangAstLowerer {
                 ));
             }
         }
+        for (name, definition) in &self.type_aliases {
+            if name.contains('.') {
+                child.type_aliases.insert(name.clone(), definition.clone());
+            }
+        }
+        for (name, definition) in &self.type_enums {
+            if name.contains('.') {
+                child.type_enums.insert(name.clone(), definition.clone());
+            }
+        }
         child.lower_body(body)?;
+
+        let empty_body_members = Vec::new();
+        let is_interface = body
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_body_members)
+            .iter()
+            .any(|member| string_field(member, "kind").as_deref() == Some("Modport"));
+        if is_interface {
+            for (name, definition) in &child.type_aliases {
+                let scoped_name = format!("{definition_name}.{name}");
+                if let Some(existing) = self.type_aliases.get(&scoped_name) {
+                    if *existing != *definition {
+                        return Err(format!(
+                            "conflicting definitions for interface type '{scoped_name}'"
+                        ));
+                    }
+                } else {
+                    self.type_aliases.insert(scoped_name, definition.clone());
+                }
+            }
+            for (name, definition) in &child.type_enums {
+                let scoped_name = format!("{definition_name}.{name}");
+                if let Some(existing) = self.type_enums.get(&scoped_name) {
+                    if *existing != *definition {
+                        return Err(format!(
+                            "conflicting definitions for interface enum '{scoped_name}'"
+                        ));
+                    }
+                } else {
+                    self.type_enums.insert(scoped_name, definition.clone());
+                }
+            }
+        }
 
         let interface_symbols = collect_interface_modport_symbols(
             member,

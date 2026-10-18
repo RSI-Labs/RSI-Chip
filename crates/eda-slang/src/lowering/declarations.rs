@@ -234,10 +234,19 @@ impl SlangAstLowerer {
             })?;
             return Ok((shape, signed, std::collections::BTreeMap::new()));
         }
-        let alias_name = type_name
-            .split_whitespace()
-            .next_back()
-            .unwrap_or_default()
+        let qualified_alias_name = type_name.split_whitespace().next_back().unwrap_or_default();
+        if let Some(definition) = self.type_aliases.get(qualified_alias_name) {
+            return Ok((
+                AstTypeShape {
+                    width: definition.width,
+                    bounds: None,
+                    dimensions: Vec::<AstPackedDimension>::new(),
+                },
+                definition.signed,
+                definition.fields.clone(),
+            ));
+        }
+        let alias_name = qualified_alias_name
             .rsplit(['.', '#', ':'])
             .next()
             .unwrap_or_default();
