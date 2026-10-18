@@ -562,7 +562,7 @@ impl SlangAstLowerer {
             .split_whitespace()
             .next_back()
             .unwrap_or_default()
-            .rsplit(['.', '#'])
+            .rsplit(['.', '#', ':'])
             .next()
             .unwrap_or_default();
         let definition = self
@@ -953,7 +953,7 @@ impl SlangAstLowerer {
             .split_whitespace()
             .next_back()
             .unwrap_or_default()
-            .rsplit(['.', '#'])
+            .rsplit(['.', '#', ':'])
             .next()
             .unwrap_or_default();
         self.type_enums

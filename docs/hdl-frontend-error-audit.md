@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-18 (local time)
-Repository state audited: `fix-digital` at `ba7a9cc` plus the uncommitted
-package-typedef changes currently in the worktree.
+Repository state audited: `fix-digital` at `5698c40` plus the uncommitted
+package-enum-method changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -49,7 +49,7 @@ All commands were run against the current worktree:
 | `cargo test -p eda-slang --all-targets -- --nocapture` | 103 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 132.76 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 146.61 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -98,7 +98,7 @@ broader tool-flow percentage.
 | F-12 | Net types, strength, and resolution | Preserve net kinds, implicit nets, strengths, tri-state resolution, multi-driver behavior, supply nets, and charge decay. | Basic `wire`/tri-state values work in tested cases. Direct lowering does not preserve a complete strength/net-resolution model; strength qualifiers are not a first-class IR property. | P1 correctness risk | 25% | Systematic multi-driver strength/tri-state truth tables and implicit-net diagnostics. |
 | F-13 | Complete string model | Support dynamic SystemVerilog strings, Unicode/locale behavior where required by methods, mutation, substrings, conversions, formatting, and concatenation overflow. | Current model is a fixed 512-bit, 64-byte NUL-padded ASCII representation. Direct path supports literals, concatenation, length, byte reads/index writes, case conversion, comparison, `putc()`, `substr()`, and decimal/hex/binary radix conversions. Dynamic growth beyond 64 bytes, Unicode behavior, and synthesis remain incomplete/fail closed. | P1 | 55% of bounded string subset; 0% for unbounded strings | String method conformance tests and explicit overflow/unknown/NUL behavior tests. |
 | F-14 | Complete function/task execution model | Support recursive/nonrecursive routines, all argument directions/default values, static/automatic lifetimes, void functions, virtual dispatch, out-of-line calls, loops, jumps, and runtime control flow. | Direct inlining supports many straight-line/control-flow functions/tasks, output/inout/ref arguments, locals, conditionals, and bounded loops. Recursion is rejected; loop unrolling is capped at 256; class/virtual calls and general procedure jumps are absent. | P0 | 35% | Separate compile-time inlining tests from a real runtime subroutine/process model. |
-| F-15 | Package and namespace elaboration | Support packages, imports, exports, scoped references, nested packages, compilation-unit scopes, typedef visibility, and configuration. | Bounded path handles selected package constants/functions and wildcard imports. Direct path imports compilation-unit package constants, functions, typedefs, and enums through wildcard and explicit imports, supports scoped constants/functions in imported packages, executes enum/struct-typed package constants, and rejects imported symbol collisions. Exports, package classes, nested packages, and full shadowing remain incomplete. | P1 | 48% | Multi-package name-collision/shadowing/order tests. |
+| F-15 | Package and namespace elaboration | Support packages, imports, exports, scoped references, nested packages, compilation-unit scopes, typedef visibility, and configuration. | Bounded path handles selected package constants/functions and wildcard imports. Direct path imports compilation-unit package constants, functions, typedefs, and enums through wildcard and explicit imports, supports scoped constants/functions in imported packages, executes enum/struct-typed package constants and package enum `next`/`prev`/`name` methods, and rejects imported symbol collisions. Exports, package classes, nested packages, and full shadowing remain incomplete. | P1 | 50% | Multi-package name-collision/shadowing/order tests. |
 | F-16 | Parameterization and elaboration diagnostics | Support integer/string/type parameters, localparams, complex override graphs, default values, parameter ports, defparam, and cycle/dependency diagnostics. | Direct path handles simple elaborated constants and generated parameter values. Type parameters and defparam are unsupported; bounded constant evaluation and diagnostics remain incomplete. | P0 | 40% | Parameter dependency/cycle/override matrix and preserve-overrides metadata in IR. |
 | F-17 | Source diagnostics engine | Every parser/elaboration/lowering error needs file, line, column, range, severity, diagnostic code, notes, related locations, suppression, and multi-error recovery. | Direct errors often include slang spans. Bounded parser diagnostics are mostly line-only; many bounded elaboration errors are plain strings. There is no complete structured diagnostic object or suppression system. | P1 | 30% | Snapshot diagnostics for malformed and unsupported corpora; no raw `Result<_, String>` at public boundaries. |
 | F-18 | Include/preprocess traceability | Diagnostics must point through macros and include stacks to user source. | Slang produces authoritative diagnostics and source spans. The bounded compatibility path loses some preprocessor provenance after single-unit preprocessing; direct spans can print non-normalized relative paths. | P1 | 50% | Include/macro expansion stack snapshots and path normalization tests. |
@@ -123,7 +123,7 @@ versus bounded probe.
 | D-06 | Primitive/UDP instances | Rejects `PrimitiveInstance`. |
 | D-07 | Full instance-array surface | One-, multidimensional, and generate-scoped elaborated instance arrays lower and simulate up to 4,096 total elements. Interface-port arrays and other unsupported child/member forms still fail closed. |
 | D-08 | Type parameters | Rejects `TypeParameter`. |
-| D-09 | Full package imports | Wildcard and explicit imports can use package constants and inlined functions; scoped references, package enums, packed structs, and enum-typed constants work, while duplicate imported names fail closed. Exports, nested packages, package classes, and full shadowing semantics remain incomplete. |
+| D-09 | Full package imports | Wildcard and explicit imports can use package constants and inlined functions; scoped references, package enums, packed structs, enum-typed constants, and package enum methods work, while duplicate imported names fail closed. Exports, nested packages, package classes, and full shadowing semantics remain incomplete. |
 | D-10 | Defparam | Unsupported and can fail through instance-connection lowering. |
 | D-11 | Bind directives | No bind member/lowering model. |
 | D-12 | Program blocks | No direct program-block lifetime/scheduling semantics. |

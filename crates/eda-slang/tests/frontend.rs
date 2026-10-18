@@ -345,11 +345,17 @@ module package_types
   input logic [7:0] data,
   output state_t state,
   output pair_t pair,
+  output state_t next_state,
+  output state_t previous_state,
+  output string state_name,
   output logic initialized,
   output logic selected_a
 );
   assign state = selector[0] ? B : A;
   assign pair = data;
+  assign next_state = state.next();
+  assign previous_state = state.prev();
+  assign state_name = state.name();
   assign initialized = (INIT == A);
   assign selected_a = (state == A);
 endmodule
@@ -364,7 +370,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower package typedefs and enums");
-    assert_eq!(design.assigns.len(), 4);
+    assert_eq!(design.assigns.len(), 7);
     let mut simulator = Simulator::new(&design).expect("create package-type simulator");
     simulator
         .set_input("selector", &LogicWord::from_u64(2, 0))
@@ -374,6 +380,15 @@ endmodule
         .unwrap();
     assert_eq!(simulator.read("state").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("pair").unwrap().to_u64(), Some(0x5A));
+    assert_eq!(simulator.read("next_state").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("previous_state").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator
+            .read("state_name")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "A"
+    );
     assert_eq!(simulator.read("initialized").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("selected_a").unwrap().to_u64(), Some(1));
 }
