@@ -416,6 +416,8 @@ pub(super) struct SlangAstLowerer {
     class_object_ids: std::collections::BTreeMap<String, AstLoweredSymbol>,
     class_object_serial: Option<AstLoweredSymbol>,
     class_static_methods: std::collections::BTreeMap<String, String>,
+    class_static_properties: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    class_static_initializer_count: usize,
     class_property_owners: std::collections::BTreeMap<usize, (String, String)>,
     class_property_temps: std::collections::BTreeMap<(String, String), AstLoweredSymbol>,
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
@@ -544,6 +546,8 @@ impl SlangAstLowerer {
             class_object_ids: std::collections::BTreeMap::new(),
             class_object_serial: None,
             class_static_methods: std::collections::BTreeMap::new(),
+            class_static_properties: std::collections::BTreeMap::new(),
+            class_static_initializer_count: 0,
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
@@ -578,7 +582,7 @@ impl SlangAstLowerer {
                 ports: Vec::new(),
             });
         lowerer.collect_compilation_unit_members(root)?;
-        lowerer.lower_body(body, true)?;
+        lowerer.lower_body(body)?;
         let top_ports = lowerer
             .design
             .ports
@@ -597,19 +601,13 @@ impl SlangAstLowerer {
         Ok(lowerer.design)
     }
 
-    fn lower_body(
-        &mut self,
-        body: &serde_json::Value,
-        allow_class_static_members: bool,
-    ) -> Result<(), String> {
+    fn lower_body(&mut self, body: &serde_json::Value) -> Result<(), String> {
         if string_field(body, "kind").as_deref() != Some("InstanceBody") {
             return Err("slang AST Instance body has unexpected kind".into());
         }
         self.collect_dynamic_class_sources(body)?;
         self.validate_dynamic_class_sources()?;
-        if allow_class_static_members {
-            self.collect_class_static_members()?;
-        }
+        self.collect_class_static_members()?;
         let members = body
             .get("members")
             .and_then(serde_json::Value::as_array)

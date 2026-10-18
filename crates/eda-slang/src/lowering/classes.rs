@@ -33,16 +33,13 @@ impl SlangAstLowerer {
                     {
                         let property_name = declaration_name(member, "static ClassProperty")
                             .map_err(|error| super::with_source_span(member, error))?;
-                        let symbol_key = member
-                            .get("addr")
-                            .and_then(Value::as_u64)
-                            .map(|address| format!("{address} {property_name}"))
-                            .ok_or_else(|| {
+                        let property_address = member.get("addr").and_then(Value::as_u64).ok_or_else(|| {
                                 super::with_source_span(
                                     member,
                                     format!("static class property '{class_name}.{property_name}' has no address"),
                                 )
                             })?;
+                        let symbol_key = format!("{property_address} {property_name}");
                         if self.symbols.contains_key(&symbol_key) {
                             continue;
                         }
@@ -52,8 +49,11 @@ impl SlangAstLowerer {
                             .map_err(|error| super::with_source_span(member, error))?;
                         let base = self.design.n_nets;
                         self.design.n_nets += shape.width;
+                        let storage_name = format!(
+                            "__class_static_{property_address}_{class_name}_{property_name}"
+                        );
                         self.design.net_decls.push(eda_core::ir::NetDecl {
-                            name: format!("__class_static_{class_name}_{property_name}"),
+                            name: storage_name.clone(),
                             width: shape.width,
                             is_reg: true,
                             is_signed: signed,
@@ -68,7 +68,8 @@ impl SlangAstLowerer {
                             memory: None,
                             struct_fields,
                         };
-                        self.symbols.insert(symbol_key.clone(), symbol);
+                        self.symbols.insert(symbol_key.clone(), symbol.clone());
+                        self.class_static_properties.insert(storage_name, symbol);
                         if let Some(initializer) = member.get("initializer") {
                             initializers.push((symbol_key, initializer.clone()));
                         }
@@ -90,6 +91,7 @@ impl SlangAstLowerer {
                 lv: class_lvalue(&symbol),
                 e: expression,
             });
+            self.class_static_initializer_count += 1;
         }
 
         for (class_name, method) in methods {

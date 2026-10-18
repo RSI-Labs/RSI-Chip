@@ -525,7 +525,7 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_rejects_child_static_class_scope_for_now() {
+fn slang_ast_direct_lowering_shares_hierarchy_global_static_class_storage() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -537,34 +537,92 @@ fn slang_ast_direct_lowering_rejects_child_static_class_scope_for_now() {
 class Registry;
   static int shared = 1;
 
+  static function void set(int value);
+    shared = value;
+  endfunction
+
   static function int get();
     return shared;
   endfunction
 endclass
 
-module static_class_child(output int result);
+module static_class_first_writer;
   initial begin
     #1;
-    result = Registry::get();
+    Registry::set(20);
   end
 endmodule
 
-module static_class_hierarchy_top(output int result);
-  static_class_child child(.result(result));
+module static_class_second_writer;
+  initial begin
+    #2;
+    Registry::set(41);
+  end
+endmodule
+
+module static_class_leaf_writer;
+  initial begin
+    #3;
+    Registry::set(55);
+  end
+endmodule
+
+module static_class_branch_writer;
+  static_class_leaf_writer leaf();
+endmodule
+
+module static_class_hierarchy_top(
+  output int initial_result,
+  output int final_result
+);
+  static_class_first_writer first_writer();
+  static_class_second_writer second_writer();
+  static_class_branch_writer branch_writer();
+
+  initial begin
+    initial_result = Registry::get();
+    #4;
+    final_result = Registry::get();
+  end
 endmodule
 "#,
     )
     .expect("write child static-class source");
-    let error = slang
+    let design = slang
         .compile_files(
             std::slice::from_ref(&source_path),
             Some("static_class_hierarchy_top"),
             &PreprocessOptions::default(),
         )
-        .expect_err("child static class scope must fail closed until storage is global");
+        .expect("directly lower hierarchy-global class statics");
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .filter(|declaration| {
+                declaration.name.starts_with("__class_static_")
+                    && declaration.name.ends_with("_Registry_shared")
+            })
+            .count(),
+        1,
+        "class static storage must have one hierarchy-global allocation"
+    );
+    let mut simulator = Simulator::new(&design).expect("simulate hierarchy-global class statics");
+    simulator
+        .run_until(4)
+        .expect("run parent and child static-class initials");
     assert!(
-        error.contains("unknown direct-lowering function 'get'"),
-        "unexpected child-static error: {error}"
+        simulator
+            .read("initial_result")
+            .unwrap()
+            .to_u64()
+            .is_some_and(|value| value == 1),
+        "class static initializer was not visible before the child write"
+    );
+    assert_eq!(
+        simulator.read("final_result").unwrap().to_u64(),
+        Some(55),
+        "nested child static write was not visible in the parent scope"
     );
 }
 

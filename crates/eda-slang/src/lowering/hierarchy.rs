@@ -487,6 +487,216 @@ pub(super) fn remap_process(process: &mut eda_core::ir::Process, offset: usize) 
     remap_statement(&mut process.body, offset);
 }
 
+#[derive(Clone, Copy)]
+struct NetRewrite {
+    from: usize,
+    to: usize,
+    width: usize,
+}
+
+fn rewrite_net(net: usize, rewrites: &[NetRewrite]) -> usize {
+    rewrites
+        .iter()
+        .find(|rewrite| net >= rewrite.from && net < rewrite.from + rewrite.width)
+        .map(|rewrite| rewrite.to + (net - rewrite.from))
+        .unwrap_or(net)
+}
+
+fn rewrite_lvalue_nets(lvalue: &mut eda_core::ir::LValue, rewrites: &[NetRewrite]) {
+    lvalue.net = rewrite_net(lvalue.net, rewrites);
+}
+
+fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetRewrite]) {
+    use eda_core::ir::Expr;
+    match expression {
+        Expr::Const(_) => {}
+        Expr::Ref { net, .. } => *net = rewrite_net(*net, rewrites),
+        Expr::Un { a, .. } => rewrite_expression_nets(a, rewrites),
+        Expr::Bin { a, b, .. } => {
+            rewrite_expression_nets(a, rewrites);
+            rewrite_expression_nets(b, rewrites);
+        }
+        Expr::Cond { c, t, f } => {
+            rewrite_expression_nets(c, rewrites);
+            rewrite_expression_nets(t, rewrites);
+            rewrite_expression_nets(f, rewrites);
+        }
+        Expr::Concat(parts) => parts
+            .iter_mut()
+            .for_each(|part| rewrite_expression_nets(part, rewrites)),
+        Expr::Repeat { e, .. } | Expr::Signed { e, .. } => rewrite_expression_nets(e, rewrites),
+        Expr::SimulationTime { .. } => {}
+        Expr::MemoryRead { indexes, .. } => indexes
+            .iter_mut()
+            .for_each(|index| rewrite_expression_nets(index, rewrites)),
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| rewrite_expression_nets(index, rewrites));
+            rewrite_expression_nets(start, rewrites);
+        }
+        Expr::Index { e, .. } => rewrite_expression_nets(e, rewrites),
+        Expr::StringLength { e } => rewrite_expression_nets(e, rewrites),
+        Expr::StringConcat { left, right } => {
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::StringGetByte { e, index } => {
+            rewrite_expression_nets(e, rewrites);
+            rewrite_expression_nets(index, rewrites);
+        }
+        Expr::StringCase { e, .. } => rewrite_expression_nets(e, rewrites),
+        Expr::StringCompare { left, right, .. } => {
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::StringPutc { e, index, value } => {
+            rewrite_expression_nets(e, rewrites);
+            rewrite_expression_nets(index, rewrites);
+            rewrite_expression_nets(value, rewrites);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            rewrite_expression_nets(e, rewrites);
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::StringToRadix { e, .. } => rewrite_expression_nets(e, rewrites),
+        Expr::StringFromRadix { value, .. } => rewrite_expression_nets(value, rewrites),
+        Expr::EventTriggered { net } => *net = rewrite_net(*net, rewrites),
+    }
+}
+
+fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRewrite]) {
+    use eda_core::ir::Stmt;
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter_mut()
+            .for_each(|statement| rewrite_statement_nets(statement, rewrites)),
+        Stmt::Forever(body) => rewrite_statement_nets(body, rewrites),
+        Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
+            rewrite_lvalue_nets(lv, rewrites);
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| rewrite_expression_nets(index, rewrites));
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::MemoryBlPart {
+            indexes, start, e, ..
+        }
+        | Stmt::MemoryNBlPart {
+            indexes, start, e, ..
+        } => {
+            indexes
+                .iter_mut()
+                .for_each(|index| rewrite_expression_nets(index, rewrites));
+            rewrite_expression_nets(start, rewrites);
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::BlIndexed { net, start, e, .. } | Stmt::NBlIndexed { net, start, e, .. } => {
+            *net = rewrite_net(*net, rewrites);
+            rewrite_expression_nets(start, rewrites);
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::If { c, t, f } => {
+            rewrite_expression_nets(c, rewrites);
+            rewrite_statement_nets(t, rewrites);
+            if let Some(statement) = f {
+                rewrite_statement_nets(statement, rewrites);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            rewrite_expression_nets(e, rewrites);
+            for (expression, _) in arms {
+                rewrite_expression_nets(expression, rewrites);
+            }
+            if let Some(statement) = dflt {
+                rewrite_statement_nets(statement, rewrites);
+            }
+        }
+        Stmt::Delay { body, .. } => rewrite_statement_nets(body, rewrites),
+        Stmt::Wait { cond, body } => {
+            rewrite_expression_nets(cond, rewrites);
+            rewrite_statement_nets(body, rewrites);
+        }
+        Stmt::EventWait { watches, body } => {
+            watches
+                .iter_mut()
+                .for_each(|watch| watch.net = rewrite_net(watch.net, rewrites));
+            rewrite_statement_nets(body, rewrites);
+        }
+        Stmt::WaitOrder {
+            events,
+            success,
+            failure,
+        } => {
+            events
+                .iter_mut()
+                .for_each(|net| *net = rewrite_net(*net, rewrites));
+            if let Some(statement) = success {
+                rewrite_statement_nets(statement, rewrites);
+            }
+            if let Some(statement) = failure {
+                rewrite_statement_nets(statement, rewrites);
+            }
+        }
+        Stmt::Fork { branches, .. } => branches
+            .iter_mut()
+            .for_each(|branch| rewrite_statement_nets(branch, rewrites)),
+        Stmt::While { cond, body, steps } => {
+            rewrite_expression_nets(cond, rewrites);
+            rewrite_statement_nets(body, rewrites);
+            steps
+                .iter_mut()
+                .for_each(|step| rewrite_statement_nets(step, rewrites));
+        }
+        Stmt::Break | Stmt::Continue => {}
+        Stmt::Repeat { count, body } => {
+            rewrite_expression_nets(count, rewrites);
+            rewrite_statement_nets(body, rewrites);
+        }
+        Stmt::Force { lv, e } => {
+            rewrite_lvalue_nets(lv, rewrites);
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::Release { lv } => rewrite_lvalue_nets(lv, rewrites),
+        Stmt::Display { args, .. } => args
+            .iter_mut()
+            .for_each(|argument| rewrite_expression_nets(argument, rewrites)),
+        Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+            rewrite_expression_nets(cond, rewrites)
+        }
+        Stmt::WriteMem { start, finish, .. } => {
+            if let Some(start) = start {
+                rewrite_expression_nets(start, rewrites);
+            }
+            if let Some(finish) = finish {
+                rewrite_expression_nets(finish, rewrites);
+            }
+        }
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+    }
+}
+
+fn rewrite_process_nets(process: &mut eda_core::ir::Process, rewrites: &[NetRewrite]) {
+    use eda_core::ir::Sens;
+    fn rewrite_sensitivity(sensitivity: &mut Sens, rewrites: &[NetRewrite]) {
+        match sensitivity {
+            Sens::Comb | Sens::Timed => {}
+            Sens::Any(net) | Sens::Posedge(net) | Sens::Negedge(net) => {
+                *net = rewrite_net(*net, rewrites)
+            }
+            Sens::List(list) => list
+                .iter_mut()
+                .for_each(|item| rewrite_sensitivity(item, rewrites)),
+        }
+    }
+    rewrite_sensitivity(&mut process.sens, rewrites);
+    rewrite_statement_nets(&mut process.body, rewrites);
+}
+
 pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, offset: usize) {
     use eda_core::ir::Expr;
     match expression {
@@ -835,6 +1045,8 @@ impl super::SlangAstLowerer {
             class_object_ids: std::collections::BTreeMap::new(),
             class_object_serial: None,
             class_static_methods: std::collections::BTreeMap::new(),
+            class_static_properties: std::collections::BTreeMap::new(),
+            class_static_initializer_count: 0,
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
@@ -976,7 +1188,7 @@ impl super::SlangAstLowerer {
                 }
             }
         }
-        child.lower_body(body, false)?;
+        child.lower_body(body)?;
 
         if is_interface {
             let instance_address = member
@@ -1040,6 +1252,7 @@ impl super::SlangAstLowerer {
         let child_net_start = offset;
         let child_ports = child.design.ports.clone();
         let child_memories = child.design.memories.clone();
+        let mut static_net_rewrites = Vec::new();
         for memory in &child.design.memories {
             let mut memory = memory.clone();
             memory.name = format!("{scoped_instance_name}.{}", memory.name);
@@ -1059,6 +1272,32 @@ impl super::SlangAstLowerer {
                 });
         }
         for declaration in &child.design.net_decls {
+            if declaration.name.starts_with("__class_static_") {
+                let Some(parent_symbol) = self.class_static_properties.get(&declaration.name)
+                else {
+                    return Err(format!(
+                        "hierarchy-global class static '{}' is missing from the root scope",
+                        declaration.name
+                    ));
+                };
+                if parent_symbol.width != declaration.width
+                    || parent_symbol.signed != declaration.is_signed
+                {
+                    return Err(format!(
+                        "hierarchy-global class static '{}' has conflicting layouts",
+                        declaration.name
+                    ));
+                }
+                static_net_rewrites.push(NetRewrite {
+                    from: declaration.base + offset,
+                    to: parent_symbol.base,
+                    width: declaration.width,
+                });
+                continue;
+            }
+            if declaration.name.contains(".__class_static_") {
+                continue;
+            }
             self.design.net_decls.push(eda_core::ir::NetDecl {
                 name: format!("{scoped_instance_name}.{}", declaration.name),
                 width: declaration.width,
@@ -1071,21 +1310,29 @@ impl super::SlangAstLowerer {
 
         for mut assignment in child.design.assigns {
             remap_assignment(&mut assignment, offset);
+            rewrite_lvalue_nets(&mut assignment.lv, &static_net_rewrites);
+            rewrite_expression_nets(&mut assignment.e, &static_net_rewrites);
             remap_expression_memory_ids(&mut assignment.e, memory_offset);
             self.design.assigns.push(assignment);
         }
-        for mut statement in child.design.initials {
+        for (initializer_index, mut statement) in child.design.initials.into_iter().enumerate() {
+            if initializer_index < child.class_static_initializer_count {
+                continue;
+            }
             remap_statement(&mut statement, offset);
+            rewrite_statement_nets(&mut statement, &static_net_rewrites);
             remap_statement_memory_ids(&mut statement, memory_offset);
             self.design.initials.push(statement);
         }
         for mut statement in child.design.final_blocks {
             remap_statement(&mut statement, offset);
+            rewrite_statement_nets(&mut statement, &static_net_rewrites);
             remap_statement_memory_ids(&mut statement, memory_offset);
             self.design.final_blocks.push(statement);
         }
         for mut process in child.design.processes {
             remap_process(&mut process, offset);
+            rewrite_process_nets(&mut process, &static_net_rewrites);
             remap_statement_memory_ids(&mut process.body, memory_offset);
             self.design.processes.push(process);
         }
