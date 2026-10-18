@@ -3779,6 +3779,126 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_runtime_while_and_for_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-runtime-loops");
+    let source_path = root.join("loops.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module loops(
+  input logic a,
+  output logic [3:0] for_value,
+  output logic [3:0] increment_value,
+  output logic [3:0] while_value
+);
+  int i;
+  int j;
+  int k;
+  initial begin
+    for_value = 4'd0;
+    for (i = 0; i < 4; i = i + 1) begin
+      for_value[i] = 1'b1;
+    end
+
+    increment_value = 4'd0;
+    for (j = 0; j < 3; j++) begin
+      increment_value = increment_value + 1;
+    end
+
+    while_value = 4'd0;
+    k = 0;
+    while (k < 3) begin
+      #1 while_value = while_value + 1;
+      k++;
+    end
+  end
+endmodule
+"#,
+    )
+    .expect("write runtime loop source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("loops"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower runtime while and for loops");
+    let mut simulator = Simulator::new(&design).expect("create runtime loop simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("for_value").unwrap().to_u64(), Some(0b1111));
+    assert_eq!(simulator.read("increment_value").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("while_value").unwrap().to_u64(), Some(0));
+    for expected in 1..=3 {
+        simulator.run_until(expected).unwrap();
+        assert_eq!(
+            simulator.read("while_value").unwrap().to_u64(),
+            Some(expected)
+        );
+    }
+
+    let inline_local_path = root.join("inline-local.sv");
+    std::fs::write(
+        &inline_local_path,
+        r#"
+module inline_local(output logic [3:0] y);
+  initial begin
+    for (int i = 0; i < 4; i++) y[i] = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write inline local loop source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&inline_local_path),
+            Some("inline_local"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("procedure-local blocks must fail closed");
+    assert!(
+        error.contains("does not support member kind 'StatementBlock'"),
+        "unexpected error: {error}"
+    );
+
+    let excessive_path = root.join("excessive.sv");
+    std::fs::write(
+        &excessive_path,
+        r#"
+module excessive(output logic y);
+  int i;
+  initial begin
+    i = 0;
+    while (i < 70000) i = i + 1;
+    y = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write excessive while source");
+    let excessive = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&excessive_path),
+            Some("excessive"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower excessive while loop");
+    let mut excessive_simulator = Simulator::new(&excessive).expect("create excessive simulator");
+    let error = excessive_simulator
+        .run_until(0)
+        .expect_err("excessive while loop must fail closed");
+    assert!(
+        error.contains("exceeds the 65536-iteration execution limit"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

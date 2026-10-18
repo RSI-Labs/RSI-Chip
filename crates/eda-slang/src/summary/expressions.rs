@@ -649,6 +649,9 @@ pub(crate) fn design_stmt_assignments(
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| assignments.extend(design_stmt_assignments(design, branch))),
+        Stmt::While { body, .. } => {
+            assignments.extend(design_stmt_assignments(design, body));
+        }
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {
                 assignments.push((name, design_expr_fingerprint(design, e)));

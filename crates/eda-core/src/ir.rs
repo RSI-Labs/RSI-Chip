@@ -653,6 +653,11 @@ pub enum Stmt {
         branches: Vec<Stmt>,
         mode: ForkMode,
     },
+    /// Execute `body` repeatedly while `cond` is true.
+    While {
+        cond: Expr,
+        body: Box<Stmt>,
+    },
     Display {
         parts: Vec<DispPart>,
         args: Vec<Expr>,
@@ -1005,6 +1010,10 @@ fn collect_memory_accesses(
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             collect_memory_accesses(branch, synchronous, memory_widths, accesses)
         }),
+        Stmt::While { cond, body } => {
+            collect_memory_expr_reads(cond, synchronous, accesses);
+            collect_memory_accesses(body, synchronous, memory_widths, accesses)
+        }
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, accesses);

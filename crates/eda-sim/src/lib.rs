@@ -84,6 +84,7 @@ pub struct Simulator<'d> {
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
     fork_joins: Vec<Option<ForkJoin<'d>>>,
+    while_iterations: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
@@ -194,6 +195,7 @@ impl<'d> Simulator<'d> {
             nba: Vec::new(),
             busy_procs: HashSet::new(),
             fork_joins: Vec::new(),
+            while_iterations: HashMap::new(),
             waiters: Vec::new(),
             memory_elements,
             memory_aliases,
@@ -932,6 +934,26 @@ impl<'d> Simulator<'d> {
                 Stmt::Forever(inner) => {
                     work.push(s);
                     work.push(inner);
+                }
+                Stmt::While { cond, body } => {
+                    const MAX_WHILE_ITERATIONS: u64 = 65_536;
+                    let condition = self.eval(cond);
+                    if condition.reduce_or().as_bool() != Some(true) {
+                        self.while_iterations.remove(&(s as *const Stmt as usize));
+                    } else {
+                        let iterations = self
+                            .while_iterations
+                            .entry(s as *const Stmt as usize)
+                            .or_insert(0);
+                        *iterations += 1;
+                        if *iterations > MAX_WHILE_ITERATIONS {
+                            return Err(
+                                "while loop exceeds the 65536-iteration execution limit".into()
+                            );
+                        }
+                        work.push(s);
+                        work.push(body);
+                    }
                 }
                 Stmt::Bl { lv, e } => {
                     let v = self.eval(e);
@@ -2293,6 +2315,10 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| walk_stmt_memories(branch, out)),
+        Stmt::While { cond, body } => {
+            walk_expr_memories(cond, out);
+            walk_stmt_memories(body, out)
+        }
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
@@ -2389,6 +2415,10 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(branch_reads);
             writes.extend(branch_writes);
         }),
+        Stmt::While { cond, body } => {
+            reads.extend(expr_nets(cond));
+            collect_stmt_access(body, reads, writes);
+        }
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2457,6 +2487,10 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt(body, out)
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
+        Stmt::While { cond, body } => {
+            walk_expr(cond, out);
+            walk_stmt(body, out)
+        }
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),

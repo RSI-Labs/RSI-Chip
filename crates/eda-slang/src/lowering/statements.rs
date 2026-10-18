@@ -224,6 +224,12 @@ impl SlangAstLowerer {
                     }
                     return self.lower_memory_file_call(expression, statement);
                 }
+                if matches!(
+                    string_field(expression, "op").as_deref(),
+                    Some("Postincrement" | "Preincrement" | "Postdecrement" | "Predecrement")
+                ) {
+                    return self.lower_increment_statement(expression);
+                }
                 if string_field(expression, "kind").as_deref() != Some("Assignment") {
                     return Err(
                         "direct slang-AST lowering supports only assignment expression statements"
@@ -233,6 +239,10 @@ impl SlangAstLowerer {
                 self.lower_assignment(expression)
             }
             "Assignment" => self.lower_assignment(statement),
+            "VariableDeclaration" => Err(
+                "direct slang-AST procedure locals are not supported; declare loop variables in module scope"
+                    .into(),
+            ),
             "Conditional" => {
                 if string_field(statement, "check").as_deref() != Some("None") {
                     let check = string_field(statement, "check").unwrap_or_default();
@@ -353,6 +363,58 @@ impl SlangAstLowerer {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Stmt::Block(statements))
             }
+            "WhileLoop" => {
+                let condition = statement
+                    .get("cond")
+                    .ok_or_else(|| "while loop has no condition".to_string())?;
+                let body = statement
+                    .get("body")
+                    .ok_or_else(|| "while loop has no body".to_string())?;
+                Ok(Stmt::While {
+                    cond: self.lower_expression(condition)?,
+                    body: Box::new(self.lower_statement(body)?),
+                })
+            }
+            "ForLoop" => {
+                let initializers = statement
+                    .get("initializers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "for loop has no initializers".to_string())?;
+                if initializers
+                    .iter()
+                    .any(|initializer| string_field(initializer, "kind").as_deref()
+                        == Some("VariableDeclaration"))
+                {
+                    return Err(
+                        "direct slang-AST for loops require module-scope loop variables".into(),
+                    );
+                }
+                let condition = statement
+                    .get("stopExpr")
+                    .ok_or_else(|| "for loop has no stop expression".to_string())?;
+                let body = statement
+                    .get("body")
+                    .ok_or_else(|| "for loop has no body".to_string())?;
+                let steps = statement
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "for loop has no steps".to_string())?;
+
+                let mut statements = Vec::with_capacity(initializers.len() + 1);
+                for initializer in initializers {
+                    statements.push(self.lower_statement(initializer)?);
+                }
+                let mut loop_body = Vec::with_capacity(steps.len() + 1);
+                loop_body.push(self.lower_statement(body)?);
+                for step in steps {
+                    loop_body.push(self.lower_update_statement(step)?);
+                }
+                statements.push(Stmt::While {
+                    cond: self.lower_expression(condition)?,
+                    body: Box::new(Stmt::Block(loop_body)),
+                });
+                Ok(Stmt::Block(statements))
+            }
             "Wait" => {
                 let condition = statement
                     .get("cond")
@@ -389,6 +451,56 @@ impl SlangAstLowerer {
         }
         slang_constant_u64(expression)
             .map_err(|_| "delay control must be an integer constant".to_string())
+    }
+
+    fn lower_increment_statement(
+        &self,
+        expression: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let operand = expression
+            .get("operand")
+            .ok_or_else(|| "increment expression has no operand".to_string())?;
+        let lv = self.lower_lvalue(operand)?;
+        let value = self.lower_expression(operand)?;
+        let width = lv.range.width();
+        let one = eda_core::ir::Expr::Const(LogicWord::from_u64(width, 1));
+        let add = matches!(
+            string_field(expression, "op").as_deref(),
+            Some("Postincrement" | "Preincrement")
+        );
+        Ok(eda_core::ir::Stmt::Bl {
+            lv,
+            e: eda_core::ir::Expr::Bin {
+                op: if add {
+                    eda_core::ir::BinOp::Add
+                } else {
+                    eda_core::ir::BinOp::Sub
+                },
+                a: Box::new(value),
+                b: Box::new(one),
+            },
+        })
+    }
+
+    fn lower_update_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        match string_field(statement, "kind").as_deref() {
+            Some("Assignment") => self.lower_assignment(statement),
+            Some(
+                kind @ ("UnaryOp" | "Postincrement" | "Preincrement" | "Postdecrement"
+                | "Predecrement"),
+            ) if kind == "UnaryOp"
+                || matches!(
+                    string_field(statement, "op").as_deref(),
+                    Some("Postincrement" | "Preincrement" | "Postdecrement" | "Predecrement")
+                ) =>
+            {
+                self.lower_increment_statement(statement)
+            }
+            _ => Err("direct slang-AST for-loop steps must be assignments or increments".into()),
+        }
     }
 
     pub(super) fn lower_memory_file_call(
