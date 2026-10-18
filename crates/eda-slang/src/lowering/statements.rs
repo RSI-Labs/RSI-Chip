@@ -415,6 +415,20 @@ impl SlangAstLowerer {
                     let event = timing
                         .get("expr")
                         .ok_or_else(|| "event control has no event expression".to_string())?;
+                    if let Some(selection) = self.event_array_selection(event)? {
+                        let edge = match string_field(timing, "edge").as_deref() {
+                            Some("None") => eda_core::ir::EventEdge::Any,
+                            Some("PosEdge") => eda_core::ir::EventEdge::Posedge,
+                            Some("NegEdge") => eda_core::ir::EventEdge::Negedge,
+                            _ => {
+                                return Err(
+                                    "direct slang-AST lowering requires a scalar signal edge"
+                                        .into(),
+                                )
+                            }
+                        };
+                        return self.lower_event_array_wait(&selection, edge, body);
+                    }
                     let lvalue = self.lower_lvalue(event)?;
                     if lvalue.range.width() != 1 {
                         return Err("event control expression must be scalar".into());
@@ -648,6 +662,9 @@ impl SlangAstLowerer {
         if !is_event {
             return Err("event trigger target must be an event".into());
         }
+        if let Some(selection) = self.event_array_selection(target)? {
+            return self.lower_event_array_trigger(&selection, nonblocking);
+        }
         let lvalue = self.lower_lvalue(target)?;
         let current = self.lower_expression(target)?;
         let unknown = eda_core::ir::Expr::Const(LogicWord::new_const(1, LogicValue::X));
@@ -675,6 +692,53 @@ impl SlangAstLowerer {
                 e: next,
             })
         }
+    }
+
+    fn lower_event_array_trigger(
+        &self,
+        selection: &super::AstEventArraySelection,
+        nonblocking: bool,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let candidates = self.event_array_candidates(selection, &selection.selectors)?;
+        let mut result = eda_core::ir::Stmt::Block(Vec::new());
+        for candidate in candidates {
+            let branch = event_array_toggle(candidate.net, nonblocking);
+            result = eda_core::ir::Stmt::If {
+                c: event_array_condition(&candidate.conditions),
+                t: Box::new(branch),
+                f: Some(Box::new(result)),
+            };
+        }
+        Ok(result)
+    }
+
+    fn lower_event_array_wait(
+        &self,
+        selection: &super::AstEventArraySelection,
+        edge: eda_core::ir::EventEdge,
+        body: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let candidates = self.event_array_candidates(selection, &selection.selectors)?;
+        let body = self.lower_statement(body)?;
+        let mut result = eda_core::ir::Stmt::Assert {
+            cond: eda_core::ir::Expr::Const(LogicWord::zero(1)),
+            message: Some("event array index is out of range".into()),
+        };
+        for candidate in candidates {
+            let branch = eda_core::ir::Stmt::EventWait {
+                watches: vec![eda_core::ir::EventWatch {
+                    net: candidate.net,
+                    edge,
+                }],
+                body: Box::new(body.clone()),
+            };
+            result = eda_core::ir::Stmt::If {
+                c: event_array_condition(&candidate.conditions),
+                t: Box::new(branch),
+                f: Some(Box::new(result)),
+            };
+        }
+        Ok(result)
     }
 
     fn lower_increment_statement(
@@ -1122,4 +1186,52 @@ fn event_watches(
             Ok(watches)
         }
     }
+}
+
+fn event_array_toggle(net: usize, nonblocking: bool) -> eda_core::ir::Stmt {
+    let lv = eda_core::ir::LValue {
+        net,
+        decl_width: 1,
+        range: full_range(1),
+    };
+    let current = eda_core::ir::Expr::Ref {
+        net,
+        decl_width: 1,
+        range: full_range(1),
+        signed: false,
+    };
+    let unknown = eda_core::ir::Expr::Const(LogicWord::new_const(1, LogicValue::X));
+    let zero = eda_core::ir::Expr::Const(LogicWord::zero(1));
+    let next = eda_core::ir::Expr::Cond {
+        c: Box::new(eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::CaseEq,
+            a: Box::new(current.clone()),
+            b: Box::new(unknown),
+        }),
+        t: Box::new(zero),
+        f: Box::new(eda_core::ir::Expr::Un {
+            op: eda_core::ir::UnOp::Not,
+            a: Box::new(current),
+        }),
+    };
+    if nonblocking {
+        eda_core::ir::Stmt::NBl { lv, e: next }
+    } else {
+        eda_core::ir::Stmt::Bl { lv, e: next }
+    }
+}
+
+pub(super) fn event_array_condition(conditions: &[eda_core::ir::Expr]) -> eda_core::ir::Expr {
+    let mut conditions = conditions.iter().cloned();
+    let Some(mut result) = conditions.next() else {
+        return eda_core::ir::Expr::Const(LogicWord::ones(1));
+    };
+    for condition in conditions {
+        result = eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::LogAnd,
+            a: Box::new(result),
+            b: Box::new(condition),
+        };
+    }
+    result
 }

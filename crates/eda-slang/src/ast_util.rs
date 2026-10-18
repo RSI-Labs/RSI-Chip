@@ -24,8 +24,10 @@ pub(super) fn normalize_detailed_types(value: &mut Value) {
     let Value::Object(fields) = value else {
         return;
     };
+    let is_type_alias = fields.get("kind").and_then(Value::as_str) == Some("TypeAlias");
     for (key, nested) in fields.iter_mut() {
-        if key == "target" {
+        let is_type_alias_target = key == "target" && is_type_alias;
+        if is_type_alias_target {
             continue;
         }
         if (key == "type" || key == "returnType") && nested.is_object() {

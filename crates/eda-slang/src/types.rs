@@ -120,6 +120,42 @@ pub(super) fn memory_type_with_element(
 
 pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     let type_name = type_name.trim();
+    let base = type_name.split('[').next()?.trim();
+    let event_array = type_name.starts_with("event$")
+        && type_name["event$".len()..].trim_start().starts_with('[');
+    if base == "event" || event_array {
+        let ranges = explicit_type_ranges(type_name)?;
+        if ranges.is_empty() {
+            return Some(AstTypeShape {
+                width: 1,
+                bounds: Some((0, 0)),
+                dimensions: Vec::new(),
+            });
+        }
+        let mut dimensions = Vec::<AstPackedDimension>::new();
+        let mut width = 1_usize;
+        for (left, right) in ranges.iter().rev() {
+            let range_width =
+                usize::try_from(((*left as i128) - (*right as i128)).unsigned_abs() + 1).ok()?;
+            dimensions.push(AstPackedDimension {
+                msb: *left,
+                lsb: *right,
+                length: range_width,
+                element_width: width,
+            });
+            width = width.checked_mul(range_width)?;
+        }
+        dimensions.reverse();
+        let bounds = match ranges.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
+        return Some(AstTypeShape {
+            width,
+            bounds,
+            dimensions,
+        });
+    }
     if type_name.contains('$')
         || type_name.contains('{')
         || type_name.contains("class")
@@ -127,8 +163,6 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
     {
         return None;
     }
-
-    let base = type_name.split('[').next()?.trim();
     let element_width = if base.contains("logic") || base.contains("reg") || base.contains("bit") {
         1
     } else if base == "event" {

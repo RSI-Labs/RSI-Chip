@@ -10,7 +10,7 @@ use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
 use super::hierarchy::full_range;
-use super::AstLoweredSymbol;
+use super::{AstEventArrayCandidate, AstEventArraySelection, AstLoweredSymbol};
 
 pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::BinOp, String> {
     match operator {
@@ -244,6 +244,7 @@ impl super::SlangAstLowerer {
             }
             "IntegerLiteral" => {
                 let word = integer_literal_word(value)
+                    .or_else(|| constant_json_word(value))
                     .ok_or_else(|| "invalid slang integer literal".to_string())?;
                 let signed = string_field(value, "type")
                     .and_then(|type_name| simple_type_signed(&type_name))
@@ -1445,6 +1446,138 @@ impl super::SlangAstLowerer {
         let name = expression_symbol(value)
             .ok_or_else(|| "packed select has no declaration symbol".to_string())?;
         Ok(self.symbols.get(&name).cloned())
+    }
+
+    pub(super) fn event_array_selection(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<AstEventArraySelection>, String> {
+        if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+            return Ok(None);
+        }
+        let mut selectors = Vec::new();
+        let mut selected = value;
+        while string_field(selected, "kind").as_deref() == Some("ElementSelect") {
+            selectors.push(
+                selected
+                    .get("selector")
+                    .ok_or_else(|| "event array select has no selector".to_string())?,
+            );
+            selected = selected
+                .get("value")
+                .ok_or_else(|| "event array select has no selected value".to_string())?;
+        }
+        let Some(symbol) = self.direct_packed_symbol(selected)? else {
+            return Ok(None);
+        };
+        if symbol.memory.is_some() || symbol.dimensions.is_empty() {
+            return Ok(None);
+        }
+        selectors.reverse();
+        if selectors.len() != symbol.dimensions.len() {
+            return Err(format!(
+                "event select rank {} does not match the declaration's {} dimensions",
+                selectors.len(),
+                symbol.dimensions.len()
+            ));
+        }
+        Ok(Some(AstEventArraySelection {
+            base: symbol.base,
+            dimensions: symbol.dimensions,
+            selectors: selectors.into_iter().cloned().collect(),
+        }))
+    }
+
+    pub(super) fn event_array_candidates(
+        &self,
+        selection: &AstEventArraySelection,
+        selectors: &[serde_json::Value],
+    ) -> Result<Vec<AstEventArrayCandidate>, String> {
+        if selection.dimensions.is_empty() {
+            return Err("event array declaration has no dimensions".into());
+        }
+        let lowered_selectors = selectors
+            .iter()
+            .map(|selector| self.lower_expression(selector))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut candidates = Vec::new();
+        self.append_event_array_candidates(
+            selection,
+            &lowered_selectors,
+            selectors,
+            0,
+            0,
+            Vec::new(),
+            &mut candidates,
+        )?;
+        Ok(candidates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_event_array_candidates(
+        &self,
+        selection: &AstEventArraySelection,
+        lowered_selectors: &[eda_core::ir::Expr],
+        selectors: &[serde_json::Value],
+        level: usize,
+        offset: usize,
+        conditions: Vec<eda_core::ir::Expr>,
+        candidates: &mut Vec<AstEventArrayCandidate>,
+    ) -> Result<(), String> {
+        let Some(dimension) = selection.dimensions.get(level) else {
+            candidates.push(AstEventArrayCandidate {
+                net: selection.base + offset,
+                conditions,
+            });
+            return Ok(());
+        };
+        let selector = &selectors[level];
+        let lower = dimension.msb.min(dimension.lsb);
+        let upper = dimension.msb.max(dimension.lsb);
+        if integer_literal_word(selector).is_some() || string_field(selector, "constant").is_some()
+        {
+            let index = constant_i64(selector)?;
+            if index < lower || index > upper {
+                return Err(format!("event array index {index} is out of range"));
+            }
+        }
+        let lowered_selector = &lowered_selectors[level];
+        let comparison_width = lowered_selector.width().max(1);
+        for logical_index in lower..=upper {
+            let coordinate = if dimension.msb >= dimension.lsb {
+                logical_index - dimension.lsb
+            } else {
+                dimension.lsb - logical_index
+            };
+            let coordinate = usize::try_from(coordinate)
+                .ok()
+                .filter(|coordinate| *coordinate < dimension.length)
+                .ok_or_else(|| {
+                    format!(
+                        "event array index {logical_index} maps to an invalid physical coordinate"
+                    )
+                })?;
+            let condition = eda_core::ir::Expr::Bin {
+                op: eda_core::ir::BinOp::Eq,
+                a: Box::new(lowered_selector.clone()),
+                b: Box::new(eda_core::ir::Expr::Const(LogicWord::from_u64(
+                    comparison_width,
+                    logical_index as u64,
+                ))),
+            };
+            let mut conditions = conditions.clone();
+            conditions.push(condition);
+            self.append_event_array_candidates(
+                selection,
+                lowered_selectors,
+                selectors,
+                level + 1,
+                offset + coordinate * dimension.element_width,
+                conditions,
+                candidates,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn declared_bit_index(

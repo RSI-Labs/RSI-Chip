@@ -1,5 +1,6 @@
 //! Straight-line function inlining from slang's elaborated AST.
 
+use super::statements::event_array_condition;
 use super::{declaration_name, SlangAstLowerer};
 use crate::ast_util::{bool_field, expression_symbol, string_field};
 use serde_json::{json, Value};
@@ -908,6 +909,18 @@ impl SlangAstLowerer {
         };
         if !is_event {
             return Err("event triggered receiver must be an event".into());
+        }
+        if let Some(selection) = self.event_array_selection(receiver)? {
+            let candidates = self.event_array_candidates(&selection, &selection.selectors)?;
+            let mut result = eda_core::ir::Expr::Const(eda_core::logic::LogicWord::xes(1));
+            for candidate in candidates {
+                result = eda_core::ir::Expr::Cond {
+                    c: Box::new(event_array_condition(&candidate.conditions)),
+                    t: Box::new(eda_core::ir::Expr::EventTriggered { net: candidate.net }),
+                    f: Box::new(result),
+                };
+            }
+            return Ok(result);
         }
         let lvalue = self.lower_lvalue(receiver)?;
         if lvalue.range.width() != 1 {

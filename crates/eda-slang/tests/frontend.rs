@@ -3661,6 +3661,234 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_event_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-array");
+    let source_path = root.join("event_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_array(
+  input logic go,
+  input int index,
+  input int wrong,
+  output logic first,
+  output logic second,
+  output logic triggered_now,
+  output logic triggered_later
+);
+  event events[2];
+  initial begin
+    first = 1'b0;
+    second = 1'b0;
+    wait (go);
+    fork
+      begin
+        @(events[index]);
+        #2 first = 1'b1;
+        @(events[index]);
+        second = 1'b1;
+      end
+      begin
+        #1 ->events[wrong];
+        #1 ->events[index];
+        #3 ->events[index];
+      end
+    join
+  end
+  initial begin
+    triggered_now = 1'b0;
+    triggered_later = 1'b0;
+    wait (go);
+    ->events[index];
+    triggered_now = events[index].triggered;
+    #1 triggered_later = events[index].triggered;
+  end
+endmodule
+"#,
+    )
+    .expect("write event-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event array");
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "events")
+            .expect("event-array declaration")
+            .width,
+        2
+    );
+    let mut simulator = Simulator::new(&design).expect("create event-array simulator");
+    simulator
+        .set_input("index", &LogicWord::from_u64(32, 0))
+        .unwrap();
+    simulator
+        .set_input("wrong", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator.run_until(10).unwrap();
+    assert_eq!(simulator.read("triggered_now").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("triggered_later").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_runtime_out_of_range_event_waits() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-array-range");
+    let source_path = root.join("event_array_range.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_array_range(input logic go, input int index);
+  event events[2];
+  initial begin
+    wait (go);
+    @(events[index]);
+  end
+endmodule
+"#,
+    )
+    .expect("write out-of-range event-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_array_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event-array range source");
+    let mut simulator = Simulator::new(&design).expect("create event-array range simulator");
+    simulator
+        .set_input("index", &LogicWord::from_u64(32, 2))
+        .unwrap();
+    let error = simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .expect_err("runtime out-of-range event waits must fail closed");
+    assert!(
+        error.contains("event array index is out of range"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_constant_nonblocking_event_array_triggers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-array-constant");
+    let source_path = root.join("event_array_constant.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_array_constant(input logic go, output logic done);
+  event events[2];
+  initial begin
+    done = 1'b0;
+    wait (go);
+    fork
+      @(events[1]) done = 1'b1;
+      #1 ->>events[1];
+    join
+  end
+endmodule
+"#,
+    )
+    .expect("write constant event-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_array_constant"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower constant event-array trigger");
+    let mut simulator = Simulator::new(&design).expect("create constant event simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator.run_until(2).unwrap();
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_multidimensional_event_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-event-array-2d");
+    let source_path = root.join("event_array_2d.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module event_array_2d(
+  input logic go,
+  input int row,
+  input int column,
+  output logic done
+);
+  event events[1:0][1:0];
+  initial begin
+    done = 1'b0;
+    wait (go);
+    fork
+      @(events[row][column]) done = 1'b1;
+      begin
+        #1 ->events[1 - row][column];
+        #1 ->events[row][column];
+      end
+    join
+  end
+endmodule
+"#,
+    )
+    .expect("write multidimensional event-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("event_array_2d"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional event array");
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|declaration| declaration.name == "events")
+            .expect("multidimensional event-array declaration")
+            .width,
+        4
+    );
+    let mut simulator = Simulator::new(&design).expect("create multidimensional event simulator");
+    simulator
+        .set_input("row", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .set_input("column", &LogicWord::from_u64(32, 0))
+        .unwrap();
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator.run_until(3).unwrap();
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

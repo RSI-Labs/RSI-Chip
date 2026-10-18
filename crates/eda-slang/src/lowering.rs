@@ -53,6 +53,17 @@ struct AstLoweredSymbol {
     struct_fields: std::collections::BTreeMap<String, AstStructField>,
 }
 
+pub(super) struct AstEventArraySelection {
+    pub(super) base: usize,
+    pub(super) dimensions: Vec<crate::types::AstPackedDimension>,
+    pub(super) selectors: Vec<serde_json::Value>,
+}
+
+pub(super) struct AstEventArrayCandidate {
+    pub(super) net: usize,
+    pub(super) conditions: Vec<eda_core::ir::Expr>,
+}
+
 #[derive(Clone, Copy)]
 struct AstStructField {
     offset: usize,
