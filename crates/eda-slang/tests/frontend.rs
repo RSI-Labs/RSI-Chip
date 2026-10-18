@@ -212,6 +212,106 @@ endmodule
         .unwrap();
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(45));
     assert_eq!(simulator.read("doubled_offset").unwrap().to_u64(), Some(85));
+
+    let explicit_path = root.join("explicit_import.sv");
+    std::fs::write(
+        &explicit_path,
+        r#"
+package scoped_pkg;
+  parameter int WIDTH = 8;
+  localparam int OFFSET = 21;
+
+  function automatic int double(input int value);
+    double = 2 * value;
+  endfunction
+endpackage
+
+module explicit_import
+  import scoped_pkg::WIDTH,
+          scoped_pkg::OFFSET,
+          scoped_pkg::double;
+(
+  input logic [WIDTH-1:0] a,
+  output logic [WIDTH-1:0] imported,
+  output logic [WIDTH-1:0] scoped,
+  output int imported_function,
+  output int scoped_function
+);
+  assign imported = a + OFFSET;
+  assign scoped = a + scoped_pkg::OFFSET;
+  assign imported_function = double(OFFSET);
+  assign scoped_function = scoped_pkg::double(OFFSET);
+endmodule
+"#,
+    )
+    .expect("write explicit-import source");
+    let explicit = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&explicit_path),
+            Some("explicit_import"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower explicit package imports");
+    assert_eq!(explicit.assigns.len(), 4);
+    let mut explicit_simulator =
+        Simulator::new(&explicit).expect("create explicit-import simulator");
+    explicit_simulator
+        .set_input("a", &LogicWord::from_u64(8, 3))
+        .unwrap();
+    assert_eq!(
+        explicit_simulator.read("imported").unwrap().to_u64(),
+        Some(24)
+    );
+    assert_eq!(
+        explicit_simulator.read("scoped").unwrap().to_u64(),
+        Some(24)
+    );
+    assert_eq!(
+        explicit_simulator
+            .read("imported_function")
+            .unwrap()
+            .to_u64(),
+        Some(42)
+    );
+    assert_eq!(
+        explicit_simulator.read("scoped_function").unwrap().to_u64(),
+        Some(42)
+    );
+
+    let collision_path = root.join("package_collision.sv");
+    std::fs::write(
+        &collision_path,
+        r#"
+package left_pkg;
+  parameter int SAME = 1;
+endpackage
+
+package right_pkg;
+  parameter int SAME = 2;
+endpackage
+
+module package_collision
+  import left_pkg::*,
+          right_pkg::*;
+(
+  output int y
+);
+  assign y = 1;
+endmodule
+"#,
+    )
+    .expect("write package-collision source");
+    let collision_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&collision_path),
+            Some("package_collision"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("ambiguous imported package names must fail closed");
+    assert!(
+        collision_error.contains("imported package symbol collision for 'SAME'"),
+        "unexpected collision error: {collision_error}"
+    );
 }
 
 #[test]

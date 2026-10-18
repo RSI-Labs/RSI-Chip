@@ -60,10 +60,42 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     normalize_instance_bodies(&mut root);
     normalize_detailed_types(&mut root);
     let mut compilation_unit_members = Vec::new();
+    let imported_package_addresses: std::collections::BTreeSet<u64> = root
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(serde_json::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|member| {
+                    matches!(
+                        string_field(member, "kind").as_deref(),
+                        Some("WildcardImport" | "ExplicitImport")
+                    )
+                })
+                .filter_map(|member| string_field(member, "package"))
+                .filter_map(|package| package.split_whitespace().next()?.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     if let Some(members) = design.get("members").and_then(serde_json::Value::as_array) {
         for member in members {
-            if string_field(member, "kind").as_deref() == Some("CompilationUnit") {
-                collect_compilation_unit_definitions(member, &mut compilation_unit_members);
+            if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+                continue;
+            }
+            let empty_packages = Vec::new();
+            for package in member
+                .get("members")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or(&empty_packages)
+            {
+                let package_address = package
+                    .get("addr")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                if imported_package_addresses.contains(&package_address) {
+                    collect_compilation_unit_definitions(package, &mut compilation_unit_members);
+                }
             }
         }
     }
@@ -174,7 +206,21 @@ impl SlangAstLowerer {
         else {
             return Ok(());
         };
+        let mut package_symbols = std::collections::BTreeSet::new();
         for member in members {
+            let name = declaration_name(member, "package definition")?;
+            let symbol_kind = match string_field(member, "kind").as_deref() {
+                Some("Parameter") => "param",
+                Some("Subroutine") => "subroutine",
+                Some("EnumType") => "enum",
+                Some("TypeAlias") => "alias",
+                _ => "definition",
+            };
+            if !package_symbols.insert(format!("{symbol_kind}:{name}"))
+                && (symbol_kind != "alias" || !package_symbols.contains(&format!("enum:{name}")))
+            {
+                return Err(format!("imported package symbol collision for '{name}'"));
+            }
             match string_field(member, "kind").as_deref() {
                 Some("Subroutine") => self
                     .collect_subroutine(member)
@@ -323,6 +369,7 @@ impl SlangAstLowerer {
                 "StatementBlock" => {}
                 "Modport" => {}
                 "WildcardImport" => {}
+                "ExplicitImport" => {}
                 "ClockingBlock" => self
                     .lower_clocking_block(member)
                     .map_err(|error| with_source_span(member, error))?,
