@@ -132,6 +132,9 @@ impl super::SlangAstLowerer {
             expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
         if let Some(symbol_id) = expression_symbol_id(value) {
             if let Some(symbol) = self.external_symbols.get(&symbol_id) {
+                if self.external_symbol_directions.get(&symbol_id) == Some(&eda_core::ir::Dir::In) {
+                    return Err("modport input variable cannot be assigned directly".into());
+                }
                 return Ok(symbol.clone());
             }
         }

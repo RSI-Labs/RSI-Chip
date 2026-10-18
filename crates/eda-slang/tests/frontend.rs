@@ -2582,6 +2582,51 @@ endmodule
         .unwrap();
     assert_eq!(simulator.read("bus.valid").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+
+    let mut ast = serde_json::from_str::<serde_json::Value>(
+        &slang
+            .ast_json_with_options(
+                std::slice::from_ref(&source_path),
+                Some("interface_top"),
+                &[],
+                &PreprocessOptions::default(),
+            )
+            .expect("serialize authoritative interface AST"),
+    )
+    .expect("parse authoritative interface AST");
+    fn make_valid_input(value: &mut serde_json::Value) {
+        if let Some(fields) = value.as_object_mut() {
+            if fields.get("kind").and_then(serde_json::Value::as_str) == Some("Modport")
+                && fields.get("name").and_then(serde_json::Value::as_str) == Some("src")
+            {
+                if let Some(members) = fields
+                    .get_mut("members")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for member in members {
+                        if member.get("name").and_then(serde_json::Value::as_str) == Some("valid") {
+                            member["direction"] = serde_json::Value::String("In".into());
+                        }
+                    }
+                }
+            }
+            for nested in fields.values_mut() {
+                make_valid_input(nested);
+            }
+        } else if let Some(values) = value.as_array_mut() {
+            for nested in values {
+                make_valid_input(nested);
+            }
+        }
+    }
+    make_valid_input(&mut ast);
+    let error = slang
+        .lower_ast_json(&ast.to_string())
+        .expect_err("modport input writes must fail closed");
+    assert!(
+        error.contains("modport input variable cannot be assigned directly"),
+        "unexpected modport direction error: {error}"
+    );
 }
 
 #[test]

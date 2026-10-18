@@ -666,6 +666,7 @@ impl super::SlangAstLowerer {
             symbols: std::collections::BTreeMap::new(),
             local_symbols: std::collections::BTreeMap::new(),
             external_symbols: std::collections::BTreeMap::new(),
+            external_symbol_directions: std::collections::BTreeMap::new(),
             local_initializers: std::collections::BTreeMap::new(),
             local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
@@ -727,6 +728,9 @@ impl super::SlangAstLowerer {
                 child
                     .external_symbols
                     .insert(symbol_id.clone(), proxy.clone());
+                child
+                    .external_symbol_directions
+                    .insert(symbol_id.clone(), modport_symbol.direction);
                 interface_proxy_connections.push((
                     modport_symbol.direction,
                     modport_symbol.symbol.clone(),
