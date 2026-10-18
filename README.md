@@ -56,7 +56,7 @@ integer-literal values, simple type width/signedness, and direct/generated
 instance inventory against the slang AST. `compile_files_via_ast`
 additionally lowers a simple module subset with elaborated parameter-constant
 leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
-if/case control flow, bounded string literals, concatenation, byte reads and
+if plus normal, wildcard, and inside case control flow, bounded string literals, concatenation, byte reads and
 writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
 comparison, inclusive `substr` extraction, and radix conversions
 (`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), scalar event lists with

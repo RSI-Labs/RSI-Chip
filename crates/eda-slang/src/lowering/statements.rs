@@ -685,48 +685,7 @@ impl SlangAstLowerer {
                 })
             }
             "Case" => {
-                let condition = string_field(statement, "condition").unwrap_or_default();
-                if condition != "Normal" {
-                    return Err(format!(
-                        "direct slang-AST lowering does not support {condition} case semantics"
-                    ));
-                }
-                let check = string_field(statement, "check").unwrap_or_default();
-                if check != "None" {
-                    return Err(format!(
-                        "direct slang-AST lowering does not support {check} case semantics"
-                    ));
-                }
-                let expression = statement
-                    .get("expr")
-                    .ok_or_else(|| "case statement has no expression".to_string())?;
-                let items = statement
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "case statement has no items".to_string())?;
-                let mut arms = Vec::new();
-                for item in items {
-                    let body = item
-                        .get("stmt")
-                        .ok_or_else(|| "case item has no statement".to_string())?;
-                    let body = self.lower_statement(body)?;
-                    let expressions = item
-                        .get("expressions")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| "case item has no expressions".to_string())?;
-                    for expression in expressions {
-                        arms.push((self.lower_expression(expression)?, body.clone()));
-                    }
-                }
-                let default = match statement.get("defaultCase") {
-                    Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
-                    None => None,
-                };
-                Ok(Stmt::Case {
-                    e: self.lower_expression(expression)?,
-                    arms,
-                    dflt: default,
-                })
+                self.lower_case_statement(statement)
             }
             "Timed" => {
                 let timing = statement
@@ -794,7 +753,7 @@ impl SlangAstLowerer {
                         Some("NegEdge") => eda_core::ir::EventEdge::Negedge,
                         _ => {
                             return Err(
-                                "direct slang-AST lowering requires a scalar signal edge".into()
+                                "direct slang-AST lowering requires a scalar signal edge".into(),
                             )
                         }
                     };
@@ -1006,6 +965,282 @@ impl SlangAstLowerer {
                 "direct slang-AST lowering does not support statement kind '{other}'"
             )),
         }
+    }
+
+    fn lower_case_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let condition = string_field(statement, "condition").unwrap_or_default();
+        let check = string_field(statement, "check").unwrap_or_default();
+        if check != "None" {
+            return Err(format!(
+                "direct slang-AST lowering does not support {check} case semantics"
+            ));
+        }
+        match condition.as_str() {
+            "WildcardJustZ" | "WildcardXOrZ" => {
+                self.lower_wildcard_case_statement(statement, condition == "WildcardXOrZ")
+            }
+            "Inside" => self.lower_inside_case_statement(statement),
+            "Normal" => self.lower_normal_case_statement(statement),
+            other => Err(format!(
+                "direct slang-AST lowering does not support {other} case semantics"
+            )),
+        }
+    }
+
+    fn lower_normal_case_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::Stmt;
+        let expression = statement
+            .get("expr")
+            .ok_or_else(|| "case statement has no expression".to_string())?;
+        let items = statement
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "case statement has no items".to_string())?;
+        let mut arms = Vec::new();
+        for item in items {
+            let body = item
+                .get("stmt")
+                .ok_or_else(|| "case item has no statement".to_string())?;
+            let body = self.lower_statement(body)?;
+            let expressions = item
+                .get("expressions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "case item has no expressions".to_string())?;
+            for expression in expressions {
+                arms.push((self.lower_expression(expression)?, body.clone()));
+            }
+        }
+        let default = match statement.get("defaultCase") {
+            Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
+            None => None,
+        };
+        Ok(Stmt::Case {
+            e: self.lower_expression(expression)?,
+            arms,
+            dflt: default,
+        })
+    }
+
+    fn lower_wildcard_case_statement(
+        &self,
+        statement: &serde_json::Value,
+        ignore_x: bool,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::{BinOp, Expr, Stmt};
+
+        let case_expression = statement
+            .get("expr")
+            .ok_or_else(|| "wildcard case statement has no expression".to_string())?;
+        let case_expression = self.lower_expression(case_expression)?;
+        let items = statement
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "wildcard case statement has no items".to_string())?;
+        let mut result = match statement.get("defaultCase") {
+            Some(default) => self.lower_statement(default)?,
+            None => Stmt::Block(Vec::new()),
+        };
+        for item in items.iter().rev() {
+            let body = item
+                .get("stmt")
+                .ok_or_else(|| "wildcard case item has no statement".to_string())?;
+            let body = self.lower_statement(body)?;
+            let expressions = item
+                .get("expressions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "wildcard case item has no expressions".to_string())?;
+            let mut alternatives = Vec::new();
+            for expression in expressions {
+                let label = self.lower_expression(expression)?;
+                alternatives.push(self.wildcard_case_match(
+                    case_expression.clone(),
+                    label,
+                    ignore_x,
+                )?);
+            }
+            let Some(first) = alternatives.first().cloned() else {
+                return Err("wildcard case item has no usable expressions".into());
+            };
+            let mut condition = first;
+            for alternative in alternatives.into_iter().skip(1) {
+                condition = Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(condition),
+                    b: Box::new(alternative),
+                };
+            }
+            result = Stmt::If {
+                c: condition,
+                t: Box::new(body),
+                f: Some(Box::new(result)),
+            };
+        }
+        Ok(result)
+    }
+
+    fn wildcard_case_match(
+        &self,
+        case_expression: eda_core::ir::Expr,
+        label: eda_core::ir::Expr,
+        ignore_x: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::{BinOp, Expr};
+
+        let width = case_expression.width().max(label.width()).max(1);
+        let mut result = Expr::Const(LogicWord::ones(1));
+        for bit in 0..width {
+            let case_bit = Self::case_bit(case_expression.clone(), bit);
+            let label_bit = Self::case_bit(label.clone(), bit);
+            let selector_wildcard = Self::bit_is(case_bit.clone(), LogicValue::Z);
+            let mut wildcard = selector_wildcard;
+            if ignore_x {
+                wildcard = Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(wildcard),
+                    b: Box::new(Self::bit_is(case_bit.clone(), LogicValue::X)),
+                };
+            }
+            let label_wildcard = Self::bit_is(label_bit.clone(), LogicValue::Z);
+            let label_wildcard = if ignore_x {
+                Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(label_wildcard),
+                    b: Box::new(Self::bit_is(label_bit.clone(), LogicValue::X)),
+                }
+            } else {
+                label_wildcard
+            };
+            wildcard = Expr::Bin {
+                op: BinOp::LogOr,
+                a: Box::new(wildcard),
+                b: Box::new(label_wildcard),
+            };
+            let matches = Expr::Bin {
+                op: BinOp::LogOr,
+                a: Box::new(wildcard),
+                b: Box::new(Expr::Bin {
+                    op: BinOp::CaseEq,
+                    a: Box::new(case_bit),
+                    b: Box::new(label_bit),
+                }),
+            };
+            result = Expr::Bin {
+                op: BinOp::LogAnd,
+                a: Box::new(result),
+                b: Box::new(matches),
+            };
+        }
+        Ok(result)
+    }
+
+    fn case_bit(expression: eda_core::ir::Expr, bit: usize) -> eda_core::ir::Expr {
+        if bit >= expression.width() {
+            return eda_core::ir::Expr::Const(LogicWord::zero(1));
+        }
+        eda_core::ir::Expr::Index {
+            e: Box::new(expression),
+            msb: bit,
+            lsb: bit,
+        }
+    }
+
+    fn bit_is(expression: eda_core::ir::Expr, value: LogicValue) -> eda_core::ir::Expr {
+        eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::CaseEq,
+            a: Box::new(expression),
+            b: Box::new(eda_core::ir::Expr::Const(LogicWord::new_const(1, value))),
+        }
+    }
+
+    fn lower_inside_case_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::{BinOp, Expr, Stmt};
+
+        let case_expression = statement
+            .get("expr")
+            .ok_or_else(|| "case inside statement has no expression".to_string())?;
+        let case_expression = self.lower_expression(case_expression)?;
+        let items = statement
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "case inside statement has no items".to_string())?;
+        let mut result = match statement.get("defaultCase") {
+            Some(default) => self.lower_statement(default)?,
+            None => Stmt::Block(Vec::new()),
+        };
+        for item in items.iter().rev() {
+            let body = item
+                .get("stmt")
+                .ok_or_else(|| "case inside item has no statement".to_string())?;
+            let body = self.lower_statement(body)?;
+            let expressions = item
+                .get("expressions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "case inside item has no expressions".to_string())?;
+            let mut alternatives = Vec::new();
+            for expression in expressions {
+                if string_field(expression, "kind").as_deref() == Some("ValueRange") {
+                    if string_field(expression, "rangeKind").as_deref() != Some("Simple") {
+                        return Err(
+                            "direct slang-AST lowering supports only simple case-inside ranges"
+                                .into(),
+                        );
+                    }
+                    let lower = expression
+                        .get("left")
+                        .ok_or_else(|| "case-inside range has no lower bound".to_string())?;
+                    let upper = expression
+                        .get("right")
+                        .ok_or_else(|| "case-inside range has no upper bound".to_string())?;
+                    let lower = self.lower_expression(lower)?;
+                    let upper = self.lower_expression(upper)?;
+                    alternatives.push(Expr::Bin {
+                        op: BinOp::LogAnd,
+                        a: Box::new(Expr::Bin {
+                            op: BinOp::Ge,
+                            a: Box::new(case_expression.clone()),
+                            b: Box::new(lower),
+                        }),
+                        b: Box::new(Expr::Bin {
+                            op: BinOp::Le,
+                            a: Box::new(case_expression.clone()),
+                            b: Box::new(upper),
+                        }),
+                    });
+                } else {
+                    alternatives.push(Expr::Bin {
+                        op: BinOp::Eq,
+                        a: Box::new(case_expression.clone()),
+                        b: Box::new(self.lower_expression(expression)?),
+                    });
+                }
+            }
+            let Some(first) = alternatives.first().cloned() else {
+                return Err("case inside item has no usable expressions".into());
+            };
+            let mut condition = first;
+            for alternative in alternatives.into_iter().skip(1) {
+                condition = Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(condition),
+                    b: Box::new(alternative),
+                };
+            }
+            result = Stmt::If {
+                c: condition,
+                t: Box::new(body),
+                f: Some(Box::new(result)),
+            };
+        }
+        Ok(result)
     }
 
     fn lower_delay_control(&self, timing: &serde_json::Value) -> Result<u64, String> {

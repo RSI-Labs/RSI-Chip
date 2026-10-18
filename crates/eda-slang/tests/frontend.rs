@@ -1,4 +1,4 @@
-use eda_core::logic::LogicWord;
+use eda_core::logic::{LogicValue, LogicWord};
 use eda_sim::Simulator;
 use eda_slang::{PreprocessOptions, SlangFrontend};
 use std::path::PathBuf;
@@ -6350,15 +6350,120 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_wildcard_and_inside_cases() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-wildcard-cases");
+    let source_path = root.join("wildcard_cases.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module wildcard_cases(
+  input logic [3:0] selector,
+  input logic [1:0] pair,
+  output logic [1:0] casez_y,
+  output logic [1:0] casex_y,
+  output logic [1:0] inside_y
+);
+  always_comb begin
+    casez_y = 2'd0;
+    casez (selector)
+      4'b1???: casez_y = 2'd1;
+      4'b01??: casez_y = 2'd2;
+      default casez_y = 2'd3;
+    endcase
+  end
+
+  always_comb begin
+    casex_y = 2'd0;
+    casex (selector)
+      4'b1xxx: casex_y = 2'd1;
+      4'b01xx: casex_y = 2'd2;
+      default casex_y = 2'd3;
+    endcase
+  end
+
+  always_comb begin
+    inside_y = 2'd0;
+    case (pair) inside
+      [0:1]: inside_y = 2'd1;
+      2: inside_y = 2'd2;
+      default inside_y = 2'd3;
+    endcase
+  end
+endmodule
+"#,
+    )
+    .expect("write wildcard-case source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("wildcard_cases"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower wildcard and inside cases");
+    let mut simulator = Simulator::new(&design).expect("create wildcard-case simulator");
+    for (selector, expected) in [
+        (0b1000_u64, 1_u64),
+        (0b1101, 1),
+        (0b0100, 2),
+        (0b0110, 2),
+        (0b0010, 3),
+    ] {
+        simulator
+            .set_input("selector", &LogicWord::from_u64(4, selector))
+            .unwrap();
+        assert_eq!(simulator.read("casez_y").unwrap().to_u64(), Some(expected));
+        assert_eq!(simulator.read("casex_y").unwrap().to_u64(), Some(expected));
+    }
+    for (pair, expected) in [(0_u64, 1_u64), (1, 1), (2, 2), (3, 3)] {
+        simulator
+            .set_input("pair", &LogicWord::from_u64(2, pair))
+            .unwrap();
+        assert_eq!(simulator.read("inside_y").unwrap().to_u64(), Some(expected));
+    }
+
+    simulator
+        .set_input(
+            "selector",
+            &LogicWord {
+                bits: vec![
+                    LogicValue::Zero,
+                    LogicValue::Zero,
+                    LogicValue::Zero,
+                    LogicValue::Z,
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(simulator.read("casez_y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("casex_y").unwrap().to_u64(), Some(1));
+
+    simulator
+        .set_input(
+            "selector",
+            &LogicWord {
+                bits: vec![
+                    LogicValue::Zero,
+                    LogicValue::Zero,
+                    LogicValue::X,
+                    LogicValue::Zero,
+                ],
+            },
+        )
+        .unwrap();
+    assert_eq!(simulator.read("casez_y").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("casex_y").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unimplemented_case_and_priority_semantics() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
     let cases = [
-        (
-            "casex",
-            "module m(input logic [3:0] a, output logic y); always_comb casex (a) 4'b1x0x: y = 1'b1; default: y = 1'b0; endcase endmodule",
-        ),
         (
             "unique_case",
             "module m(input logic [1:0] a, output logic y); always_comb unique case (a) 2'b00: y = 1'b1; default: y = 1'b0; endcase endmodule",
