@@ -1741,6 +1741,66 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_directional_sparse_memory_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-directional-memory-port");
+    let source_path = root.join("directional_memory_port.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(
+  input wire logic [7:0] in_mem [0:3],
+  output wire logic [7:0] out_mem [0:3],
+  output logic [7:0] q
+);
+  assign q = in_mem[2];
+  assign out_mem[2] = 8'h5a;
+endmodule
+
+module top(
+  input logic [7:0] din,
+  output logic [7:0] child_q,
+  output logic [7:0] parent_q
+);
+  wire logic [7:0] source [0:3];
+  wire logic [7:0] destination [0:3];
+  assign source[2] = din;
+  child u (
+    .in_mem(source),
+    .out_mem(destination),
+    .q(child_q)
+  );
+  assign parent_q = destination[2];
+endmodule
+"#,
+    )
+    .expect("write directional sparse-memory port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower directional sparse-memory ports");
+    assert_eq!(design.memories.len(), 4);
+    assert_eq!(design.memory_connections.len(), 2);
+    assert_eq!(design.memory_connections[0].child, 2);
+    assert_eq!(design.memory_connections[0].parent, 0);
+    assert_eq!(design.memory_connections[1].child, 3);
+    assert_eq!(design.memory_connections[1].parent, 1);
+
+    let mut simulator = Simulator::new(&design).expect("create directional-memory simulator");
+    simulator
+        .set_input("din", &LogicWord::from_u64(8, 0x3c))
+        .unwrap();
+    assert_eq!(simulator.read("child_q").unwrap().to_u64(), Some(0x3c));
+    assert_eq!(simulator.read("parent_q").unwrap().to_u64(), Some(0x5a));
+}
+
+#[test]
 fn slang_ast_direct_lowering_reads_sparse_memory_files() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

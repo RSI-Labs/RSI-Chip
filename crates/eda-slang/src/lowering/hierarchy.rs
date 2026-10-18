@@ -1122,11 +1122,13 @@ impl super::SlangAstLowerer {
             .iter()
             .filter_map(|port| {
                 let name = string_field(port, "name")?;
-                let is_inout_memory = string_field(port, "direction").as_deref() == Some("InOut")
-                    && self
-                        .declared_memory_type(&string_field(port, "type").unwrap_or_default())
-                        .is_some();
-                if !is_inout_memory {
+                let is_memory = matches!(
+                    string_field(port, "direction").as_deref(),
+                    Some("In" | "Out" | "InOut")
+                ) && self
+                    .declared_memory_type(&string_field(port, "type").unwrap_or_default())
+                    .is_some();
+                if !is_memory {
                     return None;
                 }
                 let local_index = child_memories
@@ -1156,18 +1158,23 @@ impl super::SlangAstLowerer {
                 .get("expr")
                 .ok_or_else(|| "instance connection has no expression".to_string())?;
             if let Some(local_memory) = memory_ports.get(&port_name).copied() {
-                let parent_target = expression
-                    .get("left")
-                    .ok_or_else(|| "inout memory connection has no parent target".to_string())?;
+                let parent_target =
+                    if string_field(expression, "kind").as_deref() == Some("Assignment") {
+                        expression
+                            .get("left")
+                            .ok_or_else(|| "memory connection has no parent target".to_string())?
+                    } else {
+                        expression
+                    };
                 let parent_name = expression_symbol(parent_target).ok_or_else(|| {
-                    format!("inout memory connection '{port_name}' has no parent symbol")
+                    format!("memory connection '{port_name}' has no parent symbol")
                 })?;
                 let parent_symbol = self
                     .symbols
                     .get(&parent_name)
-                    .ok_or_else(|| format!("unknown inout memory parent '{parent_name}'"))?;
+                    .ok_or_else(|| format!("unknown memory parent '{parent_name}'"))?;
                 let parent_memory = parent_symbol.memory.ok_or_else(|| {
-                    format!("inout memory port '{port_name}' must connect to a sparse memory")
+                    format!("memory port '{port_name}' must connect to a sparse memory")
                 })?;
                 let child_memory = memory_offset + local_memory;
                 let child = &self.design.memories[child_memory];
@@ -1179,7 +1186,7 @@ impl super::SlangAstLowerer {
                     || child.flat_length != parent.flat_length
                 {
                     return Err(format!(
-                        "instance '{scoped_instance_name}' inout memory port '{port_name}' shape does not match parent memory '{parent_name}'"
+                        "instance '{scoped_instance_name}' memory port '{port_name}' shape does not match parent memory '{parent_name}'"
                     ));
                 }
                 self.design

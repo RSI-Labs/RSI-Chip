@@ -344,23 +344,30 @@ impl SlangAstLowerer {
         member: &serde_json::Value,
         name: &str,
     ) -> Result<(), String> {
-        if string_field(member, "direction").as_deref() != Some("InOut") {
-            return Err(format!(
-                "direct slang-AST lowering supports only inout sparse-memory ports for '{name}'"
-            ));
-        }
+        let direction = match string_field(member, "direction").as_deref() {
+            Some("In") => eda_core::ir::Dir::In,
+            Some("Out") => eda_core::ir::Dir::Out,
+            // Core IR has no inout direction; MemoryConnection carries the
+            // bidirectional storage contract.
+            Some("InOut") => eda_core::ir::Dir::In,
+            other => {
+                return Err(format!(
+                    "sparse-memory port '{name}' has unsupported direction {other:?}"
+                ))
+            }
+        };
         if !self.design.name.is_empty() {
             return Err(format!(
-                "top-level inout sparse-memory port '{name}' is not supported"
+                "top-level sparse-memory port '{name}' is not supported"
             ));
         }
         self.lower_memory_declaration(member, name)?;
         let symbol = self.symbols[name].clone();
-        // Child PortDecl uses In only as internal connection metadata. The
-        // actual storage contract is represented by MemoryConnection.
+        // The placeholder PortDecl records direction for hierarchy metadata;
+        // the actual storage contract is represented by MemoryConnection.
         self.design.ports.push(eda_core::ir::PortDecl {
             name: name.to_string(),
-            dir: eda_core::ir::Dir::In,
+            dir: direction,
             base: symbol.base,
             width: 1,
         });
