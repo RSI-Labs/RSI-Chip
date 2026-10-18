@@ -3205,6 +3205,83 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_interface_instance_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-instance-array");
+    let source_path = root.join("interface_instance_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport producer(output valid);
+endinterface
+
+module array_producer(
+  bus_if.producer bus,
+  input logic value
+);
+  assign bus.valid = value;
+endmodule
+
+module interface_instance_array_top(
+  input logic clk,
+  input logic [1:0] value,
+  output logic [1:0] observed
+);
+  bus_if buses[2] (.clk(clk));
+  array_producer producers[2] (
+    .bus(buses),
+    .value(value)
+  );
+  assign observed[0] = buses[0].valid;
+  assign observed[1] = buses[1].valid;
+endmodule
+"#,
+    )
+    .expect("write interface-instance-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_instance_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface instance arrays");
+    assert_eq!(design.hierarchy.len(), 5);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "interface_instance_array_top",
+            "interface_instance_array_top.buses[0]",
+            "interface_instance_array_top.buses[1]",
+            "interface_instance_array_top.producers[0]",
+            "interface_instance_array_top.producers[1]"
+        ]
+    );
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "buses[0].valid"));
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "buses[1].valid"));
+
+    let mut simulator = Simulator::new(&design).expect("create interface-instance-array simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(2, 0b10))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b01));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

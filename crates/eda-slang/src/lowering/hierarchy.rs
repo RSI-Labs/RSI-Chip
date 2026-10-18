@@ -139,6 +139,40 @@ fn collect_interface_modport_symbols(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "interface instance has no symbol address".to_string())?;
     for member in members {
+        if !matches!(
+            string_field(member, "kind").as_deref(),
+            Some("Variable" | "Net" | "Port")
+        ) {
+            continue;
+        }
+        let member_name = string_field(member, "name").unwrap_or_default();
+        let Some(symbol) = child_symbols.get(&member_name) else {
+            continue;
+        };
+        let Some(address) = member.get("addr").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let base_instance_address = instance
+            .get("eda_base_instance_address")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(instance_address);
+        let synthesized_address = address
+            .checked_add(instance_address)
+            .and_then(|value| value.checked_sub(base_instance_address))
+            .unwrap_or(address);
+        let mut absolute = symbol.clone();
+        absolute.base += child_offset;
+        if let Some(memory) = absolute.memory.as_mut() {
+            *memory += memory_offset;
+        }
+        result
+            .signals
+            .insert(format!("{address} {member_name}"), absolute.clone());
+        result
+            .signals
+            .insert(format!("{synthesized_address} {member_name}"), absolute);
+    }
+    for member in members {
         if string_field(member, "kind").as_deref() != Some("Modport") {
             continue;
         }
@@ -629,11 +663,22 @@ impl super::SlangAstLowerer {
         }
         for (index, element) in indexes.into_iter().zip(elements) {
             let element_name = format!("{prefix}[{index}]");
+            let base_instance_address = elements
+                .first()
+                .and_then(|first| first.get("addr"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
             match string_field(element, "kind").as_deref() {
                 Some("Instance") => {
                     let mut instance = element.clone();
                     if let Some(name) = instance.get_mut("name") {
                         *name = serde_json::Value::String(element_name);
+                    }
+                    if let Some(fields) = instance.as_object_mut() {
+                        fields.insert(
+                            "eda_base_instance_address".into(),
+                            serde_json::Value::from(base_instance_address),
+                        );
                     }
                     self.lower_instance(&instance)?;
                 }
@@ -777,7 +822,9 @@ impl super::SlangAstLowerer {
         )?;
         self.interface_modport_symbols
             .extend(interface_symbols.modports);
-        self.external_symbols.extend(interface_symbols.signals);
+        for (symbol_id, symbol) in interface_symbols.signals {
+            self.external_symbols.entry(symbol_id).or_insert(symbol);
+        }
 
         let offset = child_offset;
         let child_net_start = offset;
