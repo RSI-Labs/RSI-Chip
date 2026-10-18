@@ -55,7 +55,7 @@ targets, recursive RHS operand shapes/order/symbol identity, sized
 integer-literal values, simple type width/signedness, and direct/generated
 instance inventory against the slang AST. `compile_files_via_ast`
 additionally lowers a simple module subset with elaborated parameter-constant
-leaves, wildcard/explicit package imports with scoped constants/functions, initial/always/final procedures with `$finish` shutdown execution, blocking/non-blocking assignments, blocks,
+leaves, wildcard/explicit package imports with scoped constants/functions/typedefs/enums, initial/always/final procedures with `$finish` shutdown execution, blocking/non-blocking assignments, blocks,
 if plus normal, wildcard, inside, and qualified priority/unique case control flow, bounded string literals, concatenation, byte reads and
 writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
 comparison, inclusive `substr` extraction, and radix conversions

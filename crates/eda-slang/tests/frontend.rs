@@ -315,6 +315,70 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_package_typedefs_and_enums() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-package-types");
+    let source_path = root.join("package_types.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package types_pkg;
+  typedef enum logic [1:0] {
+    A = 2'd1,
+    B = 2'd2
+  } state_t;
+
+  typedef struct packed {
+    logic [3:0] high;
+    logic [3:0] low;
+  } pair_t;
+
+  localparam state_t INIT = A;
+endpackage
+
+module package_types
+  import types_pkg::*;
+(
+  input logic [1:0] selector,
+  input logic [7:0] data,
+  output state_t state,
+  output pair_t pair,
+  output logic initialized,
+  output logic selected_a
+);
+  assign state = selector[0] ? B : A;
+  assign pair = data;
+  assign initialized = (INIT == A);
+  assign selected_a = (state == A);
+endmodule
+"#,
+    )
+    .expect("write package-typedef source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("package_types"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower package typedefs and enums");
+    assert_eq!(design.assigns.len(), 4);
+    let mut simulator = Simulator::new(&design).expect("create package-type simulator");
+    simulator
+        .set_input("selector", &LogicWord::from_u64(2, 0))
+        .unwrap();
+    simulator
+        .set_input("data", &LogicWord::from_u64(8, 0x5A))
+        .unwrap();
+    assert_eq!(simulator.read("state").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("pair").unwrap().to_u64(), Some(0x5A));
+    assert_eq!(simulator.read("initialized").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("selected_a").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_compiles_procedural_control_flow() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

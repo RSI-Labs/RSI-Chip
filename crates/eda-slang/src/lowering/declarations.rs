@@ -7,8 +7,8 @@ use crate::ast_util::{
     bool_field, literal_word, memory_initializer_statements, string_field, usize_field,
 };
 use crate::types::{
-    memory_type, memory_type_with_element, simple_type_shape, simple_type_signed, AstMemoryType,
-    AstPackedDimension, AstTypeShape,
+    memory_type, memory_type_with_element, simple_type_shape, simple_type_signed,
+    simple_type_width, AstMemoryType, AstPackedDimension, AstTypeShape,
 };
 
 impl SlangAstLowerer {
@@ -96,7 +96,7 @@ impl SlangAstLowerer {
                 .split_whitespace()
                 .next_back()
                 .unwrap_or_default()
-                .rsplit(['.', '#'])
+                .rsplit(['.', '#', ':'])
                 .next()
                 .unwrap_or_default();
             if self.type_enums.contains_key(target_name) {
@@ -238,7 +238,7 @@ impl SlangAstLowerer {
             .split_whitespace()
             .next_back()
             .unwrap_or_default()
-            .rsplit(['.', '#'])
+            .rsplit(['.', '#', ':'])
             .next()
             .unwrap_or_default();
         if let Some(definition) = self.type_enums.get(alias_name) {
@@ -495,11 +495,18 @@ impl SlangAstLowerer {
     pub(super) fn lower_parameter(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "Parameter")?;
         let type_name = string_field(member, "type").unwrap_or_default();
-        let shape = simple_type_shape(&type_name)
-            .ok_or_else(|| format!("parameter '{name}' has unsupported type '{type_name}'"))?;
+        let shape = match simple_type_shape(&type_name) {
+            Some(shape) => shape,
+            None => self.net_type(&type_name)?.0,
+        };
         let value = string_field(member, "value")
             .ok_or_else(|| format!("parameter '{name}' has no elaborated constant value"))?;
-        let word = literal_word(&type_name, &value)
+        let value_type = if simple_type_width(&type_name).is_some() {
+            type_name.clone()
+        } else {
+            format!("logic[{}:0]", shape.width.saturating_sub(1))
+        };
+        let word = literal_word(&value_type, &value)
             .ok_or_else(|| format!("parameter '{name}' has unsupported value '{value}'"))?;
         if word.width() != shape.width {
             return Err(format!(
