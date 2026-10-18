@@ -151,6 +151,20 @@ impl SlangAstLowerer {
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
+        if matches!(
+            task_name.as_str(),
+            "$display"
+                | "$displayb"
+                | "$displayh"
+                | "$write"
+                | "$writeb"
+                | "$writeh"
+                | "$monitor"
+                | "$monitorb"
+                | "$monitorh"
+        ) {
+            return self.lower_display_call(value, &task_name).map(Some);
+        }
         if task_name == "putc" {
             return self.lower_string_putc(value).map(Some);
         }
@@ -272,6 +286,56 @@ impl SlangAstLowerer {
         let result = self.lower_statement(&body);
         self.inline_stack.borrow_mut().pop();
         result.map(Some)
+    }
+
+    fn lower_display_call(
+        &self,
+        value: &Value,
+        task_name: &str,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let default_spec = match task_name {
+            "$displayb" | "$writeb" | "$monitorb" => 'b',
+            "$displayh" | "$writeh" | "$monitorh" => 'h',
+            _ => 'd',
+        };
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let mut literal = String::new();
+        let mut has_format_literal = false;
+        let value_arguments = if let Some(first) = arguments.first() {
+            if string_field(first, "kind").as_deref() == Some("StringLiteral") {
+                has_format_literal = true;
+                literal = string_field(first, "literal").unwrap_or_default();
+                &arguments[1..]
+            } else {
+                arguments
+            }
+        } else {
+            arguments
+        };
+        if !has_format_literal && !value_arguments.is_empty() {
+            literal = value_arguments
+                .iter()
+                .map(|_| format!("%{default_spec}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        if !task_name.starts_with("$write") && !task_name.starts_with("$monitor") {
+            literal.push('\n');
+        }
+        let parts = parse_display_format(&literal, value_arguments.len())?;
+        let args = value_arguments
+            .iter()
+            .map(|argument| self.lower_expression(argument))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(eda_core::ir::Stmt::Display {
+            parts,
+            args,
+            monitor: task_name.starts_with("$monitor"),
+        })
     }
 
     fn initialize_task_locals(
@@ -1360,6 +1424,76 @@ fn json_contains_named_value(value: &Value, name: &str) -> bool {
             .iter()
             .any(|nested| json_contains_named_value(nested, name)),
         _ => false,
+    }
+}
+
+fn parse_display_format(
+    format: &str,
+    argument_count: usize,
+) -> Result<Vec<eda_core::ir::DispPart>, String> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut specifiers = 0_usize;
+    let mut characters = format.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            literal.push(character);
+            continue;
+        }
+        if characters.peek() == Some(&'%') {
+            characters.next();
+            literal.push('%');
+            continue;
+        }
+        let specifier = characters
+            .next()
+            .ok_or_else(|| "display format has a trailing '%'".to_string())?;
+        match specifier {
+            'b' | 'B' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'b'));
+                specifiers += 1;
+            }
+            'd' | 'D' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'd'));
+                specifiers += 1;
+            }
+            'h' | 'H' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'h'));
+                specifiers += 1;
+            }
+            's' | 'S' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 's'));
+                specifiers += 1;
+            }
+            't' | 'T' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Time);
+            }
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support display specifier '%{other}'"
+                ))
+            }
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(eda_core::ir::DispPart::Str(literal));
+    }
+    if specifiers != argument_count {
+        return Err(format!(
+            "display has {specifiers} format specifiers but {argument_count} arguments"
+        ));
+    }
+    Ok(parts)
+}
+
+fn push_display_literal(parts: &mut Vec<eda_core::ir::DispPart>, literal: &mut String) {
+    if !literal.is_empty() {
+        parts.push(eda_core::ir::DispPart::Str(std::mem::take(literal)));
     }
 }
 

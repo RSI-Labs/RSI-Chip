@@ -147,7 +147,7 @@ endmodule
     let unsupported_path = root.join("unsupported.sv");
     std::fs::write(
         &unsupported_path,
-        "module unsupported(output logic y); initial $display(\"unsupported\"); endmodule\n",
+        "module unsupported(output logic y); initial $fopen(\"unsupported\"); endmodule\n",
     )
     .expect("write unsupported source");
     let error = slang
@@ -161,6 +161,147 @@ endmodule
         error.contains("does not support system call"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_display_tasks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-display");
+    let source_path = root.join("display.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module displays(
+  input logic [3:0] a,
+  input logic [3:0] b
+);
+  initial begin
+    #1;
+    $display("a=%b b=%h text%%", a, b);
+    $displayb(a);
+    $displayh(a);
+    $display("decimal=%d", a);
+    $display(a, b);
+    $write("plain");
+  end
+endmodule
+"#,
+    )
+    .expect("write display source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("displays"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower display tasks");
+    let mut simulator = Simulator::new(&design).expect("create display simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0b1011))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(4, 0b0010))
+        .unwrap();
+    simulator.run_until(1).expect("run display initial block");
+    assert_eq!(
+        simulator.take_displays(),
+        vec![
+            "a=1011 b=2 text%\n",
+            "1011\n",
+            "b\n",
+            "decimal=11\n",
+            "11 2\n",
+            "plain",
+        ]
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_invalid_display_formats() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-display-invalid");
+    let source_path = root.join("display_invalid.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module display_invalid(input logic [3:0] a);
+  initial $display("missing=%b", a, a);
+endmodule
+"#,
+    )
+    .expect("write invalid display source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("display_invalid"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("display argument mismatches must fail closed");
+    assert!(
+        error.contains("display has 1 format specifiers but 2 arguments"),
+        "unexpected display error: {error}"
+    );
+
+    let unsupported_path = root.join("display_unsupported.sv");
+    std::fs::write(
+        &unsupported_path,
+        r#"
+module display_unsupported(input logic [3:0] a);
+  initial $display("octal=%o", a);
+endmodule
+"#,
+    )
+    .expect("write unsupported display source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&unsupported_path),
+            Some("display_unsupported"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported display specifiers must fail closed");
+    assert!(
+        error.contains("does not support display specifier '%o'"),
+        "unexpected display specifier error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_monitor_tasks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-monitor");
+    let source_path = root.join("monitor.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module monitor_tb;
+  reg a;
+  initial a = 0;
+  initial #10 a = 1;
+  initial $monitor("a=%b", a);
+endmodule
+"#,
+    )
+    .expect("write monitor source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("monitor_tb"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower monitor task");
+    let mut simulator = Simulator::new(&design).expect("create monitor simulator");
+    simulator.run_until(20).expect("run monitor timeline");
+    let displays = simulator.take_displays();
+    assert!(displays.iter().any(|line| line == "a=0"));
+    assert!(displays.iter().any(|line| line == "a=1"));
 }
 
 #[test]
