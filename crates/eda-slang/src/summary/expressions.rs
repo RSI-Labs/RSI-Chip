@@ -405,6 +405,18 @@ pub(crate) fn collect_generate_summary(
                     parameters,
                 });
             }
+            "InstanceArray" => {
+                let array_name = string_field(member, "name")
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| "slang AST InstanceArray has no name".to_string())?;
+                let array_prefix = working_prefix
+                    .iter()
+                    .chain(std::iter::once(&array_name))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(".");
+                super::collect_instance_array_summary(member, &array_prefix, instances)?;
+            }
             "ContinuousAssign" => {
                 let Some(assignment) = member.get("assignment") else {
                     continue;

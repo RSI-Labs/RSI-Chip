@@ -2453,6 +2453,63 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_flattens_generated_instance_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-generated-instance-array");
+    let source_path = root.join("generated_instance_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(input logic a, output logic y);
+  assign y = ~a;
+endmodule
+
+module generated_instance_arrays(
+  input logic [3:0] a,
+  output logic [3:0] y
+);
+  generate
+    if (1) begin : generated_scope
+      child cells[4] (.a(a), .y(y));
+    end
+  endgenerate
+endmodule
+"#,
+    )
+    .expect("write generated instance-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("generated_instance_arrays"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower generated instance array");
+    assert_eq!(design.hierarchy.len(), 5);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "generated_instance_arrays",
+            "generated_instance_arrays.generated_scope.cells[0]",
+            "generated_instance_arrays.generated_scope.cells[1]",
+            "generated_instance_arrays.generated_scope.cells[2]",
+            "generated_instance_arrays.generated_scope.cells[3]"
+        ]
+    );
+    let mut simulator = Simulator::new(&design).expect("create generated array simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0b1001))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0b0110));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
