@@ -333,6 +333,7 @@ pub enum GateKind {
 #[derive(Clone, Debug)]
 pub enum Sens {
     Comb,
+    Timed,
     Any(Expr),
     Posedge(Expr),
     Negedge(Expr),

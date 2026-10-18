@@ -73,15 +73,29 @@ impl SlangAstLowerer {
                     let timing = body
                         .get("timing")
                         .ok_or_else(|| "timed procedure has no timing control".to_string())?;
-                    let statement = body
-                        .get("stmt")
-                        .ok_or_else(|| "timed procedure has no statement".to_string())?;
-                    let sens = self.lower_sensitivity(timing)?;
-                    let statement = self.lower_statement(statement)?;
-                    self.design.processes.push(eda_core::ir::Process {
-                        sens,
-                        body: statement,
-                    });
+                    let is_delay = string_field(timing, "kind").as_deref() == Some("Delay");
+                    if is_delay {
+                        if procedure_kind != "Always" {
+                            return Err(format!(
+                                "direct slang-AST lowering does not support delays in {procedure_kind}"
+                            ));
+                        }
+                        let statement = self.lower_statement(body)?;
+                        self.design.processes.push(eda_core::ir::Process {
+                            sens: eda_core::ir::Sens::Timed,
+                            body: eda_core::ir::Stmt::Forever(Box::new(statement)),
+                        });
+                    } else {
+                        let statement = body
+                            .get("stmt")
+                            .ok_or_else(|| "timed procedure has no statement".to_string())?;
+                        let sens = self.lower_sensitivity(timing)?;
+                        let statement = self.lower_statement(statement)?;
+                        self.design.processes.push(eda_core::ir::Process {
+                            sens,
+                            body: statement,
+                        });
+                    }
                 } else {
                     let statement = self.lower_statement(body)?;
                     self.design.processes.push(eda_core::ir::Process {
@@ -279,10 +293,43 @@ impl SlangAstLowerer {
                     dflt: default,
                 })
             }
+            "Timed" => {
+                let timing = statement
+                    .get("timing")
+                    .ok_or_else(|| "timed statement has no timing control".to_string())?;
+                let delay = self.lower_delay_control(timing)?;
+                let body = statement
+                    .get("stmt")
+                    .ok_or_else(|| "timed statement has no body".to_string())?;
+                Ok(Stmt::Delay {
+                    ns: delay,
+                    body: Box::new(self.lower_statement(body)?),
+                })
+            }
             other => Err(format!(
                 "direct slang-AST lowering does not support statement kind '{other}'"
             )),
         }
+    }
+
+    fn lower_delay_control(&self, timing: &serde_json::Value) -> Result<u64, String> {
+        if string_field(timing, "kind").as_deref() != Some("Delay") {
+            return Err("direct slang-AST lowering supports only constant Delay controls".into());
+        }
+        if timing.get("minValue").is_some()
+            || timing.get("typicalValue").is_some()
+            || timing.get("maxValue").is_some()
+        {
+            return Err("min:typ:max delay controls are not supported".into());
+        }
+        let expression = timing
+            .get("expr")
+            .ok_or_else(|| "delay control has no expression".to_string())?;
+        if string_field(expression, "kind").as_deref() == Some("MinTypMax") {
+            return Err("min:typ:max delay controls are not supported".into());
+        }
+        slang_constant_u64(expression)
+            .map_err(|_| "delay control must be an integer constant".to_string())
     }
 
     pub(super) fn lower_memory_file_call(

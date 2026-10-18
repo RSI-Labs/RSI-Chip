@@ -680,6 +680,9 @@ pub enum Stmt {
 pub enum Sens {
     /// `@(*)` — combinational.
     Comb,
+    /// A procedure driven by its own procedural delay controls, such as
+    /// `always #5 ...`, rather than by signal sensitivity.
+    Timed,
     /// Any value change of one explicitly listed scalar signal.
     Any(usize),
     Posedge(usize),
@@ -948,7 +951,7 @@ impl MemoryAccesses {
 
 fn process_is_edge_clocked(sensitivity: &Sens) -> bool {
     match sensitivity {
-        Sens::Comb => false,
+        Sens::Comb | Sens::Timed => false,
         Sens::Any(_) => false,
         Sens::Posedge(_) | Sens::Negedge(_) => true,
         Sens::List(list) => list

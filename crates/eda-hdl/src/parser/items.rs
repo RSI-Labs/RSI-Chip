@@ -494,7 +494,7 @@ impl Parser {
                     let ns = self.parse_opt_delay()?;
                     let body = self.parse_stmt()?;
                     return Ok(Item::Always {
-                        sens: Sens::Comb,
+                        sens: Sens::Timed,
                         body: Stmt::Forever(Box::new(Stmt::Delay {
                             ns,
                             body: Box::new(body),

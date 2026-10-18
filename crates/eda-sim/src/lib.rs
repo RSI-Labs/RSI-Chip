@@ -230,7 +230,7 @@ impl<'d> Simulator<'d> {
             sim.schedule(u);
         }
         for (pi, p) in design.processes.iter().enumerate() {
-            if matches!(p.sens, Sens::Comb) {
+            if matches!(p.sens, Sens::Comb | Sens::Timed) {
                 sim.conts.entry(0).or_default().push(Cont {
                     process: Some(pi),
                     work: vec![&p.body],
@@ -1587,6 +1587,7 @@ fn decl_index_of(d: &Design, flat: usize) -> Option<usize> {
 
 fn register_sens(sens: &Sens, pi: usize, body: &Stmt, out: &mut Vec<Vec<(usize, Edge)>>, n: usize) {
     match sens {
+        Sens::Timed => {}
         Sens::Comb => {
             for net in stmt_nets(body) {
                 if net < n {

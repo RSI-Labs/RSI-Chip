@@ -3385,6 +3385,93 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_constant_delay_controls() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-delays");
+    let source_path = root.join("delays.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module delays(input logic a, output logic y, output logic q);
+  initial q = 1'b0;
+  initial begin
+    #5 y = a;
+    #3 y = ~a;
+  end
+  always #5 q = ~q;
+endmodule
+"#,
+    )
+    .expect("write delay-control source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("delays"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower constant delay controls");
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("delays"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower constant delay controls through the bounded path");
+    assert_eq!(design.initials.len(), 2);
+    assert_eq!(design.processes.len(), 1);
+    assert_eq!(reference.initials.len(), design.initials.len());
+    assert_eq!(reference.processes.len(), design.processes.len());
+
+    let run_delays = |design: &eda_core::ir::Design| {
+        let mut simulator = Simulator::new(design).expect("create delay simulator");
+        simulator
+            .set_input("a", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
+        simulator.run_until(4).unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+        simulator.run_until(5).unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+        simulator.run_until(8).unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+        simulator.run_until(10).unwrap();
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
+        simulator.run_until(15).unwrap();
+        assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
+    };
+    run_delays(&design);
+    run_delays(&reference);
+
+    let min_typ_max_path = root.join("min-typ-max.sv");
+    std::fs::write(
+        &min_typ_max_path,
+        r#"
+module min_typ_max(input logic a, output logic y);
+  initial #(1:2:3) y = a;
+endmodule
+"#,
+    )
+    .expect("write min:typ:max delay source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&min_typ_max_path),
+            Some("min_typ_max"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("min:typ:max delays must fail closed");
+    assert!(
+        error.contains("min:typ:max delay controls are not supported"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

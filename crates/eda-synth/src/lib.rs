@@ -172,6 +172,7 @@ impl<'a> Synth<'a> {
             }
             self.reset_sym();
             match &p.sens {
+                Sens::Timed => return Err("delay-driven processes are not synthesizable".into()),
                 Sens::Comb | Sens::Any(_) => {
                     self.exec_stmt(&p.body)?;
                     let written = sorted_set(&self.written);

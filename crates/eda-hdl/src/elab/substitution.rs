@@ -467,6 +467,7 @@ pub(super) fn subst_expr(expr: &ast::Expr, var: &str, value: i64) -> ast::Expr {
 pub(super) fn subst_sens(sens: &ast::Sens, var: &str, value: i64) -> ast::Sens {
     match sens {
         ast::Sens::Comb => ast::Sens::Comb,
+        ast::Sens::Timed => ast::Sens::Timed,
         ast::Sens::Any(e) => ast::Sens::Any(subst_expr(e, var, value)),
         ast::Sens::Posedge(e) => ast::Sens::Posedge(subst_expr(e, var, value)),
         ast::Sens::Negedge(e) => ast::Sens::Negedge(subst_expr(e, var, value)),

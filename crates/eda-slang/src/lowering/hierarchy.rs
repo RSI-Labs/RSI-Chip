@@ -193,7 +193,7 @@ pub(super) fn remap_process(process: &mut eda_core::ir::Process, offset: usize) 
     use eda_core::ir::Sens;
     pub(super) fn remap_sensitivity(sensitivity: &mut Sens, offset: usize) {
         match sensitivity {
-            Sens::Comb => {}
+            Sens::Comb | Sens::Timed => {}
             Sens::Any(net) | Sens::Posedge(net) | Sens::Negedge(net) => *net += offset,
             Sens::List(list) => list
                 .iter_mut()
