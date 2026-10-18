@@ -109,15 +109,19 @@ pub(super) fn constant_i64(value: &serde_json::Value) -> Result<i64, String> {
 }
 
 impl super::SlangAstLowerer {
-    fn reject_clocking_variable(&self, value: &serde_json::Value) -> Result<(), String> {
+    fn clocking_variable_symbol(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<AstLoweredSymbol>, String> {
         if let Some(symbol_id) = expression_symbol_id(value) {
-            if let Some(name) = self.clocking_variables.get(&symbol_id) {
-                return Err(format!(
-                    "clocking variable '{name}' sampling/drive semantics are not supported"
-                ));
+            if let Some(variable) = self.clocking_variables.get(&symbol_id) {
+                if variable.direction == eda_core::ir::Dir::Out {
+                    return Err("clocking output variable drive semantics are not supported".into());
+                }
+                return Ok(Some(variable.symbol.clone()));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn named_symbol(
@@ -126,7 +130,18 @@ impl super::SlangAstLowerer {
     ) -> Result<AstLoweredSymbol, String> {
         let display_name =
             expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
-        self.reject_clocking_variable(value)?;
+        if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(variable) = self.clocking_variables.get(&symbol_id) {
+                return Err(format!(
+                    "clocking {} variable cannot be assigned directly",
+                    if variable.direction == eda_core::ir::Dir::In {
+                        "input"
+                    } else {
+                        "output"
+                    }
+                ));
+            }
+        }
         if let Some(symbol_id) = expression_symbol_id(value) {
             if let Some(symbol) = self.local_symbols.get(&symbol_id) {
                 return Ok(symbol.clone());
@@ -225,7 +240,14 @@ impl super::SlangAstLowerer {
             "NamedValue" => {
                 let name = expression_symbol(value)
                     .ok_or_else(|| "expression has no symbol".to_string())?;
-                self.reject_clocking_variable(value)?;
+                if let Some(symbol) = self.clocking_variable_symbol(value)? {
+                    return Ok(Expr::Ref {
+                        net: symbol.base,
+                        decl_width: symbol.width,
+                        range: full_range(symbol.width),
+                        signed: symbol.signed,
+                    });
+                }
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.local_symbols.get(&symbol_id) {
                         return Ok(Expr::Ref {

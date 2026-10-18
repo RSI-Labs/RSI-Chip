@@ -3902,17 +3902,21 @@ module clocking_event(
   input logic clk,
   input logic go,
   input logic sampled_input,
-  output logic done
+  output logic first_sample,
+  output logic second_sample
 );
   clocking cb @(posedge clk);
     input sampled_input;
   endclocking
 
   initial begin
-    done = 1'b0;
+    first_sample = 1'b0;
+    second_sample = 1'b0;
     wait (go);
     @(cb);
-    done = 1'b1;
+    first_sample = cb.sampled_input;
+    @(cb);
+    second_sample = cb.sampled_input;
   end
 endmodule
 "#,
@@ -3934,11 +3938,20 @@ endmodule
     simulator
         .set_input("go", &LogicWord::from_u64(1, 1))
         .unwrap();
-    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("first_sample").unwrap().to_u64(), Some(0));
     simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .unwrap();
-    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("first_sample").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("second_sample").unwrap().to_u64(), Some(0));
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("sampled_input", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("second_sample").unwrap().to_u64(), Some(1));
 }
 
 #[test]
@@ -3972,36 +3985,37 @@ endmodule
         "unexpected skew error: {skew_error}"
     );
 
-    let access_path = root.join("clocking_access.sv");
+    let drive_path = root.join("clocking_drive.sv");
     std::fs::write(
-        &access_path,
+        &drive_path,
         r#"
-module clocking_access(
+module clocking_drive(
   input logic clk,
   input logic a,
-  output logic y
+  output logic b
 );
   clocking cb @(posedge clk);
     input a;
+    output b;
   endclocking
   initial begin
     @(cb);
-    y = cb.a;
+    cb.b <= 1'b1;
   end
 endmodule
 "#,
     )
-    .expect("write clocking-access source");
-    let access_error = slang
+    .expect("write clocking-drive source");
+    let drive_error = slang
         .compile_files_via_ast(
-            std::slice::from_ref(&access_path),
-            Some("clocking_access"),
+            std::slice::from_ref(&drive_path),
+            Some("clocking_drive"),
             &PreprocessOptions::default(),
         )
-        .expect_err("clocking-variable sampling must fail closed");
+        .expect_err("clocking output drives must fail closed");
     assert!(
-        access_error.contains("clocking variable 'cb.a' sampling/drive semantics"),
-        "unexpected access error: {access_error}"
+        drive_error.contains("clocking output variable cannot be assigned directly"),
+        "unexpected drive error: {drive_error}"
     );
 }
 

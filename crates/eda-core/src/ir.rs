@@ -818,8 +818,23 @@ pub struct Design {
     pub assigns: Vec<Assign>,
     pub processes: Vec<Process>,
     pub initials: Vec<Stmt>,
+    /// Clocking-block input snapshots used by the event scheduler.
+    pub clocking_blocks: Vec<ClockingBlock>,
     /// Elaborated module instances retained after flattening.
     pub hierarchy: Vec<HierarchicalInstance>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClockingBlock {
+    pub name: String,
+    pub event: EventWatch,
+    pub inputs: Vec<ClockingInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClockingInput {
+    pub target: LValue,
+    pub sample: LValue,
 }
 
 impl Design {

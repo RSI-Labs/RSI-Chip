@@ -41,7 +41,7 @@ pub(super) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
 }
 
 #[derive(Clone)]
-struct AstLoweredSymbol {
+pub(super) struct AstLoweredSymbol {
     base: usize,
     width: usize,
     signed: bool,
@@ -62,6 +62,11 @@ pub(super) struct AstEventArraySelection {
 pub(super) struct AstEventArrayCandidate {
     pub(super) net: usize,
     pub(super) conditions: Vec<eda_core::ir::Expr>,
+}
+
+pub(super) struct AstClockingVariable {
+    pub(super) direction: eda_core::ir::Dir,
+    pub(super) symbol: AstLoweredSymbol,
 }
 
 #[derive(Clone, Copy)]
@@ -101,7 +106,7 @@ pub(super) struct SlangAstLowerer {
     named_block_flags: std::collections::BTreeMap<String, usize>,
     named_disable_seen: bool,
     clocking_events: std::collections::BTreeMap<String, eda_core::ir::EventWatch>,
-    clocking_variables: std::collections::BTreeMap<String, String>,
+    clocking_variables: std::collections::BTreeMap<String, AstClockingVariable>,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,

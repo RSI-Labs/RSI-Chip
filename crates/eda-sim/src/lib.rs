@@ -672,6 +672,7 @@ impl<'d> Simulator<'d> {
         self.net_change_times.insert(changed_net, self.now);
         let pos = newv == LogicValue::One && old != LogicValue::One;
         let neg = newv == LogicValue::Zero && old != LogicValue::Zero;
+        self.sample_clocking_inputs(changed_net, pos, neg)?;
         let triggers: Vec<(usize, Edge)> = self
             .proc_edges
             .get(changed_net)
@@ -746,6 +747,46 @@ impl<'d> Simulator<'d> {
             }
         }
         self.wake_net_waiters(changed_net, old, newv);
+        Ok(())
+    }
+
+    fn sample_clocking_inputs(
+        &mut self,
+        changed_net: usize,
+        pos: bool,
+        neg: bool,
+    ) -> Result<(), String> {
+        let mut updates = Vec::new();
+        for block in &self.design.clocking_blocks {
+            let event_matches = block.event.net == changed_net
+                && match block.event.edge {
+                    EventEdge::Any => true,
+                    EventEdge::Posedge => pos,
+                    EventEdge::Negedge => neg,
+                };
+            if !event_matches {
+                continue;
+            }
+            updates.extend(block.inputs.iter().cloned());
+        }
+        for input in updates {
+            let target_bits = lv_bits(&input.target);
+            let sample_bits = lv_bits(&input.sample);
+            for (target, sample) in target_bits.into_iter().zip(sample_bits) {
+                let newv = self.vals[target];
+                let old = self.vals[sample];
+                if old == newv {
+                    continue;
+                }
+                self.vals[sample] = newv;
+                self.mark_vcd_change(sample);
+                self.event_count += 1;
+                if self.event_count > MAX_EVENTS {
+                    return Err("event budget exceeded".into());
+                }
+                self.notify_change(sample, old, newv)?;
+            }
+        }
         Ok(())
     }
 

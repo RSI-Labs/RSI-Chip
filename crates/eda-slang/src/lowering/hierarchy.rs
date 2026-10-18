@@ -511,6 +511,15 @@ impl super::SlangAstLowerer {
             remap_statement_memory_ids(&mut process.body, memory_offset);
             self.design.processes.push(process);
         }
+        for mut clocking_block in child.design.clocking_blocks {
+            clocking_block.name = format!("{scoped_instance_name}.{}", clocking_block.name);
+            clocking_block.event.net += offset;
+            for input in &mut clocking_block.inputs {
+                input.target.net += offset;
+                input.sample.net += offset;
+            }
+            self.design.clocking_blocks.push(clocking_block);
+        }
 
         let nested_hierarchy = child.design.hierarchy;
 

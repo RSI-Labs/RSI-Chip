@@ -622,19 +622,39 @@ pub(crate) fn design_expr_symbol(
 ) -> Option<String> {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Ref { net, .. } => design
-            .net_decls
-            .iter()
-            .find(|declaration| {
-                *net >= declaration.base && *net < declaration.base + declaration.width
-            })
-            .map(|declaration| declaration.name.clone()),
+        Expr::Ref { net, .. } => clocking_sample_symbol(design, *net).or_else(|| {
+            design
+                .net_decls
+                .iter()
+                .find(|declaration| {
+                    *net >= declaration.base && *net < declaration.base + declaration.width
+                })
+                .map(|declaration| declaration.name.clone())
+        }),
         Expr::MemoryRead { memory, .. } | Expr::MemoryReadPart { memory, .. } => design
             .memories
             .get(*memory)
             .map(|memory| memory.name.clone()),
         _ => None,
     }
+}
+
+fn clocking_sample_symbol(design: &Design, net: usize) -> Option<String> {
+    for block in &design.clocking_blocks {
+        for input in &block.inputs {
+            let sample_width = input.sample.range.width();
+            if net < input.sample.net || net >= input.sample.net + sample_width {
+                continue;
+            }
+            let offset = net - input.sample.net;
+            let target_net = match input.target.range {
+                eda_core::ir::Range::Bit(bit) => input.target.net + bit + offset,
+                eda_core::ir::Range::Span { lsb, .. } => input.target.net + lsb + offset,
+            };
+            return Some(design.net_name(target_net));
+        }
+    }
+    None
 }
 
 pub(crate) fn design_stmt_assignments(

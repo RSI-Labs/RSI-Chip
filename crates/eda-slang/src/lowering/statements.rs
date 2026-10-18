@@ -2,7 +2,7 @@
 
 use super::expressions::{constant_i64, continuous_assignment_delay};
 use super::hierarchy::full_range;
-use super::{declaration_name, SlangAstLowerer};
+use super::{declaration_name, AstLoweredSymbol, SlangAstLowerer};
 use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
     slang_constant_u64, string_field, usize_field, with_source_span,
@@ -45,6 +45,7 @@ impl SlangAstLowerer {
             .get("members")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| format!("clocking block '{name}' has no variables"))?;
+        let mut inputs = Vec::new();
         for variable in variables {
             if string_field(variable, "kind").as_deref() != Some("ClockVar") {
                 return Err(format!(
@@ -52,14 +53,15 @@ impl SlangAstLowerer {
                 ));
             }
             let variable_name = declaration_name(variable, "ClockVar")?;
-            match string_field(variable, "direction").as_deref() {
-                Some("In" | "Out") => {}
+            let direction = match string_field(variable, "direction").as_deref() {
+                Some("In") => eda_core::ir::Dir::In,
+                Some("Out") => eda_core::ir::Dir::Out,
                 other => {
                     return Err(format!(
                         "clocking variable '{name}.{variable_name}' has unsupported direction {other:?}"
                     ))
                 }
-            }
+            };
             if variable.get("inputSkew").is_some() || variable.get("outputSkew").is_some() {
                 return Err(format!(
                     "clocking variable '{name}.{variable_name}' skew is not supported"
@@ -70,7 +72,7 @@ impl SlangAstLowerer {
             })?;
             let target = self.lower_lvalue(initializer)?;
             let type_name = string_field(variable, "type").unwrap_or_default();
-            let (shape, _, _) = self.net_type(&type_name)?;
+            let (shape, signed, _) = self.net_type(&type_name)?;
             if target.range.width() != shape.width {
                 return Err(format!(
                     "clocking variable '{name}.{variable_name}' width {} does not match target width {}",
@@ -81,12 +83,55 @@ impl SlangAstLowerer {
             let address = usize_field(variable, "addr").ok_or_else(|| {
                 format!("clocking variable '{name}.{variable_name}' has no symbol address")
             })?;
+            let symbol = if direction == eda_core::ir::Dir::In {
+                let sample_base = self.design.n_nets;
+                self.design.n_nets += shape.width;
+                self.design.net_decls.push(eda_core::ir::NetDecl {
+                    name: format!("__sample_{name}_{variable_name}"),
+                    width: shape.width,
+                    is_reg: true,
+                    is_signed: signed,
+                    base: sample_base,
+                });
+                let sample = eda_core::ir::LValue {
+                    net: sample_base,
+                    decl_width: shape.width,
+                    range: full_range(shape.width),
+                };
+                inputs.push(eda_core::ir::ClockingInput { target, sample });
+                AstLoweredSymbol {
+                    base: sample_base,
+                    width: shape.width,
+                    signed,
+                    bounds: shape.bounds,
+                    dimensions: shape.dimensions,
+                    memory: None,
+                    struct_fields: std::collections::BTreeMap::new(),
+                }
+            } else {
+                AstLoweredSymbol {
+                    base: target.net,
+                    width: shape.width,
+                    signed,
+                    bounds: shape.bounds,
+                    dimensions: shape.dimensions,
+                    memory: None,
+                    struct_fields: std::collections::BTreeMap::new(),
+                }
+            };
             self.clocking_variables.insert(
                 format!("{address} {variable_name}"),
-                format!("{name}.{variable_name}"),
+                super::AstClockingVariable { direction, symbol },
             );
         }
-        self.clocking_events.insert(name, clock_watch);
+        self.clocking_events.insert(name.clone(), clock_watch);
+        self.design
+            .clocking_blocks
+            .push(eda_core::ir::ClockingBlock {
+                name,
+                event: clock_watch,
+                inputs,
+            });
         Ok(())
     }
 

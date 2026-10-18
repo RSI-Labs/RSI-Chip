@@ -68,6 +68,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
         }],
         processes: Vec::new(),
         initials: vec![Stmt::Block(vec![memory_write])],
+        clocking_blocks: Vec::new(),
         hierarchy: Vec::new(),
     }
 }
