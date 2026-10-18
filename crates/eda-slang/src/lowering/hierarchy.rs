@@ -107,8 +107,32 @@ fn interface_modport_key(interface_instance: &str, modport: &str) -> Result<Stri
     ))
 }
 
+fn connection_interface_modport_key(
+    interface_modport_symbols: &std::collections::BTreeMap<String, InterfaceModportSymbols>,
+    interface_modport_names: &std::collections::BTreeMap<String, String>,
+    interface_instance: &str,
+    modport: &str,
+) -> Result<String, String> {
+    let exact = interface_modport_key(interface_instance, modport)?;
+    if interface_modport_symbols.contains_key(&exact) {
+        return Ok(exact);
+    }
+    let instance_address = symbol_address(interface_instance)?;
+    let modport_name = modport
+        .split_whitespace()
+        .next_back()
+        .ok_or_else(|| format!("invalid modport reference '{modport}'"))?;
+    let prefix = format!("{instance_address}:");
+    interface_modport_names
+        .iter()
+        .find(|(key, name)| key.starts_with(&prefix) && name.as_str() == modport_name)
+        .map(|(key, _)| key.clone())
+        .ok_or(exact)
+}
+
 struct InterfaceSymbols {
     modports: std::collections::BTreeMap<String, InterfaceModportSymbols>,
+    modport_names: std::collections::BTreeMap<String, String>,
     signals: std::collections::BTreeMap<String, AstLoweredSymbol>,
 }
 
@@ -121,6 +145,7 @@ fn collect_interface_modport_symbols(
 ) -> Result<InterfaceSymbols, String> {
     let mut result = InterfaceSymbols {
         modports: std::collections::BTreeMap::new(),
+        modport_names: std::collections::BTreeMap::new(),
         signals: std::collections::BTreeMap::new(),
     };
     let empty_members = Vec::new();
@@ -229,7 +254,10 @@ fn collect_interface_modport_symbols(
                 },
             );
         }
-        result.modports.insert(modport_key, symbols);
+        result.modports.insert(modport_key.clone(), symbols);
+        result
+            .modport_names
+            .insert(modport_key, modport_name.clone());
     }
     Ok(result)
 }
@@ -641,13 +669,14 @@ impl super::SlangAstLowerer {
                 "instance array '{array_name}' has {count} elements; the direct path supports at most {MAX_INSTANCE_ARRAY_ELEMENTS}"
             ));
         }
-        self.lower_instance_array_elements(member, &array_name)
+        self.lower_instance_array_elements(member, &array_name, None)
     }
 
     fn lower_instance_array_elements(
         &mut self,
         member: &serde_json::Value,
         prefix: &str,
+        base_instance_address: Option<u64>,
     ) -> Result<(), String> {
         let indexes = instance_array_indexes(member)?;
         let elements = member
@@ -661,13 +690,9 @@ impl super::SlangAstLowerer {
                 elements.len()
             ));
         }
+        let global_base = base_instance_address.or_else(|| Self::first_instance_address(member));
         for (index, element) in indexes.into_iter().zip(elements) {
             let element_name = format!("{prefix}[{index}]");
-            let base_instance_address = elements
-                .first()
-                .and_then(|first| first.get("addr"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default();
             match string_field(element, "kind").as_deref() {
                 Some("Instance") => {
                     let mut instance = element.clone();
@@ -677,13 +702,13 @@ impl super::SlangAstLowerer {
                     if let Some(fields) = instance.as_object_mut() {
                         fields.insert(
                             "eda_base_instance_address".into(),
-                            serde_json::Value::from(base_instance_address),
+                            serde_json::Value::from(global_base.unwrap_or_default()),
                         );
                     }
                     self.lower_instance(&instance)?;
                 }
                 Some("InstanceArray") => {
-                    self.lower_instance_array_elements(element, &element_name)?;
+                    self.lower_instance_array_elements(element, &element_name, global_base)?;
                 }
                 other => {
                     return Err(format!(
@@ -693,6 +718,18 @@ impl super::SlangAstLowerer {
             }
         }
         Ok(())
+    }
+
+    fn first_instance_address(member: &serde_json::Value) -> Option<u64> {
+        match string_field(member, "kind").as_deref() {
+            Some("Instance") => member.get("addr").and_then(serde_json::Value::as_u64),
+            Some("InstanceArray") => member
+                .get("members")
+                .and_then(serde_json::Value::as_array)?
+                .iter()
+                .find_map(Self::first_instance_address),
+            _ => None,
+        }
     }
 
     pub(super) fn lower_instance(&mut self, member: &serde_json::Value) -> Result<(), String> {
@@ -731,6 +768,7 @@ impl super::SlangAstLowerer {
             default_clocking_event: None,
             clocking_variables: std::collections::BTreeMap::new(),
             interface_modport_symbols: std::collections::BTreeMap::new(),
+            interface_modport_names: std::collections::BTreeMap::new(),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
@@ -751,7 +789,12 @@ impl super::SlangAstLowerer {
             ) else {
                 continue;
             };
-            let key = interface_modport_key(interface_instance, modport)?;
+            let key = connection_interface_modport_key(
+                &self.interface_modport_symbols,
+                &self.interface_modport_names,
+                interface_instance,
+                modport,
+            )?;
             let Some(modport_symbols) = self.interface_modport_symbols.get(&key) else {
                 return Err(format!(
                     "instance '{scoped_instance_name}' connects unknown interface/modport {interface_instance} {modport}"
@@ -822,6 +865,8 @@ impl super::SlangAstLowerer {
         )?;
         self.interface_modport_symbols
             .extend(interface_symbols.modports);
+        self.interface_modport_names
+            .extend(interface_symbols.modport_names);
         for (symbol_id, symbol) in interface_symbols.signals {
             self.external_symbols.entry(symbol_id).or_insert(symbol);
         }

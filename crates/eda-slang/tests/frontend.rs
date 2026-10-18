@@ -3282,6 +3282,92 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_multidimensional_interface_instance_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-instance-array-2d");
+    let source_path = root.join("interface_instance_array_2d.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  modport producer(output valid);
+endinterface
+
+module array_producer(bus_if.producer bus, input logic value);
+  assign bus.valid = value;
+endmodule
+
+module interface_instance_array_2d_top(
+  input logic clk,
+  input logic [3:0] value,
+  output logic [3:0] observed
+);
+  bus_if buses[2][2] (.clk(clk));
+  array_producer p00 (.bus(buses[0][0]), .value(value[0]));
+  array_producer p01 (.bus(buses[0][1]), .value(value[1]));
+  array_producer p10 (.bus(buses[1][0]), .value(value[2]));
+  array_producer p11 (.bus(buses[1][1]), .value(value[3]));
+  assign observed[0] = buses[0][0].valid;
+  assign observed[1] = buses[0][1].valid;
+  assign observed[2] = buses[1][0].valid;
+  assign observed[3] = buses[1][1].valid;
+endmodule
+"#,
+    )
+    .expect("write multidimensional interface-instance-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_instance_array_2d_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional interface instance arrays");
+    assert_eq!(design.hierarchy.len(), 9);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "interface_instance_array_2d_top",
+            "interface_instance_array_2d_top.buses[0][0]",
+            "interface_instance_array_2d_top.buses[0][1]",
+            "interface_instance_array_2d_top.buses[1][0]",
+            "interface_instance_array_2d_top.buses[1][1]",
+            "interface_instance_array_2d_top.p00",
+            "interface_instance_array_2d_top.p01",
+            "interface_instance_array_2d_top.p10",
+            "interface_instance_array_2d_top.p11"
+        ]
+    );
+    for path in [
+        "buses[0][0].valid",
+        "buses[0][1].valid",
+        "buses[1][0].valid",
+        "buses[1][1].valid",
+    ] {
+        assert!(
+            design
+                .net_decls
+                .iter()
+                .any(|declaration| declaration.name == path),
+            "missing interface signal {path}"
+        );
+    }
+
+    let mut simulator = Simulator::new(&design).expect("create 2D interface-array simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(4, 0b1010))
+        .unwrap();
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0b1010));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
