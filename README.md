@@ -42,38 +42,35 @@ cargo run -p eda-cpu-platform -- i8086 run platform/programs/high_memory.com --s
 cargo run -p eda-cpu-platform -- rv32i run platform/programs/rv32i_high_memory.elf --sv
 ```
 
-The optional `eda-slang` front-end adapter delegates full SystemVerilog
-validation, preprocessing, and AST serialization to
+The `eda-slang` front-end adapter delegates full SystemVerilog validation,
+preprocessing, and AST serialization to
 [slang](https://github.com/MikePopoloski/slang). It accepts include paths and
-macro definitions, rejects malformed RTL with slang diagnostics, emits
-post-elaboration AST JSON, and can feed slang's single-unit preprocessed output
-to the bounded repository elaborator. After bounded lowering, it records slang
-source spans and authoritative per-instance post-elaboration parameter values,
-then compares the result's top name, ordered port inventory/directions, simple
-declaration widths, top parameter metadata, continuous/procedural assignment
-targets, recursive RHS operand shapes/order/symbol identity, sized
-integer-literal values, simple type width/signedness, and direct/generated
-instance inventory against the slang AST. `compile_files_via_ast`
-additionally lowers a simple module subset with elaborated parameter-constant
-leaves, wildcard/explicit package imports with scoped constants/functions/typedefs/enums and enum methods, initial/always/final procedures with `$finish` shutdown execution, direct `$display`/`$write`/`$monitor` formatting tasks for `%b/%d/%h/%s/%t` integral `$time`/`$stime` expressions, per-module `timescale`/`timeunit`/`timeprecision` unit/global-precision delay scaling, `$timeformat`-driven `%t` formatting, and `$printtimescale`, blocking/non-blocking assignments, blocks,
-if plus normal, wildcard, inside, and qualified priority/unique case control flow, bounded string literals, concatenation, byte reads and
-writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
-comparison, inclusive `substr` extraction, and radix conversions
-(`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), scalar event lists with
-any-edge, posedge, and negedge signals, constant procedural delay statements,
-delay-driven always generators, delay-bearing `forever` loops, `wait`
-statements, runtime `repeat`, `while`, and `do...while` loops with
-`break`/`continue`, module-scope and initialized automatic procedure-local
-`for` loops, lexical named-block `disable`, hierarchical clocking blocks with scalar input sampling, no-skew output drives, and `##n` cycle delays, blocking/nonblocking named-event triggers with scalar or edge-qualified event-list waits, fixed event arrays with element triggers/waits/`.triggered`,
-and ordered `wait_order`, scalar `force`/`release`, and concurrent `fork` branches with `join`, `join_any`, and `join_none`, recursive
-parameterized module hierarchy with port connections, scalar, multidimensional packed-vector, packed and unpacked structs/unions including nested packed and unpacked aggregates, and multidimensional unpacked-array interface signals/modports with input-write checks, value-parameterized interface specializations, one-/multidimensional interface array ports, one-/multidimensional, generated, and multidimensional interface instance arrays, and
-multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and top-level directional/inout memory ports with multidimensional rectangular bulk stimulus/read APIs plus directional and inout child-memory sharing directly from slang's elaborated
-AST—without preprocessing and reparsing—and reports
-unsupported constructs explicitly. Its conformance tests also validate
-the repository RV32I/i8086 RTL units and the official Accellera UVM 2020.3.1
-reference source with `UVM_NO_DPI`. This establishes a full-language validation
-path and the first direct-AST lowering path, while downstream execution remains
-explicit about constructs the bounded IR can represent.
+macro definitions, rejects malformed RTL with slang diagnostics, and emits
+post-elaboration AST JSON. `compile_files` and `compile_source` now use the
+authoritative direct slang-AST lowering path and fail closed on unsupported
+constructs; `compile_files_bounded` remains an explicit compatibility and
+differential path rather than a silent fallback.
+
+The direct path lowers elaborated parameter constants, wildcard/explicit
+package imports with scoped constants/functions/typedefs/enums and enum
+methods, initial/always/final procedures with `$finish` shutdown execution,
+direct `$display`/`$write`/`$monitor` formatting tasks for
+`%b/%d/%h/%s/%t`, integral `$time`/`$stime`, per-module
+`timescale`/`timeunit`/`timeprecision` scaling, `$timeformat`, and
+`$printtimescale`, blocking/non-blocking assignments, blocks, if plus normal,
+wildcard, inside, and qualified priority/unique case control flow, bounded
+strings and their checked methods, scalar and edge-qualified event lists,
+delays, waits, runtime loops, jumps, force/release, fork join modes, recursive
+hierarchy, parameterized interfaces, interface arrays and ports, packed and
+unpacked aggregates, first-class sparse memories, memory file tasks, and
+top-level and child memory-port sharing. It records slang source spans and
+validates lowered structure against the authoritative AST. Unsupported
+constructs receive explicit diagnostics instead of a hidden preprocess/reparse
+fallback.
+
+The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
+`compile_sources` for named multi-unit compatibility testing; its explicit
+`compile_files_bounded` entry point is no longer the executable default.
 The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
 `compile_sources` for deterministic named multi-unit compilation with parser
 errors mapped back to their originating file and line.

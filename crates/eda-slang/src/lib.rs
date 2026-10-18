@@ -182,8 +182,26 @@ impl SlangFrontend {
         SlangAstSummary::parse(json)
     }
 
-    /// Checks source with slang, preprocesses it, and lowers the result.
+    /// Compiles through the authoritative direct slang elaborated-AST path.
+    ///
+    /// This is the default `eda-slang` executable path. Unsupported constructs
+    /// fail closed; they do not silently fall back to reparsing preprocessed
+    /// source text.
     pub fn compile_files(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        options: &PreprocessOptions,
+    ) -> Result<Design, String> {
+        self.compile_files_via_ast(files, top, options)
+    }
+
+    /// Checks source with slang, preprocesses it, and lowers the result through
+    /// the bounded compatibility elaborator.
+    ///
+    /// This path is retained only for legacy differentials and explicit callers.
+    /// New executable paths must use the direct AST path.
+    pub fn compile_files_bounded(
         &self,
         files: &[PathBuf],
         top: Option<&str>,

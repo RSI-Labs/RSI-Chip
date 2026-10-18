@@ -17,7 +17,7 @@ fn temporary_directory(name: &str) -> PathBuf {
 }
 
 #[test]
-fn slang_preprocesses_macros_and_includes_before_rtl_lowering() {
+fn slang_compiles_macros_and_includes_through_the_direct_default_path() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -99,7 +99,7 @@ endmodule
         )
         .expect("directly lower slang AST");
     let preprocessed_reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("simple"),
             &PreprocessOptions::default(),
@@ -827,7 +827,7 @@ endmodule
         )
         .expect("directly lower procedural slang AST");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("procedural"),
             &PreprocessOptions::default(),
@@ -922,7 +922,7 @@ endmodule
         )
         .expect("directly lower simple hierarchy");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("top"),
             &PreprocessOptions::default(),
@@ -978,7 +978,7 @@ module top(input logic a, output logic y); middle u (.a(a), .y(y)); endmodule
         )
         .expect("directly lower nested hierarchy");
     let nested_reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&nested_path),
             Some("top"),
             &PreprocessOptions::default(),
@@ -1058,7 +1058,7 @@ endmodule
         )
         .expect("directly lower sparse memory");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("memory"),
             &PreprocessOptions::default(),
@@ -1210,7 +1210,7 @@ endmodule
         )
         .expect("directly lower sparse-memory part selects");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("memory_parts"),
             &PreprocessOptions::default(),
@@ -1346,7 +1346,7 @@ endmodule
         )
         .expect("directly lower array-element simple range");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("simple_range"),
             &PreprocessOptions::default(),
@@ -1406,7 +1406,7 @@ endmodule
         )
         .expect("directly lower multidimensional sparse memory");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("memory2d"),
             &PreprocessOptions::default(),
@@ -1519,7 +1519,7 @@ endmodule
         )
         .expect("directly lower multidimensional indexed part write");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("memory2d_parts"),
             &PreprocessOptions::default(),
@@ -1620,7 +1620,7 @@ endmodule
         )
         .expect("directly lower shared sparse-memory port");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("top"),
             &PreprocessOptions::default(),
@@ -2079,7 +2079,7 @@ endmodule
         )
         .expect("directly lower sparse-memory file loads");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("readmem"),
             &PreprocessOptions::default(),
@@ -2188,7 +2188,7 @@ endmodule
         )
         .expect("directly lower ranged memory file");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("readmem_range"),
             &PreprocessOptions::default(),
@@ -2242,7 +2242,7 @@ endmodule
         )
         .expect("directly lower fixed memory mask");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("write_mask"),
             &PreprocessOptions::default(),
@@ -2301,7 +2301,7 @@ endmodule
         )
         .expect("directly lower aligned byte enable");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("byte_enable"),
             &PreprocessOptions::default(),
@@ -2349,7 +2349,7 @@ endmodule
         )
         .expect("directly lower synchronous ROM");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("sync_rom"),
             &PreprocessOptions::default(),
@@ -2410,7 +2410,7 @@ endmodule
         )
         .expect("directly lower sparse-memory dump tasks");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("writemem"),
             &PreprocessOptions::default(),
@@ -2470,7 +2470,7 @@ endmodule
     .expect("write hierarchy source");
 
     let design = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("top"),
             &PreprocessOptions::default(),
@@ -2896,7 +2896,7 @@ endmodule
         )
         .expect("compile generated instance through slang boundary");
     assert_eq!(design.name, "top");
-    assert!(design.instance("top.u").is_some());
+    assert!(design.instance("top.selected.u").is_some());
 }
 
 #[test]
@@ -2930,7 +2930,7 @@ endmodule
         )
         .expect("directly lower generated members");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("top"),
             &PreprocessOptions::default(),
@@ -6239,7 +6239,7 @@ endmodule
     )
     .expect("write bounded string source");
     let bounded = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&bounded_source_path),
             Some("strings_bounded"),
             &PreprocessOptions::default(),
@@ -6318,7 +6318,7 @@ endmodule
     ));
 
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("events"),
             &PreprocessOptions::default(),
@@ -7375,7 +7375,7 @@ endmodule
         )
         .expect("directly lower constant delay controls");
     let reference = slang
-        .compile_files(
+        .compile_files_bounded(
             std::slice::from_ref(&source_path),
             Some("delays"),
             &PreprocessOptions::default(),

@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-18 (local time)
-Repository state audited: `fix-digital` at `9a9b557` plus the uncommitted
-multidimensional rectangular memory-range API changes currently in the worktree.
+Repository state audited: `fix-digital` at `9690bd5` plus the uncommitted
+direct-default compilation-authority changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -13,23 +13,19 @@ listed as audit findings.
 
 ## 1. Executive conclusion
 
-The frontend has two different strengths that must not be conflated:
+The frontend now has one default executable authority:
 
-1. **Language validation strength:** slang 12 validates the full source,
-   expands macros/includes, checks types, elaborates parameters/generate, and
-   emits authoritative AST JSON. This part is strong because it delegates the
-   hard parser/type-checker work to slang.
-2. **Executable lowering strength:** only a subset of slang's elaborated AST is
-   directly lowered into repository IR. The older `compile_files` path still
-   asks slang to preprocess the source and then reparses it with the bounded
-   `eda-hdl` parser. That bounded parser has useful RTL/UVM-lite subsets, but it
-   is not a complete SystemVerilog implementation.
+1. slang validates the full source, expands macros/includes, checks types,
+   elaborates parameters/generate, and emits authoritative AST JSON.
+2. `compile_files`, `compile_source`, and the CLI use direct slang-AST
+   lowering. Unsupported constructs fail closed; they no longer silently fall
+   back to preprocess/reparse lowering.
+3. `compile_files_bounded` is an explicit compatibility/differential entry
+   point, not the public executable default.
 
-Therefore, the statement “the frontend uses slang” is only completely true for
-validation. It is not yet completely true for executable semantic lowering.
-The major remaining frontend error is architectural: **there are still two
-lowering authorities, and the direct slang-AST path is much smaller than the
-validation path.**
+This removes the hidden two-authority hazard. It does not make direct lowering
+complete: dynamic types, classes, full timing/assertion/coverage/UVM semantics,
+and many commercial system interfaces still fail closed.
 
 The recent bounded-string ordering mistake was exactly the kind of error this
 split makes possible: slang understood the source type, but repository-specific
@@ -49,7 +45,7 @@ All commands were run against the current worktree:
 | `cargo test -p eda-slang --all-targets -- --nocapture` | 136 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 131.58 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 141.72 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -84,7 +80,7 @@ broader tool-flow percentage.
 
 | ID | Name | Initial requirement | Current state / error | Severity | Progress | Next required evidence |
 | --- | --- | --- | --- | --- | ---: | --- |
-| F-01 | Single authoritative lowering path | Every valid input accepted by the authoritative frontend must either lower through the same semantic model or fail closed with an actionable diagnostic. | `compile_files` validates with slang, preprocesses, then reparses with the bounded parser. `compile_files_via_ast` is the better path but supports only a subset. | P0 architecture | 35% | Make direct slang-AST lowering the only executable path, or formally prove the compatibility fallback for every construct. |
+| F-01 | Single authoritative lowering path | Every valid input accepted by the authoritative frontend must either lower through the same semantic model or fail closed with an actionable diagnostic. | `compile_files`, `compile_source`, and the CLI now use the direct path. The bounded preprocess/reparse implementation remains as explicit `compile_files_bounded` for compatibility differentials and still has non-authoritative semantics. | P0 architecture | 65% | Remove or formally isolate `compile_files_bounded` and migrate every remaining differential to explicit conformance-only entry points. |
 | F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, many timing/assertion/checker forms, and many system calls. | P0 | 43% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
 | F-03 | Complete structural/semantic post-check | Slang and repository IR must agree on declarations, types, statements, expressions, hierarchy, and behavior. | Current summary checks top, ports, declarations, assignment shapes, literals, simple width/signedness, processes, and instance inventory. Fingerprints fall back to `"?"` for legacy array expansion and dynamic packed lvalues. | P0 | 45% | Remove all `"?"` equivalence cases and add runtime differential simulation for each construct. |
 | F-04 | Full official UVM execution | Compile and execute the official Accellera UVM library and user environments, including phasing, objections, factory, configuration, sequences, TLM, callbacks, reports, and coverage. | Official UVM 2020.3.1 is only checked/elaborated with `UVM_NO_DPI`. Direct AST lowering rejects `ClassType`. The bounded frontend has a separate UVM-lite subset. | P0 | 10% executable; 0% for full official UVM execution | Run an official UVM example through phasing and objections and compare event/report/coverage outcomes. |
@@ -277,7 +273,7 @@ guards.
 
 | Priority | Work package | Why it comes first |
 | --- | --- | --- |
-| P0-1 | Turn `compile_files_via_ast` into the only default executable path and remove unsupported compatibility fallbacks. | Eliminates the two-authority correctness hazard. |
+| P0-1 | Keep the direct path as the only public executable default, then remove or conformance-only isolate `compile_files_bounded`. | The hidden fallback is gone; the remaining explicit compatibility implementation must not regain product authority. |
 | P0-2 | Replace remaining `"?"` structural fingerprints and add direct-versus-bounded simulation differentials. | Prevents semantic mismatches from passing validation. |
 | P0-3 | Add normal unpacked array variables/ports independently from large sparse memories. | Small arrays and large memories currently have conflated lowering models. |
 | P0-4 | Add a real procedure/scheduling IR for delays, event lists, wait, fork, loops, jumps, and force/release. | Timing and behavioral RTL/UVM cannot be complete without it. |
