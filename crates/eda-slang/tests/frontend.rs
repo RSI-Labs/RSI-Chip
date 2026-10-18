@@ -56,6 +56,111 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_simple_class_objects() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-simple-class");
+    let source_path = root.join("simple_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Counter;
+  int value;
+
+  function new(int start);
+    value = start;
+  endfunction
+
+  function void inc();
+    value = value + 1;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+endclass
+
+module class_top(
+  output int observed0,
+  output int observed1,
+  output int observed2
+);
+  Counter counter;
+  Counter second;
+  initial begin
+    counter = new(41);
+    second = new(9);
+    counter.inc();
+    observed0 = counter.get();
+    counter.inc();
+    observed1 = counter.get();
+    second.inc();
+    observed2 = second.value;
+  end
+endmodule
+"#,
+    )
+    .expect("write simple-class source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simple class object");
+    for field in ["counter.value", "second.value"] {
+        assert!(
+            design
+                .net_decls
+                .iter()
+                .any(|declaration| declaration.name == field && declaration.width == 32),
+            "missing class field {field}"
+        );
+    }
+
+    let mut simulator = Simulator::new(&design).expect("create class simulator");
+    simulator.run_until(0).expect("run class initial block");
+    assert_eq!(simulator.read("observed0").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("observed1").unwrap().to_u64(), Some(43));
+    assert_eq!(simulator.read("observed2").unwrap().to_u64(), Some(10));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-invalid");
+    let source_path = root.join("static_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class StaticCounter;
+  static int shared;
+endclass
+
+module class_invalid_top;
+  StaticCounter counter;
+endmodule
+"#,
+    )
+    .expect("write unsupported class source");
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("class_invalid_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("static class properties must fail closed");
+    assert!(
+        error.contains("static class property 'StaticCounter.shared' is not supported"),
+        "unexpected class error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_compiles_and_simulates_simple_modules() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

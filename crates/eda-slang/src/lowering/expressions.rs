@@ -723,6 +723,9 @@ impl super::SlangAstLowerer {
                 })
             }
             "MemberAccess" => {
+                if let Some(expression) = self.lower_class_property_access(value)? {
+                    return Ok(expression);
+                }
                 let (base, msb, lsb) = self.lower_struct_member(value)?;
                 Ok(Expr::Index {
                     e: Box::new(base),

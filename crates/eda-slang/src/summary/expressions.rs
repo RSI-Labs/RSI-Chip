@@ -155,13 +155,15 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
     }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
-            let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
-            assignments.push(SlangAssignmentSummary {
-                target_names: expression_target_names(left),
-                rhs: expression_summary(right),
-                nonblocking: bool_field(value, "isNonBlocking"),
-                dynamic_packed_lvalue,
-            });
+            if !is_class_handle_target(left) {
+                let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
+                assignments.push(SlangAssignmentSummary {
+                    target_names: expression_target_names(left),
+                    rhs: expression_summary(right),
+                    nonblocking: bool_field(value, "isNonBlocking"),
+                    dynamic_packed_lvalue,
+                });
+            }
         }
     }
     match value {
@@ -180,6 +182,12 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
         _ => {}
     }
     assignments
+}
+
+fn is_class_handle_target(value: &Value) -> bool {
+    string_field(value, "type")
+        .and_then(|type_name| type_name.split_whitespace().next().map(str::to_string))
+        .is_some_and(|address| address.parse::<u64>().is_ok())
 }
 
 pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Option<&'static str> {

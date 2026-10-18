@@ -77,6 +77,9 @@ impl SlangAstLowerer {
             }
             _ => {}
         }
+        if let Some(expression) = self.lower_class_function_call(value)? {
+            return Ok(expression);
+        }
         let subroutine_name = expression_symbol(value)
             .or_else(|| {
                 subroutine
@@ -227,6 +230,9 @@ impl SlangAstLowerer {
                 _ => 10,
             };
             return self.lower_string_from_radix(value, radix).map(Some);
+        }
+        if let Some(statement) = self.lower_class_task_call(value)? {
+            return Ok(Some(statement));
         }
         let Some(definition) = self.subroutines.get(&task_name) else {
             return Ok(None);

@@ -79,6 +79,19 @@ impl SlangAstSummary {
             .map(|declaration| (declaration.name.clone(), declaration.width))
             .collect();
         for (name, slang_width) in expected_declarations {
+            // Class handles are symbol references such as `"42 Counter"`.
+            // Direct lowering expands the handle into `object.property` fields,
+            // so the placeholder handle has no scalar IR declaration.
+            if self.declarations.iter().any(|declaration| {
+                declaration.name == *name
+                    && declaration
+                        .type_name
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|address| address.parse::<u64>().is_ok())
+            }) {
+                continue;
+            }
             match visible_design_declarations.get(&name) {
                 None => {
                     return Err(

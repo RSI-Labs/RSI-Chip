@@ -384,6 +384,9 @@ impl SlangAstLowerer {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
         let type_name = string_field(member, "type").unwrap_or_default();
+        if self.declare_class_object(member, &name)? {
+            return Ok(());
+        }
         if type_name.starts_with("event$") {
             self.declare_net(member, &name, &kind)?;
             if member.get("initializer").is_some() {

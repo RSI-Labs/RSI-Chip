@@ -6,6 +6,7 @@ use crate::ast_util::{
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
 
+mod classes;
 mod declarations;
 mod expressions;
 mod functions;
@@ -64,6 +65,16 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
         return Err("slang AST root is not an elaborated Instance".into());
     }
     let mut root = root.clone();
+    let mut class_types = Vec::new();
+    collect_class_types(&document, &mut class_types);
+    if !class_types.is_empty() {
+        if let Some(fields) = root.as_object_mut() {
+            fields.insert(
+                "eda_class_types".into(),
+                serde_json::Value::Array(class_types),
+            );
+        }
+    }
     normalize_instance_bodies(&mut root);
     normalize_detailed_types(&mut root);
     let definition_time_scales: std::collections::BTreeMap<String, AstTimeScale> = document
@@ -140,6 +151,23 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
 
 pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {
     SlangAstLowerer::lower(root)
+}
+
+fn collect_class_types(value: &serde_json::Value, classes: &mut Vec<serde_json::Value>) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            classes.push(value.clone());
+        }
+        for nested in fields.values() {
+            collect_class_types(nested, classes);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_types(nested, classes);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +399,10 @@ pub(super) struct SlangAstLowerer {
     type_enums: std::collections::BTreeMap<String, AstEnumType>,
     ambiguous_type_aliases: std::collections::BTreeSet<String>,
     ambiguous_type_enums: std::collections::BTreeSet<String>,
+    class_definitions: std::collections::BTreeMap<String, serde_json::Value>,
+    class_objects:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, AstLoweredSymbol>>,
+    class_object_types: std::collections::BTreeMap<String, String>,
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
     named_block_flags: std::collections::BTreeMap<String, usize>,
     named_disable_seen: bool,
@@ -478,6 +510,18 @@ impl SlangAstLowerer {
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
+            class_definitions: root
+                .get("eda_class_types")
+                .and_then(serde_json::Value::as_array)
+                .map(|classes| {
+                    classes
+                        .iter()
+                        .filter_map(|class| Some((string_field(class, "name")?, class.clone())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            class_objects: std::collections::BTreeMap::new(),
+            class_object_types: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
             named_block_flags: std::collections::BTreeMap::new(),
             named_disable_seen: false,
