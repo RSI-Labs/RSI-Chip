@@ -680,6 +680,8 @@ pub enum Stmt {
 pub enum Sens {
     /// `@(*)` — combinational.
     Comb,
+    /// Any value change of one explicitly listed scalar signal.
+    Any(usize),
     Posedge(usize),
     Negedge(usize),
     List(Vec<Sens>),
@@ -947,6 +949,7 @@ impl MemoryAccesses {
 fn process_is_edge_clocked(sensitivity: &Sens) -> bool {
     match sensitivity {
         Sens::Comb => false,
+        Sens::Any(_) => false,
         Sens::Posedge(_) | Sens::Negedge(_) => true,
         Sens::List(list) => list
             .iter()

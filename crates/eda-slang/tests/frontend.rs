@@ -254,16 +254,21 @@ endmodule
 "#,
     )
     .expect("write mixed-event source");
-    let error = slang
+    let mixed_event = slang
         .compile_files_via_ast(
             std::slice::from_ref(&mixed_event_path),
             Some("mixed_event"),
             &PreprocessOptions::default(),
         )
-        .expect_err("mixed edge/level sensitivity must fail closed");
+        .expect("directly lower mixed edge/level sensitivity");
     assert!(
-        error.contains("single signal event sensitivity"),
-        "unexpected error: {error}"
+        matches!(
+            &mixed_event.processes[0].sens,
+            eda_core::ir::Sens::List(list)
+                if matches!(list.as_slice(), [eda_core::ir::Sens::Posedge(_), eda_core::ir::Sens::Any(_)])
+        ),
+        "unexpected sensitivity: {:?}",
+        mixed_event.processes[0].sens
     );
 }
 
@@ -3263,6 +3268,120 @@ endmodule
             .to_ascii_string_nul_terminated(),
         "Bc"
     );
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_event_sensitivity_lists() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-events");
+    let source_path = root.join("events.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module events(
+  input logic a,
+  input logic b,
+  input logic c,
+  input logic clk,
+  input logic rst,
+  input logic [3:0] vector,
+  output logic level_y,
+  output logic edge_q,
+  output logic bit_q
+);
+  always @(a or b) level_y = a & c;
+  always @(posedge clk or posedge rst) begin
+    if (rst) begin
+      edge_q <= 1'b0;
+    end else begin
+      edge_q <= ~edge_q;
+    end
+  end
+  always @(posedge vector[0]) bit_q <= vector[1];
+endmodule
+"#,
+    )
+    .expect("write event-list source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("events"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event sensitivity lists");
+    assert_eq!(design.processes.len(), 3);
+    assert!(matches!(
+        &design.processes[0].sens,
+        eda_core::ir::Sens::List(list)
+            if matches!(list.as_slice(), [eda_core::ir::Sens::Any(_), eda_core::ir::Sens::Any(_)])
+    ));
+    assert!(matches!(
+        &design.processes[1].sens,
+        eda_core::ir::Sens::List(list)
+            if matches!(list.as_slice(), [eda_core::ir::Sens::Posedge(_), eda_core::ir::Sens::Posedge(_)])
+    ));
+
+    let reference = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("events"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower event sensitivity lists through the bounded path");
+    assert_eq!(reference.processes.len(), design.processes.len());
+
+    let run_events = |design: &eda_core::ir::Design| {
+        let mut simulator = Simulator::new(design).expect("create event-list simulator");
+        simulator
+            .set_input("a", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        simulator.set_input("c", &LogicWord::zero(1)).unwrap();
+        simulator.set_input("b", &LogicWord::zero(1)).unwrap();
+        assert_eq!(simulator.read("level_y").unwrap().to_u64(), Some(0));
+
+        simulator
+            .set_input("c", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("level_y").unwrap().to_u64(), Some(0));
+
+        simulator
+            .set_input("b", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("level_y").unwrap().to_u64(), Some(1));
+
+        simulator
+            .set_input("rst", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("edge_q").unwrap().to_u64(), Some(0));
+        simulator.set_input("rst", &LogicWord::zero(1)).unwrap();
+        for expected in [1, 0, 1] {
+            simulator
+                .set_input("clk", &LogicWord::from_u64(1, 1))
+                .unwrap();
+            assert_eq!(simulator.read("edge_q").unwrap().to_u64(), Some(expected));
+            simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+        }
+
+        simulator
+            .set_input("vector", &LogicWord::from_u64(4, 0b0010))
+            .unwrap();
+        simulator
+            .set_input("vector", &LogicWord::from_u64(4, 0b0011))
+            .unwrap();
+        assert_eq!(simulator.read("bit_q").unwrap().to_u64(), Some(1));
+        simulator
+            .set_input("vector", &LogicWord::from_u64(4, 0b0010))
+            .unwrap();
+        simulator
+            .set_input("vector", &LogicWord::from_u64(4, 0b0011))
+            .unwrap();
+        assert_eq!(simulator.read("bit_q").unwrap().to_u64(), Some(1));
+    };
+    run_events(&design);
+    run_events(&reference);
 }
 
 #[test]

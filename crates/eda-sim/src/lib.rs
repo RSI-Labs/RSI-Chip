@@ -1594,6 +1594,11 @@ fn register_sens(sens: &Sens, pi: usize, body: &Stmt, out: &mut Vec<Vec<(usize, 
                 }
             }
         }
+        Sens::Any(net) => {
+            if *net < n {
+                out[*net].push((pi, Edge::Any));
+            }
+        }
         Sens::Posedge(net) => {
             if *net < n {
                 out[*net].push((pi, Edge::Pos));

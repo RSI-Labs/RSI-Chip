@@ -59,7 +59,8 @@ leaves, initial/always procedures, blocking/non-blocking assignments, blocks,
 if/case control flow, bounded string literals, concatenation, byte reads and
 writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
 comparison, inclusive `substr` extraction, and radix conversions
-(`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), single posedge/negedge sensitivity, recursive
+(`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), scalar event lists with
+any-edge, posedge, and negedge signals, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports

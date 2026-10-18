@@ -785,7 +785,6 @@ impl Parser {
             return Ok(Sens::Comb);
         }
         let mut edges = Vec::new();
-        let mut level = false;
         loop {
             if self.eat_kw("posedge") {
                 edges.push(Sens::Posedge(self.parse_expr()?));
@@ -793,8 +792,7 @@ impl Parser {
                 edges.push(Sens::Negedge(self.parse_expr()?));
             } else {
                 // plain identifier: level-sensitive
-                let _ = self.parse_expr()?;
-                level = true;
+                edges.push(Sens::Any(self.parse_expr()?));
             }
             if self.eat_kw("or") || self.eat_punct(",") {
                 continue;
@@ -802,9 +800,7 @@ impl Parser {
             break;
         }
         self.expect_punct(")")?;
-        if level {
-            Ok(Sens::Comb)
-        } else if edges.len() == 1 {
+        if edges.len() == 1 {
             Ok(edges.pop().unwrap())
         } else {
             Ok(Sens::List(edges))

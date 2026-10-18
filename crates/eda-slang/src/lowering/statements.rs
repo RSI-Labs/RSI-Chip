@@ -103,22 +103,39 @@ impl SlangAstLowerer {
         &self,
         timing: &serde_json::Value,
     ) -> Result<eda_core::ir::Sens, String> {
-        if string_field(timing, "kind").as_deref() == Some("ImplicitEvent") {
-            return Ok(eda_core::ir::Sens::Comb);
-        }
-        if string_field(timing, "kind").as_deref() != Some("SignalEvent") {
-            return Err(
-                "direct slang-AST lowering supports only a single signal event sensitivity".into(),
-            );
+        match string_field(timing, "kind").as_deref() {
+            Some("ImplicitEvent") => return Ok(eda_core::ir::Sens::Comb),
+            Some("EventList") => {
+                let events = timing
+                    .get("events")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "event list has no events".to_string())?;
+                if events.is_empty() {
+                    return Err("event list is empty".into());
+                }
+                let list = events
+                    .iter()
+                    .map(|event| self.lower_sensitivity(event))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(eda_core::ir::Sens::List(list));
+            }
+            Some("SignalEvent") => {}
+            _ => {
+                return Err(
+                    "direct slang-AST lowering supports signal and event-list sensitivity".into(),
+                )
+            }
         }
         let expression = timing
             .get("expr")
             .ok_or_else(|| "signal event has no expression".to_string())?;
         let signal = self.lower_lvalue(expression)?;
+        let net = sensitivity_net(&signal)?;
         match string_field(timing, "edge").as_deref() {
-            Some("PosEdge") => Ok(eda_core::ir::Sens::Posedge(signal.net)),
-            Some("NegEdge") => Ok(eda_core::ir::Sens::Negedge(signal.net)),
-            _ => Err("direct slang-AST lowering requires PosEdge or NegEdge sensitivity".into()),
+            Some("None") => Ok(eda_core::ir::Sens::Any(net)),
+            Some("PosEdge") => Ok(eda_core::ir::Sens::Posedge(net)),
+            Some("NegEdge") => Ok(eda_core::ir::Sens::Negedge(net)),
+            _ => Err("direct slang-AST lowering requires a scalar signal edge".into()),
         }
     }
 
@@ -624,5 +641,13 @@ impl SlangAstLowerer {
             e: rhs,
             delay: 0,
         });
+    }
+}
+
+fn sensitivity_net(signal: &eda_core::ir::LValue) -> Result<usize, String> {
+    match signal.range {
+        eda_core::ir::Range::Bit(bit) => Ok(signal.net + bit),
+        eda_core::ir::Range::Span { msb, lsb } if msb == lsb => Ok(signal.net + lsb),
+        _ => Err("sensitivity expression must be one bit wide".into()),
     }
 }

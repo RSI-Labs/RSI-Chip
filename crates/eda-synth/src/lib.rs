@@ -172,7 +172,7 @@ impl<'a> Synth<'a> {
             }
             self.reset_sym();
             match &p.sens {
-                Sens::Comb => {
+                Sens::Comb | Sens::Any(_) => {
                     self.exec_stmt(&p.body)?;
                     let written = sorted_set(&self.written);
                     let sym = self.sym.clone();

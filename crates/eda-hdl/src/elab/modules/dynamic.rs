@@ -6,6 +6,7 @@ impl<'a> Elaborator<'a> {
     pub(super) fn elab_sens(&self, sens: &ast::Sens, env: &Env) -> Result<SensIR, String> {
         Ok(match sens {
             ast::Sens::Comb => SensIR::Comb,
+            ast::Sens::Any(e) => SensIR::Any(self.single_net(e, env)?),
             ast::Sens::Posedge(e) => SensIR::Posedge(self.single_net(e, env)?),
             ast::Sens::Negedge(e) => SensIR::Negedge(self.single_net(e, env)?),
             ast::Sens::List(v) => SensIR::List(
