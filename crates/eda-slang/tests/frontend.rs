@@ -3618,6 +3618,61 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_force_and_release() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-force");
+    let source_path = root.join("force.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module force_release(
+  input logic a,
+  input logic en,
+  output logic y,
+  output logic released
+);
+  assign y = a;
+  initial begin
+    released = 1'b0;
+    wait (en);
+    force y = 1'b0;
+    #2;
+    release y;
+    released = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write force/release source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("force_release"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower force/release");
+    let mut simulator = Simulator::new(&design).expect("create force/release simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+
+    simulator
+        .set_input("en", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
+
+    simulator.run_until(1).unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
+    simulator.run_until(2).unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("released").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

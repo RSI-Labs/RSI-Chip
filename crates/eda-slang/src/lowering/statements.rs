@@ -277,6 +277,29 @@ impl SlangAstLowerer {
                 }
                 self.lower_assignment(expression)
             }
+            "ProceduralAssign" if bool_field(statement, "isForce") => {
+                let assignment = statement
+                    .get("assignment")
+                    .ok_or_else(|| "force statement has no assignment".to_string())?;
+                let left = assignment
+                    .get("left")
+                    .ok_or_else(|| "force statement has no left side".to_string())?;
+                let right = assignment
+                    .get("right")
+                    .ok_or_else(|| "force statement has no right side".to_string())?;
+                Ok(Stmt::Force {
+                    lv: self.lower_lvalue(left)?,
+                    e: self.lower_expression(right)?,
+                })
+            }
+            "ProceduralDeassign" if bool_field(statement, "isRelease") => {
+                let left = statement
+                    .get("lvalue")
+                    .ok_or_else(|| "release statement has no lvalue".to_string())?;
+                Ok(Stmt::Release {
+                    lv: self.lower_lvalue(left)?,
+                })
+            }
             "Assignment" => self.lower_assignment(statement),
             "VariableDeclaration" => Err(
                 "direct slang-AST procedure locals are not supported; declare loop variables in module scope"

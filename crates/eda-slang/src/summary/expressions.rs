@@ -140,6 +140,11 @@ fn is_dynamic_packed_lvalue(value: &Value) -> bool {
 
 pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
+    if string_field(value, "kind").as_deref() == Some("ProceduralAssign")
+        && bool_field(value, "isForce")
+    {
+        return assignments;
+    }
     if string_field(value, "kind").as_deref() == Some("RepeatLoop")
         && value
             .get("count")
@@ -661,6 +666,7 @@ pub(crate) fn design_stmt_assignments(
         Stmt::Repeat { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
+        Stmt::Force { .. } | Stmt::Release { .. } => {}
         Stmt::Break | Stmt::Continue => {}
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {

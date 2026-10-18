@@ -671,6 +671,15 @@ pub enum Stmt {
         count: Expr,
         body: Box<Stmt>,
     },
+    /// Force `lv` to `e` until an explicit release.
+    Force {
+        lv: LValue,
+        e: Expr,
+    },
+    /// Release a previously forced lvalue.
+    Release {
+        lv: LValue,
+    },
     /// Exit the nearest runtime loop.
     Break,
     /// Start the next iteration of the nearest runtime loop.
@@ -1042,6 +1051,8 @@ fn collect_memory_accesses(
             collect_memory_expr_reads(count, synchronous, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
+        Stmt::Force { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
+        Stmt::Release { .. } => {}
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, accesses);

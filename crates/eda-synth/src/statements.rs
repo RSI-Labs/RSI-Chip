@@ -55,6 +55,8 @@ impl<'a> Synth<'a> {
             Stmt::Fork { .. } => Err("fork/join blocks are not synthesizable".into()),
             Stmt::While { .. } => Err("while loops are not synthesizable".into()),
             Stmt::Repeat { .. } => Err("repeat loops are not synthesizable".into()),
+            Stmt::Force { .. } => Err("force statements are not synthesizable".into()),
+            Stmt::Release { .. } => Err("release statements are not synthesizable".into()),
             Stmt::Break | Stmt::Continue => Err("loop jumps are not synthesizable".into()),
             Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
                 let w = lv.range.width();

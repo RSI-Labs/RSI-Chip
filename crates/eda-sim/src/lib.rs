@@ -93,6 +93,8 @@ pub struct Simulator<'d> {
     repeat_remaining: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
     event_waiters: Vec<EventWaiter<'d>>,
+    forced_values: HashMap<usize, LogicValue>,
+    forced_saved_values: HashMap<usize, LogicValue>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
@@ -206,6 +208,8 @@ impl<'d> Simulator<'d> {
             repeat_remaining: HashMap::new(),
             waiters: Vec::new(),
             event_waiters: Vec::new(),
+            forced_values: HashMap::new(),
+            forced_saved_values: HashMap::new(),
             memory_elements,
             memory_aliases,
             memory_nba: Vec::new(),
@@ -462,6 +466,9 @@ impl<'d> Simulator<'d> {
     // ---------- scheduler ----------
 
     fn schedule(&mut self, u: Update) {
+        if self.forced_values.contains_key(&u.net) {
+            return;
+        }
         let queue = self.events.entry(self.now).or_default();
         let has_pending_for_driver = queue
             .iter()
@@ -589,6 +596,9 @@ impl<'d> Simulator<'d> {
     }
 
     fn apply_update(&mut self, u: Update) -> Result<(), String> {
+        if self.forced_values.contains_key(&u.net) {
+            return Ok(());
+        }
         self.event_count += 1;
         if self.event_count > MAX_EVENTS {
             return Err("event budget exceeded".into());
@@ -621,6 +631,20 @@ impl<'d> Simulator<'d> {
         self.vals[u.net] = newv;
         self.mark_vcd_change(u.net);
         self.notify_change(u.net, old, newv)
+    }
+
+    fn notify_direct_changes(
+        &mut self,
+        changes: Vec<(usize, LogicValue, LogicValue)>,
+    ) -> Result<(), String> {
+        for (net, old, newv) in changes {
+            self.event_count += 1;
+            if self.event_count > MAX_EVENTS {
+                return Err("event budget exceeded".into());
+            }
+            self.notify_change(net, old, newv)?;
+        }
+        Ok(())
     }
 
     /// Run the event consequences of a value that has already changed.
@@ -1018,6 +1042,59 @@ impl<'d> Simulator<'d> {
                         work.push(body);
                     }
                 }
+                Stmt::Force { lv, e } => {
+                    let value = self.eval(e).sized(lv_bits(lv).len());
+                    let mut changes = Vec::new();
+                    for (bit, net) in lv_bits(lv).into_iter().enumerate() {
+                        let newv = value.bit(bit);
+                        let old = self.vals[net];
+                        self.forced_saved_values.entry(net).or_insert(old);
+                        self.forced_values.insert(net, newv);
+                        if old != newv {
+                            self.vals[net] = newv;
+                            self.mark_vcd_change(net);
+                            changes.push((net, old, newv));
+                        }
+                    }
+                    self.notify_direct_changes(changes)?;
+                }
+                Stmt::Release { lv } => {
+                    let targets = lv_bits(lv);
+                    let mut restored = Vec::new();
+                    for net in targets.iter().copied() {
+                        if self.forced_values.remove(&net).is_some() {
+                            if let Some(old) = self.forced_saved_values.remove(&net) {
+                                restored.push((net, old));
+                            }
+                        }
+                    }
+
+                    let mut continuous_values = HashMap::new();
+                    for assignment in &self.design.assigns {
+                        let value = self.eval(&assignment.e);
+                        for net in targets.iter().copied() {
+                            if covers(&assignment.lv, net) {
+                                let bit = lv_bit(&assignment.lv, net)
+                                    .map(|index| value.bit(index))
+                                    .unwrap_or(LogicValue::X);
+                                let resolved = continuous_values.entry(net).or_insert(bit);
+                                *resolved = resolved.resolve(bit);
+                            }
+                        }
+                    }
+
+                    let mut changes = Vec::new();
+                    for (net, old) in restored {
+                        let newv = continuous_values.get(&net).copied().unwrap_or(old);
+                        let current = self.vals[net];
+                        if current != newv {
+                            self.vals[net] = newv;
+                            self.mark_vcd_change(net);
+                            changes.push((net, current, newv));
+                        }
+                    }
+                    self.notify_direct_changes(changes)?;
+                }
                 Stmt::Break => {
                     let Some(loop_position) = work.iter().rposition(|statement| {
                         matches!(statement, Stmt::While { .. } | Stmt::Repeat { .. })
@@ -1067,6 +1144,9 @@ impl<'d> Simulator<'d> {
                     let mut changes = Vec::new();
                     for (i, net) in lv_bits(lv).into_iter().enumerate() {
                         let newv = v.bit(i);
+                        if self.forced_values.contains_key(&net) {
+                            continue;
+                        }
                         let old = self.vals[net];
                         if old != newv {
                             self.vals[net] = newv;
@@ -2443,6 +2523,8 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(count, out);
             walk_stmt_memories(body, out)
         }
+        Stmt::Force { e, .. } => walk_expr_memories(e, out),
+        Stmt::Release { .. } => {}
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
@@ -2555,6 +2637,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(expr_nets(count));
             collect_stmt_access(body, reads, writes);
         }
+        Stmt::Force { e, .. } => reads.extend(expr_nets(e)),
+        Stmt::Release { .. } => {}
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2637,6 +2721,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(count, out);
             walk_stmt(body, out)
         }
+        Stmt::Force { e, .. } => walk_expr(e, out),
+        Stmt::Release { .. } => {}
         Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
