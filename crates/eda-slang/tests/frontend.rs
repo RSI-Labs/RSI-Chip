@@ -2190,38 +2190,6 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_rejects_fork_join_modes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
-        return;
-    };
-    for (name, join) in [("join_any.sv", "join_any"), ("join_none.sv", "join_none")] {
-        let root = temporary_directory("direct-ast-fork");
-        let source_path = root.join(name);
-        std::fs::write(
-            &source_path,
-            format!(
-                r#"
-module fork_mode(input logic a, output logic y);
-  initial fork y = a; {join} endmodule
-"#
-            ),
-        )
-        .expect("write fork source");
-        let error = slang
-            .compile_files_via_ast(
-                std::slice::from_ref(&source_path),
-                Some("fork_mode"),
-                &PreprocessOptions::default(),
-            )
-            .expect_err("fork concurrency must not be treated as sequential");
-        assert!(
-            error.contains("does not support concurrency block kind"),
-            "unexpected error: {error}"
-        );
-    }
-}
-
-#[test]
 fn slang_ast_direct_lowering_supports_fork_join_all() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -2231,11 +2199,7 @@ fn slang_ast_direct_lowering_supports_fork_join_all() {
     std::fs::write(
         &source_path,
         r#"
-module fork_join(
-  output logic x,
-  output logic y,
-  output logic z
-);
+module fork_join(output logic x, output logic y, output logic z);
   initial begin
     fork
       #5 x = 1'b1;
@@ -2258,20 +2222,10 @@ endmodule
     assert_eq!(design.initials.len(), 1);
 
     let mut simulator = Simulator::new(&design).expect("create fork/join simulator");
-    simulator.run_until(1).unwrap();
-    assert_eq!(simulator.read("x").unwrap().to_u64(), None);
-    assert_eq!(simulator.read("y").unwrap().to_u64(), None);
-    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
-
     simulator.run_until(2).unwrap();
     assert_eq!(simulator.read("x").unwrap().to_u64(), None);
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("z").unwrap().to_u64(), None);
-
-    simulator.run_until(4).unwrap();
-    assert_eq!(simulator.read("x").unwrap().to_u64(), None);
-    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
-
     simulator.run_until(5).unwrap();
     assert_eq!(simulator.read("x").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
@@ -2281,12 +2235,7 @@ endmodule
     std::fs::write(
         &nested_path,
         r#"
-module nested_fork(
-  output logic x,
-  output logic y,
-  output logic w,
-  output logic z
-);
+module nested_fork(output logic x, output logic y, output logic w, output logic z);
   initial begin
     fork
       #1 x = 1'b1;
@@ -2320,6 +2269,89 @@ endmodule
     assert_eq!(nested_simulator.read("z").unwrap().to_u64(), None);
     nested_simulator.run_until(7).unwrap();
     assert_eq!(nested_simulator.read("z").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_fork_join_any_and_none() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-fork-modes");
+
+    let any_path = root.join("join_any.sv");
+    std::fs::write(
+        &any_path,
+        r#"
+module fork_any(output logic x, output logic y, output logic z);
+  initial begin
+    fork
+      #5 x = 1'b1;
+      #2 y = 1'b1;
+    join_any
+    z = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write join_any source");
+    let any = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&any_path),
+            Some("fork_any"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower join_any");
+    let mut any_simulator = Simulator::new(&any).expect("create join_any simulator");
+    any_simulator.run_until(2).unwrap();
+    assert_eq!(any_simulator.read("x").unwrap().to_u64(), None);
+    assert_eq!(any_simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(any_simulator.read("z").unwrap().to_u64(), Some(1));
+    any_simulator.run_until(5).unwrap();
+    assert_eq!(any_simulator.read("x").unwrap().to_u64(), Some(1));
+
+    let none_path = root.join("join_none.sv");
+    std::fs::write(
+        &none_path,
+        r#"
+module fork_none(
+  output logic x,
+  output logic y,
+  output logic z,
+  output logic parent_started
+);
+  initial begin
+    parent_started = 1'b1;
+    fork
+      #2 x = 1'b1;
+      #3 y = 1'b1;
+    join_none
+    z = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write join_none source");
+    let none = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&none_path),
+            Some("fork_none"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower join_none");
+    let mut none_simulator = Simulator::new(&none).expect("create join_none simulator");
+    none_simulator.run_until(0).unwrap();
+    assert_eq!(
+        none_simulator.read("parent_started").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(none_simulator.read("z").unwrap().to_u64(), Some(1));
+    assert_eq!(none_simulator.read("x").unwrap().to_u64(), None);
+    assert_eq!(none_simulator.read("y").unwrap().to_u64(), None);
+    none_simulator.run_until(2).unwrap();
+    assert_eq!(none_simulator.read("x").unwrap().to_u64(), Some(1));
+    assert_eq!(none_simulator.read("y").unwrap().to_u64(), None);
+    none_simulator.run_until(3).unwrap();
+    assert_eq!(none_simulator.read("y").unwrap().to_u64(), Some(1));
 }
 
 #[test]

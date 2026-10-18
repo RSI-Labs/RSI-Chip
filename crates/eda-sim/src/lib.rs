@@ -8,7 +8,7 @@
 //! `$display`, `$monitor`, `$finish` and optional VCD dumping.
 
 use eda_core::cancellation::FlowCancellation;
-use eda_core::ir::{Design, Dir, Expr, LValue, Range, Sens, Stmt};
+use eda_core::ir::{Design, Dir, Expr, ForkMode, LValue, Range, Sens, Stmt};
 use eda_core::logic::{LogicValue, LogicWord};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -53,6 +53,8 @@ struct Cont<'d> {
 }
 
 struct ForkJoin<'d> {
+    mode: ForkMode,
+    released: bool,
     remaining: usize,
     continuation: Cont<'d>,
 }
@@ -1136,10 +1138,27 @@ impl<'d> Simulator<'d> {
                     });
                     return Ok(());
                 }
-                Stmt::Fork { branches } if !branches.is_empty() => {
+                Stmt::Fork {
+                    branches,
+                    mode: ForkMode::JoinNone,
+                } if !branches.is_empty() => {
+                    // join_none does not suspend the parent. Its children are
+                    // queued behind the parent continuation and retain any
+                    // enclosing join obligation.
+                    for branch in branches {
+                        self.conts.entry(self.now).or_default().push(Cont {
+                            process: None,
+                            join: c.join,
+                            work: vec![branch],
+                        });
+                    }
+                }
+                Stmt::Fork { branches, mode } if !branches.is_empty() => {
                     let join_index = self.fork_joins.len();
                     let process = c.process;
                     self.fork_joins.push(Some(ForkJoin {
+                        mode: *mode,
+                        released: false,
                         remaining: branches.len(),
                         continuation: Cont {
                             process,
@@ -1159,7 +1178,7 @@ impl<'d> Simulator<'d> {
                     }
                     return Ok(());
                 }
-                Stmt::Fork { branches: _ } => {}
+                Stmt::Fork { .. } => {}
                 Stmt::Wait { cond, body } => {
                     let condition = self.eval(cond);
                     if condition.reduce_or().as_bool() == Some(true) {
@@ -1263,7 +1282,13 @@ impl<'d> Simulator<'d> {
             return;
         };
         state.remaining = state.remaining.saturating_sub(1);
-        if state.remaining == 0 {
+        let release_parent = match state.mode {
+            ForkMode::JoinAll => state.remaining == 0,
+            ForkMode::JoinAny => !state.released,
+            ForkMode::JoinNone => false,
+        };
+        if release_parent {
+            state.released = true;
             if let Some(state) = self.fork_joins[index].take() {
                 self.conts
                     .entry(self.now)
@@ -2265,7 +2290,7 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(cond, out);
             walk_stmt_memories(body, out)
         }
-        Stmt::Fork { branches } => branches
+        Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| walk_stmt_memories(branch, out)),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
@@ -2357,7 +2382,7 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
-        Stmt::Fork { branches } => branches.iter().for_each(|branch| {
+        Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             let mut branch_reads = HashSet::new();
             let mut branch_writes = HashSet::new();
             collect_stmt_access(branch, &mut branch_reads, &mut branch_writes);
@@ -2431,7 +2456,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(cond, out);
             walk_stmt(body, out)
         }
-        Stmt::Fork { branches } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
+        Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),

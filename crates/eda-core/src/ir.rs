@@ -648,9 +648,10 @@ pub enum Stmt {
         cond: Expr,
         body: Box<Stmt>,
     },
-    /// Concurrent branches joined with `join`.
+    /// Concurrent branches joined with `join`, `join_any`, or `join_none`.
     Fork {
         branches: Vec<Stmt>,
+        mode: ForkMode,
     },
     Display {
         parts: Vec<DispPart>,
@@ -683,6 +684,13 @@ pub enum Stmt {
         finish: Option<Expr>,
     },
     Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkMode {
+    JoinAll,
+    JoinAny,
+    JoinNone,
 }
 
 #[derive(Clone, Debug)]
@@ -994,7 +1002,7 @@ fn collect_memory_accesses(
             collect_memory_expr_reads(cond, synchronous, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
-        Stmt::Fork { branches } => branches.iter().for_each(|branch| {
+        Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             collect_memory_accesses(branch, synchronous, memory_widths, accesses)
         }),
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {

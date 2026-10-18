@@ -171,7 +171,7 @@ impl SlangAstLowerer {
             "Block" => {
                 match string_field(statement, "blockKind").as_deref() {
                     None | Some("Sequential") => {}
-                    Some("JoinAll") => {
+                    Some(block_kind @ ("JoinAll" | "JoinAny" | "JoinNone")) => {
                         let body = statement
                             .get("body")
                             .ok_or_else(|| "fork block has no body".to_string())?;
@@ -183,7 +183,12 @@ impl SlangAstLowerer {
                             .iter()
                             .map(|branch| self.lower_statement(branch))
                             .collect::<Result<Vec<_>, _>>()?;
-                        return Ok(Stmt::Fork { branches });
+                        let mode = match block_kind {
+                            "JoinAny" => eda_core::ir::ForkMode::JoinAny,
+                            "JoinNone" => eda_core::ir::ForkMode::JoinNone,
+                            _ => eda_core::ir::ForkMode::JoinAll,
+                        };
+                        return Ok(Stmt::Fork { branches, mode });
                     }
                     Some(other) => {
                         return Err(format!(
