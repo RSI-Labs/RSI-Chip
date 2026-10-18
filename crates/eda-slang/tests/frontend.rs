@@ -2222,6 +2222,107 @@ module fork_mode(input logic a, output logic y);
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_fork_join_all() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-fork-join");
+    let source_path = root.join("fork_join.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module fork_join(
+  output logic x,
+  output logic y,
+  output logic z
+);
+  initial begin
+    fork
+      #5 x = 1'b1;
+      #2 y = 1'b1;
+    join
+    z = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write fork/join source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("fork_join"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fork/join");
+    assert_eq!(design.initials.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create fork/join simulator");
+    simulator.run_until(1).unwrap();
+    assert_eq!(simulator.read("x").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
+
+    simulator.run_until(2).unwrap();
+    assert_eq!(simulator.read("x").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
+
+    simulator.run_until(4).unwrap();
+    assert_eq!(simulator.read("x").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
+
+    simulator.run_until(5).unwrap();
+    assert_eq!(simulator.read("x").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(1));
+
+    let nested_path = root.join("nested-fork.sv");
+    std::fs::write(
+        &nested_path,
+        r#"
+module nested_fork(
+  output logic x,
+  output logic y,
+  output logic w,
+  output logic z
+);
+  initial begin
+    fork
+      #1 x = 1'b1;
+      fork
+        #2 y = 1'b1;
+        #3 w = 1'b1;
+      join
+    join
+    #4 z = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write nested fork/join source");
+    let nested = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&nested_path),
+            Some("nested_fork"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nested fork/join");
+    let mut nested_simulator = Simulator::new(&nested).expect("create nested fork simulator");
+    nested_simulator.run_until(1).unwrap();
+    assert_eq!(nested_simulator.read("x").unwrap().to_u64(), Some(1));
+    assert_eq!(nested_simulator.read("w").unwrap().to_u64(), None);
+    nested_simulator.run_until(2).unwrap();
+    assert_eq!(nested_simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(nested_simulator.read("z").unwrap().to_u64(), None);
+    nested_simulator.run_until(3).unwrap();
+    assert_eq!(nested_simulator.read("w").unwrap().to_u64(), Some(1));
+    assert_eq!(nested_simulator.read("z").unwrap().to_u64(), None);
+    nested_simulator.run_until(7).unwrap();
+    assert_eq!(nested_simulator.read("z").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

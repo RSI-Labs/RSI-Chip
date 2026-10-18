@@ -171,6 +171,20 @@ impl SlangAstLowerer {
             "Block" => {
                 match string_field(statement, "blockKind").as_deref() {
                     None | Some("Sequential") => {}
+                    Some("JoinAll") => {
+                        let body = statement
+                            .get("body")
+                            .ok_or_else(|| "fork block has no body".to_string())?;
+                        let list = body
+                            .get("list")
+                            .and_then(serde_json::Value::as_array)
+                            .ok_or_else(|| "fork block body is not a statement list".to_string())?;
+                        let branches = list
+                            .iter()
+                            .map(|branch| self.lower_statement(branch))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(Stmt::Fork { branches });
+                    }
                     Some(other) => {
                         return Err(format!(
                             "direct slang-AST lowering does not support concurrency block kind '{other}'"

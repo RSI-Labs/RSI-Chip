@@ -48,7 +48,13 @@ enum MemoryNbaUpdate {
 
 struct Cont<'d> {
     process: Option<usize>,
+    join: Option<usize>,
     work: Vec<&'d Stmt>,
+}
+
+struct ForkJoin<'d> {
+    remaining: usize,
+    continuation: Cont<'d>,
 }
 
 struct Waiter<'d> {
@@ -75,6 +81,7 @@ pub struct Simulator<'d> {
     now: u64,
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
+    fork_joins: Vec<Option<ForkJoin<'d>>>,
     waiters: Vec<Waiter<'d>>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
@@ -184,6 +191,7 @@ impl<'d> Simulator<'d> {
             now: 0,
             nba: Vec::new(),
             busy_procs: HashSet::new(),
+            fork_joins: Vec::new(),
             waiters: Vec::new(),
             memory_elements,
             memory_aliases,
@@ -215,6 +223,7 @@ impl<'d> Simulator<'d> {
         for init in &design.initials {
             sim.conts.entry(0).or_default().push(Cont {
                 process: None,
+                join: None,
                 work: vec![init],
             });
         }
@@ -242,6 +251,7 @@ impl<'d> Simulator<'d> {
             if matches!(p.sens, Sens::Comb | Sens::Timed) {
                 sim.conts.entry(0).or_default().push(Cont {
                     process: Some(pi),
+                    join: None,
                     work: vec![&p.body],
                 });
             }
@@ -644,6 +654,7 @@ impl<'d> Simulator<'d> {
                         self.busy_procs.insert(pi);
                         self.run_cont(Cont {
                             process: Some(pi),
+                            join: None,
                             work: vec![body],
                         })?;
                     }
@@ -654,6 +665,7 @@ impl<'d> Simulator<'d> {
             let body = &self.design.processes[pi].body;
             self.conts.entry(self.now).or_default().push(Cont {
                 process: Some(pi),
+                join: None,
                 work: vec![body],
             });
         }
@@ -764,6 +776,7 @@ impl<'d> Simulator<'d> {
             let body = &self.design.processes[pi].body;
             self.conts.entry(self.now).or_default().push(Cont {
                 process: Some(pi),
+                join: None,
                 work: vec![body],
             });
         }
@@ -1118,10 +1131,35 @@ impl<'d> Simulator<'d> {
                     }
                     self.conts.entry(self.now + ns).or_default().push(Cont {
                         process: c.process,
+                        join: c.join,
                         work: exec_order,
                     });
                     return Ok(());
                 }
+                Stmt::Fork { branches } if !branches.is_empty() => {
+                    let join_index = self.fork_joins.len();
+                    let process = c.process;
+                    self.fork_joins.push(Some(ForkJoin {
+                        remaining: branches.len(),
+                        continuation: Cont {
+                            process,
+                            join: c.join,
+                            work,
+                        },
+                    }));
+                    for branch in branches {
+                        self.conts.entry(self.now).or_default().push(Cont {
+                            process: None,
+                            join: Some(join_index),
+                            work: vec![branch],
+                        });
+                    }
+                    if let Some(process) = process {
+                        self.busy_procs.remove(&process);
+                    }
+                    return Ok(());
+                }
+                Stmt::Fork { branches: _ } => {}
                 Stmt::Wait { cond, body } => {
                     let condition = self.eval(cond);
                     if condition.reduce_or().as_bool() == Some(true) {
@@ -1141,6 +1179,7 @@ impl<'d> Simulator<'d> {
                             .collect();
                         let continuation = Cont {
                             process: c.process,
+                            join: c.join,
                             work: exec_order,
                         };
                         if let Some(process) = c.process {
@@ -1204,10 +1243,34 @@ impl<'d> Simulator<'d> {
                 return Ok(());
             }
         }
-        if let Some(pi) = c.process {
-            self.busy_procs.remove(&pi);
+        if let Some(process) = c.process {
+            self.busy_procs.remove(&process);
+        }
+        if let Some(join) = c.join {
+            self.complete_join(join);
         }
         Ok(())
+    }
+
+    fn complete_join(&mut self, index: usize) {
+        if index >= self.fork_joins.len() {
+            return;
+        }
+        let Some(state) = self.fork_joins.get_mut(index) else {
+            return;
+        };
+        let Some(state) = state.as_mut() else {
+            return;
+        };
+        state.remaining = state.remaining.saturating_sub(1);
+        if state.remaining == 0 {
+            if let Some(state) = self.fork_joins[index].take() {
+                self.conts
+                    .entry(self.now)
+                    .or_default()
+                    .push(state.continuation);
+            }
+        }
     }
 
     fn format_display(&self, parts: &[eda_core::ir::DispPart], args: &[Expr]) -> String {
@@ -2202,6 +2265,9 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(cond, out);
             walk_stmt_memories(body, out)
         }
+        Stmt::Fork { branches } => branches
+            .iter()
+            .for_each(|branch| walk_stmt_memories(branch, out)),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
@@ -2291,6 +2357,13 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
+        Stmt::Fork { branches } => branches.iter().for_each(|branch| {
+            let mut branch_reads = HashSet::new();
+            let mut branch_writes = HashSet::new();
+            collect_stmt_access(branch, &mut branch_reads, &mut branch_writes);
+            reads.extend(branch_reads);
+            writes.extend(branch_writes);
+        }),
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2358,6 +2431,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(cond, out);
             walk_stmt(body, out)
         }
+        Stmt::Fork { branches } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),

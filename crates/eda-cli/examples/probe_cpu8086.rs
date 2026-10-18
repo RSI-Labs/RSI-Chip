@@ -127,6 +127,9 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(cond, reads);
                 walk(body, reads, writes);
             }
+            Stmt::Fork { branches } => branches
+                .iter()
+                .for_each(|branch| walk(branch, reads, writes)),
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
                 expr_nets(cond, reads)
             }

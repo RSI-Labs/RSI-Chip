@@ -61,8 +61,8 @@ writes (`getc`, indexed byte assignment, and `putc`), length/case conversion,
 comparison, inclusive `substr` extraction, and radix conversions
 (`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), scalar event lists with
 any-edge, posedge, and negedge signals, constant procedural delay statements,
-delay-driven always generators, delay-bearing `forever` loops, and `wait`
-statements, recursive
+delay-driven always generators, delay-bearing `forever` loops, `wait`
+statements, and concurrent `fork`/`join` branches, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports

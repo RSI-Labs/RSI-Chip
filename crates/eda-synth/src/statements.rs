@@ -51,6 +51,7 @@ impl<'a> Synth<'a> {
             }
             Stmt::Forever(_) => Err("forever is not synthesizable".into()),
             Stmt::Wait { .. } => Err("wait statements are not synthesizable".into()),
+            Stmt::Fork { .. } => Err("fork/join blocks are not synthesizable".into()),
             Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
                 let w = lv.range.width();
                 let v = self.blast(e, w)?;
