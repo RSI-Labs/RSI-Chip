@@ -30,6 +30,12 @@ impl SlangAstSummary {
             .ports
             .iter()
             .map(|port| {
+                if design.memory_ports.iter().any(|memory_port| {
+                    memory_port.name == port.name
+                        && memory_port.direction == eda_core::ir::MemoryPortDirection::InOut
+                }) {
+                    return (port.name.clone(), "InOut");
+                }
                 let direction = match port.dir {
                     eda_core::ir::Dir::In => "In",
                     eda_core::ir::Dir::Out => "Out",

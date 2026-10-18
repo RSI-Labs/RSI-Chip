@@ -1869,6 +1869,77 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-top-inout-memory-port");
+    let source_path = root.join("top_inout_memory_port.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module top(
+  inout wire logic [7:0] bus [0:3],
+  output logic [7:0] observed
+);
+  assign observed = bus[2];
+  assign bus[3] = bus[1];
+endmodule
+"#,
+    )
+    .expect("write top-level inout sparse-memory port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower top-level inout sparse-memory port");
+    assert_eq!(design.memory_ports.len(), 1);
+    assert_eq!(
+        design.memory_ports[0],
+        eda_core::ir::MemoryPortDecl {
+            name: "bus".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::InOut,
+            memory: 0,
+        }
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create top-inout-memory simulator");
+    let invalid_bulk = vec![
+        (vec![0], LogicWord::from_u64(8, 0xaa)),
+        (vec![99], LogicWord::from_u64(8, 0xbb)),
+    ];
+    let error = simulator
+        .set_memory_input_bulk("bus", &invalid_bulk)
+        .expect_err("bulk memory stimulus must validate every index before writing");
+    assert!(error.contains("index is out of range"));
+    assert_eq!(
+        simulator
+            .read_memory_output("bus", &[0])
+            .expect("failed bulk update must not write the valid prefix"),
+        LogicWord::xes(8)
+    );
+
+    let stimulus = vec![
+        (vec![2], LogicWord::from_u64(8, 0x42)),
+        (vec![1], LogicWord::from_u64(8, 0x7c)),
+    ];
+    simulator
+        .set_memory_input_bulk("bus", &stimulus)
+        .expect("bulk-set top-level inout memory");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x42));
+    let readback = simulator
+        .read_memory_output_bulk("bus", &[vec![3], vec![2]])
+        .expect("bulk-read top-level inout memory");
+    assert_eq!(
+        readback,
+        vec![LogicWord::from_u64(8, 0x7c), LogicWord::from_u64(8, 0x42)]
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_reads_sparse_memory_files() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
