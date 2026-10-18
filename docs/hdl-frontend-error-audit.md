@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-18 (local time)
-Repository state audited: `fix-digital` at `629fc3a` plus the uncommitted
-wildcard-case changes currently in the worktree.
+Repository state audited: `fix-digital` at `dfd400e` plus the uncommitted
+qualified-if/case changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -49,7 +49,7 @@ All commands were run against the current worktree:
 | `cargo test -p eda-slang --all-targets -- --nocapture` | 95 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 130.79 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 130.73 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -85,7 +85,7 @@ broader tool-flow percentage.
 | ID | Name | Initial requirement | Current state / error | Severity | Progress | Next required evidence |
 | --- | --- | --- | --- | --- | ---: | --- |
 | F-01 | Single authoritative lowering path | Every valid input accepted by the authoritative frontend must either lower through the same semantic model or fail closed with an actionable diagnostic. | `compile_files` validates with slang, preprocesses, then reparses with the bounded parser. `compile_files_via_ast` is the better path but supports only a subset. | P0 architecture | 35% | Make direct slang-AST lowering the only executable path, or formally prove the compatibility fallback for every construct. |
-| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, interfaces, many timing/assertion/checker forms, arrays of instances, and many system calls. | P0 | 26% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
+| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, interfaces, many timing/assertion/checker forms, arrays of instances, and many system calls. | P0 | 27% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
 | F-03 | Complete structural/semantic post-check | Slang and repository IR must agree on declarations, types, statements, expressions, hierarchy, and behavior. | Current summary checks top, ports, declarations, assignment shapes, literals, simple width/signedness, processes, and instance inventory. Fingerprints fall back to `"?"` for legacy array expansion and dynamic packed lvalues. | P0 | 45% | Remove all `"?"` equivalence cases and add runtime differential simulation for each construct. |
 | F-04 | Full official UVM execution | Compile and execute the official Accellera UVM library and user environments, including phasing, objections, factory, configuration, sequences, TLM, callbacks, reports, and coverage. | Official UVM 2020.3.1 is only checked/elaborated with `UVM_NO_DPI`. Direct AST lowering rejects `ClassType`. The bounded frontend has a separate UVM-lite subset. | P0 | 10% executable; 0% for full official UVM execution | Run an official UVM example through phasing and objections and compare event/report/coverage outcomes. |
 | F-05 | Full data types | Support integral, real, string, event, chandle, enum, packed/unpacked aggregates, dynamic arrays, queues, associative arrays, classes, virtual interfaces, type parameters, and typed packages. | Direct path supports simple integral vectors, packed arrays, enums, packed structs/unions, bounded strings, sparse memories, scalar named events, and fixed-size event arrays with element triggers/waits/`.triggered`. It rejects real, ordinary unpacked aggregates, dynamic storage, queues, associative arrays, classes, arbitrary event expressions, chandle, and type parameters. | P0 | 31% | Add type-category tests with layout, assignment, comparison, and selected-member semantics. |
@@ -177,7 +177,7 @@ versus bounded probe.
 | D-52 | `disable fork`/named process termination | Unsupported and fails closed; sequential lexical block `disable` is supported. |
 | D-53 | Procedure-level `return` | Unsupported as a general statement (function inlining has selected return handling). |
 | D-54 | Procedural `deassign` | Scalar static-lvalue `force` and `release` are supported; procedural variable `deassign` and aggregate/dynamic force targets remain unsupported. |
-| D-55 | `unique`/`priority` if/case | Rejects qualified conditional/case semantics. |
+| D-55 | Qualified wildcard/inside checks | Normal `priority`/`unique`/`unique0` if/case checks execute, including runtime no-match and overlap diagnostics. Qualified wildcard and case-inside forms still fail closed. |
 | D-56 | Full wildcard/inside case grammar | Direct statements support `casez`, `casex`, and simple `case ... inside` value/range arms. Remaining exotic range/pattern forms still fail closed. |
 | D-58 | General event expressions in sensitivity | Scalar signal references, explicit edges in procedure sensitivity, edge-qualified event-list statement controls, and dynamic fixed-event-array element statement selectors are supported; arbitrary expressions and wildcard events remain unsupported in both procedure and statement sensitivity. |
 | D-59 | Clocking-variable sampling/drive semantics | Scalar input snapshot reads and no-skew output drives are supported; skew semantics fail closed. |

@@ -650,39 +650,7 @@ impl SlangAstLowerer {
             ),
             "Disable" => self.lower_named_disable(statement),
             "Conditional" => {
-                if string_field(statement, "check").as_deref() != Some("None") {
-                    let check = string_field(statement, "check").unwrap_or_default();
-                    return Err(format!(
-                        "direct slang-AST lowering does not support {check} conditional semantics"
-                    ));
-                }
-                let conditions = statement
-                    .get("conditions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| "conditional statement has no conditions".to_string())?;
-                if conditions.len() != 1 {
-                    return Err(
-                        "direct slang-AST lowering supports one unqualified if condition".into(),
-                    );
-                }
-                let condition = conditions
-                    .first()
-                    .and_then(|condition| condition.get("expr"))
-                    .ok_or_else(|| {
-                        "conditional statement has no condition expression".to_string()
-                    })?;
-                let true_statement = statement
-                    .get("ifTrue")
-                    .ok_or_else(|| "conditional statement has no true branch".to_string())?;
-                let false_statement = match statement.get("ifFalse") {
-                    Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
-                    None => None,
-                };
-                Ok(Stmt::If {
-                    c: self.lower_expression(condition)?,
-                    t: Box::new(self.lower_statement(true_statement)?),
-                    f: false_statement,
-                })
+                self.lower_conditional_statement(statement)
             }
             "Case" => {
                 self.lower_case_statement(statement)
@@ -967,23 +935,178 @@ impl SlangAstLowerer {
         }
     }
 
+    fn lower_conditional_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::{Expr, Stmt};
+        let check = string_field(statement, "check").unwrap_or_default();
+        match check.as_str() {
+            "None" | "Priority" | "Unique" | "Unique0" => {}
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support {other} conditional semantics"
+                ))
+            }
+        }
+        let mut chain_conditions = Vec::new();
+        let mut has_terminal_else = false;
+        let mut current = statement;
+        loop {
+            let conditions = current
+                .get("conditions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "conditional statement has no conditions".to_string())?;
+            if conditions.len() != 1 {
+                return Err("direct slang-AST lowering supports one condition per if chain".into());
+            }
+            let condition = conditions
+                .first()
+                .and_then(|condition| condition.get("expr"))
+                .ok_or_else(|| "conditional statement has no condition expression".to_string())?;
+            chain_conditions.push(condition);
+            match current.get("ifFalse") {
+                Some(nested) if string_field(nested, "kind").as_deref() == Some("Conditional") => {
+                    current = nested;
+                }
+                Some(_) => {
+                    has_terminal_else = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        let lowered_conditions = chain_conditions
+            .iter()
+            .map(|condition| self.lower_expression(condition))
+            .collect::<Result<Vec<_>, _>>()?;
+        let selection = self.lower_unchecked_conditional_statement(statement)?;
+        let mut statements = Vec::new();
+        if check == "Priority" && !has_terminal_else {
+            let conditions_are_known = all_expressions_known(&lowered_conditions);
+            let definite_matches = lowered_conditions
+                .iter()
+                .map(definite_true)
+                .collect::<Vec<_>>();
+            statements.push(Stmt::Assert {
+                cond: Expr::Bin {
+                    op: eda_core::ir::BinOp::LogOr,
+                    a: Box::new(Expr::Un {
+                        op: eda_core::ir::UnOp::Not,
+                        a: Box::new(conditions_are_known),
+                    }),
+                    b: Box::new(logical_or(&definite_matches)),
+                },
+                message: Some("priority if has no matching condition".into()),
+            });
+        }
+        if check == "Unique" || check == "Unique0" {
+            let conditions_are_known = all_expressions_known(&lowered_conditions);
+            for left in 0..lowered_conditions.len() {
+                for right in (left + 1)..lowered_conditions.len() {
+                    let definite_overlap = Expr::Bin {
+                        op: eda_core::ir::BinOp::LogAnd,
+                        a: Box::new(definite_true(&lowered_conditions[left])),
+                        b: Box::new(definite_true(&lowered_conditions[right])),
+                    };
+                    statements.push(Stmt::Assert {
+                        cond: Expr::Bin {
+                            op: eda_core::ir::BinOp::LogOr,
+                            a: Box::new(Expr::Un {
+                                op: eda_core::ir::UnOp::Not,
+                                a: Box::new(conditions_are_known.clone()),
+                            }),
+                            b: Box::new(Expr::Un {
+                                op: eda_core::ir::UnOp::Not,
+                                a: Box::new(definite_overlap),
+                            }),
+                        },
+                        message: Some("unique if has multiple matching conditions".into()),
+                    });
+                }
+            }
+            if check == "Unique" && !has_terminal_else {
+                let definite_matches = lowered_conditions
+                    .iter()
+                    .map(definite_true)
+                    .collect::<Vec<_>>();
+                statements.push(Stmt::Assert {
+                    cond: Expr::Bin {
+                        op: eda_core::ir::BinOp::LogOr,
+                        a: Box::new(Expr::Un {
+                            op: eda_core::ir::UnOp::Not,
+                            a: Box::new(conditions_are_known),
+                        }),
+                        b: Box::new(logical_or(&definite_matches)),
+                    },
+                    message: Some("unique if has no matching condition".into()),
+                });
+            }
+        }
+        if statements.is_empty() {
+            return Ok(selection);
+        }
+        statements.push(selection);
+        Ok(Stmt::Block(statements))
+    }
+
+    fn lower_unchecked_conditional_statement(
+        &self,
+        statement: &serde_json::Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let conditions = statement
+            .get("conditions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "conditional statement has no conditions".to_string())?;
+        if conditions.len() != 1 {
+            return Err("direct slang-AST lowering supports one condition per if".into());
+        }
+        let condition = conditions
+            .first()
+            .and_then(|condition| condition.get("expr"))
+            .ok_or_else(|| "conditional statement has no condition expression".to_string())?;
+        let true_statement = statement
+            .get("ifTrue")
+            .ok_or_else(|| "conditional statement has no true branch".to_string())?;
+        let false_statement = match statement.get("ifFalse") {
+            Some(nested) if string_field(nested, "kind").as_deref() == Some("Conditional") => Some(
+                Box::new(self.lower_unchecked_conditional_statement(nested)?),
+            ),
+            Some(nested) => Some(Box::new(self.lower_statement(nested)?)),
+            None => None,
+        };
+        Ok(eda_core::ir::Stmt::If {
+            c: self.lower_expression(condition)?,
+            t: Box::new(self.lower_statement(true_statement)?),
+            f: false_statement,
+        })
+    }
+
     fn lower_case_statement(
         &self,
         statement: &serde_json::Value,
     ) -> Result<eda_core::ir::Stmt, String> {
         let condition = string_field(statement, "condition").unwrap_or_default();
         let check = string_field(statement, "check").unwrap_or_default();
-        if check != "None" {
-            return Err(format!(
-                "direct slang-AST lowering does not support {check} case semantics"
-            ));
-        }
         match condition.as_str() {
             "WildcardJustZ" | "WildcardXOrZ" => {
+                if check != "None" {
+                    return Err(format!(
+                        "direct slang-AST lowering does not support {check} wildcard case semantics"
+                    ));
+                }
                 self.lower_wildcard_case_statement(statement, condition == "WildcardXOrZ")
             }
-            "Inside" => self.lower_inside_case_statement(statement),
-            "Normal" => self.lower_normal_case_statement(statement),
+            "Inside" => {
+                if check != "None" {
+                    return Err(format!(
+                        "direct slang-AST lowering does not support {check} case-inside semantics"
+                    ));
+                }
+                self.lower_inside_case_statement(statement)
+            }
+            "Normal" => self.lower_normal_case_statement(statement, &check),
             other => Err(format!(
                 "direct slang-AST lowering does not support {other} case semantics"
             )),
@@ -993,11 +1116,22 @@ impl SlangAstLowerer {
     fn lower_normal_case_statement(
         &self,
         statement: &serde_json::Value,
+        check: &str,
     ) -> Result<eda_core::ir::Stmt, String> {
-        use eda_core::ir::Stmt;
+        use eda_core::ir::{BinOp, Expr, Stmt};
+        match check {
+            "None" | "Priority" | "Unique" | "Unique0" => {}
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support {other} case semantics"
+                ))
+            }
+        }
         let expression = statement
             .get("expr")
             .ok_or_else(|| "case statement has no expression".to_string())?;
+        let case_expression = self.lower_expression(expression)?;
+        let case_is_known = expression_is_known(&case_expression);
         let items = statement
             .get("items")
             .and_then(Value::as_array)
@@ -1016,15 +1150,83 @@ impl SlangAstLowerer {
                 arms.push((self.lower_expression(expression)?, body.clone()));
             }
         }
+        let matches = arms
+            .iter()
+            .map(|(label, _)| Expr::Bin {
+                op: BinOp::CaseEq,
+                a: Box::new(case_expression.clone()),
+                b: Box::new(label.clone()),
+            })
+            .collect::<Vec<_>>();
         let default = match statement.get("defaultCase") {
             Some(statement) => Some(Box::new(self.lower_statement(statement)?)),
             None => None,
         };
-        Ok(Stmt::Case {
-            e: self.lower_expression(expression)?,
+        let has_default = default.is_some();
+        let selection = Stmt::Case {
+            e: case_expression,
             arms,
             dflt: default,
-        })
+        };
+        let mut statements = Vec::new();
+        if check == "Priority" && !has_default {
+            let definite_matches = matches.iter().map(definite_true).collect::<Vec<_>>();
+            statements.push(Stmt::Assert {
+                cond: Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(Expr::Un {
+                        op: eda_core::ir::UnOp::Not,
+                        a: Box::new(case_is_known.clone()),
+                    }),
+                    b: Box::new(logical_or(&definite_matches)),
+                },
+                message: Some("priority case has no matching item".into()),
+            });
+        }
+        if check == "Unique" || check == "Unique0" {
+            for left in 0..matches.len() {
+                for right in (left + 1)..matches.len() {
+                    let definite_overlap = Expr::Bin {
+                        op: BinOp::LogAnd,
+                        a: Box::new(definite_true(&matches[left])),
+                        b: Box::new(definite_true(&matches[right])),
+                    };
+                    statements.push(Stmt::Assert {
+                        cond: Expr::Bin {
+                            op: BinOp::LogOr,
+                            a: Box::new(Expr::Un {
+                                op: eda_core::ir::UnOp::Not,
+                                a: Box::new(case_is_known.clone()),
+                            }),
+                            b: Box::new(Expr::Un {
+                                op: eda_core::ir::UnOp::Not,
+                                a: Box::new(definite_overlap),
+                            }),
+                        },
+                        message: Some("unique case has multiple matching items".into()),
+                    });
+                }
+            }
+            if check == "Unique" && !has_default {
+                let definite_matches = matches.iter().map(definite_true).collect::<Vec<_>>();
+                statements.push(Stmt::Assert {
+                    cond: Expr::Bin {
+                        op: BinOp::LogOr,
+                        a: Box::new(Expr::Un {
+                            op: eda_core::ir::UnOp::Not,
+                            a: Box::new(case_is_known),
+                        }),
+                        b: Box::new(logical_or(&definite_matches)),
+                    },
+                    message: Some("unique case has no matching item".into()),
+                });
+            }
+        }
+        if statements.is_empty() {
+            return Ok(selection);
+        }
+        statements.push(selection);
+        Ok(Stmt::Block(statements))
     }
 
     fn lower_wildcard_case_statement(
@@ -1857,4 +2059,127 @@ pub(super) fn event_array_condition(conditions: &[eda_core::ir::Expr]) -> eda_co
         };
     }
     result
+}
+
+fn logical_or(expressions: &[eda_core::ir::Expr]) -> eda_core::ir::Expr {
+    let Some(first) = expressions.first() else {
+        return eda_core::ir::Expr::Const(LogicWord::zero(1));
+    };
+    let mut result = first.clone();
+    for expression in expressions.iter().skip(1) {
+        result = eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::LogOr,
+            a: Box::new(result),
+            b: Box::new(expression.clone()),
+        };
+    }
+    result
+}
+
+fn expression_is_known(expression: &eda_core::ir::Expr) -> eda_core::ir::Expr {
+    let mut unknown_bits = Vec::new();
+    for bit in 0..expression.width() {
+        let selected = eda_core::ir::Expr::Index {
+            e: Box::new(expression.clone()),
+            msb: bit,
+            lsb: bit,
+        };
+        unknown_bits.push(eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::CaseEq,
+            a: Box::new(selected.clone()),
+            b: Box::new(eda_core::ir::Expr::Const(LogicWord::new_const(
+                1,
+                LogicValue::X,
+            ))),
+        });
+        unknown_bits.push(eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::CaseEq,
+            a: Box::new(selected),
+            b: Box::new(eda_core::ir::Expr::Const(LogicWord::new_const(
+                1,
+                LogicValue::Z,
+            ))),
+        });
+    }
+    eda_core::ir::Expr::Un {
+        op: eda_core::ir::UnOp::Not,
+        a: Box::new(logical_or(&unknown_bits)),
+    }
+}
+
+fn all_expressions_known(expressions: &[eda_core::ir::Expr]) -> eda_core::ir::Expr {
+    let mut result = eda_core::ir::Expr::Const(LogicWord::ones(1));
+    let mut references = Vec::new();
+    for expression in expressions {
+        collect_expression_references(expression, &mut references);
+    }
+    for reference in &references {
+        result = eda_core::ir::Expr::Bin {
+            op: eda_core::ir::BinOp::LogAnd,
+            a: Box::new(result),
+            b: Box::new(expression_is_known(reference)),
+        };
+    }
+    result
+}
+
+fn collect_expression_references(
+    expression: &eda_core::ir::Expr,
+    references: &mut Vec<eda_core::ir::Expr>,
+) {
+    use eda_core::ir::Expr;
+    match expression {
+        Expr::Const(_) | Expr::EventTriggered { .. } => {}
+        Expr::Ref { .. } => references.push(expression.clone()),
+        Expr::Un { a, .. }
+        | Expr::Signed { e: a, .. }
+        | Expr::StringLength { e: a }
+        | Expr::StringCase { e: a, .. }
+        | Expr::StringToRadix { e: a, .. } => collect_expression_references(a, references),
+        Expr::Bin { a, b, .. } => {
+            collect_expression_references(a, references);
+            collect_expression_references(b, references);
+        }
+        Expr::Cond { c, t, f } => {
+            collect_expression_references(c, references);
+            collect_expression_references(t, references);
+            collect_expression_references(f, references);
+        }
+        Expr::Concat(parts) => parts
+            .iter()
+            .for_each(|part| collect_expression_references(part, references)),
+        Expr::Repeat { e, .. } => collect_expression_references(e, references),
+        Expr::MemoryRead { indexes, .. } => indexes
+            .iter()
+            .for_each(|index| collect_expression_references(index, references)),
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes
+                .iter()
+                .for_each(|index| collect_expression_references(index, references));
+            collect_expression_references(start, references);
+        }
+        Expr::Index { e, .. } => collect_expression_references(e, references),
+        Expr::StringConcat { left, right } | Expr::StringCompare { left, right, .. } => {
+            collect_expression_references(left, references);
+            collect_expression_references(right, references);
+        }
+        Expr::StringGetByte { e, index } | Expr::StringPutc { e, index, .. } => {
+            collect_expression_references(e, references);
+            collect_expression_references(index, references);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            collect_expression_references(e, references);
+            collect_expression_references(left, references);
+            collect_expression_references(right, references);
+        }
+        Expr::StringFromRadix { value, .. } => collect_expression_references(value, references),
+    }
+}
+
+fn definite_true(expression: &eda_core::ir::Expr) -> eda_core::ir::Expr {
+    eda_core::ir::Expr::Bin {
+        op: eda_core::ir::BinOp::CaseEq,
+        a: Box::new(expression.clone()),
+        b: Box::new(eda_core::ir::Expr::Const(LogicWord::ones(1))),
+    }
 }

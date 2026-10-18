@@ -6459,36 +6459,236 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_rejects_unimplemented_case_and_priority_semantics() {
+fn slang_ast_direct_lowering_supports_qualified_if_and_case_checks() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let cases = [
-        (
-            "unique_case",
-            "module m(input logic [1:0] a, output logic y); always_comb unique case (a) 2'b00: y = 1'b1; default: y = 1'b0; endcase endmodule",
-        ),
-        (
-            "priority_if",
-            "module m(input logic [1:0] a, output logic y); always_comb priority if (a[0]) y = 1'b1; else y = 1'b0; endmodule",
-        ),
-    ];
-    for (name, source) in cases {
-        let root = temporary_directory("direct-ast-case-semantics");
-        let source_path = root.join(format!("{name}.sv"));
-        std::fs::write(&source_path, source).expect("write case-semantics source");
-        let error = slang
-            .compile_files_via_ast(
-                std::slice::from_ref(&source_path),
-                Some("m"),
-                &PreprocessOptions::default(),
-            )
-            .expect_err("unimplemented case/priority semantics must not silently lower");
-        assert!(
-            error.contains("case semantics") || error.contains("conditional semantics"),
-            "{name}: {error}"
+    let root = temporary_directory("direct-ast-qualified-checks");
+    let source_path = root.join("qualified.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module qualified(
+  input logic [1:0] selector,
+  output logic [1:0] priority_if_y,
+  output logic [1:0] unique_if_y,
+  output logic [1:0] priority_case_y,
+  output logic [1:0] unique_case_y
+);
+  always_comb begin
+    priority_if_y = 2'd0;
+    priority if (selector == 2'd0) priority_if_y = 2'd1;
+    else if (selector == 2'd1) priority_if_y = 2'd2;
+    else priority_if_y = 2'd3;
+  end
+
+  always_comb begin
+    unique_if_y = 2'd0;
+    unique if (selector == 2'd0) unique_if_y = 2'd1;
+    else if (selector == 2'd1) unique_if_y = 2'd2;
+    else unique_if_y = 2'd3;
+  end
+
+  always_comb begin
+    priority_case_y = 2'd0;
+    priority case (selector)
+      2'd0: priority_case_y = 2'd1;
+      2'd1: priority_case_y = 2'd2;
+      default priority_case_y = 2'd3;
+    endcase
+  end
+
+  always_comb begin
+    unique_case_y = 2'd0;
+    unique case (selector)
+      2'd0: unique_case_y = 2'd1;
+      2'd1: unique_case_y = 2'd2;
+      default unique_case_y = 2'd3;
+    endcase
+  end
+endmodule
+"#,
+    )
+    .expect("write qualified-check source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("qualified"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower qualified if/case checks");
+    let mut simulator = Simulator::new(&design).expect("create qualified-check simulator");
+    for selector in 0..4 {
+        let expected = if selector < 2 { selector + 1 } else { 3 };
+        simulator
+            .set_input("selector", &LogicWord::from_u64(2, selector))
+            .unwrap();
+        assert_eq!(
+            simulator.read("priority_if_y").unwrap().to_u64(),
+            Some(expected)
+        );
+        assert_eq!(
+            simulator.read("unique_if_y").unwrap().to_u64(),
+            Some(expected)
+        );
+        assert_eq!(
+            simulator.read("priority_case_y").unwrap().to_u64(),
+            Some(expected)
+        );
+        assert_eq!(
+            simulator.read("unique_case_y").unwrap().to_u64(),
+            Some(expected)
         );
     }
+
+    let qualified_wildcard_path = root.join("qualified_wildcard.sv");
+    std::fs::write(
+        &qualified_wildcard_path,
+        r#"
+module qualified_wildcard(input logic [1:0] selector, output logic y);
+  always_comb unique casez (selector)
+    2'b?0: y = 1'b1;
+    default y = 1'b0;
+  endcase
+endmodule
+"#,
+    )
+    .expect("write qualified-wildcard source");
+    let qualified_wildcard_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&qualified_wildcard_path),
+            Some("qualified_wildcard"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("qualified wildcard checks must fail closed");
+    assert!(
+        qualified_wildcard_error.contains("Unique wildcard case semantics"),
+        "unexpected qualified wildcard error: {qualified_wildcard_error}"
+    );
+
+    let overlap_path = root.join("unique_overlap.sv");
+    std::fs::write(
+        &overlap_path,
+        r#"
+module unique_overlap(input logic [1:0] selector, output logic [1:0] y);
+  always_comb begin
+    y = 2'd0;
+    unique if (selector == 2'd0) y = 2'd1;
+    else if (selector < 2'd2) y = 2'd2;
+    else y = 2'd3;
+  end
+endmodule
+"#,
+    )
+    .expect("write unique-if overlap source");
+    let overlap = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&overlap_path),
+            Some("unique_overlap"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unique-if overlap check");
+    let mut overlap_simulator = Simulator::new(&overlap).expect("create overlap simulator");
+    let error = overlap_simulator
+        .set_input("selector", &LogicWord::from_u64(2, 0))
+        .expect_err("multiple unique-if matches must fail at runtime");
+    assert!(
+        error.contains("unique if has multiple matching conditions"),
+        "unexpected overlap error: {error}"
+    );
+
+    let no_match_path = root.join("priority_no_match.sv");
+    std::fs::write(
+        &no_match_path,
+        r#"
+module priority_no_match(input logic [1:0] selector, output logic [1:0] y);
+  always_comb begin
+    y = 2'd0;
+    priority case (selector)
+      2'd0: y = 2'd1;
+      2'd1: y = 2'd2;
+    endcase
+  end
+endmodule
+"#,
+    )
+    .expect("write priority no-match source");
+    let no_match = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&no_match_path),
+            Some("priority_no_match"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower priority no-match check");
+    let mut no_match_simulator = Simulator::new(&no_match).expect("create no-match simulator");
+    let error = no_match_simulator
+        .set_input("selector", &LogicWord::from_u64(2, 2))
+        .expect_err("priority case no-match must fail at runtime");
+    assert!(
+        error.contains("priority case has no matching item"),
+        "unexpected no-match error: {error}"
+    );
+
+    let duplicate_path = root.join("unique_duplicate.sv");
+    std::fs::write(
+        &duplicate_path,
+        r#"
+module unique_duplicate(input logic [1:0] selector, output logic [1:0] y);
+  always_comb begin
+    y = 2'd0;
+    unique case (selector)
+      2'd0: y = 2'd1;
+      2'd0: y = 2'd2;
+    endcase
+  end
+endmodule
+"#,
+    )
+    .expect("write unique-case duplicate source");
+    let duplicate = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&duplicate_path),
+            Some("unique_duplicate"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unique-case overlap check");
+    let mut duplicate_simulator = Simulator::new(&duplicate).expect("create duplicate simulator");
+    let error = duplicate_simulator
+        .set_input("selector", &LogicWord::from_u64(2, 0))
+        .expect_err("multiple unique-case items must fail at runtime");
+    assert!(
+        error.contains("unique case has multiple matching items"),
+        "unexpected duplicate error: {error}"
+    );
+
+    let unique_zero_path = root.join("unique_zero.sv");
+    std::fs::write(
+        &unique_zero_path,
+        r#"
+module unique_zero(input logic [1:0] selector, output logic [1:0] y);
+  always_comb begin
+    y = 2'd0;
+    unique0 case (selector)
+      2'd0: y = 2'd1;
+    endcase
+  end
+endmodule
+"#,
+    )
+    .expect("write unique0 source");
+    let unique_zero = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&unique_zero_path),
+            Some("unique_zero"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unique0 case check");
+    let mut unique_zero_simulator = Simulator::new(&unique_zero).expect("create unique0 simulator");
+    unique_zero_simulator
+        .set_input("selector", &LogicWord::from_u64(2, 1))
+        .unwrap();
+    assert_eq!(unique_zero_simulator.read("y").unwrap().to_u64(), Some(0));
 }
 
 #[test]
