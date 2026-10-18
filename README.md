@@ -65,8 +65,10 @@ hierarchy, parameterized interfaces, interface arrays and ports, packed and
 unpacked aggregates, simple non-virtual class objects with constructors,
 properties, methods, single-inheritance field flattening, constructor chaining,
 receiver-resolved virtual calls, direct base/derived handle reassignment with
-object-identity propagation, runtime virtual dispatch through a base handle, and
-hierarchy-global static class properties/methods shared by object and module instances,
+object-identity propagation, runtime virtual dispatch through a base handle,
+hierarchy-global static class properties/methods shared by object and module
+instances, package-qualified classes, and elaborated value-parameterized class
+specializations,
 first-class sparse memories, memory file tasks, and top-level and child
 memory-port sharing. It records slang source spans and
 validates lowered structure against the authoritative AST. Unsupported

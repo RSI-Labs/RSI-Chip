@@ -22,7 +22,12 @@ fn collect_class_handle_names(
 ) {
     if let Some(fields) = value.as_object() {
         let type_name = string_field(value, "type").unwrap_or_default();
-        let class_name = type_name.split_whitespace().next_back();
+        let class_name = type_name
+            .split_whitespace()
+            .next_back()
+            .and_then(|raw_name| raw_name.split('#').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
         if class_type_is_selected(value, class_name, class_types) {
             if let Some(symbol) = string_field(value, "symbol").filter(|symbol| !symbol.is_empty())
             {

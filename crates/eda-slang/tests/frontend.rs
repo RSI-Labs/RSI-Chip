@@ -404,7 +404,6 @@ endmodule
     simulator
         .run_until(1)
         .expect("run dynamic-class initial block");
-
     assert_eq!(simulator.read("base_kind").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("derived_kind").unwrap().to_u64(), Some(2));
     assert_eq!(simulator.read("dynamic_kind").unwrap().to_u64(), Some(2));
@@ -525,6 +524,108 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_parameterized_classes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-parameterized-class");
+    let source_path = root.join("parameterized_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Box #(parameter int WIDTH = 8);
+  logic [WIDTH-1:0] value;
+
+  function new(logic [WIDTH-1:0] v);
+    value = v;
+  endfunction
+
+  function logic [WIDTH-1:0] get();
+    return value;
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class DerivedBox #(parameter int WIDTH = 8) extends Box #(WIDTH);
+  logic [WIDTH-1:0] extra;
+
+  function new(logic [WIDTH-1:0] v, logic [WIDTH-1:0] e);
+    super.new(v);
+    extra = e;
+  endfunction
+
+  function logic [WIDTH:0] sum();
+    return value + extra;
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+module parameterized_class_top(
+  input logic [7:0] value8,
+  input logic [15:0] value16,
+  input logic [7:0] extra8,
+  output logic [7:0] observed8,
+  output logic [15:0] observed16,
+  output logic [8:0] observed_sum,
+  output int dynamic_kind
+);
+  Box #(.WIDTH(8)) box8;
+  Box #(.WIDTH(16)) box16;
+  DerivedBox #(.WIDTH(8)) derived_box;
+  Box #(.WIDTH(8)) base_box;
+
+  initial begin
+    #1;
+    box8 = new(value8);
+    box16 = new(value16);
+    derived_box = new(value8, extra8);
+    observed8 = box8.get();
+    observed16 = box16.get();
+    observed_sum = derived_box.sum();
+    base_box = derived_box;
+    dynamic_kind = base_box.kind();
+  end
+endmodule
+"#,
+    )
+    .expect("write parameterized-class source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("parameterized_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower parameterized classes");
+    let mut simulator = Simulator::new(&design).expect("create parameterized-class simulator");
+    simulator
+        .set_input("value8", &LogicWord::from_u64(8, 0xa5))
+        .unwrap();
+    simulator
+        .set_input("value16", &LogicWord::from_u64(16, 0x1234))
+        .unwrap();
+    simulator
+        .set_input("extra8", &LogicWord::from_u64(8, 0x5b))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run parameterized-class initial block");
+    assert_eq!(simulator.read("observed8").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(simulator.read("observed16").unwrap().to_u64(), Some(0x1234));
+    assert_eq!(
+        simulator.read("observed_sum").unwrap().to_u64(),
+        Some(0x100)
+    );
+    assert_eq!(simulator.read("dynamic_kind").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_ast_direct_lowering_shares_hierarchy_global_static_class_storage() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -601,7 +702,7 @@ endmodule
             .iter()
             .filter(|declaration| {
                 declaration.name.starts_with("__class_static_")
-                    && declaration.name.ends_with("_Registry_shared")
+                    && declaration.name.ends_with("_shared")
             })
             .count(),
         1,
@@ -1378,6 +1479,204 @@ endmodule
     assert!(
         collision_error.contains("imported package symbol collision for 'SAME'"),
         "unexpected collision error: {collision_error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_package_classes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-package-classes");
+    let source_path = root.join("package_classes.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package class_pkg;
+  class Item;
+    int value;
+
+    function new(int v);
+      value = v;
+    endfunction
+
+    function int get();
+      return value;
+    endfunction
+  endclass
+
+  class Registry extends Item;
+    int extra;
+
+    function new(int v, int e);
+      super.new(v);
+      extra = e;
+    endfunction
+
+    function int total();
+      return value + extra;
+    endfunction
+  endclass
+endpackage
+
+module package_class_top(
+  input int v,
+  input int e,
+  output int item_value,
+  output int registry_total,
+  output int registry_extra
+);
+  import class_pkg::Item,
+          class_pkg::Registry;
+
+  Item item;
+  Registry registry;
+
+  initial begin
+    #1;
+    item = new(v);
+    registry = new(v, e);
+    item_value = item.get();
+    registry_total = registry.total();
+    registry_extra = registry.extra;
+  end
+endmodule
+"#,
+    )
+    .expect("write package-class source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("package_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower package classes");
+    let mut simulator = Simulator::new(&design).expect("create package-class simulator");
+    simulator
+        .set_input("v", &LogicWord::from_u64(32, 19))
+        .unwrap();
+    simulator
+        .set_input("e", &LogicWord::from_u64(32, 23))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run package-class initial block");
+    assert_eq!(simulator.read("item_value").unwrap().to_u64(), Some(19));
+    assert_eq!(simulator.read("registry_total").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("registry_extra").unwrap().to_u64(), Some(23));
+
+    let scoped_path = root.join("scoped_package_class.sv");
+    std::fs::write(
+        &scoped_path,
+        r#"
+package scoped_class_pkg;
+  class Value;
+    int value;
+
+    function new(int v);
+      value = v;
+    endfunction
+
+    function int get();
+      return value;
+    endfunction
+  endclass
+endpackage
+
+module scoped_package_class_top(
+  input int v,
+  output int result
+);
+  scoped_class_pkg::Value object;
+
+  initial begin
+    #1;
+    object = new(v);
+    result = object.get();
+  end
+endmodule
+"#,
+    )
+    .expect("write scoped package-class source");
+    let scoped = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&scoped_path),
+            Some("scoped_package_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower package-scoped class references");
+    let mut scoped_simulator =
+        Simulator::new(&scoped).expect("create scoped package-class simulator");
+    scoped_simulator
+        .set_input("v", &LogicWord::from_u64(32, 55))
+        .unwrap();
+    scoped_simulator
+        .run_until(1)
+        .expect("run scoped package-class initial block");
+    assert_eq!(scoped_simulator.read("result").unwrap().to_u64(), Some(55));
+
+    let collision_path = root.join("package_class_collision.sv");
+    std::fs::write(
+        &collision_path,
+        r#"
+package left_class_pkg;
+  class Same;
+    int value;
+
+    function new(int v);
+      value = v;
+    endfunction
+
+    function int get();
+      return value;
+    endfunction
+  endclass
+endpackage
+
+package right_class_pkg;
+  class Same;
+    int value;
+  endclass
+endpackage
+
+module package_class_collision_top(
+  input int v,
+  output int result
+);
+  left_class_pkg::Same object;
+
+  initial begin
+    #1;
+    object = new(v);
+    result = object.get();
+  end
+endmodule
+"#,
+    )
+    .expect("write duplicate package-class-name source");
+    let duplicate_name = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&collision_path),
+            Some("package_class_collision_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower package-qualified duplicate class names");
+    let mut duplicate_name_simulator = Simulator::new(&duplicate_name)
+        .expect("create package-qualified duplicate-class simulator");
+    duplicate_name_simulator
+        .set_input("v", &LogicWord::from_u64(32, 77))
+        .unwrap();
+    duplicate_name_simulator
+        .run_until(1)
+        .expect("run package-qualified duplicate-class initial block");
+    assert!(
+        duplicate_name_simulator
+            .read("result")
+            .unwrap()
+            .to_u64()
+            .is_some_and(|value| value == 77),
+        "package-qualified duplicate class selected the wrong definition"
     );
 }
 

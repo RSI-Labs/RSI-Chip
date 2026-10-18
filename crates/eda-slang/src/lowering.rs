@@ -24,19 +24,17 @@ fn collect_compilation_unit_definitions(
     value: &serde_json::Value,
     definitions: &mut Vec<serde_json::Value>,
 ) {
-    if let Some(fields) = value.as_object() {
+    let empty_members = Vec::new();
+    let members = value
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty_members);
+    for member in members {
         if matches!(
-            fields.get("kind").and_then(serde_json::Value::as_str),
+            string_field(member, "kind").as_deref(),
             Some("Parameter" | "Subroutine" | "TypeAlias" | "EnumType")
         ) {
-            definitions.push(value.clone());
-        }
-        for nested in fields.values() {
-            collect_compilation_unit_definitions(nested, definitions);
-        }
-    } else if let Some(values) = value.as_array() {
-        for nested in values {
-            collect_compilation_unit_definitions(nested, definitions);
+            definitions.push(member.clone());
         }
     }
 }
@@ -168,6 +166,29 @@ fn collect_class_types(value: &serde_json::Value, classes: &mut Vec<serde_json::
             collect_class_types(nested, classes);
         }
     }
+}
+
+fn class_definitions(
+    root: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    let empty_classes = Vec::new();
+    let classes = root
+        .get("eda_class_types")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty_classes);
+    let mut definitions: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for class in classes {
+        let Some(name) = string_field(class, "name") else {
+            continue;
+        };
+        let address = class.get("addr").and_then(serde_json::Value::as_u64);
+        if let Some(address) = address {
+            definitions.insert(format!("{name}@{address}"), class.clone());
+        }
+        definitions.entry(name).or_insert_with(|| class.clone());
+    }
+    Ok(definitions)
 }
 
 #[derive(Clone, Copy)]
@@ -503,6 +524,7 @@ impl SlangAstLowerer {
         let top_name = string_field(root, "name")
             .or_else(|| string_field(body, "name"))
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
+        let class_definitions = class_definitions(root)?;
         let mut lowerer = Self {
             design: Design {
                 name: top_name.clone(),
@@ -527,16 +549,7 @@ impl SlangAstLowerer {
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
-            class_definitions: root
-                .get("eda_class_types")
-                .and_then(serde_json::Value::as_array)
-                .map(|classes| {
-                    classes
-                        .iter()
-                        .filter_map(|class| Some((string_field(class, "name")?, class.clone())))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            class_definitions,
             class_objects: std::collections::BTreeMap::new(),
             class_object_types: std::collections::BTreeMap::new(),
             dynamic_class_sources: std::collections::BTreeMap::new(),

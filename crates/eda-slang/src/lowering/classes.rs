@@ -16,8 +16,30 @@ struct ClassMethodCandidate {
 }
 
 impl SlangAstLowerer {
+    fn class_type_key(&self, type_name: &str) -> String {
+        let Some(base_name) = class_name(type_name) else {
+            return type_name.to_string();
+        };
+        if let Some(address) = type_name
+            .split_whitespace()
+            .next()
+            .and_then(|candidate| candidate.parse::<u64>().ok())
+        {
+            let specialized = format!("{base_name}@{address}");
+            if self.class_definitions.contains_key(&specialized) {
+                return specialized;
+            }
+        }
+        base_name
+    }
+
     pub(super) fn collect_class_static_members(&mut self) -> Result<(), String> {
-        let definitions = self.class_definitions.clone();
+        let definitions = self
+            .class_definitions
+            .iter()
+            .filter(|(key, _)| key.contains('@'))
+            .map(|(key, class)| (key.clone(), class.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut initializers = Vec::new();
         let mut methods = Vec::new();
         for (class_name, class) in &definitions {
@@ -183,6 +205,7 @@ impl SlangAstLowerer {
         let Some((target_key, target_class)) = named_class_handle(left) else {
             return Ok(());
         };
+        let target_class = self.class_type_key(&target_class);
         if string_field(right, "kind").as_deref() == Some("NewClass") {
             self.initialized_class_objects.insert(target_key.clone());
             self.constructed_class_objects.insert(target_key);
@@ -192,6 +215,7 @@ impl SlangAstLowerer {
         let Some((source_key, source_class)) = named_class_handle(source) else {
             return Ok(());
         };
+        let source_class = self.class_type_key(&source_class);
         if !self.class_definitions.contains_key(&target_class)
             || !self.class_definitions.contains_key(&source_class)
         {
@@ -224,10 +248,11 @@ impl SlangAstLowerer {
         let Some(class_name) = class_name(&type_name) else {
             return Ok(false);
         };
-        if !self.class_definitions.contains_key(&class_name) {
+        let class_key = self.class_type_key(&type_name);
+        if !self.class_definitions.contains_key(&class_key) {
             return Ok(false);
         }
-        let Some(class) = self.class_definitions.get(&class_name).cloned() else {
+        let Some(class) = self.class_definitions.get(&class_key).cloned() else {
             return Ok(false);
         };
         if bool_field(&class, "isAbstract")
@@ -243,7 +268,7 @@ impl SlangAstLowerer {
         {
             return Err(format!("class '{class_name}' interfaces are not supported"));
         }
-        let chain = self.class_chain(&class_name)?;
+        let chain = self.class_chain(&class_key)?;
         let empty_members = Vec::new();
         let mut declared_properties = BTreeMap::new();
         for (owner_name, class) in &chain {
@@ -337,7 +362,7 @@ impl SlangAstLowerer {
         }
         self.class_objects.insert(object_key.clone(), fields);
         self.class_object_types
-            .insert(object_key.clone(), class_name);
+            .insert(object_key.clone(), class_key);
         let tag =
             self.declare_class_internal_net(&format!("__class_tag_{handle_address}_{name}"), 32);
         let id = self
@@ -552,6 +577,7 @@ impl SlangAstLowerer {
         let Some((target_key, target_class)) = named_class_handle(left) else {
             return Ok(None);
         };
+        let target_class = self.class_type_key(&target_class);
         if !self.class_definitions.contains_key(&target_class) {
             return Ok(None);
         }
@@ -1019,13 +1045,20 @@ impl SlangAstLowerer {
             let Some(class) = self.class_definitions.get(&current).cloned() else {
                 return Err(format!("unknown class '{current}'"));
             };
-            let base = class
+            let base_reference = class
                 .get("baseClass")
                 .and_then(Value::as_str)
-                .and_then(class_name);
+                .map(str::to_string);
+            let base = base_reference.as_deref().and_then(class_name);
             chain.push((current, class));
             match base {
-                Some(next) => current = next,
+                Some(_) => {
+                    current = self.class_type_key(
+                        base_reference
+                            .as_deref()
+                            .expect("class base reference was just checked"),
+                    )
+                }
                 None => break,
             }
         }
@@ -1244,7 +1277,9 @@ impl SlangAstLowerer {
 }
 
 fn class_name(type_name: &str) -> Option<String> {
-    type_name.split_whitespace().next_back().map(str::to_string)
+    let raw_name = type_name.split_whitespace().next_back()?;
+    let base_name = raw_name.split('#').next()?.trim();
+    (!base_name.is_empty()).then(|| base_name.to_string())
 }
 
 fn method_return_type(method: &Value) -> String {
@@ -1274,8 +1309,7 @@ fn named_class_handle(value: &Value) -> Option<(String, String)> {
     }
     let object_key = string_field(value, "symbol")?;
     let type_name = string_field(value, "type")?;
-    let class_name = class_name(&type_name)?;
-    Some((object_key, class_name))
+    Some((object_key, type_name))
 }
 
 fn conversion_operand(value: &Value) -> Option<&Value> {
