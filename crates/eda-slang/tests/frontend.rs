@@ -2997,6 +2997,152 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_parameterized_interface_specializations() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-parameterized-interface");
+    let source_path = root.join("parameterized_interface.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if #(parameter int WIDTH = 8) (input logic clk);
+  logic [WIDTH-1:0] data;
+  modport producer(output data);
+endinterface
+
+module producer #(parameter WIDTH = 4) (
+  bus_if.producer bus,
+  input logic [WIDTH-1:0] value,
+  output logic [WIDTH-1:0] observed
+);
+  assign bus.data = value;
+  assign observed = bus.data;
+endmodule
+
+module parameterized_interface_top(
+  input logic clk,
+  input logic [3:0] value4,
+  input logic [7:0] value8,
+  output logic [3:0] observed4,
+  output logic [7:0] observed8
+);
+  bus_if #(.WIDTH(4)) bus4(.clk(clk));
+  bus_if #(.WIDTH(8)) bus8(.clk(clk));
+  producer #(.WIDTH(4)) p4(.bus(bus4), .value(value4), .observed(observed4));
+  producer #(.WIDTH(8)) p8(.bus(bus8), .value(value8), .observed(observed8));
+endmodule
+"#,
+    )
+    .expect("write parameterized-interface source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("parameterized_interface_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower parameterized interface specializations");
+    let mut simulator = Simulator::new(&design).expect("create parameterized-interface simulator");
+    simulator
+        .set_input("value4", &LogicWord::from_u64(4, 0b0101))
+        .unwrap();
+    simulator
+        .set_input("value8", &LogicWord::from_u64(8, 0b1010_0101))
+        .unwrap();
+    assert_eq!(simulator.read("observed4").unwrap().to_u64(), Some(0b0101));
+    assert_eq!(
+        simulator.read("observed8").unwrap().to_u64(),
+        Some(0b1010_0101)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_parameterized_interface_aggregate_specializations() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-parameterized-interface-aggregate");
+    let source_path = root.join("parameterized_interface_aggregate.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if #(parameter int WIDTH = 8) (input logic clk);
+  typedef struct packed {
+    logic [WIDTH-1:0] value;
+  } payload_t;
+  typedef struct packed {
+    payload_t payload;
+    logic [1:0] tag;
+  } packet_t;
+
+  packet_t packet;
+  modport producer(output packet);
+endinterface
+
+module producer #(parameter WIDTH = 4) (
+  bus_if.producer bus,
+  input logic [WIDTH-1:0] value,
+  input logic [1:0] tag,
+  output logic [WIDTH-1:0] observed
+);
+  assign bus.packet.payload.value = value;
+  assign bus.packet.tag = tag;
+  assign observed = bus.packet.payload.value;
+endmodule
+
+module parameterized_interface_aggregate_top(
+  input logic clk,
+  input logic [3:0] value4,
+  input logic [7:0] value8,
+  input logic [1:0] tag,
+  output logic [3:0] observed4,
+  output logic [7:0] observed8
+);
+  bus_if #(.WIDTH(4)) bus4(.clk(clk));
+  bus_if #(.WIDTH(8)) bus8(.clk(clk));
+  producer #(.WIDTH(4)) p4(
+    .bus(bus4),
+    .value(value4),
+    .tag(tag),
+    .observed(observed4)
+  );
+  producer #(.WIDTH(8)) p8(
+    .bus(bus8),
+    .value(value8),
+    .tag(tag),
+    .observed(observed8)
+  );
+endmodule
+"#,
+    )
+    .expect("write parameterized-interface aggregate source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("parameterized_interface_aggregate_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower parameterized interface aggregate specializations");
+    let mut simulator = Simulator::new(&design).expect("create parameterized aggregate simulator");
+    simulator
+        .set_input("value4", &LogicWord::from_u64(4, 0b0101))
+        .unwrap();
+    simulator
+        .set_input("value8", &LogicWord::from_u64(8, 0b1010_0101))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(2, 0b11))
+        .unwrap();
+    assert_eq!(simulator.read("observed4").unwrap().to_u64(), Some(0b0101));
+    assert_eq!(
+        simulator.read("observed8").unwrap().to_u64(),
+        Some(0b1010_0101)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_interface_packed_union_members() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

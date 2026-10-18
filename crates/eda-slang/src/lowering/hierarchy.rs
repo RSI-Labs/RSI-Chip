@@ -676,6 +676,48 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
 }
 
 impl super::SlangAstLowerer {
+    fn inject_interface_type_specialization(
+        &self,
+        child: &mut Self,
+        interface_instance: &str,
+    ) -> Result<(), String> {
+        let instance_address = symbol_address(interface_instance)?;
+        let prefix = format!("__interface_instance_{instance_address}__.");
+        for (name, definition) in &self.type_aliases {
+            let Some(visible_name) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if let Some(existing) = child.type_aliases.get(visible_name) {
+                if *existing != *definition {
+                    return Err(format!(
+                        "child module uses conflicting interface type '{visible_name}'"
+                    ));
+                }
+            } else {
+                child
+                    .type_aliases
+                    .insert(visible_name.to_string(), definition.clone());
+            }
+        }
+        for (name, definition) in &self.type_enums {
+            let Some(visible_name) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if let Some(existing) = child.type_enums.get(visible_name) {
+                if *existing != *definition {
+                    return Err(format!(
+                        "child module uses conflicting interface enum '{visible_name}'"
+                    ));
+                }
+            } else {
+                child
+                    .type_enums
+                    .insert(visible_name.to_string(), definition.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_instance_array(
         &mut self,
         member: &serde_json::Value,
@@ -780,6 +822,8 @@ impl super::SlangAstLowerer {
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
             type_enums: std::collections::BTreeMap::new(),
+            ambiguous_type_aliases: std::collections::BTreeSet::new(),
+            ambiguous_type_enums: std::collections::BTreeSet::new(),
             enum_constants: std::collections::BTreeMap::new(),
             named_block_flags: std::collections::BTreeMap::new(),
             named_disable_seen: false,
@@ -819,6 +863,7 @@ impl super::SlangAstLowerer {
             ) else {
                 continue;
             };
+            self.inject_interface_type_specialization(&mut child, interface_instance)?;
             let key = connection_interface_modport_key(
                 &self.interface_modport_symbols,
                 &self.interface_modport_names,
@@ -897,18 +942,6 @@ impl super::SlangAstLowerer {
                 ));
             }
         }
-        for (name, definition) in &self.type_aliases {
-            if name.contains('.') {
-                child.type_aliases.insert(name.clone(), definition.clone());
-            }
-        }
-        for (name, definition) in &self.type_enums {
-            if name.contains('.') {
-                child.type_enums.insert(name.clone(), definition.clone());
-            }
-        }
-        child.lower_body(body)?;
-
         let empty_body_members = Vec::new();
         let is_interface = body
             .get("members")
@@ -916,26 +949,56 @@ impl super::SlangAstLowerer {
             .unwrap_or(&empty_body_members)
             .iter()
             .any(|member| string_field(member, "kind").as_deref() == Some("Modport"));
+        if !is_interface {
+            for (name, definition) in &self.type_aliases {
+                if name.contains('.') && !name.starts_with("__interface_instance_") {
+                    child.type_aliases.insert(name.clone(), definition.clone());
+                }
+            }
+            for (name, definition) in &self.type_enums {
+                if name.contains('.') && !name.starts_with("__interface_instance_") {
+                    child.type_enums.insert(name.clone(), definition.clone());
+                }
+            }
+        }
+        child.lower_body(body)?;
+
         if is_interface {
+            let instance_address = member
+                .get("addr")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "interface instance has no address".to_string())?;
+            let specialization_prefix = format!("__interface_instance_{instance_address}__.");
             for (name, definition) in &child.type_aliases {
+                let specialized_name = format!("{specialization_prefix}{definition_name}.{name}");
+                self.type_aliases
+                    .insert(specialized_name, definition.clone());
+
                 let scoped_name = format!("{definition_name}.{name}");
+                if self.ambiguous_type_aliases.contains(&scoped_name) {
+                    continue;
+                }
                 if let Some(existing) = self.type_aliases.get(&scoped_name) {
                     if *existing != *definition {
-                        return Err(format!(
-                            "conflicting definitions for interface type '{scoped_name}'"
-                        ));
+                        self.type_aliases.remove(&scoped_name);
+                        self.ambiguous_type_aliases.insert(scoped_name);
                     }
                 } else {
                     self.type_aliases.insert(scoped_name, definition.clone());
                 }
             }
             for (name, definition) in &child.type_enums {
+                let specialized_name = format!("{specialization_prefix}{definition_name}.{name}");
+                self.type_enums.insert(specialized_name, definition.clone());
+
                 let scoped_name = format!("{definition_name}.{name}");
+                if self.ambiguous_type_enums.contains(&scoped_name) {
+                    continue;
+                }
                 if let Some(existing) = self.type_enums.get(&scoped_name) {
                     if *existing != *definition {
-                        return Err(format!(
-                            "conflicting definitions for interface enum '{scoped_name}'"
-                        ));
+                        self.type_enums.remove(&scoped_name);
+                        self.ambiguous_type_enums.insert(scoped_name);
                     }
                 } else {
                     self.type_enums.insert(scoped_name, definition.clone());
