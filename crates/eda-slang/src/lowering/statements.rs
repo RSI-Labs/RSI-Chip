@@ -526,9 +526,7 @@ impl SlangAstLowerer {
         &self,
         statement: &serde_json::Value,
     ) -> Result<eda_core::ir::Stmt, String> {
-        if bool_field(statement, "isNonBlocking") {
-            return Err("nonblocking event triggers are not supported".into());
-        }
+        let nonblocking = bool_field(statement, "isNonBlocking");
         let target = statement
             .get("target")
             .ok_or_else(|| "event trigger has no target".to_string())?;
@@ -562,10 +560,17 @@ impl SlangAstLowerer {
                 a: Box::new(current),
             }),
         };
-        Ok(eda_core::ir::Stmt::Bl {
-            lv: lvalue,
-            e: next,
-        })
+        if nonblocking {
+            Ok(eda_core::ir::Stmt::NBl {
+                lv: lvalue,
+                e: next,
+            })
+        } else {
+            Ok(eda_core::ir::Stmt::Bl {
+                lv: lvalue,
+                e: next,
+            })
+        }
     }
 
     fn lower_increment_statement(

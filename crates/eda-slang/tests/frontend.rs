@@ -3566,6 +3566,58 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nonblocking-events");
+    let source_path = root.join("nonblocking_events.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module nonblocking_events(
+  input logic go,
+  output logic ready,
+  output logic observed_ready,
+  output logic waiter_done
+);
+  event e;
+  initial begin
+    ready = 1'b0;
+    observed_ready = 1'b0;
+    waiter_done = 1'b0;
+    @(e);
+    observed_ready = ready;
+    waiter_done = 1'b1;
+  end
+
+  initial begin
+    wait (go);
+    ready = 1'b1;
+    ->>e;
+  end
+endmodule
+"#,
+    )
+    .expect("write nonblocking event source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("nonblocking_events"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nonblocking event trigger");
+    let mut simulator = Simulator::new(&design).expect("create nonblocking event simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("ready").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("observed_ready").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("waiter_done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
