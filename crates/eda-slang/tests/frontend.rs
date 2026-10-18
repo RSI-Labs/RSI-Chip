@@ -3389,8 +3389,16 @@ fn slang_ast_direct_lowering_supports_interface_unpacked_struct_members() {
 interface bus_if(input logic clk);
   typedef struct {
     logic [7:0] value;
+  } payload_t;
+
+  typedef struct {
     logic [3:0] tag;
     logic valid;
+  } metadata_t;
+
+  typedef struct {
+    payload_t payload;
+    metadata_t metadata;
   } packet_t;
 
   packet_t packet;
@@ -3402,9 +3410,9 @@ module producer(
   input logic [7:0] value,
   input logic [3:0] tag
 );
-  assign bus.packet.value = value;
-  assign bus.packet.tag = tag;
-  assign bus.packet.valid = 1'b1;
+  assign bus.packet.payload.value = value;
+  assign bus.packet.metadata.tag = tag;
+  assign bus.packet.metadata.valid = 1'b1;
 endmodule
 
 module interface_unpacked_struct_top(
@@ -3417,9 +3425,9 @@ module interface_unpacked_struct_top(
 );
   bus_if bus(.clk(clk));
   producer producer_u(.bus(bus), .value(value), .tag(tag));
-  assign observed_value = bus.packet.value;
-  assign observed_tag = bus.packet.tag;
-  assign observed_valid = bus.packet.valid;
+  assign observed_value = bus.packet.payload.value;
+  assign observed_tag = bus.packet.metadata.tag;
+  assign observed_valid = bus.packet.metadata.valid;
 endmodule
 "#,
     )
@@ -4840,6 +4848,113 @@ endmodule
     assert_eq!(
         simulator.read("observed_union").unwrap().to_u64(),
         Some(0x7)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_nested_unpacked_aggregates() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nested-unpacked");
+    let source_path = root.join("nested_unpacked.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module nested_unpacked(
+  input logic [7:0] value,
+  input logic [3:0] tag,
+  output logic [7:0] observed_value,
+  output logic [3:0] observed_tag,
+  output logic [1:0] observed_mode,
+  output logic [3:0] observed_union
+);
+  typedef struct {
+    logic [7:0] value;
+    logic [3:0] tag;
+  } inner_t;
+
+  typedef struct {
+    inner_t inner;
+    logic [1:0] mode;
+  } outer_t;
+
+  typedef union {
+    logic [7:0] wide;
+    logic [3:0] narrow;
+  } raw_t;
+
+  typedef struct {
+    raw_t raw;
+    logic [3:0] checksum;
+  } wrapper_t;
+
+  outer_t packet;
+  outer_t copied;
+  wrapper_t wrapper;
+
+  assign packet.inner.value = value;
+  assign packet.inner.tag = tag;
+  assign packet.mode = 2'b10;
+  assign wrapper.raw.wide = value;
+  assign wrapper.checksum = tag;
+  assign copied = packet;
+
+  assign observed_value = copied.inner.value;
+  assign observed_tag = copied.inner.tag;
+  assign observed_mode = copied.mode;
+  assign observed_union = wrapper.raw.narrow;
+endmodule
+"#,
+    )
+    .expect("write nested-unpacked source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("nested_unpacked"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nested unpacked aggregates");
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|decl| decl.name == "packet")
+            .map(|decl| decl.width),
+        Some(14)
+    );
+    assert_eq!(
+        design
+            .net_decls
+            .iter()
+            .find(|decl| decl.name == "wrapper")
+            .map(|decl| decl.width),
+        Some(12)
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create nested-unpacked simulator");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0x5d))
+        .unwrap();
+    simulator
+        .set_input("tag", &LogicWord::from_u64(4, 0b0110))
+        .unwrap();
+    assert_eq!(
+        simulator.read("observed_value").unwrap().to_u64(),
+        Some(0x5d)
+    );
+    assert_eq!(
+        simulator.read("observed_tag").unwrap().to_u64(),
+        Some(0b0110)
+    );
+    assert_eq!(
+        simulator.read("observed_mode").unwrap().to_u64(),
+        Some(0b10)
+    );
+    assert_eq!(
+        simulator.read("observed_union").unwrap().to_u64(),
+        Some(0xd)
     );
 }
 
