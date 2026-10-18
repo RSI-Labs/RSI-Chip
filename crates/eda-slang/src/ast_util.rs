@@ -433,3 +433,7 @@ pub(super) fn expression_symbol(value: &Value) -> Option<String> {
         .filter(|symbol| !symbol.is_empty())
         .map(str::to_string)
 }
+
+pub(super) fn expression_symbol_id(value: &Value) -> Option<String> {
+    string_field(value, "symbol").filter(|symbol| !symbol.trim().is_empty())
+}

@@ -79,6 +79,9 @@ struct AstEnumType {
 pub(super) struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    local_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    local_initializers: std::collections::BTreeMap<String, serde_json::Value>,
+    local_blocks: std::collections::BTreeMap<String, Vec<String>>,
     constants: std::collections::BTreeMap<String, LogicWord>,
     subroutines: std::collections::BTreeMap<String, serde_json::Value>,
     type_aliases: std::collections::BTreeMap<String, AstStructType>,
@@ -105,6 +108,9 @@ impl SlangAstLowerer {
                 ..Design::default()
             },
             symbols: std::collections::BTreeMap::new(),
+            local_symbols: std::collections::BTreeMap::new(),
+            local_initializers: std::collections::BTreeMap::new(),
+            local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
@@ -168,6 +174,9 @@ impl SlangAstLowerer {
                 Some("EnumType") => self
                     .collect_enum_type(member)
                     .map_err(|error| with_source_span(member, error))?,
+                Some("StatementBlock") => self
+                    .collect_procedure_locals(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 _ => {}
             }
         }
@@ -195,6 +204,7 @@ impl SlangAstLowerer {
                 "Subroutine" => {}
                 "TypeAlias" => {}
                 "EnumType" => {}
+                "StatementBlock" => {}
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}

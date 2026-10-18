@@ -3861,25 +3861,29 @@ endmodule
     std::fs::write(
         &inline_local_path,
         r#"
-module inline_local(output logic [3:0] y);
+module inline_local(output logic [3:0] y, output logic [3:0] z);
   initial begin
+    y = 4'd0;
+    z = 4'd0;
     for (int i = 0; i < 4; i++) y[i] = 1'b1;
+    for (int i = 0; i < 2; i++) z[i] = 1'b1;
   end
 endmodule
 "#,
     )
     .expect("write inline local loop source");
-    let error = slang
+    let inline_local = slang
         .compile_files_via_ast(
             std::slice::from_ref(&inline_local_path),
             Some("inline_local"),
             &PreprocessOptions::default(),
         )
-        .expect_err("procedure-local blocks must fail closed");
-    assert!(
-        error.contains("does not support member kind 'StatementBlock'"),
-        "unexpected error: {error}"
-    );
+        .expect("directly lower procedure-local loop variables");
+    let mut inline_simulator =
+        Simulator::new(&inline_local).expect("create procedure-local loop simulator");
+    inline_simulator.run_until(0).unwrap();
+    assert_eq!(inline_simulator.read("y").unwrap().to_u64(), Some(0b1111));
+    assert_eq!(inline_simulator.read("z").unwrap().to_u64(), Some(0b0011));
 
     let excessive_path = root.join("excessive.sv");
     std::fs::write(

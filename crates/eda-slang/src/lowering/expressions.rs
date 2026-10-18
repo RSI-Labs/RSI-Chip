@@ -1,8 +1,8 @@
 //! Expression operator and constant helpers for direct slang lowering.
 
 use crate::ast_util::{
-    constant_json_word, expression_symbol, integer_literal_word, named_constant_word, string_field,
-    usize_field, with_source_span,
+    constant_json_word, expression_symbol, expression_symbol_id, integer_literal_word,
+    named_constant_word, string_field, usize_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
@@ -109,6 +109,23 @@ pub(super) fn constant_i64(value: &serde_json::Value) -> Result<i64, String> {
 }
 
 impl super::SlangAstLowerer {
+    pub(super) fn named_symbol(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<AstLoweredSymbol, String> {
+        let display_name =
+            expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
+        if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(symbol) = self.local_symbols.get(&symbol_id) {
+                return Ok(symbol.clone());
+            }
+        }
+        self.symbols
+            .get(&display_name)
+            .cloned()
+            .ok_or_else(|| format!("unknown direct-lowering symbol '{display_name}'"))
+    }
+
     pub(super) fn lower_lvalue(
         &self,
         value: &serde_json::Value,
@@ -123,12 +140,7 @@ impl super::SlangAstLowerer {
     ) -> Result<eda_core::ir::LValue, String> {
         match string_field(value, "kind").as_deref() {
             Some("NamedValue") => {
-                let name = expression_symbol(value)
-                    .ok_or_else(|| "assignment target has no symbol".to_string())?;
-                let symbol = self
-                    .symbols
-                    .get(&name)
-                    .ok_or_else(|| format!("unknown direct-lowering symbol '{name}'"))?;
+                let symbol = self.named_symbol(value)?;
                 Ok(eda_core::ir::LValue {
                     net: symbol.base,
                     decl_width: symbol.width,
@@ -201,6 +213,16 @@ impl super::SlangAstLowerer {
             "NamedValue" => {
                 let name = expression_symbol(value)
                     .ok_or_else(|| "expression has no symbol".to_string())?;
+                if let Some(symbol_id) = expression_symbol_id(value) {
+                    if let Some(symbol) = self.local_symbols.get(&symbol_id) {
+                        return Ok(Expr::Ref {
+                            net: symbol.base,
+                            decl_width: symbol.width,
+                            range: full_range(symbol.width),
+                            signed: symbol.signed,
+                        });
+                    }
+                }
                 if let Some(word) = self.constants.get(&name).cloned() {
                     return Ok(Expr::Const(word));
                 }
@@ -1414,6 +1436,11 @@ impl super::SlangAstLowerer {
     ) -> Result<Option<AstLoweredSymbol>, String> {
         if string_field(value, "kind").as_deref() != Some("NamedValue") {
             return Ok(None);
+        }
+        if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(symbol) = self.local_symbols.get(&symbol_id) {
+                return Ok(Some(symbol.clone()));
+            }
         }
         let name = expression_symbol(value)
             .ok_or_else(|| "packed select has no declaration symbol".to_string())?;

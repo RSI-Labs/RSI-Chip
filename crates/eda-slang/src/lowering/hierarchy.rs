@@ -415,6 +415,9 @@ impl super::SlangAstLowerer {
         let mut child = Self {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
+            local_symbols: std::collections::BTreeMap::new(),
+            local_initializers: std::collections::BTreeMap::new(),
+            local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),

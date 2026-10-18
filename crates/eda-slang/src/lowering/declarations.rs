@@ -3,13 +3,86 @@
 use super::{
     declaration_name, AstEnumType, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer,
 };
-use crate::ast_util::{bool_field, literal_word, memory_initializer_statements, string_field};
+use crate::ast_util::{
+    bool_field, literal_word, memory_initializer_statements, string_field, usize_field,
+};
 use crate::types::{
     memory_type, memory_type_with_element, simple_type_shape, simple_type_signed, AstMemoryType,
     AstPackedDimension, AstTypeShape,
 };
 
 impl SlangAstLowerer {
+    pub(super) fn collect_procedure_locals(
+        &mut self,
+        member: &serde_json::Value,
+    ) -> Result<(), String> {
+        let Some(block_address) = usize_field(member, "addr") else {
+            return Err("procedure-local block has no symbol address".into());
+        };
+        let variables = member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "procedure-local block has no members".to_string())?;
+        let mut symbol_ids = Vec::new();
+        for variable in variables {
+            if string_field(variable, "kind").as_deref() != Some("Variable") {
+                continue;
+            }
+            let name = declaration_name(variable, "local Variable")?;
+            if string_field(variable, "lifetime").as_deref() != Some("Automatic") {
+                return Err(format!(
+                    "procedure-local variable '{name}' must be automatic"
+                ));
+            }
+            let Some(initializer) = variable.get("initializer") else {
+                return Err(format!(
+                    "procedure-local variable '{name}' must have an initializer in this subset"
+                ));
+            };
+            let Some(address) = usize_field(variable, "addr") else {
+                return Err(format!(
+                    "procedure-local variable '{name}' has no symbol address"
+                ));
+            };
+            let symbol_id = format!("{address} {name}");
+            let type_name = string_field(variable, "type").unwrap_or_default();
+            if self.declared_memory_type(&type_name).is_some() {
+                return Err(format!(
+                    "procedure-local sparse memories are not supported for '{name}'"
+                ));
+            }
+            let (shape, signed, struct_fields) = self.net_type(&type_name)?;
+            let internal_name = format!("__local_{address}_{name}");
+            let base = self.design.n_nets;
+            self.design.n_nets += shape.width;
+            self.design.net_decls.push(eda_core::ir::NetDecl {
+                name: internal_name,
+                width: shape.width,
+                is_reg: true,
+                is_signed: signed,
+                base,
+            });
+            self.local_symbols.insert(
+                symbol_id.clone(),
+                AstLoweredSymbol {
+                    base,
+                    width: shape.width,
+                    signed,
+                    bounds: shape.bounds,
+                    dimensions: shape.dimensions,
+                    memory: None,
+                    struct_fields,
+                },
+            );
+            self.local_initializers
+                .insert(symbol_id.clone(), initializer.clone());
+            symbol_ids.push(symbol_id);
+        }
+        self.local_blocks
+            .insert(block_address.to_string(), symbol_ids);
+        Ok(())
+    }
+
     pub(super) fn collect_type_alias(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let name = declaration_name(member, "TypeAlias")?;
         let target = member

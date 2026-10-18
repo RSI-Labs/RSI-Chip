@@ -63,8 +63,9 @@ comparison, inclusive `substr` extraction, and radix conversions
 any-edge, posedge, and negedge signals, constant procedural delay statements,
 delay-driven always generators, delay-bearing `forever` loops, `wait`
 statements, runtime `repeat`, `while`, and `do...while` loops with
-`break`/`continue`, module-scope `for` loops, and concurrent `fork` branches
-with `join`, `join_any`, and `join_none`, recursive
+`break`/`continue`, module-scope and initialized automatic procedure-local
+`for` loops, and concurrent `fork` branches with `join`, `join_any`, and
+`join_none`, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports

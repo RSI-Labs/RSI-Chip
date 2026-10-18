@@ -198,7 +198,46 @@ impl SlangAstLowerer {
                 }
                 if let Some(nested) = statement.get("body") {
                     if string_field(nested, "kind").as_deref() == Some("List") {
-                        return self.lower_statement(nested);
+                        let local_ids = statement
+                            .get("block")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .and_then(|block| self.local_blocks.get(block))
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut statements = Vec::new();
+                        for symbol_id in &local_ids {
+                            let initializer = self
+                                .local_initializers
+                                .get(symbol_id)
+                                .ok_or_else(|| "procedure-local initializer was not collected".to_string())?;
+                            let symbol = self
+                                .local_symbols
+                                .get(symbol_id)
+                                .ok_or_else(|| "procedure-local symbol was not collected".to_string())?;
+                            let rhs = self.lower_expression(initializer)?;
+                            statements.push(Stmt::Bl {
+                                lv: eda_core::ir::LValue {
+                                    net: symbol.base,
+                                    decl_width: symbol.width,
+                                    range: full_range(symbol.width),
+                                },
+                                e: rhs,
+                            });
+                        }
+                        let items = nested
+                            .get("list")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| "statement list has no items".to_string())?;
+                        for item in items {
+                            if !local_ids.is_empty()
+                                && string_field(item, "kind").as_deref() == Some("VariableDeclaration")
+                            {
+                                continue;
+                            }
+                            statements.push(self.lower_statement(item)?);
+                        }
+                        return Ok(Stmt::Block(statements));
                     }
                     let nested = self.lower_statement(nested)?;
                     return Ok(Stmt::Block(vec![nested]));
