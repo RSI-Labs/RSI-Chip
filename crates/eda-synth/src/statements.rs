@@ -53,6 +53,7 @@ impl<'a> Synth<'a> {
             Stmt::Wait { .. } => Err("wait statements are not synthesizable".into()),
             Stmt::Fork { .. } => Err("fork/join blocks are not synthesizable".into()),
             Stmt::While { .. } => Err("while loops are not synthesizable".into()),
+            Stmt::Break | Stmt::Continue => Err("loop jumps are not synthesizable".into()),
             Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
                 let w = lv.range.width();
                 let v = self.blast(e, w)?;

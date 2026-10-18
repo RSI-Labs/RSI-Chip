@@ -935,7 +935,7 @@ impl<'d> Simulator<'d> {
                     work.push(s);
                     work.push(inner);
                 }
-                Stmt::While { cond, body } => {
+                Stmt::While { cond, body, steps } => {
                     const MAX_WHILE_ITERATIONS: u64 = 65_536;
                     let condition = self.eval(cond);
                     if condition.reduce_or().as_bool() != Some(true) {
@@ -952,8 +952,34 @@ impl<'d> Simulator<'d> {
                             );
                         }
                         work.push(s);
+                        work.extend(steps.iter().rev());
                         work.push(body);
                     }
+                }
+                Stmt::Break => {
+                    let Some(loop_position) = work
+                        .iter()
+                        .rposition(|statement| matches!(statement, Stmt::While { .. }))
+                    else {
+                        return Err("break is outside a runtime loop".into());
+                    };
+                    work.truncate(loop_position);
+                }
+                Stmt::Continue => {
+                    let Some(loop_position) = work
+                        .iter()
+                        .rposition(|statement| matches!(statement, Stmt::While { .. }))
+                    else {
+                        return Err("continue is outside a runtime loop".into());
+                    };
+                    let loop_statement = work[loop_position];
+                    let steps = match loop_statement {
+                        Stmt::While { steps, .. } => steps,
+                        _ => unreachable!("loop position must point to a While statement"),
+                    };
+                    work.truncate(loop_position);
+                    work.push(loop_statement);
+                    work.extend(steps.iter().rev());
                 }
                 Stmt::Bl { lv, e } => {
                     let v = self.eval(e);
@@ -2315,10 +2341,12 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::Fork { branches, .. } => branches
             .iter()
             .for_each(|branch| walk_stmt_memories(branch, out)),
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, steps } => {
             walk_expr_memories(cond, out);
-            walk_stmt_memories(body, out)
+            walk_stmt_memories(body, out);
+            steps.iter().for_each(|step| walk_stmt_memories(step, out));
         }
+        Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
@@ -2415,10 +2443,14 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(branch_reads);
             writes.extend(branch_writes);
         }),
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, steps } => {
             reads.extend(expr_nets(cond));
             collect_stmt_access(body, reads, writes);
+            steps
+                .iter()
+                .for_each(|step| collect_stmt_access(step, reads, writes));
         }
+        Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2487,10 +2519,12 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt(body, out)
         }
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| walk_stmt(branch, out)),
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, steps } => {
             walk_expr(cond, out);
-            walk_stmt(body, out)
+            walk_stmt(body, out);
+            steps.iter().for_each(|step| walk_stmt(step, out));
         }
+        Stmt::Break | Stmt::Continue => {}
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),

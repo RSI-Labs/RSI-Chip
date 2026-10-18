@@ -373,6 +373,7 @@ impl SlangAstLowerer {
                 Ok(Stmt::While {
                     cond: self.lower_expression(condition)?,
                     body: Box::new(self.lower_statement(body)?),
+                    steps: Vec::new(),
                 })
             }
             "DoWhileLoop" => {
@@ -386,6 +387,7 @@ impl SlangAstLowerer {
                 let repeated_execution = Stmt::While {
                     cond: self.lower_expression(condition)?,
                     body: Box::new(self.lower_statement(body)?),
+                    steps: Vec::new(),
                 };
                 Ok(Stmt::Block(vec![first_execution, repeated_execution]))
             }
@@ -418,17 +420,20 @@ impl SlangAstLowerer {
                 for initializer in initializers {
                     statements.push(self.lower_statement(initializer)?);
                 }
-                let mut loop_body = Vec::with_capacity(steps.len() + 1);
-                loop_body.push(self.lower_statement(body)?);
-                for step in steps {
-                    loop_body.push(self.lower_update_statement(step)?);
-                }
+                let loop_body = self.lower_statement(body)?;
+                let lowered_steps = steps
+                    .iter()
+                    .map(|step| self.lower_update_statement(step))
+                    .collect::<Result<Vec<_>, _>>()?;
                 statements.push(Stmt::While {
                     cond: self.lower_expression(condition)?,
-                    body: Box::new(Stmt::Block(loop_body)),
+                    body: Box::new(loop_body),
+                    steps: lowered_steps,
                 });
                 Ok(Stmt::Block(statements))
             }
+            "Break" => Ok(Stmt::Break),
+            "Continue" => Ok(Stmt::Continue),
             "Wait" => {
                 let condition = statement
                     .get("cond")

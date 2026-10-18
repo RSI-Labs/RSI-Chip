@@ -3950,6 +3950,60 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_runtime_break_and_continue() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-loop-jumps");
+    let source_path = root.join("jumps.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module jumps(
+  output logic [3:0] break_index,
+  output logic [3:0] continue_count,
+  output logic [3:0] after_loops
+);
+  int i;
+  initial begin
+    break_index = 4'd0;
+    for (i = 0; i < 10; i++) begin
+      if (i == 3) begin
+        break;
+      end
+      break_index = i[3:0] + 1;
+    end
+
+    continue_count = 4'd0;
+    for (i = 0; i < 8; i++) begin
+      if (i < 4) begin
+        continue;
+      end
+      continue_count = continue_count + 1;
+    end
+
+    after_loops = 4'd1;
+  end
+endmodule
+"#,
+    )
+    .expect("write loop-jump source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("jumps"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower break and continue");
+    let mut simulator = Simulator::new(&design).expect("create loop-jump simulator");
+    simulator.run_until(0).unwrap();
+    assert_eq!(simulator.read("break_index").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("continue_count").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("after_loops").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

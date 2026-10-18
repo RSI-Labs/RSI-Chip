@@ -657,7 +657,12 @@ pub enum Stmt {
     While {
         cond: Expr,
         body: Box<Stmt>,
+        steps: Vec<Stmt>,
     },
+    /// Exit the nearest runtime loop.
+    Break,
+    /// Start the next iteration of the nearest runtime loop.
+    Continue,
     Display {
         parts: Vec<DispPart>,
         args: Vec<Expr>,
@@ -1010,10 +1015,14 @@ fn collect_memory_accesses(
         Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
             collect_memory_accesses(branch, synchronous, memory_widths, accesses)
         }),
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, steps } => {
             collect_memory_expr_reads(cond, synchronous, accesses);
-            collect_memory_accesses(body, synchronous, memory_widths, accesses)
+            collect_memory_accesses(body, synchronous, memory_widths, accesses);
+            for step in steps {
+                collect_memory_accesses(step, synchronous, memory_widths, accesses);
+            }
         }
+        Stmt::Break | Stmt::Continue => {}
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, accesses);
