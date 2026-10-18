@@ -123,6 +123,10 @@ fn feedback(s: &Stmt) -> bool {
                 }
             }
             Stmt::Delay { body, .. } => walk(body, reads, writes),
+            Stmt::Wait { cond, body } => {
+                expr_nets(cond, reads);
+                walk(body, reads, writes);
+            }
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
                 expr_nets(cond, reads)
             }

@@ -635,6 +635,9 @@ pub(crate) fn design_stmt_assignments(
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
+        Stmt::Wait { body, .. } => {
+            assignments.extend(design_stmt_assignments(design, body));
+        }
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {
                 assignments.push((name, design_expr_fingerprint(design, e)));

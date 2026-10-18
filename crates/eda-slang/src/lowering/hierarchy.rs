@@ -170,6 +170,10 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             }
         }
         Stmt::Delay { body, .. } => remap_statement(body, offset),
+        Stmt::Wait { cond, body } => {
+            remap_expression(cond, offset);
+            remap_statement(body, offset);
+        }
         Stmt::Display { args, .. } => {
             args.iter_mut()
                 .for_each(|argument| remap_expression(argument, offset));
@@ -335,6 +339,10 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             }
         }
         Stmt::Delay { body, .. } => remap_statement_memory_ids(body, offset),
+        Stmt::Wait { cond, body } => {
+            remap_expression_memory_ids(cond, offset);
+            remap_statement_memory_ids(body, offset);
+        }
         Stmt::Display { args, .. } => {
             args.iter_mut()
                 .for_each(|argument| remap_expression_memory_ids(argument, offset));

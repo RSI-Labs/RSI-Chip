@@ -3394,10 +3394,18 @@ fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     std::fs::write(
         &source_path,
         r#"
-module delays(input logic a, output logic y, output logic q, output logic clock);
+module delays(
+  input logic a,
+  input logic clk,
+  output logic y,
+  output logic q,
+  output logic clock,
+  output logic delayed_q
+);
   initial begin
     q = 1'b0;
     clock = 1'b0;
+    delayed_q = 1'b0;
   end
   initial begin
     #5 y = a;
@@ -3405,6 +3413,7 @@ module delays(input logic a, output logic y, output logic q, output logic clock)
   end
   always #5 q = ~q;
   initial forever #5 clock = ~clock;
+  always @(posedge clk) #2 delayed_q = ~delayed_q;
 endmodule
 "#,
     )
@@ -3425,7 +3434,7 @@ endmodule
         )
         .expect("lower constant delay controls through the bounded path");
     assert_eq!(design.initials.len(), 3);
-    assert_eq!(design.processes.len(), 1);
+    assert_eq!(design.processes.len(), 2);
     assert_eq!(reference.initials.len(), design.initials.len());
     assert_eq!(reference.processes.len(), design.processes.len());
 
@@ -3434,9 +3443,11 @@ endmodule
         simulator
             .set_input("a", &LogicWord::from_u64(1, 1))
             .unwrap();
+        simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), None);
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(0));
         assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("delayed_q").unwrap().to_u64(), Some(0));
         simulator.run_until(4).unwrap();
         assert_eq!(simulator.read("y").unwrap().to_u64(), None);
         simulator.run_until(5).unwrap();
@@ -3453,6 +3464,17 @@ endmodule
         simulator.run_until(15).unwrap();
         assert_eq!(simulator.read("q").unwrap().to_u64(), Some(1));
         assert_eq!(simulator.read("clock").unwrap().to_u64(), Some(1));
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        simulator.run_until(17).unwrap();
+        assert_eq!(simulator.read("delayed_q").unwrap().to_u64(), Some(1));
+        simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+        simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        simulator.run_until(19).unwrap();
+        assert_eq!(simulator.read("delayed_q").unwrap().to_u64(), Some(0));
     };
     run_delays(&design);
     run_delays(&reference);
@@ -3478,6 +3500,65 @@ endmodule
         error.contains("min:typ:max delay controls are not supported"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_wait_statements() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-wait");
+    let source_path = root.join("wait.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module waits(
+  input logic a,
+  input logic b,
+  output logic y,
+  output logic z,
+  output logic invert
+);
+  initial begin
+    wait (a && b) y = 1'b1;
+    wait (a) z = b;
+  end
+  initial wait (!a) invert = 1'b1;
+endmodule
+"#,
+    )
+    .expect("write wait source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("waits"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower wait statements");
+    assert_eq!(design.initials.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create wait simulator");
+    simulator
+        .set_input("b", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("z").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("invert").unwrap().to_u64(), None);
+
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("invert").unwrap().to_u64(), None);
+
+    simulator.run_until(10).unwrap();
+    assert_eq!(simulator.read("invert").unwrap().to_u64(), None);
+    simulator.set_input("a", &LogicWord::zero(1)).unwrap();
+    assert_eq!(simulator.read("invert").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("z").unwrap().to_u64(), Some(1));
 }
 
 #[test]

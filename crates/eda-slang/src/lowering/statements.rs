@@ -312,6 +312,18 @@ impl SlangAstLowerer {
                     .ok_or_else(|| "forever loop has no body".to_string())?;
                 Ok(Stmt::Forever(Box::new(self.lower_statement(body)?)))
             }
+            "Wait" => {
+                let condition = statement
+                    .get("cond")
+                    .ok_or_else(|| "wait statement has no condition".to_string())?;
+                let body = statement
+                    .get("stmt")
+                    .ok_or_else(|| "wait statement has no body".to_string())?;
+                Ok(Stmt::Wait {
+                    cond: self.lower_expression(condition)?,
+                    body: Box::new(self.lower_statement(body)?),
+                })
+            }
             other => Err(format!(
                 "direct slang-AST lowering does not support statement kind '{other}'"
             )),

@@ -51,6 +51,13 @@ struct Cont<'d> {
     work: Vec<&'d Stmt>,
 }
 
+struct Waiter<'d> {
+    condition: &'d Expr,
+    nets: HashSet<usize>,
+    memories: HashSet<usize>,
+    continuation: Cont<'d>,
+}
+
 struct Monitor<'d> {
     parts: &'d [eda_core::ir::DispPart],
     args: &'d [Expr],
@@ -68,6 +75,7 @@ pub struct Simulator<'d> {
     now: u64,
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
+    waiters: Vec<Waiter<'d>>,
     memory_elements: Vec<HashMap<u64, LogicWord>>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
@@ -176,6 +184,7 @@ impl<'d> Simulator<'d> {
             now: 0,
             nba: Vec::new(),
             busy_procs: HashSet::new(),
+            waiters: Vec::new(),
             memory_elements,
             memory_aliases,
             memory_nba: Vec::new(),
@@ -674,6 +683,7 @@ impl<'d> Simulator<'d> {
                 }
             }
         }
+        self.wake_net_waiters(changed_net);
         Ok(())
     }
 
@@ -784,7 +794,44 @@ impl<'d> Simulator<'d> {
                 }
             }
         }
+        self.wake_memory_waiters(memory);
         Ok(())
+    }
+
+    fn wake_net_waiters(&mut self, changed_net: usize) {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.waiters.len() {
+            let waiter = &self.waiters[index];
+            if waiter.nets.contains(&changed_net)
+                && self.eval(waiter.condition).reduce_or().as_bool() == Some(true)
+            {
+                ready.push(self.waiters.remove(index).continuation);
+            } else {
+                index += 1;
+            }
+        }
+        for continuation in ready {
+            self.conts.entry(self.now).or_default().push(continuation);
+        }
+    }
+
+    fn wake_memory_waiters(&mut self, changed_memory: usize) {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.waiters.len() {
+            let waiter = &self.waiters[index];
+            if waiter.memories.contains(&changed_memory)
+                && self.eval(waiter.condition).reduce_or().as_bool() == Some(true)
+            {
+                ready.push(self.waiters.remove(index).continuation);
+            } else {
+                index += 1;
+            }
+        }
+        for continuation in ready {
+            self.conts.entry(self.now).or_default().push(continuation);
+        }
     }
 
     fn canonical_memory(&self, memory: usize) -> usize {
@@ -1066,11 +1113,47 @@ impl<'d> Simulator<'d> {
                     let mut exec_order: Vec<&Stmt> = vec![&**body];
                     exec_order.extend(work.iter().rev().copied());
                     exec_order.reverse(); // LIFO: pop() returns body first
+                    if let Some(process) = c.process {
+                        self.busy_procs.remove(&process);
+                    }
                     self.conts.entry(self.now + ns).or_default().push(Cont {
                         process: c.process,
                         work: exec_order,
                     });
                     return Ok(());
+                }
+                Stmt::Wait { cond, body } => {
+                    let condition = self.eval(cond);
+                    if condition.reduce_or().as_bool() == Some(true) {
+                        work.push(body);
+                    } else {
+                        let mut exec_order: Vec<&Stmt> = vec![&**body];
+                        exec_order.extend(work.iter().rev().copied());
+                        exec_order.reverse();
+                        let nets = expr_nets(cond)
+                            .into_iter()
+                            .filter(|net| *net < self.design.n_nets)
+                            .collect();
+                        let memories = expr_memories(cond)
+                            .into_iter()
+                            .filter(|memory| *memory < self.design.memories.len())
+                            .map(|memory| self.canonical_memory(memory))
+                            .collect();
+                        let continuation = Cont {
+                            process: c.process,
+                            work: exec_order,
+                        };
+                        if let Some(process) = c.process {
+                            self.busy_procs.remove(&process);
+                        }
+                        self.waiters.push(Waiter {
+                            condition: cond,
+                            nets,
+                            memories,
+                            continuation,
+                        });
+                        return Ok(());
+                    }
                 }
                 Stmt::Display { parts, args, .. } => {
                     let line = self.format_display(parts, args);
@@ -2115,6 +2198,10 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             }
         }
         Stmt::Delay { body, .. } => walk_stmt_memories(body, out),
+        Stmt::Wait { cond, body } => {
+            walk_expr_memories(cond, out);
+            walk_stmt_memories(body, out)
+        }
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
@@ -2203,6 +2290,7 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
                 collect_stmt_access(body, reads, writes);
             }
         }
+        Stmt::Wait { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
@@ -2266,6 +2354,10 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             }
         }
         Stmt::Delay { body, .. } => walk_stmt(body, out),
+        Stmt::Wait { cond, body } => {
+            walk_expr(cond, out);
+            walk_stmt(body, out)
+        }
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),
