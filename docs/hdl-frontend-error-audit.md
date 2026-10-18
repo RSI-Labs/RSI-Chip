@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-18 (local time)
-Repository state audited: `fix-digital` at `dfd400e` plus the uncommitted
-qualified-if/case changes currently in the worktree.
+Repository state audited: `fix-digital` at `4d1a3ea` plus the uncommitted
+instance-array changes currently in the worktree.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -46,10 +46,10 @@ All commands were run against the current worktree:
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 89 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 95 passed |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 96 passed |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 43 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 130.73 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 131.63 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -85,14 +85,14 @@ broader tool-flow percentage.
 | ID | Name | Initial requirement | Current state / error | Severity | Progress | Next required evidence |
 | --- | --- | --- | --- | --- | ---: | --- |
 | F-01 | Single authoritative lowering path | Every valid input accepted by the authoritative frontend must either lower through the same semantic model or fail closed with an actionable diagnostic. | `compile_files` validates with slang, preprocesses, then reparses with the bounded parser. `compile_files_via_ast` is the better path but supports only a subset. | P0 architecture | 35% | Make direct slang-AST lowering the only executable path, or formally prove the compatibility fallback for every construct. |
-| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, interfaces, many timing/assertion/checker forms, arrays of instances, and many system calls. | P0 | 27% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
+| F-02 | Direct AST language coverage | Direct lowering must cover slang’s elaborated SystemVerilog surface construct-by-construct. | Member/statement/expression matches reject dynamic types, classes, interfaces, many timing/assertion/checker forms, and many system calls. | P0 | 28% | Maintain a machine-checked construct matrix with one positive test and one fail-closed unsupported test per construct. |
 | F-03 | Complete structural/semantic post-check | Slang and repository IR must agree on declarations, types, statements, expressions, hierarchy, and behavior. | Current summary checks top, ports, declarations, assignment shapes, literals, simple width/signedness, processes, and instance inventory. Fingerprints fall back to `"?"` for legacy array expansion and dynamic packed lvalues. | P0 | 45% | Remove all `"?"` equivalence cases and add runtime differential simulation for each construct. |
 | F-04 | Full official UVM execution | Compile and execute the official Accellera UVM library and user environments, including phasing, objections, factory, configuration, sequences, TLM, callbacks, reports, and coverage. | Official UVM 2020.3.1 is only checked/elaborated with `UVM_NO_DPI`. Direct AST lowering rejects `ClassType`. The bounded frontend has a separate UVM-lite subset. | P0 | 10% executable; 0% for full official UVM execution | Run an official UVM example through phasing and objections and compare event/report/coverage outcomes. |
 | F-05 | Full data types | Support integral, real, string, event, chandle, enum, packed/unpacked aggregates, dynamic arrays, queues, associative arrays, classes, virtual interfaces, type parameters, and typed packages. | Direct path supports simple integral vectors, packed arrays, enums, packed structs/unions, bounded strings, sparse memories, scalar named events, and fixed-size event arrays with element triggers/waits/`.triggered`. It rejects real, ordinary unpacked aggregates, dynamic storage, queues, associative arrays, classes, arbitrary event expressions, chandle, and type parameters. | P0 | 31% | Add type-category tests with layout, assignment, comparison, and selected-member semantics. |
 | F-06 | Process timing and concurrency | Model delays, event controls, wait, fork/join modes, process lifetime, ordering regions, clocking, and nondeterminism. | Direct procedural lowering supports initial/always subsets, implicit sensitivity, scalar any-edge signals, event lists containing scalar any-edge/posedge/negedge signals, constant procedural delays, delay-driven always generators, delay-bearing `forever` loops, `wait` statements, blocking/nonblocking named-event triggers with scalar, edge-qualified event-list, and fixed event-array element waits, time-slot `.triggered`, ordered `wait_order`, lexical sequential named-block `disable`, hierarchical clocking-block event controls with scalar input snapshots, no-skew output drives, and constant `##n` cycle delays, runtime `repeat`, `while`, and `do...while` loops with `break`/`continue`, module-scope and initialized automatic procedure-local `for` loops, scalar force/release, and concurrent `fork` branches with `join`, `join_any`, `join_none`, and nested joins. It still rejects process cancellation/`disable fork`, named-process termination, jump propagation across fork boundaries, `disable` interaction with fork/forever, clocking skews/full reactive regions, procedural `deassign`, min:typ:max delays, intra-assignment delays, and general event expressions. | P0 | 69% | Golden scheduling traces for active/NBA regions, delays, event races, fork join modes, and clocking blocks. |
 | F-07 | Full temporal assertions and coverage | Support complete SVA sequences/properties, clocking, disable iff, recursion, local variables, matched/triggered, sampled-value functions, checkers, assumptions, and covergroups. | A bounded module-level temporal subset exists. Direct AST path rejects `ConcurrentAssertion`, checker instances, and covergroups; clocking blocks have only the scalar event/sampling/drive/cycle subset described in F-06. | P0 | 10% | Import an external SVA conformance suite and compare pass/fail/cover traces. |
 | F-08 | System task/function surface | Support display/write/read, files, strings, random/stochastic, time, assertions control, coverage, cast, and simulation control semantics. | Direct path supports only `$readmemh`, `$readmemb`, `$writememh`, and `$writememb`. Bounded path has `$display`/finish and string formatting subsets. File IO, random, full formatting, time scale, coverage controls, VPI/PLI, and DPI-C are absent/incomplete. | P0 | 15% | System-task matrix covering formats, unknowns, file handles, errors, and argument checking. |
-| F-09 | Interfaces, programs, checkers, and hierarchy | Support interfaces/modports, program blocks, checkers, generate hierarchy, arrays of instances, binds, configs, libraries, defparams, and primitives. | Direct path handles simple module instances and generated blocks. It rejects interface ports, instance arrays, primitive instances, checker instances, specify blocks, bind, and wildcard imports. Bounded path supports selected interface/module-array subsets but not all forms. | P0 | 25% | Multi-file hierarchy matrix, including port coercion, modports, arrays, config resolution, and generated instance identity. |
+| F-09 | Interfaces, programs, checkers, and hierarchy | Support interfaces/modports, program blocks, checkers, generate hierarchy, arrays of instances, binds, configs, libraries, defparams, and primitives. | Direct path handles simple module instances, generated blocks, and one-/multidimensional instance arrays up to 4,096 total elements. It rejects interface ports, primitive instances, checker instances, specify blocks, bind, and wildcard imports. Bounded path supports selected interface/module-array subsets but not all forms. | P0 | 28% | Multi-file hierarchy matrix, including port coercion, modports, arrays, config resolution, and generated instance identity. |
 | F-10 | Dynamic and unpacked storage semantics | Support dynamic allocation, queues, associative arrays, normal unpacked array variables/ports, array methods, assignment patterns, copies, bounds, and lifetime management. | Direct lowering treats unpacked declarations as sparse memories. Consequently ordinary small unpacked ports can be rejected unless they use the supported child-memory `inout` form. Dynamic arrays, queues, and associative arrays are rejected. | P0 | 25% | Runtime allocation/deletion/copy/size/bounds tests and normal unpacked input/output port tests. |
 | F-11 | Complete width/signedness/type propagation | Implement IEEE 1800 self-determined and context-determined expression rules, literal sizing, mixed-sign rules, casts, port coercion, and X/Z propagation. | Many basic tests pass and summary checks simple width/sign. Propagation is not a complete LRM implementation, and bounded constant evaluation is historically `i64`-oriented. | P0 | 45% | Differential expression corpus against an independent evaluator, including 64-bit boundaries, unsigned values above `i64::MAX`, mixed signs, shifts, casts, and context widths. |
 | F-12 | Net types, strength, and resolution | Preserve net kinds, implicit nets, strengths, tri-state resolution, multi-driver behavior, supply nets, and charge decay. | Basic `wire`/tri-state values work in tested cases. Direct lowering does not preserve a complete strength/net-resolution model; strength qualifiers are not a first-class IR property. | P1 correctness risk | 25% | Systematic multi-driver strength/tri-state truth tables and implicit-net diagnostics. |
@@ -121,7 +121,7 @@ versus bounded probe.
 | D-04 | Specify blocks | Rejects `SpecifyBlock`; no module path delay/check semantics. |
 | D-05 | Checker definitions/instances | Rejects checker instantiation. |
 | D-06 | Primitive/UDP instances | Rejects `PrimitiveInstance`. |
-| D-07 | Instance arrays | Rejects `InstanceArray`. |
+| D-07 | Full instance-array surface | One- and multidimensional elaborated instance arrays lower and simulate up to 4,096 total elements. Interface-port arrays and other unsupported child/member forms still fail closed. |
 | D-08 | Type parameters | Rejects `TypeParameter`. |
 | D-09 | Package imports | Rejects `WildcardImport`; package elaboration is incomplete. |
 | D-10 | Defparam | Unsupported and can fail through instance-connection lowering. |
@@ -240,7 +240,7 @@ commercial-scale RTL.
 | L-09 | Function-local scalar width | 1..=64 bits in bounded function elaboration. |
 | L-10 | Function/task loop unrolling | 256 iterations in direct inlining and bounded function elaboration. |
 | L-11 | Function unpacked arrays | Each dimension <=256, total <=4,096 elements/bits guards. |
-| L-12 | Module/interface instance-array dimensions | Each <=256; total <=4,096 where applicable. |
+| L-12 | Module/interface instance-array dimensions | Bounded path: each <=256, total <=4,096. Direct slang path: total <=4,096. |
 | L-13 | Bounded strings | 64 bytes / 512 bits, NUL padded. |
 | L-14 | Class composition nesting | 8 levels in bounded class elaboration. |
 | L-15 | Power operands | Direct path rejects operands wider than 64 bits. |

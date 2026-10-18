@@ -15,6 +15,72 @@ mod expressions;
 mod validation;
 use serde_json::Value;
 
+fn collect_instance_array_summary(
+    member: &Value,
+    prefix: &str,
+    instances: &mut Vec<SlangInstanceSummary>,
+) -> Result<(), String> {
+    let range = string_field(member, "range").unwrap_or_default();
+    let range = range.trim().trim_start_matches('[').trim_end_matches(']');
+    let Some((left, right)) = range.split_once(':') else {
+        return Err(format!("instance array has invalid range '{range}'"));
+    };
+    let left = left
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("instance array has invalid left bound '{left}'"))?;
+    let right = right
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("instance array has invalid right bound '{right}'"))?;
+    let indexes = if left <= right {
+        (left..=right).collect::<Vec<_>>()
+    } else {
+        (right..=left).rev().collect::<Vec<_>>()
+    };
+    let elements = member
+        .get("members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "slang AST InstanceArray has no members".to_string())?;
+    if indexes.len() != elements.len() {
+        return Err(format!(
+            "instance array range has {} indexes but {} elaborated elements",
+            indexes.len(),
+            elements.len()
+        ));
+    }
+    for (index, element) in indexes.into_iter().zip(elements) {
+        let instance_name = format!("{prefix}[{index}]");
+        match string_field(element, "kind").as_deref() {
+            Some("Instance") => {
+                let definition_name = element
+                    .get("body")
+                    .and_then(|body| string_field(body, "name"))
+                    .unwrap_or_default();
+                let parameters = element
+                    .get("body")
+                    .map(instance_parameters)
+                    .transpose()?
+                    .unwrap_or_default();
+                instances.push(SlangInstanceSummary {
+                    instance_name,
+                    definition_name,
+                    parameters,
+                });
+            }
+            Some("InstanceArray") => {
+                collect_instance_array_summary(element, &instance_name, instances)?;
+            }
+            other => {
+                return Err(format!(
+                    "instance array contains unsupported member kind {other:?}"
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
@@ -295,6 +361,12 @@ impl SlangAstSummary {
                     if let Some(span) = source_span(member) {
                         source_spans.insert(format!("instance:{instance_name}"), span);
                     }
+                }
+                "InstanceArray" => {
+                    let array_name = string_field(member, "name")
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| "slang AST InstanceArray has no name".to_string())?;
+                    collect_instance_array_summary(member, &array_name, &mut instances)?;
                 }
                 generate_kind if generate_kind.starts_with("GenerateBlock") => {
                     collect_generate_summary(

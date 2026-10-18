@@ -2355,6 +2355,104 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_flattens_instance_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-instance-array");
+    let source_path = root.join("instance_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(input logic a, output logic y);
+  assign y = ~a;
+endmodule
+
+module top #(parameter N = 2) (
+  input logic [N-1:0] a,
+  output logic [N-1:0] y
+);
+  child u[N] (.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write instance-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower instance array");
+    assert_eq!(design.hierarchy.len(), 3);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["top", "top.u[0]", "top.u[1]"]
+    );
+    let mut simulator = Simulator::new(&design).expect("create instance-array simulator");
+    for value in 0..4_u64 {
+        simulator
+            .set_input("a", &LogicWord::from_u64(2, value))
+            .unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(!value & 0b11));
+    }
+
+    let multidimensional_path = root.join("instance_array_2d.sv");
+    std::fs::write(
+        &multidimensional_path,
+        r#"
+module child(input logic a, output logic y);
+  assign y = ~a;
+endmodule
+
+module top (
+  input logic [3:0] a,
+  output logic [3:0] y
+);
+  child u[2][2] (.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write multidimensional instance-array source");
+    let multidimensional = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&multidimensional_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional instance array");
+    assert_eq!(multidimensional.hierarchy.len(), 5);
+    assert_eq!(
+        multidimensional
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "top",
+            "top.u[0][0]",
+            "top.u[0][1]",
+            "top.u[1][0]",
+            "top.u[1][1]"
+        ]
+    );
+    let mut multidimensional_simulator =
+        Simulator::new(&multidimensional).expect("create multidimensional array simulator");
+    multidimensional_simulator
+        .set_input("a", &LogicWord::from_u64(4, 0b1010))
+        .unwrap();
+    assert_eq!(
+        multidimensional_simulator.read("y").unwrap().to_u64(),
+        Some(0b0101)
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

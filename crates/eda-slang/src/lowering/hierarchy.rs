@@ -4,6 +4,8 @@ use super::declaration_name;
 use crate::ast_util::{expression_symbol, string_field};
 use eda_core::ir::Design;
 
+const MAX_INSTANCE_ARRAY_ELEMENTS: usize = 4096;
+
 pub(super) fn full_range(width: usize) -> eda_core::ir::Range {
     if width == 1 {
         eda_core::ir::Range::Bit(0)
@@ -39,6 +41,55 @@ pub(super) fn rewrite_hierarchy_path(path: &str, prefix: &str) -> String {
     } else {
         format!("{prefix}.{path}")
     }
+}
+
+fn instance_array_indexes(member: &serde_json::Value) -> Result<Vec<i64>, String> {
+    let range = string_field(member, "range").unwrap_or_default();
+    let range = range.trim().trim_start_matches('[').trim_end_matches(']');
+    let Some((left, right)) = range.split_once(':') else {
+        return Err(format!("instance array has invalid range '{range}'"));
+    };
+    let left = left
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("instance array has invalid left bound '{left}'"))?;
+    let right = right
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("instance array has invalid right bound '{right}'"))?;
+    if left <= right {
+        Ok((left..=right).collect())
+    } else {
+        Ok((right..=left).rev().collect())
+    }
+}
+
+fn count_instance_array_members(
+    member: &serde_json::Value,
+    count: &mut usize,
+) -> Result<(), String> {
+    let indexes = instance_array_indexes(member)?;
+    let elements = member
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "slang InstanceArray has no members".to_string())?;
+    if indexes.len() != elements.len() {
+        return Err(format!(
+            "instance array range has {} indexes but {} elaborated elements",
+            indexes.len(),
+            elements.len()
+        ));
+    }
+    for element in elements {
+        if string_field(element, "kind").as_deref() == Some("InstanceArray") {
+            count_instance_array_members(element, count)?;
+        } else {
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| "instance array element count overflows".to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn expression_parent_bits(
@@ -436,6 +487,61 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
 }
 
 impl super::SlangAstLowerer {
+    pub(super) fn lower_instance_array(
+        &mut self,
+        member: &serde_json::Value,
+    ) -> Result<(), String> {
+        let array_name = declaration_name(member, "InstanceArray")?;
+        let mut count = 0_usize;
+        count_instance_array_members(member, &mut count)?;
+        if count > MAX_INSTANCE_ARRAY_ELEMENTS {
+            return Err(format!(
+                "instance array '{array_name}' has {count} elements; the direct path supports at most {MAX_INSTANCE_ARRAY_ELEMENTS}"
+            ));
+        }
+        self.lower_instance_array_elements(member, &array_name)
+    }
+
+    fn lower_instance_array_elements(
+        &mut self,
+        member: &serde_json::Value,
+        prefix: &str,
+    ) -> Result<(), String> {
+        let indexes = instance_array_indexes(member)?;
+        let elements = member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "slang InstanceArray has no members".to_string())?;
+        if indexes.len() != elements.len() {
+            return Err(format!(
+                "instance array '{prefix}' range has {} indexes but {} elaborated elements",
+                indexes.len(),
+                elements.len()
+            ));
+        }
+        for (index, element) in indexes.into_iter().zip(elements) {
+            let element_name = format!("{prefix}[{index}]");
+            match string_field(element, "kind").as_deref() {
+                Some("Instance") => {
+                    let mut instance = element.clone();
+                    if let Some(name) = instance.get_mut("name") {
+                        *name = serde_json::Value::String(element_name);
+                    }
+                    self.lower_instance(&instance)?;
+                }
+                Some("InstanceArray") => {
+                    self.lower_instance_array_elements(element, &element_name)?;
+                }
+                other => {
+                    return Err(format!(
+                        "instance array '{prefix}' contains unsupported member kind {other:?}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_instance(&mut self, member: &serde_json::Value) -> Result<(), String> {
         let instance_name = declaration_name(member, "Instance")?;
         let scoped_instance_name = self
