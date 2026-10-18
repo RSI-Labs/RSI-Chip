@@ -417,6 +417,12 @@ pub enum Expr {
         e: Box<Expr>,
         upper: bool,
     },
+    /// Lexicographically compares two bounded ASCII strings.
+    StringCompare {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        ignore_case: bool,
+    },
 }
 
 impl Expr {
@@ -456,6 +462,7 @@ impl Expr {
             Expr::StringConcat { left, .. } => left.width(),
             Expr::StringGetByte { .. } => 8,
             Expr::StringCase { e, .. } => e.width(),
+            Expr::StringCompare { .. } => 32,
         }
     }
 
@@ -493,6 +500,7 @@ impl Expr {
             Expr::StringConcat { .. } => false,
             Expr::StringGetByte { .. } => false,
             Expr::StringCase { .. } => false,
+            Expr::StringCompare { .. } => true,
         }
     }
 }
@@ -1080,6 +1088,10 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             collect_memory_expr_reads(index, synchronous, accesses);
         }
         Expr::StringCase { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
+        Expr::StringCompare { left, right, .. } => {
+            collect_memory_expr_reads(left, synchronous, accesses);
+            collect_memory_expr_reads(right, synchronous, accesses);
+        }
     }
 }
 

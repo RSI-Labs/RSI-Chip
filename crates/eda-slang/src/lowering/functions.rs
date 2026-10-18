@@ -34,6 +34,9 @@ impl SlangAstLowerer {
             "len" => return self.lower_string_len(value),
             "getc" => return self.lower_string_getc(value),
             "toupper" | "tolower" => return self.lower_string_case(value, subroutine == "toupper"),
+            "compare" | "icompare" => {
+                return self.lower_string_compare(value, subroutine == "icompare")
+            }
             _ => {}
         }
         let subroutine_name = expression_symbol(value)
@@ -691,6 +694,27 @@ impl SlangAstLowerer {
             e: Box::new(receiver),
             upper,
         })
+    }
+
+    fn lower_string_compare(
+        &self,
+        value: &Value,
+        ignore_case: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "string compare call has no arguments".to_string())?;
+        if arguments.len() != 2 {
+            return Err("string compare expects two string receivers".into());
+        }
+        let left = arguments
+            .first()
+            .ok_or_else(|| "string compare call has no left receiver".to_string())?;
+        let right = arguments
+            .get(1)
+            .ok_or_else(|| "string compare call has no right receiver".to_string())?;
+        self.lower_string_compare_operands(left, right, ignore_case)
     }
 
     fn enum_method_definition(&self, value: &Value) -> Result<&super::AstEnumType, String> {

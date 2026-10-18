@@ -139,6 +139,9 @@ impl<'a> Synth<'a> {
             Expr::StringCase { .. } => {
                 return Err("bounded string case conversion is not synthesizable yet".into())
             }
+            Expr::StringCompare { .. } => {
+                return Err("bounded string comparison is not synthesizable yet".into())
+            }
         })
     }
 

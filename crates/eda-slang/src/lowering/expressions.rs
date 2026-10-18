@@ -343,6 +343,44 @@ impl super::SlangAstLowerer {
             "BinaryOp" => {
                 if matches!(
                     string_field(value, "op").as_deref(),
+                    Some(
+                        "Equality"
+                            | "Inequality"
+                            | "LessThan"
+                            | "LessThanEqual"
+                            | "GreaterThan"
+                            | "GreaterThanEqual"
+                    )
+                ) && value
+                    .get("left")
+                    .is_some_and(|left| string_field(left, "type").as_deref() == Some("string"))
+                {
+                    let left = value
+                        .get("left")
+                        .ok_or_else(|| "string comparison has no left operand".to_string())?;
+                    let right = value
+                        .get("right")
+                        .ok_or_else(|| "string comparison has no right operand".to_string())?;
+                    let comparison = self.lower_string_compare_operands(left, right, false)?;
+                    let comparison_operator = match string_field(value, "op").as_deref() {
+                        Some("Equality") => eda_core::ir::BinOp::Eq,
+                        Some("Inequality") => eda_core::ir::BinOp::Ne,
+                        Some("LessThan") => eda_core::ir::BinOp::Lt,
+                        Some("LessThanEqual") => eda_core::ir::BinOp::Le,
+                        Some("GreaterThan") => eda_core::ir::BinOp::Gt,
+                        _ => eda_core::ir::BinOp::Ge,
+                    };
+                    return Ok(Expr::Bin {
+                        op: comparison_operator,
+                        a: Box::new(comparison),
+                        b: Box::new(Expr::Signed {
+                            e: Box::new(Expr::Const(LogicWord::zero(32))),
+                            signed: true,
+                        }),
+                    });
+                }
+                if matches!(
+                    string_field(value, "op").as_deref(),
                     Some("WildcardEquality" | "WildcardInequality")
                 ) {
                     let equality = self.lower_wildcard_equality(value)?;
@@ -806,6 +844,26 @@ impl super::SlangAstLowerer {
             "operand": value,
         });
         self.lower_expression(&converted)
+    }
+
+    pub(super) fn lower_string_compare_operands(
+        &self,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        ignore_case: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        use eda_core::ir::Expr;
+
+        if string_field(left, "type").as_deref() != Some("string")
+            || string_field(right, "type").as_deref() != Some("string")
+        {
+            return Err("string comparison requires two string receivers".into());
+        }
+        Ok(Expr::StringCompare {
+            left: Box::new(self.lower_string_operand(left)?),
+            right: Box::new(self.lower_string_operand(right)?),
+            ignore_case,
+        })
     }
 
     fn lower_string_concat_pair(

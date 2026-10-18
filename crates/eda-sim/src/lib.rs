@@ -1440,6 +1440,18 @@ impl<'d> Simulator<'d> {
                 }
             }
             Expr::StringCase { e, upper } => change_string_case(&self.eval(e), *upper),
+            Expr::StringCompare {
+                left,
+                right,
+                ignore_case,
+            } => {
+                let left = self.eval(left);
+                let right = self.eval(right);
+                match compare_packed_strings(&left, &right, *ignore_case) {
+                    Some(result) => LogicWord::from_u64(32, result as u64),
+                    None => LogicWord::xes(32),
+                }
+            }
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -1664,6 +1676,34 @@ fn change_string_case(word: &LogicWord, upper: bool) -> LogicWord {
     LogicWord::from_bytes_le(word.width(), &bytes)
 }
 
+fn compare_packed_strings(left: &LogicWord, right: &LogicWord, ignore_case: bool) -> Option<i32> {
+    let left_length = ascii_string_length(left)?;
+    let right_length = ascii_string_length(right)?;
+    for byte in 0..left_length.min(right_length) {
+        let left_value = packed_string_byte(left, byte)
+            .to_u64()
+            .map(|value| value as u8)?;
+        let right_value = packed_string_byte(right, byte)
+            .to_u64()
+            .map(|value| value as u8)?;
+        let compared = if ignore_case {
+            left_value
+                .to_ascii_lowercase()
+                .cmp(&right_value.to_ascii_lowercase())
+        } else {
+            left_value.cmp(&right_value)
+        };
+        if compared != std::cmp::Ordering::Equal {
+            return Some(if compared == std::cmp::Ordering::Less {
+                -1
+            } else {
+                1
+            });
+        }
+    }
+    Some((left_length as i64 - right_length as i64).signum() as i32)
+}
+
 fn concat_packed_strings(
     left: &LogicWord,
     left_length: usize,
@@ -1762,6 +1802,10 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(index, out);
         }
         Expr::StringCase { e, .. } => walk_expr(e, out),
+        Expr::StringCompare { left, right, .. } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -1810,6 +1854,10 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(index, out);
         }
         Expr::StringCase { e, .. } => walk_expr_memories(e, out),
+        Expr::StringCompare { left, right, .. } => {
+            walk_expr_memories(left, out);
+            walk_expr_memories(right, out);
+        }
         Expr::MemoryReadPart {
             memory,
             indexes,

@@ -100,6 +100,10 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             remap_expression(index, offset);
         }
         Expr::StringCase { e, .. } => remap_expression(e, offset),
+        Expr::StringCompare { left, right, .. } => {
+            remap_expression(left, offset);
+            remap_expression(right, offset);
+        }
     }
 }
 
@@ -238,6 +242,10 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
             remap_expression_memory_ids(index, offset);
         }
         Expr::StringCase { e, .. } => remap_expression_memory_ids(e, offset),
+        Expr::StringCompare { left, right, .. } => {
+            remap_expression_memory_ids(left, offset);
+            remap_expression_memory_ids(right, offset);
+        }
     }
 }
 

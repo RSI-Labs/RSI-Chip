@@ -2918,6 +2918,8 @@ module strings(
   input string left,
   input string right,
   input string mixed,
+  input string same,
+  input string case_variant,
   input int byte_index,
   output string literal_value,
   output string joined,
@@ -2932,7 +2934,12 @@ module strings(
   output byte method_byte,
   output byte out_of_range,
   output string upper_value,
-  output string lower_value
+  output string lower_value,
+  output logic strings_equal,
+  output logic strings_less,
+  output int compare_result,
+  output int case_compare_result,
+  output int case_insensitive_compare_result
 );
   typedef enum logic [1:0] {
     A = 2'b00,
@@ -2958,6 +2965,11 @@ module strings(
   assign right_length = right.len();
   assign upper_value = mixed.toupper();
   assign lower_value = mixed.tolower();
+  assign strings_equal = mixed == same;
+  assign strings_less = mixed < right;
+  assign compare_result = mixed.compare(case_variant);
+  assign case_compare_result = mixed.compare(case_variant);
+  assign case_insensitive_compare_result = mixed.icompare(case_variant);
 endmodule
 "#,
     )
@@ -2971,7 +2983,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 10);
+    assert_eq!(design.assigns.len(), 15);
     assert_eq!(
         design
             .net_decls
@@ -2998,6 +3010,12 @@ endmodule
             .unwrap();
         simulator
             .set_input("mixed", &LogicWord::from_bytes_le(512, b"aBcD"))
+            .unwrap();
+        simulator
+            .set_input("same", &LogicWord::from_bytes_le(512, b"aBcD"))
+            .unwrap();
+        simulator
+            .set_input("case_variant", &LogicWord::from_bytes_le(512, b"AbCd"))
             .unwrap();
         simulator
             .set_input("byte_index", &LogicWord::from_u64(32, selector))
@@ -3077,6 +3095,20 @@ endmodule
                 .unwrap()
                 .to_ascii_string_nul_terminated(),
             "abcd"
+        );
+        assert_eq!(simulator.read("strings_equal").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("strings_less").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("compare_result").unwrap().to_u64(), Some(1));
+        assert_eq!(
+            simulator.read("case_compare_result").unwrap().to_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            simulator
+                .read("case_insensitive_compare_result")
+                .unwrap()
+                .to_u64(),
+            Some(0)
         );
     }
 }

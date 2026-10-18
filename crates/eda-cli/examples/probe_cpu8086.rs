@@ -31,6 +31,10 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
             expr_nets(index, out);
         }
         Expr::StringCase { e, .. } => expr_nets(e, out),
+        Expr::StringCompare { left, right, .. } => {
+            expr_nets(left, out);
+            expr_nets(right, out);
+        }
         Expr::MemoryRead { indexes, .. } => {
             indexes.iter().for_each(|e| expr_nets(e, out));
         }
