@@ -473,6 +473,48 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_timeunit_declarations() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-timeunit");
+    let source_path = root.join("timeunit.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module timeunit_probe(
+  output logic [63:0] elapsed
+);
+  timeunit 100ns;
+  timeprecision 1ps;
+  initial begin
+    #2;
+    elapsed = $time;
+    $printtimescale;
+  end
+endmodule
+"#,
+    )
+    .expect("write timeunit source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("timeunit_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower timeunit declarations");
+    assert_eq!(design.time_scale.precision_exponent, -12);
+
+    let mut simulator = Simulator::new(&design).expect("create timeunit simulator");
+    simulator.run_until(200_000).expect("run timeunit timeline");
+    assert_eq!(simulator.read("elapsed").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.take_displays(),
+        vec!["time unit = 100ns, time precision = 1ps\n"]
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -195,6 +195,28 @@ impl SlangAstLowerer {
         if task_name == "$timeformat" {
             return self.lower_timeformat_call(value).map(Some);
         }
+        if task_name == "$printtimescale" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err("$printtimescale does not take arguments".into());
+            }
+            return Ok(Some(eda_core::ir::Stmt::Display {
+                parts: vec![eda_core::ir::DispPart::Str(format!(
+                    "time unit = {}, time precision = {}\n",
+                    format_time_component(
+                        self.time_scale.unit_magnitude,
+                        self.time_scale.unit_exponent
+                    ),
+                    format_time_precision(self.time_scale.precision_exponent)
+                ))],
+                args: Vec::new(),
+                monitor: false,
+            }));
+        }
         if task_name == "putc" {
             return self.lower_string_putc(value).map(Some);
         }
@@ -1598,6 +1620,29 @@ fn timeformat_suffix(value: &Value) -> Result<String, String> {
             .ok_or_else(|| "timeformat suffix literal has no value".to_string());
     }
     Err("$timeformat suffix must be a string literal".into())
+}
+
+fn format_time_component(magnitude: u64, exponent: i8) -> String {
+    let unit = match exponent {
+        0 => "s",
+        -3 => "ms",
+        -6 => "us",
+        -9 => "ns",
+        -12 => "ps",
+        -15 => "fs",
+        _ => "s",
+    };
+    format!("{magnitude}{unit}")
+}
+
+fn format_time_precision(exponent: i8) -> String {
+    let exponent = i16::from(exponent);
+    let base = ((exponent - 2) / 3) * 3;
+    let remainder = exponent - base;
+    let magnitude = 10_u64
+        .checked_pow(u32::try_from(remainder).unwrap_or(u32::MAX))
+        .unwrap_or(1);
+    format_time_component(magnitude, i8::try_from(base).unwrap_or(-9))
 }
 
 fn constant_ast_i64(value: &Value) -> Result<i64, String> {
