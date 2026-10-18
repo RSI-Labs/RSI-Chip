@@ -833,6 +833,8 @@ impl super::SlangAstLowerer {
             clocking_variables: std::collections::BTreeMap::new(),
             interface_modport_symbols: std::collections::BTreeMap::new(),
             interface_modport_names: std::collections::BTreeMap::new(),
+            time_scale: super::body_time_scale(body),
+            global_time_precision: self.global_time_precision,
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),

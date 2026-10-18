@@ -1726,10 +1726,9 @@ impl<'d> Simulator<'d> {
             Some(value) => value,
             None => return "x".to_string(),
         };
-        // The repository scheduler currently uses nanosecond ticks as its
-        // canonical integral time representation.
-        const BASELINE_UNITS: i8 = -9;
-        let exponent = i16::from(BASELINE_UNITS) - i16::from(self.timeformat_units);
+        let baseline_units =
+            simulation_time_unit(argument).unwrap_or(self.design.time_scale.precision_exponent);
+        let exponent = i16::from(baseline_units) - i16::from(self.timeformat_units);
         let (numerator, denominator) = if exponent >= 0 {
             let scale = 10_u128
                 .checked_pow(u32::try_from(exponent).unwrap_or(u32::MAX))
@@ -2086,7 +2085,23 @@ impl<'d> Simulator<'d> {
                         .is_some_and(|time| *time == self.now),
                 )],
             },
-            Expr::SimulationTime { width, .. } => LogicWord::from_u64(*width, self.now),
+            Expr::SimulationTime {
+                width,
+                unit_exponent,
+                ..
+            } => {
+                let precision = i16::from(self.design.time_scale.precision_exponent);
+                let scale_exponent = i16::from(*unit_exponent) - precision;
+                let value = if scale_exponent <= 0 {
+                    self.now
+                } else {
+                    let scale = 10_u64
+                        .checked_pow(u32::try_from(scale_exponent).unwrap_or(u32::MAX))
+                        .unwrap_or(u64::MAX);
+                    self.now / scale
+                };
+                LogicWord::from_u64(*width, value)
+            }
             Expr::StringToRadix { e, radix } => {
                 let string = self.eval(e);
                 match parse_packed_string_radix(&string, *radix) {
@@ -2614,6 +2629,14 @@ fn expr_memories(e: &Expr) -> Vec<usize> {
     let mut out = Vec::new();
     walk_expr_memories(e, &mut out);
     out
+}
+
+fn simulation_time_unit(expression: &Expr) -> Option<i8> {
+    match expression {
+        Expr::SimulationTime { unit_exponent, .. } => Some(*unit_exponent),
+        Expr::Signed { e: operand, .. } => simulation_time_unit(operand),
+        _ => None,
+    }
 }
 
 fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {

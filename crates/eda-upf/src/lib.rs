@@ -1194,6 +1194,7 @@ mod tests {
         ];
         Design {
             name: "m".into(),
+            time_scale: Default::default(),
             net_decls,
             memories: Vec::new(),
             memory_connections: Vec::new(),

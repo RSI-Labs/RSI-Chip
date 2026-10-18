@@ -64,7 +64,10 @@ impl VcdWriter {
         let mut header_prefix = String::new();
         header_prefix.push_str("$date\n  today\n$end\n");
         header_prefix.push_str("$version\n  eda-sim 0.1\n$end\n");
-        header_prefix.push_str("$timescale 1ns $end\n");
+        header_prefix.push_str(&format!(
+            "$timescale 1{} $end\n",
+            vcd_time_unit(design.time_scale.precision_exponent)
+        ));
         header_prefix.push_str("$scope module top $end\n");
         for d in &decls {
             if d.width == 1 {
@@ -241,6 +244,17 @@ impl VcdWriter {
                 .push(vec![LogicValue::X; self.memory_decls[index].width]);
             let _ = value;
         }
+    }
+}
+
+fn vcd_time_unit(exponent: i8) -> &'static str {
+    match exponent {
+        0 => "s",
+        -3 => "ms",
+        -6 => "us",
+        -12 => "ps",
+        -15 => "fs",
+        _ => "ns",
     }
 }
 

@@ -42,11 +42,13 @@ impl SlangAstLowerer {
                 eda_core::ir::Expr::SimulationTime {
                     width: 64,
                     signed: true,
+                    unit_exponent: self.time_scale.normalized_unit_exponent(),
                 }
             } else {
                 eda_core::ir::Expr::SimulationTime {
                     width: 32,
                     signed: false,
+                    unit_exponent: self.time_scale.normalized_unit_exponent(),
                 }
             });
         }

@@ -20,6 +20,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
 
     Design {
         name: "sparse_memory".into(),
+        time_scale: Default::default(),
         net_decls: vec![NetDecl {
             name: "q".into(),
             width: 8,

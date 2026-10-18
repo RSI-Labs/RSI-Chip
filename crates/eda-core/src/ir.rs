@@ -433,6 +433,7 @@ pub enum Expr {
     SimulationTime {
         width: usize,
         signed: bool,
+        unit_exponent: i8,
     },
     /// Updates one byte in a bounded string. This is used only as the RHS of
     /// a whole-string assignment when lowering the void `putc()` method.
@@ -655,6 +656,7 @@ pub enum Stmt {
     },
     /// `#delay stmt`
     Delay {
+        /// Historical field name; the value is canonical simulation ticks.
         ns: u64,
         body: Box<Stmt>,
     },
@@ -819,13 +821,15 @@ pub struct HierarchicalPort {
 pub struct Assign {
     pub lv: LValue,
     pub e: Expr,
-    /// Net delay in ns (gate delay `assign #5 y = ...`).
+    /// Net delay in canonical simulation ticks (gate delay `assign #5 y = ...`).
     pub delay: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Design {
     pub name: String,
+    /// Canonical simulator tick precision as a decimal second exponent.
+    pub time_scale: TimeScale,
     pub net_decls: Vec<NetDecl>,
     pub memories: Vec<MemoryDecl>,
     pub memory_connections: Vec<MemoryConnection>,
@@ -840,6 +844,20 @@ pub struct Design {
     pub clocking_blocks: Vec<ClockingBlock>,
     /// Elaborated module instances retained after flattening.
     pub hierarchy: Vec<HierarchicalInstance>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeScale {
+    /// Decimal second exponent of one simulation tick; -9 means nanoseconds.
+    pub precision_exponent: i8,
+}
+
+impl Default for TimeScale {
+    fn default() -> Self {
+        Self {
+            precision_exponent: -9,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

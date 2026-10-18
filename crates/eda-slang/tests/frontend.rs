@@ -410,6 +410,69 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_preserves_module_timescales() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-module-timescales");
+    let top_path = root.join("timescale_top.sv");
+    let child_path = root.join("timescale_child.sv");
+    std::fs::write(
+        &top_path,
+        r#"
+`timescale 100ns/1ps
+module timescale_top(
+  input logic a,
+  output logic y,
+  output logic [63:0] top_time,
+  output logic [63:0] child_time
+);
+  time_probe child(.child_time(child_time));
+  assign #2 y = ~a;
+  initial #7 top_time = $time;
+endmodule
+"#,
+    )
+    .expect("write top timescale source");
+    std::fs::write(
+        &child_path,
+        r#"
+`timescale 1ps/1ps
+module time_probe(
+  output logic [63:0] child_time
+);
+  initial #3 child_time = $time;
+endmodule
+"#,
+    )
+    .expect("write child timescale source");
+    let files = [top_path, child_path];
+    let design = slang
+        .compile_files_via_ast(&files, Some("timescale_top"), &PreprocessOptions::default())
+        .expect("directly lower module timescales");
+    assert_eq!(design.time_scale.precision_exponent, -12);
+
+    let mut simulator = Simulator::new(&design).expect("create timescale simulator");
+    simulator.enable_vcd();
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 0))
+        .unwrap();
+    simulator.run_until(199_999).expect("run before top delay");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), None);
+    simulator.run_until(200_000).expect("run after top delay");
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("child_time").unwrap().to_u64(), Some(3));
+    simulator
+        .run_until(700_000)
+        .expect("run after top time capture");
+    assert_eq!(simulator.read("top_time").unwrap().to_u64(), Some(7));
+    assert!(simulator
+        .vcd()
+        .expect("timescale VCD output")
+        .contains("$timescale 1ps $end"));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -44,9 +44,9 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let start = json
         .find('{')
         .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
-    let root: serde_json::Value = serde_json::from_str(&json[start..])
+    let document: serde_json::Value = serde_json::from_str(&json[start..])
         .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
-    let design = root.get("design").unwrap_or(&root);
+    let design = document.get("design").unwrap_or(&document);
     let root = if string_field(design, "kind").as_deref() == Some("Root") {
         design
             .get("members")
@@ -66,6 +66,23 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let mut root = root.clone();
     normalize_instance_bodies(&mut root);
     normalize_detailed_types(&mut root);
+    let definition_time_scales: std::collections::BTreeMap<String, AstTimeScale> = document
+        .get("definitions")
+        .and_then(serde_json::Value::as_array)
+        .map(|definitions| collect_definition_time_scales(definitions))
+        .unwrap_or_default();
+    let global_time_precision = definition_time_scales
+        .values()
+        .map(|scale| scale.precision_exponent)
+        .min()
+        .unwrap_or(-9);
+    annotate_time_scales(&mut root, &definition_time_scales);
+    if let Some(fields) = root.as_object_mut() {
+        fields.insert(
+            "eda_global_time_precision".into(),
+            serde_json::Value::from(global_time_precision),
+        );
+    }
     let mut compilation_unit_members = Vec::new();
     let imported_package_addresses: std::collections::BTreeSet<u64> = root
         .get("body")
@@ -123,6 +140,160 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
 
 pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {
     SlangAstLowerer::lower(root)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct AstTimeScale {
+    unit_magnitude: u64,
+    unit_exponent: i8,
+    precision_exponent: i8,
+}
+
+impl Default for AstTimeScale {
+    fn default() -> Self {
+        Self {
+            unit_magnitude: 1,
+            unit_exponent: -9,
+            precision_exponent: -9,
+        }
+    }
+}
+
+impl AstTimeScale {
+    pub(super) fn normalized_unit_exponent(&self) -> i8 {
+        let zeros = match self.unit_magnitude {
+            1 => 0,
+            10 => 1,
+            100 => 2,
+            _ => 0,
+        };
+        self.unit_exponent.saturating_add(zeros)
+    }
+}
+
+pub(super) fn body_time_scale(body: &serde_json::Value) -> AstTimeScale {
+    AstTimeScale {
+        unit_magnitude: body
+            .get("eda_time_unit_magnitude")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1),
+        unit_exponent: body
+            .get("eda_time_unit_exponent")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i8::try_from(value).ok())
+            .unwrap_or(-9),
+        precision_exponent: body
+            .get("eda_time_precision_exponent")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i8::try_from(value).ok())
+            .unwrap_or(-9),
+    }
+}
+
+fn collect_definition_time_scales(
+    definitions: &[serde_json::Value],
+) -> std::collections::BTreeMap<String, AstTimeScale> {
+    let mut scales = std::collections::BTreeMap::new();
+    for definition in definitions {
+        let Some(address) = definition.get("addr").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(name) = string_field(definition, "name") else {
+            continue;
+        };
+        let scale = definition
+            .get("timeScale")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_time_scale)
+            .unwrap_or_default();
+        scales.insert(format!("{address} {name}"), scale);
+    }
+    scales
+}
+
+fn parse_time_scale(text: &str) -> Option<AstTimeScale> {
+    let (unit, precision) = text.split_once('/')?;
+    let (unit_magnitude, unit_exponent) = parse_time_component(unit.trim())?;
+    let (precision_magnitude, precision_base_exponent) = parse_time_component(precision.trim())?;
+    // Normalize 10ps/100ps precision into a single decimal exponent
+    // (`100ps == 10^-10s`) so the global precision can be compared directly.
+    let precision_exponent = precision_base_exponent + trailing_decimal_zeros(precision_magnitude)?;
+    let normalized_unit_exponent = unit_exponent + trailing_decimal_zeros(unit_magnitude)?;
+    if precision_exponent > normalized_unit_exponent {
+        return None;
+    }
+    Some(AstTimeScale {
+        unit_magnitude,
+        unit_exponent,
+        precision_exponent,
+    })
+}
+
+fn parse_time_component(text: &str) -> Option<(u64, i8)> {
+    let digits_end = text
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(text.len());
+    let magnitude = text.get(..digits_end)?.parse::<u64>().ok()?;
+    if !matches!(magnitude, 1 | 10 | 100) {
+        return None;
+    }
+    let exponent = match text.get(digits_end..)?.trim() {
+        "s" | "sec" | "seconds" => 0,
+        "ms" | "millisecond" | "milliseconds" => -3,
+        "us" | "microsecond" | "microseconds" => -6,
+        "ns" | "nanosecond" | "nanoseconds" => -9,
+        "ps" | "picosecond" | "picoseconds" => -12,
+        "fs" | "femtosecond" | "femtoseconds" => -15,
+        _ => return None,
+    };
+    Some((magnitude, exponent))
+}
+
+fn trailing_decimal_zeros(value: u64) -> Option<i8> {
+    match value {
+        1 => Some(0),
+        10 => Some(1),
+        100 => Some(2),
+        _ => None,
+    }
+}
+
+fn annotate_time_scales(
+    value: &mut serde_json::Value,
+    definitions: &std::collections::BTreeMap<String, AstTimeScale>,
+) {
+    if let Some(fields) = value.as_object_mut() {
+        let is_instance_body = fields
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "InstanceBody");
+        if is_instance_body {
+            if let Some(reference) = fields.get("definition").and_then(|value| value.as_str()) {
+                let scale = definitions.get(reference).copied().unwrap_or_default();
+                fields.insert(
+                    "eda_time_unit_magnitude".into(),
+                    serde_json::Value::from(scale.unit_magnitude),
+                );
+                fields.insert(
+                    "eda_time_unit_exponent".into(),
+                    serde_json::Value::from(scale.unit_exponent),
+                );
+                fields.insert(
+                    "eda_time_precision_exponent".into(),
+                    serde_json::Value::from(scale.precision_exponent),
+                );
+            }
+        }
+        for nested in fields.values_mut() {
+            annotate_time_scales(nested, definitions);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array_mut() {
+        for nested in values {
+            annotate_time_scales(nested, definitions);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -207,12 +378,30 @@ pub(super) struct SlangAstLowerer {
     clocking_variables: std::collections::BTreeMap<String, AstClockingVariable>,
     interface_modport_symbols: std::collections::BTreeMap<String, InterfaceModportSymbols>,
     interface_modport_names: std::collections::BTreeMap<String, String>,
+    time_scale: AstTimeScale,
+    global_time_precision: i8,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
 }
 
 impl SlangAstLowerer {
+    pub(super) fn scale_delay(&self, delay: u64) -> Result<u64, String> {
+        let exponent =
+            i16::from(self.time_scale.unit_exponent) - i16::from(self.global_time_precision);
+        if exponent < 0 {
+            return Err("module time unit is less precise than the global time precision".into());
+        }
+        let scale = 10_u64
+            .checked_pow(
+                u32::try_from(exponent).map_err(|_| "time scale exponent overflows".to_string())?,
+            )
+            .and_then(|scale| scale.checked_mul(self.time_scale.unit_magnitude))
+            .and_then(|scale| delay.checked_mul(scale))
+            .ok_or_else(|| "scaled delay overflows".to_string())?;
+        Ok(scale)
+    }
+
     fn collect_compilation_unit_members(&mut self, root: &serde_json::Value) -> Result<(), String> {
         let Some(members) = root
             .get("eda_compilation_unit_members")
@@ -267,6 +456,13 @@ impl SlangAstLowerer {
         let mut lowerer = Self {
             design: Design {
                 name: top_name.clone(),
+                time_scale: eda_core::ir::TimeScale {
+                    precision_exponent: root
+                        .get("eda_global_time_precision")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i8::try_from(value).ok())
+                        .unwrap_or(-9),
+                },
                 ..Design::default()
             },
             symbols: std::collections::BTreeMap::new(),
@@ -289,6 +485,12 @@ impl SlangAstLowerer {
             clocking_variables: std::collections::BTreeMap::new(),
             interface_modport_symbols: std::collections::BTreeMap::new(),
             interface_modport_names: std::collections::BTreeMap::new(),
+            time_scale: body_time_scale(body),
+            global_time_precision: root
+                .get("eda_global_time_precision")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| i8::try_from(value).ok())
+                .unwrap_or(-9),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),

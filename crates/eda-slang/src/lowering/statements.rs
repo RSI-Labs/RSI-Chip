@@ -231,7 +231,7 @@ impl SlangAstLowerer {
         &mut self,
         member: &serde_json::Value,
     ) -> Result<(), String> {
-        let delay = continuous_assignment_delay(member)?;
+        let delay = self.scale_delay(continuous_assignment_delay(member)?)?;
         let assignment = member
             .get("assignment")
             .ok_or_else(|| "ContinuousAssign has no assignment".to_string())?;
@@ -1465,8 +1465,9 @@ impl SlangAstLowerer {
         if string_field(expression, "kind").as_deref() == Some("MinTypMax") {
             return Err("min:typ:max delay controls are not supported".into());
         }
-        slang_constant_u64(expression)
-            .map_err(|_| "delay control must be an integer constant".to_string())
+        let delay = slang_constant_u64(expression)
+            .map_err(|_| "delay control must be an integer constant".to_string())?;
+        self.scale_delay(delay)
     }
 
     fn lower_event_trigger(
