@@ -172,7 +172,7 @@ fn feedback(s: &Stmt) -> bool {
                     expr_nets(finish, reads);
                 }
             }
-            Stmt::Display { .. } | Stmt::Finish => {}
+            Stmt::Display { .. } | Stmt::TimeFormat { .. } | Stmt::Finish => {}
         }
     }
     let mut r = HashSet::new();

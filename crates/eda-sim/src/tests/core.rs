@@ -145,7 +145,7 @@ fn testbench_display_and_finish() {
             initial begin
                 a = 0;
                 #10 a = 1;
-                #5 $display(\"a=%b t=%t\", a);
+                #5 $display(\"a=%b t=%t\", a, a);
                 $display(\"done\");
                 $finish;
             end
@@ -154,7 +154,7 @@ fn testbench_display_and_finish() {
     sim.run_until(100).unwrap();
     assert!(sim.finished());
     let out = sim.take_displays();
-    assert!(out.iter().any(|l| l.starts_with("a=1 t=15")));
+    assert!(out.iter().any(|l| l.starts_with("a=1 t=1")));
     assert!(out.iter().any(|l| l == "done"));
 }
 

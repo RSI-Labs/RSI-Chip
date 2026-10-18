@@ -907,7 +907,11 @@ impl<'a> Elaborator<'a> {
                 for part in fmt {
                     match part {
                         ast::DispPartSrc::Str(s) => parts.push(DispPartIR::Str(s.clone())),
-                        ast::DispPartSrc::Time => parts.push(DispPartIR::Time),
+                        ast::DispPartSrc::Time => {
+                            let argument = self.elab_expr(&args[args_ir.len()], env)?;
+                            args_ir.push(argument);
+                            parts.push(DispPartIR::Time(args_ir.len() - 1));
+                        }
                         ast::DispPartSrc::Arg(spec) => {
                             let argument = self.elab_expr(&args[args_ir.len()], env)?;
                             args_ir.push(argument);

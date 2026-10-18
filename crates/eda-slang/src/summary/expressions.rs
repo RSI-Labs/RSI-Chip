@@ -756,6 +756,7 @@ pub(crate) fn design_stmt_assignments(
         | Stmt::Assert { .. }
         | Stmt::Assume { .. }
         | Stmt::Cover { .. }
+        | Stmt::TimeFormat { .. }
         | Stmt::WriteMem { .. }
         | Stmt::Finish => {}
     }

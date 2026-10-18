@@ -190,6 +190,9 @@ impl SlangAstLowerer {
         ) {
             return self.lower_display_call(value, &task_name).map(Some);
         }
+        if task_name == "$timeformat" {
+            return self.lower_timeformat_call(value).map(Some);
+        }
         if task_name == "putc" {
             return self.lower_string_putc(value).map(Some);
         }
@@ -360,6 +363,64 @@ impl SlangAstLowerer {
             parts,
             args,
             monitor: task_name.starts_with("$monitor"),
+        })
+    }
+
+    fn lower_timeformat_call(&self, value: &Value) -> Result<eda_core::ir::Stmt, String> {
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() > 4 {
+            return Err("$timeformat supports at most four arguments".into());
+        }
+        let mut fields = [None, None, None, None];
+        for (argument, field) in arguments.iter().zip(fields.iter_mut()) {
+            *field = Some(argument);
+        }
+
+        let units = match fields[0] {
+            Some(argument) => {
+                let units = constant_ast_i64(argument)?;
+                if !matches!(units, -15 | -12 | -9 | -6 | -3 | 0) {
+                    return Err(format!("$timeformat has unsupported time unit '{units}'"));
+                }
+                i8::try_from(units)
+                    .map_err(|_| format!("$timeformat unit '{units}' is out of range"))?
+            }
+            None => -9,
+        };
+        let precision = match fields[1] {
+            Some(argument) => {
+                let precision = constant_ast_i64(argument)?;
+                if !(0..=9).contains(&precision) {
+                    return Err(format!(
+                        "$timeformat precision {precision} is outside 0..=9"
+                    ));
+                }
+                u8::try_from(precision)
+                    .map_err(|_| format!("$timeformat precision '{precision}' is invalid"))?
+            }
+            None => 0,
+        };
+        let suffix = match fields[2] {
+            Some(argument) => timeformat_suffix(argument)?,
+            None => String::new(),
+        };
+        let min_width = match fields[3] {
+            Some(argument) => {
+                let width = constant_ast_i64(argument)?;
+                usize::try_from(width)
+                    .map_err(|_| format!("$timeformat minimum width '{width}' is invalid"))?
+            }
+            None => 0,
+        };
+        Ok(eda_core::ir::Stmt::TimeFormat {
+            units,
+            precision,
+            suffix,
+            min_width,
         })
     }
 
@@ -1496,7 +1557,8 @@ fn parse_display_format(
             }
             't' | 'T' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Time);
+                parts.push(eda_core::ir::DispPart::Time(specifiers));
+                specifiers += 1;
             }
             other => {
                 return Err(format!(
@@ -1520,6 +1582,20 @@ fn push_display_literal(parts: &mut Vec<eda_core::ir::DispPart>, literal: &mut S
     if !literal.is_empty() {
         parts.push(eda_core::ir::DispPart::Str(std::mem::take(literal)));
     }
+}
+
+fn timeformat_suffix(value: &Value) -> Result<String, String> {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        let operand = value
+            .get("operand")
+            .ok_or_else(|| "timeformat suffix conversion has no operand".to_string())?;
+        return timeformat_suffix(operand);
+    }
+    if string_field(value, "kind").as_deref() == Some("StringLiteral") {
+        return string_field(value, "literal")
+            .ok_or_else(|| "timeformat suffix literal has no value".to_string());
+    }
+    Err("$timeformat suffix must be a string literal".into())
 }
 
 fn constant_ast_i64(value: &Value) -> Result<i64, String> {

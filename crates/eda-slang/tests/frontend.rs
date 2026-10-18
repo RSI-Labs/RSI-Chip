@@ -345,6 +345,71 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_timeformat_tasks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-timeformat");
+    let source_path = root.join("timeformat.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module timeformat(
+  input logic [3:0] a
+);
+  initial begin
+    #7;
+    $timeformat(-9, 3, " ns", 10);
+    $display("t=%t a=%h", $time, a);
+    $timeformat(-6, 3, " us", 0);
+    $display("t=%t a=%h", $time, a);
+  end
+endmodule
+"#,
+    )
+    .expect("write timeformat source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("timeformat"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower timeformat task");
+    let mut simulator = Simulator::new(&design).expect("create timeformat simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(4, 0xb))
+        .unwrap();
+    simulator.run_until(7).expect("run timeformat timeline");
+    assert_eq!(
+        simulator.take_displays(),
+        vec!["t=  7.000 ns a=b\n", "t=0.007 us a=b\n"]
+    );
+
+    let invalid_path = root.join("timeformat_invalid.sv");
+    std::fs::write(
+        &invalid_path,
+        r#"
+module timeformat_invalid;
+  initial $timeformat(-9, 10, " ns", 0);
+endmodule
+"#,
+    )
+    .expect("write invalid timeformat source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_path),
+            Some("timeformat_invalid"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported timeformat precision must fail closed");
+    assert!(
+        error.contains("$timeformat precision 10 is outside 0..=9"),
+        "unexpected timeformat error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

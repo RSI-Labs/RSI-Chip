@@ -566,8 +566,8 @@ pub enum DispPart {
     Str(String),
     /// Index into `Stmt::Display::args`.
     Arg(usize, char), // char is the conversion specifier: b/d/h
-    /// `$time` in a display format.
-    Time,
+    /// A time-typed display argument, indexed into `Stmt::Display::args`.
+    Time(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -711,6 +711,14 @@ pub enum Stmt {
         args: Vec<Expr>,
         /// `$monitor`: re-print whenever an argument changes.
         monitor: bool,
+    },
+    /// Configure `%t` formatting for subsequent display tasks.
+    TimeFormat {
+        /// Decimal exponent from seconds; for example `-9` means nanoseconds.
+        units: i8,
+        precision: u8,
+        suffix: String,
+        min_width: usize,
     },
     /// Immediate procedural assertion; a false/X/Z condition is an error.
     Assert {
@@ -1203,7 +1211,7 @@ fn collect_memory_accesses(
                 collect_memory_expr_reads(argument, synchronous, accesses);
             }
         }
-        Stmt::WriteMem { .. } | Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::WriteMem { .. } | Stmt::Finish => {}
     }
 }
 

@@ -57,6 +57,7 @@ impl<'a> Synth<'a> {
             Stmt::While { .. } => Err("while loops are not synthesizable".into()),
             Stmt::Repeat { .. } => Err("repeat loops are not synthesizable".into()),
             Stmt::Force { .. } => Err("force statements are not synthesizable".into()),
+            Stmt::TimeFormat { .. } => Err("time formatting is not synthesizable".into()),
             Stmt::Release { .. } => Err("release statements are not synthesizable".into()),
             Stmt::Break | Stmt::Continue => Err("loop jumps are not synthesizable".into()),
             Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {

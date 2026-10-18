@@ -420,6 +420,7 @@ fn parse_format(
                 't' | 'T' => {
                     parts.push(DispPartSrc::Str(std::mem::take(&mut lit)));
                     parts.push(DispPartSrc::Time);
+                    argi += 1;
                     continue;
                 }
                 _ => default_spec,

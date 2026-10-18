@@ -113,6 +113,10 @@ pub struct Simulator<'d> {
     assign_fanin: Vec<Vec<usize>>,
     proc_edges: Vec<Vec<(usize, Edge)>>,
     pub displays: Vec<String>,
+    timeformat_units: i8,
+    timeformat_precision: u8,
+    timeformat_suffix: String,
+    timeformat_min_width: usize,
     property_covers: BTreeMap<String, u64>,
     finished: bool,
     final_blocks_executed: bool,
@@ -231,6 +235,10 @@ impl<'d> Simulator<'d> {
             assign_fanin,
             proc_edges,
             displays: Vec::new(),
+            timeformat_units: -9,
+            timeformat_precision: 0,
+            timeformat_suffix: String::new(),
+            timeformat_min_width: 0,
             property_covers: BTreeMap::new(),
             finished: false,
             final_blocks_executed: false,
@@ -1460,9 +1468,10 @@ impl<'d> Simulator<'d> {
                 }
                 Stmt::Delay { ns, body } => {
                     // Wake at now+ns, run `body`, then the pending work.
-                    let mut exec_order: Vec<&Stmt> = vec![&**body];
-                    exec_order.extend(work.iter().rev().copied());
-                    exec_order.reverse(); // LIFO: pop() returns body first
+                    // `work` is LIFO, so cloning it and pushing the delay body
+                    // keeps the body first and then resumes the pending stack.
+                    let mut exec_order = work.clone();
+                    exec_order.push(body);
                     if let Some(process) = c.process {
                         self.busy_procs.remove(&process);
                     }
@@ -1595,6 +1604,17 @@ impl<'d> Simulator<'d> {
                     }
                     self.displays.push(line);
                 }
+                Stmt::TimeFormat {
+                    units,
+                    precision,
+                    suffix,
+                    min_width,
+                } => {
+                    self.timeformat_units = *units;
+                    self.timeformat_precision = *precision;
+                    self.timeformat_suffix = suffix.clone();
+                    self.timeformat_min_width = *min_width;
+                }
                 Stmt::Assert { cond, message } => {
                     let value = self.eval(cond);
                     if value.reduce_or().as_bool() != Some(true) {
@@ -1680,7 +1700,7 @@ impl<'d> Simulator<'d> {
         for p in parts {
             match p {
                 DispPart::Str(s) => out.push_str(s),
-                DispPart::Time => out.push_str(&self.now.to_string()),
+                DispPart::Time(index) => out.push_str(&self.format_time_value(&args[*index])),
                 DispPart::Arg(i, spec) => {
                     let v = self.eval(&args[*i]);
                     match spec {
@@ -1699,6 +1719,54 @@ impl<'d> Simulator<'d> {
             }
         }
         out
+    }
+
+    fn format_time_value(&self, argument: &Expr) -> String {
+        let ticks = match self.eval(argument).to_u64() {
+            Some(value) => value,
+            None => return "x".to_string(),
+        };
+        // The repository scheduler currently uses nanosecond ticks as its
+        // canonical integral time representation.
+        const BASELINE_UNITS: i8 = -9;
+        let exponent = i16::from(BASELINE_UNITS) - i16::from(self.timeformat_units);
+        let (numerator, denominator) = if exponent >= 0 {
+            let scale = 10_u128
+                .checked_pow(u32::try_from(exponent).unwrap_or(u32::MAX))
+                .unwrap_or(u128::MAX);
+            (u128::from(ticks).saturating_mul(scale), 1_u128)
+        } else {
+            let scale = 10_u128
+                .checked_pow(u32::try_from(-exponent).unwrap_or(u32::MAX))
+                .unwrap_or(u128::MAX);
+            (u128::from(ticks), scale)
+        };
+        let precision = u32::from(self.timeformat_precision);
+        let decimal_scale = 10_u128.checked_pow(precision).unwrap_or(u128::MAX);
+        let scaled_numerator = numerator.saturating_mul(decimal_scale);
+        let scaled_denominator = denominator;
+        let mut quotient = scaled_numerator / scaled_denominator;
+        let remainder = scaled_numerator % scaled_denominator;
+        if remainder * 2 >= scaled_denominator {
+            quotient = quotient.saturating_add(1);
+        }
+        let integer = quotient / decimal_scale.max(1);
+        let fraction = if precision == 0 {
+            0
+        } else {
+            quotient % decimal_scale
+        };
+        let mut text = if precision == 0 {
+            integer.to_string()
+        } else {
+            format!("{integer}.{fraction:0width$}", width = precision as usize)
+        };
+        text.push_str(&self.timeformat_suffix);
+        if text.len() < self.timeformat_min_width {
+            let padding = self.timeformat_min_width - text.len();
+            text = format!("{}{text}", " ".repeat(padding));
+        }
+        text
     }
 
     // ---------- expression evaluation ----------
@@ -2723,7 +2791,7 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr_memories(finish, out);
             }
         }
-        Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
     }
 }
 
@@ -2841,7 +2909,7 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
                 reads.extend(expr_nets(finish));
             }
         }
-        Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
     }
 }
 
@@ -2939,7 +3007,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr(finish, out);
             }
         }
-        Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
     }
 }
 

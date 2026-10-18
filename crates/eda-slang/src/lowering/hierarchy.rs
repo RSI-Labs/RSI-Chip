@@ -468,7 +468,7 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
                 remap_expression(finish, offset);
             }
         }
-        Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
     }
 }
 
@@ -672,7 +672,7 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
                 remap_expression_memory_ids(finish, offset);
             }
         }
-        Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
     }
 }
 
