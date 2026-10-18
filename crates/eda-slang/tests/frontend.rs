@@ -79,6 +79,7 @@ class Counter;
   function int get();
     return value;
   endfunction
+
 endclass
 
 module class_top(
@@ -265,6 +266,281 @@ endmodule
     assert_eq!(simulator.read("derived_sum").unwrap().to_u64(), Some(42));
     assert_eq!(simulator.read("derived_kind").unwrap().to_u64(), Some(2));
     assert_eq!(simulator.read("base_kind").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_class_handles() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-class");
+    let source_path = root.join("dynamic_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+
+  function void inc(int amount);
+    value = value + amount;
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+
+  virtual function int total();
+    return value;
+  endfunction
+endclass
+
+class Derived extends Base;
+  int extra;
+
+  function new(int v, int e);
+    super.new(v);
+    extra = e;
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+
+  virtual function int total();
+    return value + extra;
+  endfunction
+endclass
+
+module dynamic_class_top(
+  input int first_value_in,
+  input int first_extra_in,
+  input int second_value_in,
+  input int second_extra_in,
+  output int base_kind,
+  output int derived_kind,
+  output int dynamic_kind,
+  output int dynamic_get,
+  output int dynamic_total,
+  output int derived_write_visible,
+  output int base_write_visible,
+  output int method_write_visible,
+  output int transitive_write_visible,
+  output int second_total,
+  output int first_still_total
+);
+  Base base;
+  Base mirror;
+  Derived first;
+  Derived second;
+
+  initial begin
+    #1;
+    base = new(first_value_in);
+    first = new(first_value_in, first_extra_in);
+    second = new(second_value_in, second_extra_in);
+
+    base_kind = base.kind();
+    derived_kind = first.kind();
+
+    base = first;
+    mirror = base;
+    dynamic_kind = base.kind();
+    dynamic_get = base.get();
+    dynamic_total = base.total();
+
+    first.value = first_value_in + 10;
+    derived_write_visible = base.get();
+
+    base.value = first_value_in + 20;
+    base_write_visible = first.get();
+
+    first.inc(5);
+    method_write_visible = base.get();
+    transitive_write_visible = mirror.get();
+
+    first_still_total = first.total();
+    base = second;
+    second_total = base.total();
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic-class source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic class handles");
+    let mut simulator = Simulator::new(&design).expect("create dynamic-class simulator");
+    simulator
+        .set_input("first_value_in", &LogicWord::from_u64(32, 7))
+        .unwrap();
+    simulator
+        .set_input("first_extra_in", &LogicWord::from_u64(32, 35))
+        .unwrap();
+    simulator
+        .set_input("second_value_in", &LogicWord::from_u64(32, 11))
+        .unwrap();
+    simulator
+        .set_input("second_extra_in", &LogicWord::from_u64(32, 22))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run dynamic-class initial block");
+
+    assert_eq!(simulator.read("base_kind").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("derived_kind").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("dynamic_kind").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("dynamic_get").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.read("dynamic_total").unwrap().to_u64(), Some(42));
+    assert_eq!(
+        simulator.read("derived_write_visible").unwrap().to_u64(),
+        Some(17)
+    );
+    assert_eq!(
+        simulator.read("base_write_visible").unwrap().to_u64(),
+        Some(27)
+    );
+    assert_eq!(
+        simulator.read("method_write_visible").unwrap().to_u64(),
+        Some(32)
+    );
+    assert_eq!(
+        simulator.read("transitive_write_visible").unwrap().to_u64(),
+        Some(32)
+    );
+    assert_eq!(
+        simulator.read("first_still_total").unwrap().to_u64(),
+        Some(67)
+    );
+    assert_eq!(simulator.read("second_total").unwrap().to_u64(), Some(33));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_null_class_access() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-null-class");
+    let source_path = root.join("null_class.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  function int kind();
+    return 1;
+  endfunction
+endclass
+
+module null_class_top(output int result);
+  Base base;
+  initial begin
+    result = base.kind();
+  end
+endmodule
+"#,
+    )
+    .expect("write null-class source");
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("null_class_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("null class access must fail closed");
+    assert!(
+        error.contains("may be null; null object access is not supported"),
+        "unexpected null-class error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_null_class_handle_propagation() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-null-class-propagation");
+    let source_path = root.join("null_class_propagation.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  function int kind();
+    return 1;
+  endfunction
+endclass
+
+module null_class_propagation_top(output int result);
+  Base source;
+  Base target;
+  initial begin
+    #1;
+    target = source;
+    result = target.kind();
+  end
+endmodule
+"#,
+    )
+    .expect("write null-class propagation source");
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("null_class_propagation_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("null class handle propagation must fail closed");
+    assert!(
+        error.contains("null handle propagation is not supported"),
+        "unexpected null-propagation error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_class_property_shadowing() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-shadowing");
+    let source_path = root.join("class_shadowing.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  int value;
+endclass
+
+class Derived extends Base;
+  int value;
+endclass
+
+module class_shadowing_top;
+  Derived object;
+endmodule
+"#,
+    )
+    .expect("write class-shadowing source");
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("class_shadowing_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("class property shadowing must fail closed");
+    assert!(
+        error.contains("class property shadowing"),
+        "unexpected shadowing error: {error}"
+    );
 }
 
 #[test]

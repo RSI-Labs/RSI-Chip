@@ -15,6 +15,64 @@ mod expressions;
 mod validation;
 use serde_json::Value;
 
+fn collect_class_handle_names(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+    handles: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(fields) = value.as_object() {
+        let type_name = string_field(value, "type").unwrap_or_default();
+        let class_name = type_name.split_whitespace().next_back();
+        if class_type_is_selected(value, class_name, class_types) {
+            if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
+                handles.insert(name);
+            } else if let Some(symbol) = string_field(value, "symbol") {
+                if let Some(name) = symbol.split_whitespace().next_back() {
+                    handles.insert(name.to_string());
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_class_handle_names(nested, class_types, handles);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_handle_names(nested, class_types, handles);
+        }
+    }
+}
+
+fn collect_class_type_names(value: &Value, class_types: &mut std::collections::BTreeSet<String>) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            if let Some(name) = string_field(value, "name") {
+                class_types.insert(name);
+            }
+        }
+        for nested in fields.values() {
+            collect_class_type_names(nested, class_types);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_type_names(nested, class_types);
+        }
+    }
+}
+
+fn class_type_is_selected(
+    value: &Value,
+    class_name: Option<&str>,
+    class_types: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(class_name) = class_name else {
+        return false;
+    };
+    matches!(
+        string_field(value, "kind").as_deref(),
+        Some("Net" | "Variable" | "Port" | "NamedValue" | "HierarchicalValue")
+    ) && class_types.contains(class_name)
+}
+
 fn collect_instance_array_summary(
     member: &Value,
     prefix: &str,
@@ -192,9 +250,9 @@ impl SlangAstSummary {
         let start = json
             .find('{')
             .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
-        let root: Value = serde_json::from_str(&json[start..])
+        let document: Value = serde_json::from_str(&json[start..])
             .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
-        let root = root.get("design").unwrap_or(&root);
+        let root = document.get("design").unwrap_or(&document);
         let root = if string_field(root, "kind").as_deref() == Some("Root") {
             root.get("members")
                 .and_then(Value::as_array)
@@ -232,6 +290,10 @@ impl SlangAstSummary {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let mut class_types = std::collections::BTreeSet::new();
+        collect_class_type_names(&document, &mut class_types);
+        let mut class_handles = std::collections::BTreeSet::new();
+        collect_class_handle_names(root, &class_types, &mut class_handles);
         let mut ports = Vec::new();
         let mut declarations = Vec::new();
         let mut parameters = Vec::new();
@@ -325,7 +387,7 @@ impl SlangAstSummary {
                 }
                 "ProceduralBlock" => {
                     let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
-                    let assignments = procedural_assignments(member);
+                    let assignments = procedural_assignments(member, &class_handles);
                     let assignment_targets = assignments
                         .iter()
                         .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -375,6 +437,7 @@ impl SlangAstSummary {
                         &mut instances,
                         &mut continuous_targets,
                         &mut procedural_blocks,
+                        &class_handles,
                     )?;
                 }
                 _ => {}

@@ -337,6 +337,12 @@ pub(super) struct AstLoweredSymbol {
     struct_fields: std::collections::BTreeMap<String, AstStructField>,
 }
 
+#[derive(Clone)]
+pub(super) struct DynamicClassSource {
+    pub(super) object_key: String,
+    pub(super) class_name: String,
+}
+
 pub(super) struct AstEventArraySelection {
     pub(super) base: usize,
     pub(super) dimensions: Vec<crate::types::AstPackedDimension>,
@@ -403,6 +409,14 @@ pub(super) struct SlangAstLowerer {
     class_objects:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, AstLoweredSymbol>>,
     class_object_types: std::collections::BTreeMap<String, String>,
+    dynamic_class_sources: std::collections::BTreeMap<String, Vec<DynamicClassSource>>,
+    initialized_class_objects: std::collections::BTreeSet<String>,
+    constructed_class_objects: std::collections::BTreeSet<String>,
+    class_object_tags: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    class_object_ids: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    class_object_serial: Option<AstLoweredSymbol>,
+    class_property_owners: std::collections::BTreeMap<usize, (String, String)>,
+    class_property_temps: std::collections::BTreeMap<(String, String), AstLoweredSymbol>,
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
     named_block_flags: std::collections::BTreeMap<String, usize>,
     named_disable_seen: bool,
@@ -522,6 +536,14 @@ impl SlangAstLowerer {
                 .unwrap_or_default(),
             class_objects: std::collections::BTreeMap::new(),
             class_object_types: std::collections::BTreeMap::new(),
+            dynamic_class_sources: std::collections::BTreeMap::new(),
+            initialized_class_objects: std::collections::BTreeSet::new(),
+            constructed_class_objects: std::collections::BTreeSet::new(),
+            class_object_tags: std::collections::BTreeMap::new(),
+            class_object_ids: std::collections::BTreeMap::new(),
+            class_object_serial: None,
+            class_property_owners: std::collections::BTreeMap::new(),
+            class_property_temps: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),
             named_block_flags: std::collections::BTreeMap::new(),
             named_disable_seen: false,
@@ -577,6 +599,8 @@ impl SlangAstLowerer {
         if string_field(body, "kind").as_deref() != Some("InstanceBody") {
             return Err("slang AST Instance body has unexpected kind".into());
         }
+        self.collect_dynamic_class_sources(body)?;
+        self.validate_dynamic_class_sources()?;
         let members = body
             .get("members")
             .and_then(serde_json::Value::as_array)

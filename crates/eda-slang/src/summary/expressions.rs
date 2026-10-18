@@ -138,7 +138,10 @@ fn is_dynamic_packed_lvalue(value: &Value) -> bool {
     }
 }
 
-pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummary> {
+pub(crate) fn procedural_assignments(
+    value: &Value,
+    class_handles: &std::collections::BTreeSet<String>,
+) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
     if string_field(value, "kind").as_deref() == Some("ProceduralAssign")
         && bool_field(value, "isForce")
@@ -155,7 +158,7 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
     }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
-            if !is_class_handle_target(left) {
+            if !is_class_handle_target(left, class_handles) {
                 let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
                 assignments.push(SlangAssignmentSummary {
                     target_names: expression_target_names(left),
@@ -169,7 +172,7 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
     match value {
         Value::Array(values) => values
             .iter()
-            .for_each(|nested| assignments.extend(procedural_assignments(nested))),
+            .for_each(|nested| assignments.extend(procedural_assignments(nested, class_handles))),
         Value::Object(fields) => {
             let is_assignment = string_field(value, "kind").as_deref() == Some("Assignment");
             fields
@@ -177,17 +180,32 @@ pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummar
                 .filter(|(field, _)| {
                     !(is_assignment && (field.as_str() == "left" || field.as_str() == "right"))
                 })
-                .for_each(|(_, nested)| assignments.extend(procedural_assignments(nested)));
+                .for_each(|(_, nested)| {
+                    assignments.extend(procedural_assignments(nested, class_handles))
+                });
         }
         _ => {}
     }
     assignments
 }
 
-fn is_class_handle_target(value: &Value) -> bool {
-    string_field(value, "type")
-        .and_then(|type_name| type_name.split_whitespace().next().map(str::to_string))
-        .is_some_and(|address| address.parse::<u64>().is_ok())
+fn is_class_handle_target(
+    value: &Value,
+    class_handles: &std::collections::BTreeSet<String>,
+) -> bool {
+    if string_field(value, "kind").as_deref() == Some("MemberAccess") {
+        return value
+            .get("value")
+            .map(|selected| is_class_handle_target(selected, class_handles))
+            .unwrap_or(false);
+    }
+    let Some(symbol) = string_field(value, "symbol") else {
+        return false;
+    };
+    let Some(handle_name) = symbol.split_whitespace().next_back() else {
+        return false;
+    };
+    class_handles.contains(handle_name)
 }
 
 pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Option<&'static str> {
@@ -340,6 +358,7 @@ pub(crate) fn collect_generate_summary(
     instances: &mut Vec<SlangInstanceSummary>,
     continuous_targets: &mut Vec<SlangContinuousTarget>,
     procedural_blocks: &mut Vec<SlangProceduralBlockSummary>,
+    class_handles: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     if string_field(value, "kind").as_deref() == Some("GenerateBlockArray") {
         let array_name = string_field(value, "name")
@@ -369,6 +388,7 @@ pub(crate) fn collect_generate_summary(
                 instances,
                 continuous_targets,
                 procedural_blocks,
+                class_handles,
             )?;
         }
         return Ok(());
@@ -446,7 +466,7 @@ pub(crate) fn collect_generate_summary(
             }
             "ProceduralBlock" => {
                 let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
-                let assignments = procedural_assignments(member);
+                let assignments = procedural_assignments(member, class_handles);
                 let assignment_targets = assignments
                     .iter()
                     .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -464,6 +484,7 @@ pub(crate) fn collect_generate_summary(
                     instances,
                     continuous_targets,
                     procedural_blocks,
+                    class_handles,
                 )?;
             }
             _ => {}

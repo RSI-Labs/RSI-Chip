@@ -1731,6 +1731,12 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_class_constructor(assignment)? {
             return Ok(statement);
         }
+        if let Some(statement) = self.lower_class_handle_assignment(assignment)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = self.lower_class_property_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
         if let Some(statement) = self.memory_struct_member_assignment(assignment, left, right)? {
             return Ok(statement);
         }

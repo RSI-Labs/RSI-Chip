@@ -63,9 +63,11 @@ strings and their checked methods, scalar and edge-qualified event lists,
 delays, waits, runtime loops, jumps, force/release, fork join modes, recursive
 hierarchy, parameterized interfaces, interface arrays and ports, packed and
 unpacked aggregates, simple non-virtual class objects with constructors,
-properties, methods, single-inheritance field flattening, constructor chaining, and
-receiver-resolved virtual calls, first-class sparse memories, memory file tasks, and
-top-level and child memory-port sharing. It records slang source spans and
+properties, methods, single-inheritance field flattening, constructor chaining,
+receiver-resolved virtual calls, direct base/derived handle reassignment with
+object-identity propagation, and runtime virtual dispatch through a base handle,
+first-class sparse memories, memory file tasks, and top-level and child
+memory-port sharing. It records slang source spans and
 validates lowered structure against the authoritative AST. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
