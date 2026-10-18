@@ -148,6 +148,9 @@ impl SlangAstLowerer {
             .next_back()
             .unwrap_or_default()
             .to_string();
+        if task_name == "$finish" {
+            return Ok(Some(eda_core::ir::Stmt::Finish));
+        }
         if task_name == "putc" {
             return self.lower_string_putc(value).map(Some);
         }

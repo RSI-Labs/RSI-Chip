@@ -162,12 +162,23 @@ impl SlangAstSummary {
         let expected_process_count = self
             .procedural_blocks
             .iter()
-            .filter(|block| block.procedure_kind != "Initial")
+            .filter(|block| !matches!(block.procedure_kind.as_str(), "Initial" | "Final"))
             .count();
         if design.processes.len() < expected_process_count {
             return Err(format!(
                 "bounded elaborator dropped procedural blocks: slang expects {expected_process_count}, internal has {}",
                 design.processes.len()
+            ) + &self.span_note("procedural:"));
+        }
+        let expected_final_count = self
+            .procedural_blocks
+            .iter()
+            .filter(|block| block.procedure_kind == "Final")
+            .count();
+        if design.final_blocks.len() < expected_final_count {
+            return Err(format!(
+                "bounded elaborator dropped final blocks: slang expects {expected_final_count}, internal has {}",
+                design.final_blocks.len()
             ) + &self.span_note("procedural:"));
         }
 
@@ -232,6 +243,16 @@ impl SlangAstSummary {
         }
         for process in &design.processes {
             for (name, shape) in design_stmt_assignments(design, &process.body) {
+                if !name.starts_with("__") && !name.contains('.') {
+                    actual_procedural_targets
+                        .entry(name)
+                        .or_default()
+                        .push(shape);
+                }
+            }
+        }
+        for final_block in &design.final_blocks {
+            for (name, shape) in design_stmt_assignments(design, final_block) {
                 if !name.starts_with("__") && !name.contains('.') {
                     actual_procedural_targets
                         .entry(name)

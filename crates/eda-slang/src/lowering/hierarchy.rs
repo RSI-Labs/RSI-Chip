@@ -782,6 +782,11 @@ impl super::SlangAstLowerer {
             remap_statement_memory_ids(&mut statement, memory_offset);
             self.design.initials.push(statement);
         }
+        for mut statement in child.design.final_blocks {
+            remap_statement(&mut statement, offset);
+            remap_statement_memory_ids(&mut statement, memory_offset);
+            self.design.final_blocks.push(statement);
+        }
         for mut process in child.design.processes {
             remap_process(&mut process, offset);
             remap_statement_memory_ids(&mut process.body, memory_offset);

@@ -279,6 +279,10 @@ impl SlangAstLowerer {
                 let statement = self.lower_statement(body)?;
                 self.design.initials.push(statement);
             }
+            "Final" => {
+                let statement = self.lower_statement(body)?;
+                self.design.final_blocks.push(statement);
+            }
             "AlwaysComb" => {
                 let statement = self.lower_statement(body)?;
                 self.design.processes.push(eda_core::ir::Process {

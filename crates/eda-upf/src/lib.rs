@@ -1221,6 +1221,7 @@ mod tests {
             assigns: Vec::new(),
             processes: Vec::new(),
             initials: Vec::new(),
+            final_blocks: Vec::new(),
             clocking_blocks: Vec::new(),
             hierarchy: Vec::new(),
         }

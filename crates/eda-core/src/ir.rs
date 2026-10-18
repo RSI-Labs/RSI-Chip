@@ -818,6 +818,8 @@ pub struct Design {
     pub assigns: Vec<Assign>,
     pub processes: Vec<Process>,
     pub initials: Vec<Stmt>,
+    /// SystemVerilog `final` procedures executed at simulation shutdown.
+    pub final_blocks: Vec<Stmt>,
     /// Clocking-block input snapshots used by the event scheduler.
     pub clocking_blocks: Vec<ClockingBlock>,
     /// Elaborated module instances retained after flattening.
@@ -897,6 +899,9 @@ impl Design {
         for process in &self.processes {
             let synchronous = process_is_edge_clocked(&process.sens);
             collect_memory_accesses(&process.body, synchronous, &memory_widths, &mut accesses);
+        }
+        for final_block in &self.final_blocks {
+            collect_memory_accesses(final_block, false, &memory_widths, &mut accesses);
         }
         for assignment in &self.assigns {
             collect_memory_expr_reads(&assignment.e, false, &mut accesses);

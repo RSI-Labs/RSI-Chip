@@ -115,6 +115,7 @@ pub struct Simulator<'d> {
     pub displays: Vec<String>,
     property_covers: BTreeMap<String, u64>,
     finished: bool,
+    final_blocks_executed: bool,
     print_stdout: bool,
     monitors: Vec<Monitor<'d>>,
     vcd: Option<VcdWriter>,
@@ -232,6 +233,7 @@ impl<'d> Simulator<'d> {
             displays: Vec::new(),
             property_covers: BTreeMap::new(),
             finished: false,
+            final_blocks_executed: false,
             print_stdout: false,
             monitors: mons
                 .into_iter()
@@ -1071,6 +1073,31 @@ impl<'d> Simulator<'d> {
             .map_err(|error| format!("cannot write memory file '{path}': {error}"))
     }
 
+    fn run_final_blocks(&mut self) -> Result<(), String> {
+        if self.final_blocks_executed {
+            return Ok(());
+        }
+        self.final_blocks_executed = true;
+        let final_blocks = self.final_blocks();
+        self.finished = false;
+        for body in final_blocks {
+            if self.cancellation.is_cancelled() {
+                return Err("simulation cancelled".into());
+            }
+            self.run_cont(Cont {
+                process: None,
+                join: None,
+                work: vec![body],
+            })?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn final_blocks(&self) -> &'d [Stmt] {
+        self.design.final_blocks.as_slice()
+    }
+
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
         let mut work = c.work;
         while let Some(s) = work.pop() {
@@ -1603,6 +1630,7 @@ impl<'d> Simulator<'d> {
                 }
                 Stmt::Finish => {
                     self.finished = true;
+                    self.run_final_blocks()?;
                     return Ok(());
                 }
             }

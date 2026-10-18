@@ -4836,6 +4836,57 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_final_blocks() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-final-blocks");
+    let source_path = root.join("final_blocks.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module final_blocks(
+  input logic go,
+  output logic y,
+  output logic finalized
+);
+  initial begin
+    y = 1'b0;
+    finalized = 1'b0;
+    wait (go);
+    #1 y = 1'b1;
+    $finish;
+  end
+
+  final begin
+    finalized = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write final-block source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("final_blocks"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower final blocks");
+    assert_eq!(design.final_blocks.len(), 1);
+    let mut simulator = Simulator::new(&design).expect("create final-block simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("finalized").unwrap().to_u64(), Some(0));
+    simulator.run_until(1).unwrap();
+    assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert!(simulator.finished());
+    assert_eq!(simulator.read("finalized").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
