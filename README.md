@@ -64,7 +64,7 @@ any-edge, posedge, and negedge signals, constant procedural delay statements,
 delay-driven always generators, delay-bearing `forever` loops, `wait`
 statements, runtime `repeat`, `while`, and `do...while` loops with
 `break`/`continue`, module-scope and initialized automatic procedure-local
-`for` loops, lexical named-block `disable`, blocking/nonblocking named-event triggers with scalar or edge-qualified event-list waits, fixed event arrays with element triggers/waits/`.triggered`,
+`for` loops, lexical named-block `disable`, clocking-block event controls, blocking/nonblocking named-event triggers with scalar or edge-qualified event-list waits, fixed event arrays with element triggers/waits/`.triggered`,
 and ordered `wait_order`, scalar `force`/`release`, and concurrent `fork` branches with `join`, `join_any`, and `join_none`, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated

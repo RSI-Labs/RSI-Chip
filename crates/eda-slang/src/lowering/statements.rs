@@ -2,10 +2,10 @@
 
 use super::expressions::{constant_i64, continuous_assignment_delay};
 use super::hierarchy::full_range;
-use super::SlangAstLowerer;
+use super::{declaration_name, SlangAstLowerer};
 use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
-    slang_constant_u64, string_field, with_source_span,
+    slang_constant_u64, string_field, usize_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
 use eda_core::logic::{LogicValue, LogicWord};
@@ -24,6 +24,70 @@ impl SlangAstLowerer {
                     Ok(())
                 }
             })
+    }
+
+    pub(super) fn lower_clocking_block(
+        &mut self,
+        member: &serde_json::Value,
+    ) -> Result<(), String> {
+        let name = declaration_name(member, "ClockingBlock")?;
+        let event = member
+            .get("event")
+            .ok_or_else(|| format!("clocking block '{name}' has no event"))?;
+        let watches = event_watches(&self.lower_sensitivity(event)?)?;
+        if watches.len() != 1 {
+            return Err(format!(
+                "clocking block '{name}' must have exactly one scalar event"
+            ));
+        }
+        let clock_watch = watches[0];
+        let variables = member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("clocking block '{name}' has no variables"))?;
+        for variable in variables {
+            if string_field(variable, "kind").as_deref() != Some("ClockVar") {
+                return Err(format!(
+                    "clocking block '{name}' contains an unsupported member kind"
+                ));
+            }
+            let variable_name = declaration_name(variable, "ClockVar")?;
+            match string_field(variable, "direction").as_deref() {
+                Some("In" | "Out") => {}
+                other => {
+                    return Err(format!(
+                        "clocking variable '{name}.{variable_name}' has unsupported direction {other:?}"
+                    ))
+                }
+            }
+            if variable.get("inputSkew").is_some() || variable.get("outputSkew").is_some() {
+                return Err(format!(
+                    "clocking variable '{name}.{variable_name}' skew is not supported"
+                ));
+            }
+            let initializer = variable.get("initializer").ok_or_else(|| {
+                format!("clocking variable '{name}.{variable_name}' has no target")
+            })?;
+            let target = self.lower_lvalue(initializer)?;
+            let type_name = string_field(variable, "type").unwrap_or_default();
+            let (shape, _, _) = self.net_type(&type_name)?;
+            if target.range.width() != shape.width {
+                return Err(format!(
+                    "clocking variable '{name}.{variable_name}' width {} does not match target width {}",
+                    shape.width,
+                    target.range.width()
+                ));
+            }
+            let address = usize_field(variable, "addr").ok_or_else(|| {
+                format!("clocking variable '{name}.{variable_name}' has no symbol address")
+            })?;
+            self.clocking_variables.insert(
+                format!("{address} {variable_name}"),
+                format!("{name}.{variable_name}"),
+            );
+        }
+        self.clocking_events.insert(name, clock_watch);
+        Ok(())
     }
 
     fn collect_named_block_flags_inner(
@@ -646,6 +710,17 @@ impl SlangAstLowerer {
                     let event = timing
                         .get("expr")
                         .ok_or_else(|| "event control has no event expression".to_string())?;
+                    if string_field(event, "kind").as_deref() == Some("ArbitrarySymbol") {
+                        let clocking_name = expression_symbol(event).ok_or_else(|| {
+                            "clocking-block event control has no symbol".to_string()
+                        })?;
+                        if let Some(watch) = self.clocking_events.get(&clocking_name).copied() {
+                            return Ok(Stmt::EventWait {
+                                watches: vec![watch],
+                                body: Box::new(self.lower_statement(body)?),
+                            });
+                        }
+                    }
                     if let Some(selection) = self.event_array_selection(event)? {
                         let edge = match string_field(timing, "edge").as_deref() {
                             Some("None") => eda_core::ir::EventEdge::Any,

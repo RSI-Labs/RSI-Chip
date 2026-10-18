@@ -3889,6 +3889,123 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_clocking_block_events() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-clocking-event");
+    let source_path = root.join("clocking_event.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module clocking_event(
+  input logic clk,
+  input logic go,
+  input logic sampled_input,
+  output logic done
+);
+  clocking cb @(posedge clk);
+    input sampled_input;
+  endclocking
+
+  initial begin
+    done = 1'b0;
+    wait (go);
+    @(cb);
+    done = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write clocking-event source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("clocking_event"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower clocking-block event");
+    let mut simulator = Simulator::new(&design).expect("create clocking simulator");
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("sampled_input", &LogicWord::zero(1))
+        .unwrap();
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(0));
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unsupported_clocking_semantics() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-clocking-unsupported");
+
+    let skew_path = root.join("clocking_skew.sv");
+    std::fs::write(
+        &skew_path,
+        r#"
+module clocking_skew(input logic clk, input logic a);
+  clocking cb @(posedge clk);
+    input #1step a;
+  endclocking
+endmodule
+"#,
+    )
+    .expect("write clocking-skew source");
+    let skew_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&skew_path),
+            Some("clocking_skew"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("clocking skew must fail closed");
+    assert!(
+        skew_error.contains("skew is not supported"),
+        "unexpected skew error: {skew_error}"
+    );
+
+    let access_path = root.join("clocking_access.sv");
+    std::fs::write(
+        &access_path,
+        r#"
+module clocking_access(
+  input logic clk,
+  input logic a,
+  output logic y
+);
+  clocking cb @(posedge clk);
+    input a;
+  endclocking
+  initial begin
+    @(cb);
+    y = cb.a;
+  end
+endmodule
+"#,
+    )
+    .expect("write clocking-access source");
+    let access_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&access_path),
+            Some("clocking_access"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("clocking-variable sampling must fail closed");
+    assert!(
+        access_error.contains("clocking variable 'cb.a' sampling/drive semantics"),
+        "unexpected access error: {access_error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

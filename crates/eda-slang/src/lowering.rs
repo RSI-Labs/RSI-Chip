@@ -100,6 +100,8 @@ pub(super) struct SlangAstLowerer {
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
     named_block_flags: std::collections::BTreeMap<String, usize>,
     named_disable_seen: bool,
+    clocking_events: std::collections::BTreeMap<String, eda_core::ir::EventWatch>,
+    clocking_variables: std::collections::BTreeMap<String, String>,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
@@ -132,6 +134,8 @@ impl SlangAstLowerer {
             enum_constants: std::collections::BTreeMap::new(),
             named_block_flags: std::collections::BTreeMap::new(),
             named_disable_seen: false,
+            clocking_events: std::collections::BTreeMap::new(),
+            clocking_variables: std::collections::BTreeMap::new(),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
@@ -222,6 +226,9 @@ impl SlangAstLowerer {
                 "TypeAlias" => {}
                 "EnumType" => {}
                 "StatementBlock" => {}
+                "ClockingBlock" => self
+                    .lower_clocking_block(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 // slang has already elaborated the loop; its per-iteration
                 // GenerateBlock members carry the materialized localparam.
                 "Genvar" => {}

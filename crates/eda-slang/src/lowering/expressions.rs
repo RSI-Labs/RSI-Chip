@@ -109,12 +109,24 @@ pub(super) fn constant_i64(value: &serde_json::Value) -> Result<i64, String> {
 }
 
 impl super::SlangAstLowerer {
+    fn reject_clocking_variable(&self, value: &serde_json::Value) -> Result<(), String> {
+        if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(name) = self.clocking_variables.get(&symbol_id) {
+                return Err(format!(
+                    "clocking variable '{name}' sampling/drive semantics are not supported"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn named_symbol(
         &self,
         value: &serde_json::Value,
     ) -> Result<AstLoweredSymbol, String> {
         let display_name =
             expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
+        self.reject_clocking_variable(value)?;
         if let Some(symbol_id) = expression_symbol_id(value) {
             if let Some(symbol) = self.local_symbols.get(&symbol_id) {
                 return Ok(symbol.clone());
@@ -213,6 +225,7 @@ impl super::SlangAstLowerer {
             "NamedValue" => {
                 let name = expression_symbol(value)
                     .ok_or_else(|| "expression has no symbol".to_string())?;
+                self.reject_clocking_variable(value)?;
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.local_symbols.get(&symbol_id) {
                         return Ok(Expr::Ref {
