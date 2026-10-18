@@ -69,6 +69,14 @@ pub(super) struct AstClockingVariable {
     pub(super) symbol: AstLoweredSymbol,
 }
 
+pub(super) struct AstInterfaceModportSymbol {
+    pub(super) direction: eda_core::ir::Dir,
+    pub(super) symbol: AstLoweredSymbol,
+}
+
+pub(super) type InterfaceModportSymbols =
+    std::collections::BTreeMap<String, AstInterfaceModportSymbol>;
+
 #[derive(Clone, Copy)]
 struct AstStructField {
     offset: usize,
@@ -96,6 +104,7 @@ pub(super) struct SlangAstLowerer {
     design: Design,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     local_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
+    external_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     local_initializers: std::collections::BTreeMap<String, serde_json::Value>,
     local_blocks: std::collections::BTreeMap<String, Vec<String>>,
     constants: std::collections::BTreeMap<String, LogicWord>,
@@ -108,6 +117,7 @@ pub(super) struct SlangAstLowerer {
     clocking_events: std::collections::BTreeMap<String, eda_core::ir::EventWatch>,
     default_clocking_event: Option<eda_core::ir::EventWatch>,
     clocking_variables: std::collections::BTreeMap<String, AstClockingVariable>,
+    interface_modport_symbols: std::collections::BTreeMap<String, InterfaceModportSymbols>,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
     inline_stack: std::cell::RefCell<Vec<String>>,
@@ -131,6 +141,7 @@ impl SlangAstLowerer {
             },
             symbols: std::collections::BTreeMap::new(),
             local_symbols: std::collections::BTreeMap::new(),
+            external_symbols: std::collections::BTreeMap::new(),
             local_initializers: std::collections::BTreeMap::new(),
             local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
@@ -143,6 +154,7 @@ impl SlangAstLowerer {
             clocking_events: std::collections::BTreeMap::new(),
             default_clocking_event: None,
             clocking_variables: std::collections::BTreeMap::new(),
+            interface_modport_symbols: std::collections::BTreeMap::new(),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
@@ -214,6 +226,7 @@ impl SlangAstLowerer {
                 "Port" => self
                     .lower_port(member)
                     .map_err(|error| with_source_span(member, error))?,
+                "InterfacePort" => {}
                 "Net" | "Variable" => self
                     .lower_declaration(member)
                     .map_err(|error| with_source_span(member, error))?,
@@ -236,6 +249,7 @@ impl SlangAstLowerer {
                 "TypeAlias" => {}
                 "EnumType" => {}
                 "StatementBlock" => {}
+                "Modport" => {}
                 "ClockingBlock" => self
                     .lower_clocking_block(member)
                     .map_err(|error| with_source_span(member, error))?,

@@ -131,6 +131,11 @@ impl super::SlangAstLowerer {
         let display_name =
             expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
         if let Some(symbol_id) = expression_symbol_id(value) {
+            if let Some(symbol) = self.external_symbols.get(&symbol_id) {
+                return Ok(symbol.clone());
+            }
+        }
+        if let Some(symbol_id) = expression_symbol_id(value) {
             if let Some(variable) = self.clocking_variables.get(&symbol_id) {
                 if variable.direction == eda_core::ir::Dir::In {
                     return Err("clocking input variable cannot be assigned directly".into());
@@ -162,7 +167,7 @@ impl super::SlangAstLowerer {
         value: &serde_json::Value,
     ) -> Result<eda_core::ir::LValue, String> {
         match string_field(value, "kind").as_deref() {
-            Some("NamedValue") => {
+            Some("NamedValue" | "HierarchicalValue") => {
                 let symbol = self.named_symbol(value)?;
                 Ok(eda_core::ir::LValue {
                     net: symbol.base,
@@ -233,7 +238,7 @@ impl super::SlangAstLowerer {
         use eda_core::ir::{Expr, UnOp};
         let kind = string_field(value, "kind").unwrap_or_default();
         match kind.as_str() {
-            "NamedValue" => {
+            "NamedValue" | "HierarchicalValue" => {
                 let name = expression_symbol(value)
                     .ok_or_else(|| "expression has no symbol".to_string())?;
                 if let Some(symbol) = self.clocking_variable_symbol(value)? {
@@ -243,6 +248,16 @@ impl super::SlangAstLowerer {
                         range: full_range(symbol.width),
                         signed: symbol.signed,
                     });
+                }
+                if let Some(symbol_id) = expression_symbol_id(value) {
+                    if let Some(symbol) = self.external_symbols.get(&symbol_id) {
+                        return Ok(Expr::Ref {
+                            net: symbol.base,
+                            decl_width: symbol.width,
+                            range: full_range(symbol.width),
+                            signed: symbol.signed,
+                        });
+                    }
                 }
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.local_symbols.get(&symbol_id) {

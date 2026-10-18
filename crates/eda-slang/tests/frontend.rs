@@ -2510,6 +2510,81 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_interface_modports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-modport");
+    let source_path = root.join("interface_modport.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface bus_if(input logic clk);
+  logic valid;
+  logic ready = 1'b1;
+  modport src(input clk, ready, output valid);
+endinterface
+
+module producer(
+  bus_if.src bus,
+  input logic go,
+  output logic done
+);
+  assign bus.valid = go;
+  assign done = bus.ready;
+endmodule
+
+module interface_top(
+  input logic clk,
+  input logic go,
+  output logic valid,
+  output logic done
+);
+  bus_if bus(.clk(clk));
+  producer producer_u(.bus(bus), .go(go), .done(done));
+endmodule
+"#,
+    )
+    .expect("write interface-modport source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("interface_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower interface modports");
+    assert_eq!(design.hierarchy.len(), 3);
+    assert_eq!(
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "interface_top",
+            "interface_top.bus",
+            "interface_top.producer_u"
+        ]
+    );
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "bus.valid"));
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| declaration.name == "bus.ready"));
+
+    let mut simulator = Simulator::new(&design).expect("create interface simulator");
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("bus.valid").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -1,6 +1,6 @@
 //! Hierarchy flattening and IR offset-remapping helpers.
 
-use super::declaration_name;
+use super::{declaration_name, AstLoweredSymbol, InterfaceModportSymbols};
 use crate::ast_util::{expression_symbol, string_field};
 use eda_core::ir::Design;
 
@@ -90,6 +90,100 @@ fn count_instance_array_members(
         }
     }
     Ok(())
+}
+
+fn symbol_address(raw: &str) -> Result<u64, String> {
+    raw.split_whitespace()
+        .next()
+        .and_then(|address| address.parse::<u64>().ok())
+        .ok_or_else(|| format!("invalid slang symbol reference '{raw}'"))
+}
+
+fn interface_modport_key(interface_instance: &str, modport: &str) -> Result<String, String> {
+    Ok(format!(
+        "{}:{}",
+        symbol_address(interface_instance)?,
+        symbol_address(modport)?
+    ))
+}
+
+fn collect_interface_modport_symbols(
+    instance: &serde_json::Value,
+    body: &serde_json::Value,
+    child_symbols: &std::collections::BTreeMap<String, AstLoweredSymbol>,
+    child_offset: usize,
+) -> Result<std::collections::BTreeMap<String, InterfaceModportSymbols>, String> {
+    let mut result = std::collections::BTreeMap::new();
+    let empty_members = Vec::new();
+    let members = body
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty_members);
+    if !members
+        .iter()
+        .any(|member| string_field(member, "kind").as_deref() == Some("Modport"))
+    {
+        return Ok(result);
+    }
+    let instance_address = instance
+        .get("addr")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "interface instance has no symbol address".to_string())?;
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("Modport") {
+            continue;
+        }
+        let modport_name = string_field(member, "name").unwrap_or_default();
+        let modport_address = member
+            .get("addr")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("modport '{modport_name}' has no symbol address"))?;
+        let modport_key = format!("{instance_address}:{modport_address}");
+        let mut symbols = InterfaceModportSymbols::new();
+        for port in member
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            if string_field(port, "kind").as_deref() != Some("ModportPort") {
+                continue;
+            }
+            let port_name = string_field(port, "name").unwrap_or_default();
+            let internal = string_field(port, "internalSymbol")
+                .ok_or_else(|| format!("modport port '{port_name}' has no internal symbol"))?;
+            let internal_name = internal
+                .split_whitespace()
+                .next_back()
+                .ok_or_else(|| format!("modport port '{port_name}' has invalid internal symbol"))?;
+            let symbol = child_symbols
+                .get(internal_name)
+                .ok_or_else(|| format!("unknown interface signal '{internal_name}'"))?;
+            let port_address = port
+                .get("addr")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("modport port '{port_name}' has no symbol address"))?;
+            let direction = match string_field(port, "direction").as_deref() {
+                Some("In") => eda_core::ir::Dir::In,
+                Some("Out") => eda_core::ir::Dir::Out,
+                other => {
+                    return Err(format!(
+                        "modport port '{port_name}' has unsupported direction {other:?}"
+                    ))
+                }
+            };
+            let mut absolute = symbol.clone();
+            absolute.base += child_offset;
+            symbols.insert(
+                format!("{port_address} {port_name}"),
+                super::AstInterfaceModportSymbol {
+                    direction,
+                    symbol: absolute,
+                },
+            );
+        }
+        result.insert(modport_key, symbols);
+    }
+    Ok(result)
 }
 
 pub(super) fn expression_parent_bits(
@@ -555,10 +649,13 @@ impl super::SlangAstLowerer {
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
         let definition_name = string_field(body, "name").unwrap_or_default();
+        let child_offset = self.design.n_nets;
+        let mut interface_proxy_connections = Vec::new();
         let mut child = Self {
             design: Design::default(),
             symbols: std::collections::BTreeMap::new(),
             local_symbols: std::collections::BTreeMap::new(),
+            external_symbols: std::collections::BTreeMap::new(),
             local_initializers: std::collections::BTreeMap::new(),
             local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
@@ -571,13 +668,69 @@ impl super::SlangAstLowerer {
             clocking_events: std::collections::BTreeMap::new(),
             default_clocking_event: None,
             clocking_variables: std::collections::BTreeMap::new(),
+            interface_modport_symbols: std::collections::BTreeMap::new(),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
+        let empty_connections = Vec::new();
+        for connection in member
+            .get("connections")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_connections)
+        {
+            let (Some(interface_instance), Some(modport)) = (
+                connection
+                    .get("ifaceInstance")
+                    .and_then(serde_json::Value::as_str),
+                connection
+                    .get("modport")
+                    .and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let key = interface_modport_key(interface_instance, modport)?;
+            let Some(modport_symbols) = self.interface_modport_symbols.get(&key) else {
+                return Err(format!(
+                    "instance '{scoped_instance_name}' connects unknown interface/modport {interface_instance} {modport}"
+                ));
+            };
+            for (symbol_id, modport_symbol) in modport_symbols {
+                if modport_symbol.symbol.memory.is_some() {
+                    return Err("sparse-memory interface modports are not supported yet".into());
+                }
+                let port_name = symbol_id
+                    .split_whitespace()
+                    .next_back()
+                    .ok_or_else(|| "interface modport symbol has no name".to_string())?;
+                let proxy_base = child.design.n_nets;
+                child.design.n_nets += modport_symbol.symbol.width;
+                child.design.net_decls.push(eda_core::ir::NetDecl {
+                    name: format!("__interface_{port_name}"),
+                    width: modport_symbol.symbol.width,
+                    is_reg: true,
+                    is_signed: modport_symbol.symbol.signed,
+                    base: proxy_base,
+                });
+                let mut proxy = modport_symbol.symbol.clone();
+                proxy.base = proxy_base;
+                child
+                    .external_symbols
+                    .insert(symbol_id.clone(), proxy.clone());
+                interface_proxy_connections.push((
+                    modport_symbol.direction,
+                    modport_symbol.symbol.clone(),
+                    proxy,
+                ));
+            }
+        }
         child.lower_body(body)?;
 
-        let offset = self.design.n_nets;
+        let interface_modports =
+            collect_interface_modport_symbols(member, body, &child.symbols, child_offset)?;
+        self.interface_modport_symbols.extend(interface_modports);
+
+        let offset = child_offset;
         let memory_offset = self.design.memories.len();
         let child_net_start = offset;
         let child_ports = child.design.ports.clone();
@@ -617,6 +770,30 @@ impl super::SlangAstLowerer {
             remap_process(&mut process, offset);
             remap_statement_memory_ids(&mut process.body, memory_offset);
             self.design.processes.push(process);
+        }
+        for (direction, interface_symbol, proxy) in interface_proxy_connections {
+            let mut proxy = proxy;
+            proxy.base += offset;
+            let (target, source) = match direction {
+                eda_core::ir::Dir::Out => (interface_symbol, proxy),
+                eda_core::ir::Dir::In => (proxy, interface_symbol),
+            };
+            let target_lvalue = eda_core::ir::LValue {
+                net: target.base,
+                decl_width: target.width,
+                range: full_range(target.width),
+            };
+            let source_expression = eda_core::ir::Expr::Ref {
+                net: source.base,
+                decl_width: source.width,
+                range: full_range(source.width),
+                signed: source.signed,
+            };
+            self.design.assigns.push(eda_core::ir::Assign {
+                lv: target_lvalue,
+                e: source_expression,
+                delay: 0,
+            });
         }
         for mut clocking_block in child.design.clocking_blocks {
             clocking_block.name = format!("{scoped_instance_name}.{}", clocking_block.name);
@@ -661,6 +838,9 @@ impl super::SlangAstLowerer {
                 .get("port")
                 .and_then(|port| string_field(port, "name"))
                 .ok_or_else(|| "instance connection has no port".to_string())?;
+            if connection.get("ifaceInstance").is_some() {
+                continue;
+            }
             let Some(port) = child_ports.iter().find(|port| port.name == port_name) else {
                 return Err(format!(
                     "instance '{scoped_instance_name}' connects unknown child port '{port_name}'"
