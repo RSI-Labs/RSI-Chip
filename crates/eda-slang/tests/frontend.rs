@@ -2585,6 +2585,72 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_packed_interface_vectors() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-interface-vector");
+    let source_path = root.join("interface_vector.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+interface vector_if(input logic clk);
+  logic [7:0] outgoing;
+  logic [7:0] incoming = 8'h3c;
+  modport producer(input clk, incoming, output outgoing);
+endinterface
+
+module vector_producer(
+  vector_if.producer bus,
+  input logic increment,
+  output logic [7:0] captured
+);
+  assign bus.outgoing = bus.incoming + (increment ? 8'h10 : 8'h00);
+  assign captured = bus.incoming;
+endmodule
+
+module vector_interface_top(
+  input logic clk,
+  input logic increment,
+  output logic [7:0] outgoing,
+  output logic [7:0] captured
+);
+  vector_if bus(.clk(clk));
+  vector_producer producer_u(
+    .bus(bus),
+    .increment(increment),
+    .captured(captured)
+  );
+  assign outgoing = bus.outgoing;
+endmodule
+"#,
+    )
+    .expect("write packed-interface-vector source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("vector_interface_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower packed interface vectors");
+    let outgoing = design
+        .net_decls
+        .iter()
+        .find(|declaration| declaration.name == "bus.outgoing")
+        .expect("interface outgoing vector");
+    assert_eq!(outgoing.width, 8);
+
+    let mut simulator = Simulator::new(&design).expect("create interface-vector simulator");
+    simulator
+        .set_input("increment", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("bus.outgoing").unwrap().to_u64(), Some(0x4c));
+    assert_eq!(simulator.read("captured").unwrap().to_u64(), Some(0x3c));
+    assert_eq!(simulator.read("outgoing").unwrap().to_u64(), Some(0x4c));
+}
+
+#[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

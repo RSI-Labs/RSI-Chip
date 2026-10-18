@@ -107,13 +107,21 @@ fn interface_modport_key(interface_instance: &str, modport: &str) -> Result<Stri
     ))
 }
 
+struct InterfaceSymbols {
+    modports: std::collections::BTreeMap<String, InterfaceModportSymbols>,
+    signals: std::collections::BTreeMap<String, AstLoweredSymbol>,
+}
+
 fn collect_interface_modport_symbols(
     instance: &serde_json::Value,
     body: &serde_json::Value,
     child_symbols: &std::collections::BTreeMap<String, AstLoweredSymbol>,
     child_offset: usize,
-) -> Result<std::collections::BTreeMap<String, InterfaceModportSymbols>, String> {
-    let mut result = std::collections::BTreeMap::new();
+) -> Result<InterfaceSymbols, String> {
+    let mut result = InterfaceSymbols {
+        modports: std::collections::BTreeMap::new(),
+        signals: std::collections::BTreeMap::new(),
+    };
     let empty_members = Vec::new();
     let members = body
         .get("members")
@@ -140,10 +148,11 @@ fn collect_interface_modport_symbols(
             .ok_or_else(|| format!("modport '{modport_name}' has no symbol address"))?;
         let modport_key = format!("{instance_address}:{modport_address}");
         let mut symbols = InterfaceModportSymbols::new();
+        let empty_modport_ports = Vec::new();
         for port in member
             .get("members")
             .and_then(serde_json::Value::as_array)
-            .unwrap_or(&Vec::new())
+            .unwrap_or(&empty_modport_ports)
         {
             if string_field(port, "kind").as_deref() != Some("ModportPort") {
                 continue;
@@ -173,6 +182,7 @@ fn collect_interface_modport_symbols(
             };
             let mut absolute = symbol.clone();
             absolute.base += child_offset;
+            result.signals.insert(internal, absolute.clone());
             symbols.insert(
                 format!("{port_address} {port_name}"),
                 super::AstInterfaceModportSymbol {
@@ -181,7 +191,7 @@ fn collect_interface_modport_symbols(
                 },
             );
         }
-        result.insert(modport_key, symbols);
+        result.modports.insert(modport_key, symbols);
     }
     Ok(result)
 }
@@ -726,9 +736,11 @@ impl super::SlangAstLowerer {
         }
         child.lower_body(body)?;
 
-        let interface_modports =
+        let interface_symbols =
             collect_interface_modport_symbols(member, body, &child.symbols, child_offset)?;
-        self.interface_modport_symbols.extend(interface_modports);
+        self.interface_modport_symbols
+            .extend(interface_symbols.modports);
+        self.external_symbols.extend(interface_symbols.signals);
 
         let offset = child_offset;
         let memory_offset = self.design.memories.len();
