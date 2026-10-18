@@ -3984,10 +3984,17 @@ endmodule
         skew_error.contains("skew is not supported"),
         "unexpected skew error: {skew_error}"
     );
+}
 
-    let drive_path = root.join("clocking_drive.sv");
+#[test]
+fn slang_ast_direct_lowering_supports_clocking_output_drives() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-clocking-drive");
+    let source_path = root.join("clocking_drive.sv");
     std::fs::write(
-        &drive_path,
+        &source_path,
         r#"
 module clocking_drive(
   input logic clk,
@@ -3998,25 +4005,34 @@ module clocking_drive(
     input a;
     output b;
   endclocking
+
   initial begin
+    b = 1'b0;
     @(cb);
-    cb.b <= 1'b1;
+    cb.b <= cb.a;
   end
 endmodule
 "#,
     )
     .expect("write clocking-drive source");
-    let drive_error = slang
+
+    let design = slang
         .compile_files_via_ast(
-            std::slice::from_ref(&drive_path),
+            std::slice::from_ref(&source_path),
             Some("clocking_drive"),
             &PreprocessOptions::default(),
         )
-        .expect_err("clocking output drives must fail closed");
-    assert!(
-        drive_error.contains("clocking output variable cannot be assigned directly"),
-        "unexpected drive error: {drive_error}"
-    );
+        .expect("directly lower clocking output drive");
+    let mut simulator = Simulator::new(&design).expect("create clocking-drive simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    assert_eq!(simulator.read("b").unwrap().to_u64(), Some(0));
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("b").unwrap().to_u64(), Some(1));
 }
 
 #[test]

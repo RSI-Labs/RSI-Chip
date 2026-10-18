@@ -132,14 +132,10 @@ impl super::SlangAstLowerer {
             expression_symbol(value).ok_or_else(|| "expression has no symbol".to_string())?;
         if let Some(symbol_id) = expression_symbol_id(value) {
             if let Some(variable) = self.clocking_variables.get(&symbol_id) {
-                return Err(format!(
-                    "clocking {} variable cannot be assigned directly",
-                    if variable.direction == eda_core::ir::Dir::In {
-                        "input"
-                    } else {
-                        "output"
-                    }
-                ));
+                if variable.direction == eda_core::ir::Dir::In {
+                    return Err("clocking input variable cannot be assigned directly".into());
+                }
+                return Ok(variable.symbol.clone());
             }
         }
         if let Some(symbol_id) = expression_symbol_id(value) {
