@@ -375,6 +375,20 @@ impl SlangAstLowerer {
                     body: Box::new(self.lower_statement(body)?),
                 })
             }
+            "DoWhileLoop" => {
+                let condition = statement
+                    .get("cond")
+                    .ok_or_else(|| "do-while loop has no condition".to_string())?;
+                let body = statement
+                    .get("body")
+                    .ok_or_else(|| "do-while loop has no body".to_string())?;
+                let first_execution = self.lower_statement(body)?;
+                let repeated_execution = Stmt::While {
+                    cond: self.lower_expression(condition)?,
+                    body: Box::new(self.lower_statement(body)?),
+                };
+                Ok(Stmt::Block(vec![first_execution, repeated_execution]))
+            }
             "ForLoop" => {
                 let initializers = statement
                     .get("initializers")

@@ -3899,6 +3899,57 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_runtime_do_while_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-do-while");
+    let source_path = root.join("do_while.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module do_while(
+  output logic [3:0] count,
+  output logic execute_once
+);
+  int i;
+  initial begin
+    i = 0;
+    count = 4'd0;
+    do begin
+      #1 count = count + 1;
+      i = i + 1;
+    end while (i < 3);
+
+    i = 100;
+    do begin
+      execute_once = 1'b1;
+    end while (i < 0);
+  end
+endmodule
+"#,
+    )
+    .expect("write do-while source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("do_while"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower do-while loops");
+    let mut simulator = Simulator::new(&design).expect("create do-while simulator");
+    simulator.run_until(0).unwrap();
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("execute_once").unwrap().to_u64(), None);
+    for expected in 1..=3 {
+        simulator.run_until(expected).unwrap();
+        assert_eq!(simulator.read("count").unwrap().to_u64(), Some(expected));
+    }
+    assert_eq!(simulator.read("execute_once").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
