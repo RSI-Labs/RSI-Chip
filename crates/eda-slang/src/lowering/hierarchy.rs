@@ -463,6 +463,7 @@ impl super::SlangAstLowerer {
             named_block_flags: std::collections::BTreeMap::new(),
             named_disable_seen: false,
             clocking_events: std::collections::BTreeMap::new(),
+            default_clocking_event: None,
             clocking_variables: std::collections::BTreeMap::new(),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),

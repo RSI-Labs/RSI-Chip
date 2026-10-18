@@ -41,10 +41,11 @@ impl SlangAstLowerer {
             ));
         }
         let clock_watch = watches[0];
+        let empty_members = Vec::new();
         let variables = member
             .get("members")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("clocking block '{name}' has no variables"))?;
+            .unwrap_or(&empty_members);
         let mut inputs = Vec::new();
         for variable in variables {
             if string_field(variable, "kind").as_deref() != Some("ClockVar") {
@@ -125,6 +126,9 @@ impl SlangAstLowerer {
             );
         }
         self.clocking_events.insert(name.clone(), clock_watch);
+        if bool_field(member, "isDefault") {
+            self.default_clocking_event = Some(clock_watch);
+        }
         self.design
             .clocking_blocks
             .push(eda_core::ir::ClockingBlock {
@@ -801,6 +805,36 @@ impl SlangAstLowerer {
                         }],
                         body: Box::new(self.lower_statement(body)?),
                     });
+                }
+                if string_field(timing, "kind").as_deref() == Some("CycleDelay") {
+                    let body = statement
+                        .get("stmt")
+                        .ok_or_else(|| "cycle delay has no statement".to_string())?;
+                    let expression = timing
+                        .get("expr")
+                        .ok_or_else(|| "cycle delay has no count".to_string())?;
+                    let cycles = slang_constant_u64(expression)
+                        .map_err(|_| "cycle delay count must be an integer constant".to_string())?;
+                    let Some(watch) = self.default_clocking_event else {
+                        return Err(
+                            "cycle delay requires a default clocking block".to_string()
+                        );
+                    };
+                    let body = self.lower_statement(body)?;
+                    if cycles == 0 {
+                        return Ok(body);
+                    }
+                    let wait = Stmt::EventWait {
+                        watches: vec![watch],
+                        body: Box::new(Stmt::Block(Vec::new())),
+                    };
+                    return Ok(Stmt::Block(vec![
+                        Stmt::Repeat {
+                            count: eda_core::ir::Expr::Const(LogicWord::from_u64(64, cycles)),
+                            body: Box::new(wait),
+                        },
+                        body,
+                    ]));
                 }
                 let delay = self.lower_delay_control(timing)?;
                 let body = statement

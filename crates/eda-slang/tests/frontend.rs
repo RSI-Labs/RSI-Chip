@@ -4036,6 +4036,75 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_clocking_cycle_delays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-clocking-cycle-delay");
+    let source_path = root.join("cycle_delay.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module cycle_delay(
+  input logic clk,
+  input logic go,
+  output logic zero_cycle,
+  output logic first,
+  output logic second
+);
+  default clocking cb @(posedge clk);
+  endclocking
+
+  initial begin
+    zero_cycle = 1'b0;
+    first = 1'b0;
+    second = 1'b0;
+    wait (go);
+    ##0 zero_cycle = 1'b1;
+    ##1 first = 1'b1;
+    ##2 second = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write clocking cycle-delay source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("cycle_delay"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower clocking cycle delays");
+    let mut simulator = Simulator::new(&design).expect("create cycle-delay simulator");
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("go", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("zero_cycle").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(0));
+
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(0));
+
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(0));
+
+    simulator.set_input("clk", &LogicWord::zero(1)).unwrap();
+    simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
