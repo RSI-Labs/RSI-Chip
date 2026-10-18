@@ -2,7 +2,7 @@
 
 use crate::ast_util::{
     bool_field, expression_symbol, expression_target_names, instance_parameters,
-    integer_literal_word, literal_word, named_constant_word, string_field,
+    integer_literal_word, literal_word, named_constant_word, slang_constant_u64, string_field,
 };
 use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
@@ -140,6 +140,14 @@ fn is_dynamic_packed_lvalue(value: &Value) -> bool {
 
 pub(crate) fn procedural_assignments(value: &Value) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
+    if string_field(value, "kind").as_deref() == Some("RepeatLoop")
+        && value
+            .get("count")
+            .and_then(|count| slang_constant_u64(count).ok())
+            .is_some_and(|count| count == 0)
+    {
+        return assignments;
+    }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
             let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);

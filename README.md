@@ -62,8 +62,8 @@ comparison, inclusive `substr` extraction, and radix conversions
 (`atoi`/`atohex`/`atobin`/`itoa`/`hextoa`/`bintoa`), scalar event lists with
 any-edge, posedge, and negedge signals, constant procedural delay statements,
 delay-driven always generators, delay-bearing `forever` loops, `wait`
-statements, and concurrent `fork` branches with `join`, `join_any`, and
-`join_none`, recursive
+statements, constant-count `repeat` loops, and concurrent `fork` branches with
+`join`, `join_any`, and `join_none`, recursive
 parameterized module hierarchy with port connections, generated members, and
 multidimensional sparse-memory whole/part-select operations, inline initializers, compile-time `$readmemh`/`$readmemb` loads with constant bounds and runtime `$writememh`/`$writememb` dumps, and direct inout child-memory sharing directly from slang's elaborated
 AST—without preprocessing and reparsing—and reports

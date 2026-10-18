@@ -3695,6 +3695,90 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_constant_repeat_loops() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-repeat");
+    let source_path = root.join("repeat.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module repeats(
+  input logic a,
+  output logic [3:0] y,
+  output logic [3:0] immediate,
+  output logic zero
+);
+  initial begin
+    y = 4'd0;
+    repeat (4) begin
+      #1 y = y + 1;
+    end
+  end
+
+  initial begin
+    immediate = 4'd0;
+    repeat (2) immediate = immediate + 1;
+
+    zero = 1'b0;
+    repeat (0) zero = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write repeat-loop source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("repeats"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower repeat loops");
+
+    let run_repeat = |design: &eda_core::ir::Design| {
+        let mut simulator = Simulator::new(design).expect("create repeat simulator");
+        simulator
+            .set_input("a", &LogicWord::from_u64(1, 1))
+            .unwrap();
+        assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
+        assert_eq!(simulator.read("immediate").unwrap().to_u64(), Some(2));
+        assert_eq!(simulator.read("zero").unwrap().to_u64(), Some(0));
+        for expected in 1..=4 {
+            simulator.run_until(expected).unwrap();
+            assert_eq!(simulator.read("y").unwrap().to_u64(), Some(expected));
+        }
+    };
+    // The bounded compatibility frontend still rejects module-level repeat
+    // loops; this regression intentionally covers the authoritative direct AST
+    // path until the legacy elaborator catches up.
+    run_repeat(&design);
+
+    let excessive_path = root.join("excessive.sv");
+    std::fs::write(
+        &excessive_path,
+        r#"
+module excessive(output logic y);
+  initial repeat (257) y = 1'b1;
+endmodule
+"#,
+    )
+    .expect("write excessive repeat source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&excessive_path),
+            Some("excessive"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("excessive repeat loops must fail closed");
+    assert!(
+        error.contains("exceeds the 256-iteration lowering limit"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_replication() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
