@@ -12691,6 +12691,103 @@ endmodule
 }
 
 #[test]
+fn slang_direct_component_registry_preserves_component_names() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-component-name-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ComponentNameTrace;
+  static string name = "";
+endclass
+
+class direct_named_component extends uvm_test;
+  `uvm_component_utils(direct_named_component)
+
+  function new(string name = "direct_named_component",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+class direct_named_component_env extends uvm_test;
+  `uvm_component_utils(direct_named_component_env)
+
+  direct_named_component component;
+
+  function new(string name = "direct_named_component_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    component = direct_named_component::type_id::create("leaf", this);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    ComponentNameTrace::name = component.get_name();
+  endtask
+endclass
+
+module official_uvm_component_name_probe(output string name);
+  initial begin
+    run_test("direct_named_component_env");
+    name = ComponentNameTrace::name;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM component-name wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_component_name_probe"),
+            &options,
+        )
+        .expect("directly lower a named component creation");
+    let mut simulator = Simulator::new(&design).expect("create named component simulator");
+    simulator
+        .run_until(0)
+        .expect("run the named component phase");
+    assert_eq!(
+        simulator
+            .read("name")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "leaf"
+    );
+}
+
+#[test]
 fn slang_direct_object_registry_applies_factory_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

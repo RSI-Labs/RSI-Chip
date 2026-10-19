@@ -791,6 +791,10 @@ impl SlangAstLowerer {
                 self.declare_class_internal_net(&format!("__class_tag_{synthetic_prefix}"), 32);
             let id = self
                 .declare_class_internal_net(&format!("__class_object_id_{synthetic_prefix}"), 64);
+            let object_name = self.declare_class_internal_net(
+                &format!("__class_object_name_{synthetic_prefix}"),
+                crate::types::STRING_WIDTH,
+            );
             self.design.initials.extend([
                 Stmt::Bl {
                     lv: class_lvalue(&tag),
@@ -803,6 +807,8 @@ impl SlangAstLowerer {
             ]);
             self.class_object_tags.insert(object_key.clone(), tag);
             self.class_object_ids.insert(object_key.clone(), id);
+            self.class_object_names
+                .insert(object_key.clone(), object_name);
             if let Some(index) = index {
                 array_elements.insert(index, object_key.clone());
             }
@@ -1018,6 +1024,30 @@ impl SlangAstLowerer {
             .class_object_serial
             .clone()
             .ok_or_else(|| "class object serial counter is missing".to_string())?;
+        let object_name = self
+            .class_object_names
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?;
+        let empty_constructor_arguments = Vec::new();
+        let constructor_arguments = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_constructor_arguments);
+        let name_statement = constructor_arguments
+            .first()
+            .filter(|actual| {
+                string_field(conversion_operand(actual).unwrap_or(actual), "kind").as_deref()
+                    == Some("StringLiteral")
+            })
+            .map(|actual| {
+                let expression = self.lower_expression(actual)?;
+                Ok::<Stmt, String>(Stmt::Bl {
+                    lv: class_lvalue(&object_name),
+                    e: expression,
+                })
+            })
+            .transpose()?;
         let initializer_statements = self.class_property_initializer_statements(&object_key)?;
         let body = if constructor_class != target_class {
             let Some((method, owner)) = self.resolve_class_method(&constructor_class, "new")?
@@ -1050,6 +1080,9 @@ impl SlangAstLowerer {
                 },
             },
         ];
+        if let Some(statement) = name_statement {
+            statements.push(statement);
+        }
         statements.extend(initializer_statements);
         statements.push(body);
         Ok(Some(Stmt::Block(statements)))
@@ -1298,6 +1331,10 @@ impl SlangAstLowerer {
                 self.class_object_ids[&target_key].clone(),
                 self.class_object_ids[&source_key].clone(),
             ),
+            (
+                self.class_object_names[&target_key].clone(),
+                self.class_object_names[&source_key].clone(),
+            ),
         ] {
             copy.push(Stmt::Bl {
                 lv: class_lvalue(&target_symbol),
@@ -1406,6 +1443,23 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         self.require_initialized_class_object(&object_key)?;
+        let method_name = string_field(call, "subroutine")
+            .and_then(|symbol| symbol.split_whitespace().next_back().map(str::to_string))
+            .unwrap_or_default();
+        let empty_call_arguments = Vec::new();
+        let call_arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_call_arguments);
+        if matches!(method_name.as_str(), "get_name" | "get_full_name") && call_arguments.is_empty()
+        {
+            let name = self
+                .class_object_names
+                .get(&object_key)
+                .cloned()
+                .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?;
+            return Ok(Some(class_expr(&name)));
+        }
         let Some((method, owner)) = self.class_method(&object_key, call)? else {
             return Ok(None);
         };
@@ -1568,6 +1622,10 @@ impl SlangAstLowerer {
             (
                 &self.class_object_ids[target_key],
                 &self.class_object_ids[source_key],
+            ),
+            (
+                &self.class_object_names[target_key],
+                &self.class_object_names[source_key],
             ),
         ] {
             statements.push(Stmt::Bl {
