@@ -155,6 +155,29 @@ impl SlangAstLowerer {
         Ok(object_key)
     }
 
+    fn class_object_depth(&self, object_key: &str) -> Result<u64, String> {
+        let mut current = object_key.to_string();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut depth = 1_u64;
+        loop {
+            if !visited.insert(current.clone()) {
+                return Err(format!("class parent cycle at '{current}'"));
+            }
+            let Some(parent) = self
+                .class_object_parent_keys
+                .borrow()
+                .get(&current)
+                .cloned()
+            else {
+                return Ok(depth);
+            };
+            depth = depth
+                .checked_add(1)
+                .ok_or_else(|| "class component depth overflows".to_string())?;
+            current = parent;
+        }
+    }
+
     fn dynamic_sources_for(&self, object_key: &str) -> Vec<super::DynamicClassSource> {
         let mut sources = self
             .dynamic_class_sources
@@ -1831,6 +1854,33 @@ impl SlangAstLowerer {
             return Ok(Some(Expr::Const(LogicWord::from_u64(
                 32,
                 child_count as u64,
+            ))));
+        }
+        if method_name == "get_depth" && call_arguments.is_empty() {
+            let depth = self.class_object_depth(&object_key)?;
+            return Ok(Some(Expr::Const(LogicWord::from_u64(32, depth))));
+        }
+        if method_name == "has_child" && call_arguments.len() == 1 {
+            let child_name = string_field(
+                conversion_operand(&call_arguments[0]).unwrap_or(&call_arguments[0]),
+                "literal",
+            )
+            .ok_or_else(|| "class has_child requires a string literal".to_string())?;
+            let has_child = self
+                .class_object_children
+                .borrow()
+                .get(&object_key)
+                .is_some_and(|children| {
+                    children.iter().any(|child| {
+                        self.class_object_declared_names
+                            .borrow()
+                            .get(child)
+                            .is_some_and(|name| *name == child_name)
+                    })
+                });
+            return Ok(Some(Expr::Const(LogicWord::from_u64(
+                32,
+                u64::from(has_child),
             ))));
         }
         let Some((method, owner)) = self.class_method(&object_key, call)? else {

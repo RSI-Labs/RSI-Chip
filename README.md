@@ -96,8 +96,9 @@ class properties, including compatible derived overrides with runtime virtual
 dispatch, preserved constructor names for `get_name()`, parent-qualified `get_full_name()`, and `get_parent()` identity comparison plus checked parent-handle cast.
 It also records prepared children by literal constructor name, rejects
 duplicate sibling names, supports `get_child(...)`, relative and leading-dot absolute `lookup(...)`, and
-checked component-handle recovery, rejects duplicate sibling names, and reports the
-prepared child count through `get_num_children()`.
+checked component-handle recovery, rejects duplicate sibling names, reports the prepared child count through
+`get_num_children()`, checks literal `has_child(...)`, and returns prepared
+hierarchy depth through `get_depth()`.
 This is still a bootstrap:
 the registry and timeout are finite, phase objects are synthetic, factory
 overrides are compile-time mappings, there is no parallel phase graph or
