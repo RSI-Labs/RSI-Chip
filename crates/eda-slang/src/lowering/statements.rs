@@ -487,14 +487,22 @@ impl SlangAstLowerer {
                         let body = statement
                             .get("body")
                             .ok_or_else(|| "fork block has no body".to_string())?;
-                        let list = body
-                            .get("list")
-                            .and_then(serde_json::Value::as_array)
-                            .ok_or_else(|| "fork block body is not a statement list".to_string())?;
-                        let branches = list
-                            .iter()
-                            .map(|branch| self.lower_statement(branch))
-                            .collect::<Result<Vec<_>, _>>()?;
+                        let branches = if let Some(list) =
+                            body.get("list").and_then(serde_json::Value::as_array)
+                        {
+                            list.iter()
+                                .map(|branch| self.lower_statement(branch))
+                                .collect::<Result<Vec<_>, _>>()?
+                        } else if matches!(
+                            string_field(body, "kind").as_deref(),
+                            Some("Timed" | "Block")
+                        ) {
+                            vec![self.lower_statement(body)?]
+                        } else {
+                            return Err(
+                                "fork block body is not a statement list".to_string()
+                            );
+                        };
                         let mode = match block_kind {
                             "JoinAny" => eda_core::ir::ForkMode::JoinAny,
                             "JoinNone" => eda_core::ir::ForkMode::JoinNone,

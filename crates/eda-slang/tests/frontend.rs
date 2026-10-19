@@ -12044,12 +12044,86 @@ endmodule
         .expect("directly lower an unbalanced objection test");
     let mut simulator = Simulator::new(&design).expect("create unbalanced objection simulator");
     let error = simulator
-        .run_until(1)
+        .run_until(1_001)
         .expect_err("undrained UVM objections must fail the simulation");
     assert!(
-        error.contains("run_phase completed with raised UVM objections"),
+        error.contains("objections did not drain before the UVM bootstrap timeout"),
         "{error}"
     );
+}
+
+#[test]
+fn slang_direct_run_test_waits_for_asynchronous_objection_drain() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-drain-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_drain_probe extends uvm_test;
+  function new(string name = "direct_drain_probe", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    fork
+      #2 phase.drop_objection(this);
+    join_none
+  endtask
+endclass
+
+module official_uvm_drain_probe(output int done);
+  initial begin
+    run_test("direct_drain_probe");
+    done = 1;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM objection drain wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_drain_probe"),
+            &options,
+        )
+        .expect("directly lower an asynchronous objection drain test");
+    let mut simulator = Simulator::new(&design).expect("create objection drain simulator");
+    simulator
+        .run_until(0)
+        .expect("run until the pending objection is observed");
+    assert!(
+        simulator.read("done").unwrap().to_u64().is_none(),
+        "run_test must not finish before the forked objection drains"
+    );
+    simulator
+        .run_until(2)
+        .expect("wait for the forked objection to drain");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
 }
 
 #[test]

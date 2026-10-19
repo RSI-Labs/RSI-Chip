@@ -19,6 +19,7 @@ const UVM_BOOTSTRAP_PHASES: [&str; 9] = [
     "report_phase",
     "final_phase",
 ];
+const UVM_BOOTSTRAP_OBJECTION_TIMEOUT: u64 = 1_000;
 
 impl SlangAstLowerer {
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
@@ -133,6 +134,10 @@ impl SlangAstLowerer {
                 &format!("__uvm_run_test_objections_{handle_address}"),
                 32,
             );
+            let objection_drained = self.declare_class_internal_net(
+                &format!("__uvm_objections_drained_{handle_address}"),
+                1,
+            );
             let owner_keys = self.uvm_objection_owner_keys(&object_key);
             let mut objection_owner_counts = BTreeMap::new();
             for (owner_index, owner_key) in owner_keys.into_iter().enumerate() {
@@ -155,6 +160,7 @@ impl SlangAstLowerer {
                     object_key,
                     phase_key,
                     objection_count,
+                    objection_drained,
                     objection_owner_counts,
                 },
             );
@@ -240,6 +246,10 @@ impl SlangAstLowerer {
             lv: class_lvalue(&run_object.objection_count),
             e: Expr::Const(LogicWord::zero(32)),
         });
+        statements.push(Stmt::Bl {
+            lv: class_lvalue(&run_object.objection_drained),
+            e: Expr::Const(LogicWord::zero(1)),
+        });
         for owner_count in run_object.objection_owner_counts.values() {
             statements.push(Stmt::Bl {
                 lv: class_lvalue(owner_count),
@@ -282,16 +292,12 @@ impl SlangAstLowerer {
             };
             statements.push(phase_statement);
             if phase_name == "run_phase" {
-                statements.push(Stmt::Assert {
-                    cond: Expr::Bin {
-                        op: BinOp::Eq,
-                        a: Box::new(class_expr(&run_object.objection_count)),
-                        b: Box::new(Expr::Const(LogicWord::zero(32))),
-                    },
-                    message: Some("run_phase completed with raised UVM objections".into()),
-                });
+                let mut drain_checks = vec![Stmt::Bl {
+                    lv: class_lvalue(&run_object.objection_drained),
+                    e: Expr::Const(LogicWord::from_u64(1, 1)),
+                }];
                 for owner_count in run_object.objection_owner_counts.values() {
-                    statements.push(Stmt::Assert {
+                    drain_checks.push(Stmt::Assert {
                         cond: Expr::Bin {
                             op: BinOp::Eq,
                             a: Box::new(class_expr(owner_count)),
@@ -302,6 +308,39 @@ impl SlangAstLowerer {
                         ),
                     });
                 }
+                let timeout_check = Stmt::If {
+                    c: Expr::Bin {
+                        op: BinOp::Eq,
+                        a: Box::new(class_expr(&run_object.objection_drained)),
+                        b: Box::new(Expr::Const(LogicWord::zero(1))),
+                    },
+                    t: Box::new(Stmt::Assert {
+                        cond: Expr::Const(LogicWord::zero(1)),
+                        message: Some(
+                            "run_phase objections did not drain before the UVM bootstrap timeout"
+                                .into(),
+                        ),
+                    }),
+                    f: None,
+                };
+                statements.push(Stmt::Fork {
+                    branches: vec![Stmt::Delay {
+                        ns: UVM_BOOTSTRAP_OBJECTION_TIMEOUT,
+                        body: Box::new(timeout_check),
+                    }],
+                    mode: eda_core::ir::ForkMode::JoinNone,
+                });
+                statements.push(Stmt::Delay {
+                    ns: 0,
+                    body: Box::new(Stmt::Wait {
+                        cond: Expr::Bin {
+                            op: BinOp::Eq,
+                            a: Box::new(class_expr(&run_object.objection_count)),
+                            b: Box::new(Expr::Const(LogicWord::zero(32))),
+                        },
+                        body: Box::new(Stmt::Block(drain_checks)),
+                    }),
+                });
             }
         }
         Ok(Some(Stmt::Block(statements)))

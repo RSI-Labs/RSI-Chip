@@ -85,10 +85,11 @@ overridden `run_phase` executed, and a minimal `run_test("class")` entry can
 construct such a class and sequentially execute its user-overridden common phase
 methods. Its bootstrap phase object supports constant-count
 `raise_objection`/`drop_objection` calls, per-owner counts selected by runtime
-object identity across prepared registry slots, and rejection of undrained or
-wrong-owner objections. This is still a bootstrap: the registry is finite and
-pre-elaborated, phase objects are synthetic, there is no parallel phase graph,
-and factories, TLM, and sequences are not yet executed.
+object identity across prepared registry slots, asynchronous drain before later
+phases, a fixed 1000-tick bootstrap timeout, and rejection of wrong-owner
+objections. This is still a bootstrap: the registry and timeout are finite,
+phase objects are synthetic, there is no parallel phase graph or callback-based
+objection scheduler, and factories, TLM, and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit
