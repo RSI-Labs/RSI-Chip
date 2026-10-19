@@ -12730,6 +12730,7 @@ class ComponentNameTrace;
   static int parent_identity = 0;
   static int child_match = 0;
   static int child_identity = 0;
+  static int child_count = 0;
 endclass
 
 class direct_named_component extends uvm_test;
@@ -12789,6 +12790,15 @@ class direct_named_component_env extends direct_named_base;
     end else begin
       ComponentNameTrace::parent_identity = parent_handle.identity();
     end
+    ComponentNameTrace::child_count = this.get_num_children();
+    if (this.get_child("leaf") == component) begin
+      ComponentNameTrace::child_match = 1;
+    end
+    if (!$cast(recovered_child, this.get_child("leaf"))) begin
+      ComponentNameTrace::child_identity = 0;
+    end else begin
+      ComponentNameTrace::child_identity = recovered_child.identity();
+    end
   endtask
 endclass
 
@@ -12798,7 +12808,8 @@ module official_uvm_component_name_probe(
   output int parent_match,
   output int parent_identity,
   output int child_match,
-  output int child_identity
+  output int child_identity,
+  output int child_count
 );
   initial begin
     run_test("direct_named_component_env");
@@ -12808,6 +12819,7 @@ module official_uvm_component_name_probe(
     parent_identity = ComponentNameTrace::parent_identity;
     child_match = ComponentNameTrace::child_match;
     child_identity = ComponentNameTrace::child_identity;
+    child_count = ComponentNameTrace::child_count;
   end
 endmodule
 "#,
@@ -12840,6 +12852,92 @@ endmodule
     );
     assert_eq!(simulator.read("parent_match").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("parent_identity").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("child_match").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("child_identity").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("child_count").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_direct_component_registry_rejects_duplicate_child_names() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-duplicate-child-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_duplicate_component extends uvm_test;
+  `uvm_component_utils(direct_duplicate_component)
+
+  function new(string name = "direct_duplicate_component",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+class direct_duplicate_env extends uvm_test;
+  `uvm_component_utils(direct_duplicate_env)
+
+  direct_duplicate_component first;
+  direct_duplicate_component second;
+
+  function new(string name = "direct_duplicate_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    first = direct_duplicate_component::type_id::create("same", this);
+    second = direct_duplicate_component::type_id::create("same", this);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_duplicate_child_probe;
+  initial begin
+    run_test("direct_duplicate_env");
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM duplicate-child wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_duplicate_child_probe"),
+            &options,
+        )
+        .expect_err("duplicate UVM child names must fail closed");
+    assert!(error.contains("duplicate child name 'same'"), "{error}");
 }
 
 #[test]

@@ -33,7 +33,7 @@ impl SlangAstLowerer {
     fn class_child_lookup_key(&self, call: &Value) -> Result<String, String> {
         let receiver = call
             .get("thisClass")
-            .ok_or_else(|| "class get_child_by_name call has no receiver".to_string())?;
+            .ok_or_else(|| "class get_child call has no receiver".to_string())?;
         let parent_key = self
             .class_object_key_for_value(receiver)?
             .or_else(|| {
@@ -43,22 +43,20 @@ impl SlangAstLowerer {
                     None
                 }
             })
-            .ok_or_else(|| {
-                "class get_child_by_name receiver is not a prepared class object".to_string()
-            })?;
+            .ok_or_else(|| "class get_child receiver is not a prepared class object".to_string())?;
         let empty_arguments = Vec::new();
         let arguments = call
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_arguments);
         if arguments.len() != 1 {
-            return Err("class get_child_by_name requires one string argument".into());
+            return Err("class get_child requires one string argument".into());
         }
         let requested_name = string_field(
             conversion_operand(&arguments[0]).unwrap_or(&arguments[0]),
             "literal",
         )
-        .ok_or_else(|| "class get_child_by_name requires a string literal".to_string())?;
+        .ok_or_else(|| "class get_child requires a string literal".to_string())?;
         let children = self
             .class_object_children
             .borrow()
@@ -1196,19 +1194,22 @@ impl SlangAstLowerer {
                 .insert(object_key.clone(), parent_key.clone());
         }
         if let (Some(parent_key), Some(declared_name)) = (&parent_key, declared_name) {
-            self.class_object_declared_names
-                .borrow_mut()
-                .insert(object_key.clone(), declared_name.to_string());
-            self.class_object_children
-                .borrow_mut()
-                .entry(parent_key.clone())
-                .or_default()
-                .retain(|existing| existing != &object_key);
-            self.class_object_children
-                .borrow_mut()
-                .get_mut(parent_key)
-                .ok_or_else(|| format!("class parent '{parent_key}' has no child registry"))?
-                .push(object_key.clone());
+            let mut children = self.class_object_children.borrow_mut();
+            let mut declared_names = self.class_object_declared_names.borrow_mut();
+            let siblings = children.entry(parent_key.clone()).or_default();
+            if siblings.iter().any(|existing| {
+                existing != &object_key
+                    && declared_names
+                        .get(existing)
+                        .is_some_and(|name| *name == declared_name)
+            }) {
+                return Err(format!(
+                    "class parent '{parent_key}' has duplicate child name '{declared_name}'"
+                ));
+            }
+            declared_names.insert(object_key.clone(), declared_name.to_string());
+            siblings.retain(|existing| existing != &object_key);
+            siblings.push(object_key.clone());
         }
         let full_name_expression = match (&name_expression, &parent_key) {
             (Some(name_expression), Some(parent_key)) => {
@@ -1351,7 +1352,12 @@ impl SlangAstLowerer {
             }
             return Ok(Some(Stmt::Block(statements)));
         }
-        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+        let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
+            is_this_reference(receiver)
+                .then(|| self.active_class_objects.borrow().last().cloned())
+                .flatten()
+        });
+        let Some(object_key) = object_key else {
             return Ok(None);
         };
         if !self.is_class_object_key(&object_key) {
@@ -1512,15 +1518,27 @@ impl SlangAstLowerer {
                 "$cast source '{source_key}' has no possible '{target_type}' object"
             ));
         }
-        let acceptable_classes = self
-            .class_definitions
-            .keys()
-            .filter(|candidate| {
-                self.class_chain(candidate)
-                    .is_ok_and(|chain| chain.iter().any(|(owner, _)| *owner == target_type))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut acceptable_classes = possible_source_types.clone();
+        acceptable_classes.extend(
+            self.class_definitions
+                .keys()
+                .filter(|candidate| {
+                    self.class_chain(candidate)
+                        .is_ok_and(|chain| chain.iter().any(|(owner, _)| *owner == target_type))
+                })
+                .cloned(),
+        );
+        for class_name in acceptable_classes.clone() {
+            if let Some(base_name) = class_name.split('@').next() {
+                let base_key = self.class_type_key(base_name);
+                if self.class_definitions.contains_key(&base_key) {
+                    acceptable_classes.push(base_key);
+                }
+            }
+        }
+        acceptable_classes.sort();
+        acceptable_classes.dedup();
+        let acceptable_classes = acceptable_classes.into_iter().collect::<Vec<_>>();
         if acceptable_classes.is_empty() {
             return Err(format!("$cast target class '{target_type}' is unknown"));
         }
@@ -1671,7 +1689,12 @@ impl SlangAstLowerer {
             }
             return Ok(Some(result));
         }
-        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+        let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
+            is_this_reference(receiver)
+                .then(|| self.active_class_objects.borrow().last().cloned())
+                .flatten()
+        });
+        let Some(object_key) = object_key else {
             return Ok(None);
         };
         if !self.is_class_object_key(&object_key) {
@@ -1702,6 +1725,18 @@ impl SlangAstLowerer {
                     .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?
             };
             return Ok(Some(class_expr(&name)));
+        }
+        if method_name == "get_num_children" && call_arguments.is_empty() {
+            let child_count = self
+                .class_object_children
+                .borrow()
+                .get(&object_key)
+                .map(Vec::len)
+                .unwrap_or(0);
+            return Ok(Some(Expr::Const(LogicWord::from_u64(
+                32,
+                child_count as u64,
+            ))));
         }
         let Some((method, owner)) = self.class_method(&object_key, call)? else {
             return Ok(None);
@@ -2979,7 +3014,7 @@ fn is_class_child_lookup_call(value: &Value) -> bool {
                     .map(str::to_string)
             })
             .as_deref()
-            == Some("get_child_by_name")
+            == Some("get_child")
         && value
             .get("arguments")
             .and_then(Value::as_array)
