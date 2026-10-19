@@ -105,6 +105,13 @@ impl SlangAstLowerer {
                     .into(),
             );
         }
+        for method_name in ["read_by_type", "write_by_type"] {
+            if self.uvm_resource_db_type_name(value, method_name).is_some() {
+                return Err(format!(
+                    "direct UVM resource DB {method_name} is supported only as a conditional expression"
+                ));
+            }
+        }
         if let Some(expression) = self.lower_static_class_function_call(value)? {
             return Ok(expression);
         }

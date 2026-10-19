@@ -12710,6 +12710,8 @@ class ResourceDbTrace;
   static int missing_executed = 0;
   static int write_found = 0;
   static int missing_write_executed = 0;
+  static int typed_found = 0;
+  static int typed_value = -1;
 endclass
 
 class direct_resource_db_probe extends uvm_test;
@@ -12717,6 +12719,7 @@ class direct_resource_db_probe extends uvm_test;
   string string_value;
   int shared_value;
   int missing_value;
+  int typed_value;
 
   function new(string name = "direct_resource_db_probe",
                uvm_component parent = null);
@@ -12725,6 +12728,7 @@ class direct_resource_db_probe extends uvm_test;
     string_value = "";
     shared_value = -1;
     missing_value = -1;
+    typed_value = -1;
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
@@ -12744,6 +12748,11 @@ class direct_resource_db_probe extends uvm_test;
       "shared_value",
       77
     );
+    uvm_resource_db#(int)::set(
+      "uvm_test_top.typed",
+      "resource_name_is_ignored",
+      88
+    );
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -12755,6 +12764,24 @@ class direct_resource_db_probe extends uvm_test;
       ResourceDbTrace::write_found = 0;
     end else begin
       ResourceDbTrace::write_found = 1;
+    end
+
+    if (!uvm_resource_db#(int)::write_by_type(
+      "uvm_test_top.typed",
+      89
+    )) begin
+      ResourceDbTrace::typed_found = 0;
+    end else begin
+      ResourceDbTrace::typed_found = 1;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.typed",
+      typed_value
+    )) begin
+      ResourceDbTrace::typed_found = 0;
+    end else begin
+      ResourceDbTrace::typed_value = typed_value;
     end
 
     if (!uvm_resource_db#(int)::read_by_name(
@@ -12821,7 +12848,9 @@ module official_uvm_resource_db_probe(
   output int shared_value,
   output int missing_executed,
   output int write_found,
-  output int missing_write_executed
+  output int missing_write_executed,
+  output int typed_found,
+  output int typed_value
 );
   initial begin
     run_test("direct_resource_db_probe");
@@ -12834,6 +12863,8 @@ module official_uvm_resource_db_probe(
     missing_executed = ResourceDbTrace::missing_executed;
     write_found = ResourceDbTrace::write_found;
     missing_write_executed = ResourceDbTrace::missing_write_executed;
+    typed_found = ResourceDbTrace::typed_found;
+    typed_value = ResourceDbTrace::typed_value;
   end
 endmodule
 "#,
@@ -12851,6 +12882,8 @@ endmodule
     assert_eq!(simulator.read("integer_found").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("integer_value").unwrap().to_u64(), Some(43));
     assert_eq!(simulator.read("write_found").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("typed_found").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("typed_value").unwrap().to_u64(), Some(89));
     assert_eq!(simulator.read("string_found").unwrap().to_u64(), Some(1));
     assert_eq!(
         simulator
@@ -13503,7 +13536,7 @@ endmodule
     .expect("write direct UVM resource write wrapper");
     let error = slang
         .compile_files(
-            &[source, direct_resource_write],
+            &[source.clone(), direct_resource_write],
             Some("official_uvm_direct_resource_write_probe"),
             &options,
         )
@@ -13514,6 +13547,67 @@ endmodule
         ),
         "unexpected direct resource write error: {error}"
     );
+
+    for (method_name, call) in [
+        (
+            "read_by_type",
+            r#"uvm_resource_db#(int)::read_by_type("uvm_test_top", value)"#,
+        ),
+        (
+            "write_by_type",
+            r#"uvm_resource_db#(int)::write_by_type("uvm_test_top", 42)"#,
+        ),
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "eda-official-uvm-direct-{method_name}-{}-{}.sv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+import uvm_pkg::*;
+
+class DirectResourceTypeCall extends uvm_test;
+  int value;
+  bit found;
+
+  function new(string name = "DirectResourceTypeCall",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+    found = 0;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    found = {call};
+  endtask
+endclass
+
+module official_uvm_direct_{method_name}_probe;
+  initial begin
+    run_test("DirectResourceTypeCall");
+  end
+endmodule
+"#
+            ),
+        )
+        .expect("write direct UVM resource type-call wrapper");
+        let top = format!("official_uvm_direct_{method_name}_probe");
+        let error = slang
+            .compile_files(&[source.clone(), path], Some(&top), &options)
+            .expect_err("a direct resource type call must fail closed");
+        assert!(
+            error.contains(&format!(
+                "direct UVM resource DB {method_name} is supported only as a conditional expression"
+            )),
+            "unexpected direct {method_name} error: {error}"
+        );
+    }
 }
 
 #[test]

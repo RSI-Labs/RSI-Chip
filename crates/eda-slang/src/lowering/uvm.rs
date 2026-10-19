@@ -1316,6 +1316,164 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(success.into_iter().collect())))
     }
 
+    pub(super) fn lower_uvm_resource_read_type_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some((call, negated)) = uvm_conditional_call(statement)? else {
+            return Ok(None);
+        };
+        let Some(type_name) = self.uvm_resource_db_type_name(call, "read_by_type") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM resource DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Err(
+                "UVM resource DB read_by_type requires two arguments plus optional accessor".into(),
+            );
+        }
+        if arguments.len() == 3
+            && string_field(unwrap_conversion(&arguments[2]), "kind").as_deref()
+                != Some("NullLiteral")
+        {
+            return Err("UVM resource DB accessors are not yet supported".into());
+        }
+        let scope = string_literal_allow_empty(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM resource DB scopes must be string literals".to_string())?;
+        let target = arguments[1]
+            .get("left")
+            .ok_or_else(|| "UVM resource DB read output must be assignable".to_string())?;
+
+        let mut selected_entry: Option<&super::AstUvmConfigEntry> = None;
+        let entries = self.uvm_config_entries.borrow();
+        for entry in entries.iter() {
+            if entry.type_name == type_name
+                && Self::uvm_config_scope_match(&entry.scope, &scope)?
+                && selected_entry
+                    .as_ref()
+                    .is_none_or(|selected| entry.precedence >= selected.precedence)
+            {
+                selected_entry = Some(entry);
+            }
+        }
+        let entry = selected_entry.map(|entry| entry.value.clone());
+        let Some(entry) = entry else {
+            let failure = if negated {
+                statement.get("ifTrue")
+            } else {
+                statement.get("ifFalse")
+            };
+            return failure
+                .map(|failure| self.lower_statement(failure).map(Some))
+                .transpose()
+                .map(|statement| statement.unwrap_or_else(|| Some(Stmt::Block(Vec::new()))));
+        };
+        let assignment = Stmt::Bl {
+            lv: self.lower_lvalue(target)?,
+            e: self.lower_expression(&entry)?,
+        };
+        let success = if negated {
+            statement.get("ifFalse")
+        } else {
+            statement.get("ifTrue")
+        };
+        let success = success
+            .map(|success| self.lower_statement(success))
+            .transpose()?;
+        let mut statements = vec![assignment];
+        statements.extend(success);
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    pub(super) fn lower_uvm_resource_write_type_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some((call, negated)) = uvm_conditional_call(statement)? else {
+            return Ok(None);
+        };
+        let Some(type_name) = self.uvm_resource_db_type_name(call, "write_by_type") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM resource DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Err(
+                "UVM resource DB write_by_type requires two arguments plus optional accessor"
+                    .into(),
+            );
+        }
+        if arguments.len() == 3
+            && string_field(unwrap_conversion(&arguments[2]), "kind").as_deref()
+                != Some("NullLiteral")
+        {
+            return Err("UVM resource DB accessors are not yet supported".into());
+        }
+        let scope = string_literal_allow_empty(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM resource DB scopes must be string literals".to_string())?;
+        let write_value = unwrap_conversion(&arguments[1]).clone();
+        if !matches!(
+            string_field(&write_value, "kind").as_deref(),
+            Some("IntegerLiteral" | "StringLiteral")
+        ) {
+            return Err(
+                "UVM resource DB bootstrap values must be integer or string literals".into(),
+            );
+        }
+
+        let mut selected_index: Option<usize> = None;
+        {
+            let entries = self.uvm_config_entries.borrow();
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.type_name == type_name
+                    && Self::uvm_config_scope_match(&entry.scope, &scope)?
+                    && selected_index
+                        .is_none_or(|selected| entry.precedence >= entries[selected].precedence)
+                {
+                    selected_index = Some(index);
+                }
+            }
+        }
+        let Some(selected_index) = selected_index else {
+            let failure = if negated {
+                statement.get("ifTrue")
+            } else {
+                statement.get("ifFalse")
+            };
+            return failure
+                .map(|failure| self.lower_statement(failure).map(Some))
+                .transpose()
+                .map(|statement| statement.unwrap_or_else(|| Some(Stmt::Block(Vec::new()))));
+        };
+        self.uvm_config_entries.borrow_mut()[selected_index].value = write_value;
+        let success = if negated {
+            statement.get("ifFalse")
+        } else {
+            statement.get("ifTrue")
+        };
+        let success = success
+            .map(|success| self.lower_statement(success))
+            .transpose()?;
+        Ok(Some(Stmt::Block(success.into_iter().collect())))
+    }
+
     pub(super) fn lower_uvm_config_exists_conditional(
         &self,
         statement: &Value,
@@ -1607,6 +1765,8 @@ impl SlangAstLowerer {
             "set" => Some(2),
             "read_by_name" => Some(2),
             "write_by_name" => Some(2),
+            "read_by_type" => Some(1),
+            "write_by_type" => Some(1),
             _ => None,
         };
         if let Some(index) = argument_index {
@@ -2354,6 +2514,26 @@ fn unwrap_conversion(mut value: &Value) -> &Value {
         value = operand;
     }
     value
+}
+
+fn uvm_conditional_call(statement: &Value) -> Result<Option<(&Value, bool)>, String> {
+    let Some(condition) = statement
+        .get("conditions")
+        .and_then(Value::as_array)
+        .and_then(|conditions| conditions.first())
+        .and_then(|condition| condition.get("expr"))
+    else {
+        return Ok(None);
+    };
+    if string_field(condition, "kind").as_deref() == Some("UnaryOp")
+        && string_field(condition, "op").as_deref() == Some("LogicalNot")
+    {
+        let call = condition
+            .get("operand")
+            .ok_or_else(|| "logical-not expression has no operand".to_string())?;
+        return Ok(Some((call, true)));
+    }
+    Ok(Some((condition, false)))
 }
 
 fn is_this_reference(value: &Value) -> bool {
