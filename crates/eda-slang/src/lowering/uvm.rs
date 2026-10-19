@@ -1099,16 +1099,16 @@ impl SlangAstLowerer {
                 "UVM config DB exists requires three arguments plus an optional spell check".into(),
             );
         }
-        if arguments.len() == 4
-            && !matches!(
-                (
-                    string_field(unwrap_conversion(&arguments[3]), "kind").as_deref(),
-                    string_field(unwrap_conversion(&arguments[3]), "value").as_deref(),
-                ),
-                (Some("IntegerLiteral"), Some("0"))
-            )
-        {
-            return Err("UVM config DB spell checking is not yet supported".into());
+        let mut spell_check = false;
+        if arguments.len() == 4 {
+            match (
+                string_field(unwrap_conversion(&arguments[3]), "kind").as_deref(),
+                string_field(unwrap_conversion(&arguments[3]), "value").as_deref(),
+            ) {
+                (Some("IntegerLiteral"), Some("0")) => {}
+                (Some("IntegerLiteral"), Some("1")) => spell_check = true,
+                _ => return Err("UVM config DB spell check must be a literal 0 or 1".into()),
+            }
         }
         let scope = self.uvm_config_db_scope(
             unwrap_conversion(&arguments[0]),
@@ -1127,10 +1127,53 @@ impl SlangAstLowerer {
         } else {
             statement.get("ifFalse")
         };
-        selected
-            .map(|selected| self.lower_statement(selected).map(Some))
-            .transpose()
-            .map(|statement| statement.unwrap_or_else(|| Some(Stmt::Block(Vec::new()))))
+        let selected = selected
+            .map(|selected| self.lower_statement(selected))
+            .transpose()?;
+        let mut statements = Vec::new();
+        if !exists && spell_check {
+            let alternatives = self.uvm_config_spell_alternatives(&type_name, &field_name);
+            let suggestion = if alternatives.is_empty() {
+                format!("{field_name} not located, no alternatives to suggest")
+            } else {
+                format!(
+                    "{field_name} not located, did you mean {}",
+                    alternatives.join("|")
+                )
+            };
+            statements.push(Stmt::Display {
+                parts: vec![eda_core::ir::DispPart::Str(format!(
+                    "[UVM_INFO][UVM/CONFIGDB/SPELLCHK][UVM_NONE] {suggestion}\n"
+                ))],
+                args: Vec::new(),
+                monitor: false,
+            });
+        }
+        if let Some(selected) = selected {
+            statements.push(selected);
+        }
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    fn uvm_config_spell_alternatives(&self, type_name: &str, field_name: &str) -> Vec<String> {
+        let mut minimum = usize::MAX;
+        let mut alternatives = Vec::new();
+        for entry in self.uvm_config_entries.borrow().iter() {
+            if entry.type_name != type_name {
+                continue;
+            }
+            let distance = Self::levenshtein_distance(&entry.field_name, field_name);
+            if distance == minimum {
+                if !alternatives.contains(&entry.field_name) {
+                    alternatives.push(entry.field_name.clone());
+                }
+            } else if distance < minimum {
+                minimum = distance;
+                alternatives.clear();
+                alternatives.push(entry.field_name.clone());
+            }
+        }
+        alternatives
     }
 
     fn uvm_config_db_scope(
@@ -1202,6 +1245,26 @@ impl SlangAstLowerer {
             }
         }
         match_bytes(pattern.as_bytes(), text.as_bytes())
+    }
+
+    fn levenshtein_distance(left: &str, right: &str) -> usize {
+        let left = left.as_bytes();
+        let right = right.as_bytes();
+        let mut previous = (0..=right.len()).collect::<Vec<_>>();
+        for (left_index, left_byte) in left.iter().enumerate() {
+            let mut current = vec![left_index + 1];
+            for (right_index, right_byte) in right.iter().enumerate() {
+                let substitution = previous[right_index] + usize::from(left_byte != right_byte);
+                current.push(
+                    previous[right_index + 1]
+                        .saturating_add(1)
+                        .min(current[right_index].saturating_add(1))
+                        .min(substitution),
+                );
+            }
+            previous = current;
+        }
+        previous[right.len()]
     }
 
     fn uvm_config_event_trigger(net: usize) -> Stmt {

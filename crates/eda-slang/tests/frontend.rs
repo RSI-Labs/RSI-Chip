@@ -12664,6 +12664,7 @@ import uvm_pkg::*;
 class ConfigExistsTrace;
   static int present = 0;
   static int missing = 0;
+  static int spell_checked = 0;
 endclass
 
 class direct_config_exists_probe extends uvm_test;
@@ -12688,17 +12689,25 @@ class direct_config_exists_probe extends uvm_test;
     end else begin
       ConfigExistsTrace::missing = 0;
     end
+
+    if (!uvm_config_db#(int)::exists(this, "", "valeu", 1)) begin
+      ConfigExistsTrace::spell_checked = 1;
+    end else begin
+      ConfigExistsTrace::spell_checked = 0;
+    end
   endtask
 endclass
 
 module official_uvm_config_exists_probe(
   output int present,
-  output int missing
+  output int missing,
+  output int spell_checked
 );
   initial begin
     run_test("direct_config_exists_probe");
     present = ConfigExistsTrace::present;
     missing = ConfigExistsTrace::missing;
+    spell_checked = ConfigExistsTrace::spell_checked;
   end
 endmodule
 "#,
@@ -12711,10 +12720,15 @@ endmodule
             &options,
         )
         .expect("directly lower scoped UVM config exists checks");
+    assert!(
+        format!("{design:?}").contains("valeu not located, did you mean value"),
+        "expected the config spell checker to suggest the prepared field"
+    );
     let mut simulator = Simulator::new(&design).expect("create config exists simulator");
     simulator.run_until(0).expect("run config exists phases");
     assert_eq!(simulator.read("present").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("missing").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("spell_checked").unwrap().to_u64(), Some(1));
 }
 
 #[test]
