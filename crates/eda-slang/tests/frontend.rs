@@ -13146,27 +13146,27 @@ module official_uvm_instance_factory_probe(
     uvm_factory::get().set_inst_alias(
       "direct_instance_base_alias",
       direct_instance_base::get_type(),
-      "direct_instance_env.aliased"
+      "uvm_test_top.aliased"
     );
     uvm_factory::get().set_inst_override_by_name(
       "direct_instance_base_alias",
       "direct_instance_derived",
-      "direct_instance_env.aliased"
+      "uvm_test_top.aliased"
     );
     uvm_factory::get().set_inst_override_by_type(
       direct_instance_base::get_type(),
       direct_instance_derived::get_type(),
-      "direct_instance_env.leaf"
+      "uvm_test_top.leaf"
     );
     uvm_factory::get().set_inst_override_by_type(
       direct_instance_base::get_type(),
       direct_instance_derived::get_type(),
-      "direct_instance_env.wild*"
+      "uvm_test_top.wild*"
     );
     uvm_factory::get().set_inst_override_by_type(
       direct_instance_base::get_type(),
       direct_instance_second::get_type(),
-      "direct_instance_env.wild*"
+      "uvm_test_top.wild*"
     );
     run_test("direct_instance_env");
     stage = InstanceOverrideTrace::kind;
@@ -13437,6 +13437,7 @@ import uvm_pkg::*;
 class ComponentNameTrace;
   static string name = "";
   static string full_name = "";
+  static string root_name = "";
   static int parent_match = 0;
   static int parent_identity = 0;
   static int child_match = 0;
@@ -13523,6 +13524,7 @@ class direct_named_component_env extends direct_named_base;
   virtual task run_phase(uvm_phase phase);
     ComponentNameTrace::name = component.get_name();
     ComponentNameTrace::full_name = component.get_full_name();
+    ComponentNameTrace::root_name = this.get_name();
     if (component.get_parent() == this) begin
       ComponentNameTrace::parent_match = 1;
     end
@@ -13556,12 +13558,12 @@ class direct_named_component_env extends direct_named_base;
     end else begin
       ComponentNameTrace::nested_identity = recovered_nested.identity();
     end
-    if (component.nested.lookup(".direct_named_component_env.leaf") == component) begin
+    if (component.nested.lookup(".uvm_test_top.leaf") == component) begin
       ComponentNameTrace::absolute_match = 1;
     end
     if (!$cast(
       recovered_child,
-      component.nested.lookup(".direct_named_component_env.leaf")
+      component.nested.lookup(".uvm_test_top.leaf")
     )) begin
       ComponentNameTrace::absolute_identity = 0;
     end else begin
@@ -13579,6 +13581,7 @@ endclass
 module official_uvm_component_name_probe(
   output string name,
   output string full_name,
+  output string root_name,
   output int parent_match,
   output int parent_identity,
   output int child_match,
@@ -13601,6 +13604,7 @@ module official_uvm_component_name_probe(
     run_test("direct_named_component_env");
     name = ComponentNameTrace::name;
     full_name = ComponentNameTrace::full_name;
+    root_name = ComponentNameTrace::root_name;
     parent_match = ComponentNameTrace::parent_match;
     parent_identity = ComponentNameTrace::parent_identity;
     child_match = ComponentNameTrace::child_match;
@@ -13646,7 +13650,14 @@ endmodule
             .read("full_name")
             .unwrap()
             .to_ascii_string_nul_terminated(),
-        "direct_named_component_env.leaf"
+        "uvm_test_top.leaf"
+    );
+    assert_eq!(
+        simulator
+            .read("root_name")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "uvm_test_top"
     );
     assert_eq!(simulator.read("parent_match").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("parent_identity").unwrap().to_u64(), Some(2));

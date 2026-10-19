@@ -95,7 +95,7 @@ official `uvm_factory::get().set_type_override_by_name` and
 `set_inst_override_by_type(...)`/`set_inst_override_by_name(...)`, and
 direct `create_component_by_name(...)`/`create_object_by_name(...)` and type-wrapper `create_component_by_type(...)`/`create_object_by_type(...)`,
 and `Class::type_id::create(...)` component/object construction through prepared
-class properties, including compatible derived overrides with runtime virtual
+class properties under the official `uvm_test_top` run-test instance name, including compatible derived overrides with runtime virtual
 dispatch, preserved constructor names for `get_name()`, parent-qualified `get_full_name()`, and `get_parent()` identity comparison plus checked parent-handle cast.
 It also records prepared children by literal constructor name, rejects
 duplicate sibling names, supports `get_child(...)`, relative and leading-dot absolute `lookup(...)`, and

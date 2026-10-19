@@ -318,7 +318,7 @@ impl SlangAstLowerer {
                     ),
                 ));
             }
-            let root_name = formals
+            formals
                 .first()
                 .and_then(|formal| formal.get("defaultValue").cloned())
                 .and_then(|default| string_field(unwrap_conversion(&default), "literal"))
@@ -330,6 +330,10 @@ impl SlangAstLowerer {
                         ),
                     )
                 })?;
+            // Official uvm_root::run_test creates the selected test component
+            // under the fixed instance name "uvm_test_top"; the constructor's
+            // name default is only a validation contract for this bootstrap.
+            let root_name = "uvm_test_top".to_string();
 
             let handle_address = self.next_synthetic_class_handle;
             self.next_synthetic_class_handle = self
@@ -447,6 +451,17 @@ impl SlangAstLowerer {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let mut actuals = actuals;
+        if let Some(root_actual) = actuals.first_mut() {
+            *root_actual = json!({
+                "kind": "StringLiteral",
+                "type": formals
+                    .first()
+                    .and_then(|formal| string_field(formal, "type"))
+                    .unwrap_or_else(|| "string".into()),
+                "literal": "uvm_test_top",
+            });
+        }
         let constructor_address = constructor
             .get("addr")
             .and_then(Value::as_u64)
