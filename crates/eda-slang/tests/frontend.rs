@@ -12487,6 +12487,131 @@ endmodule
 }
 
 #[test]
+fn slang_direct_component_registry_applies_instance_overrides() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-instance-factory-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class InstanceOverrideTrace;
+  static int kind = 0;
+  static int unaffected_kind = 0;
+endclass
+
+class direct_instance_base extends uvm_test;
+  `uvm_component_utils(direct_instance_base)
+
+  function new(string name = "direct_instance_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class direct_instance_derived extends direct_instance_base;
+  `uvm_component_utils(direct_instance_derived)
+
+  function new(string name = "direct_instance_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+class direct_instance_env extends uvm_test;
+  `uvm_component_utils(direct_instance_env)
+
+  direct_instance_base component;
+  direct_instance_base unaffected;
+
+  function new(string name = "direct_instance_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    component = direct_instance_base::type_id::create("leaf", this);
+    unaffected = direct_instance_base::type_id::create("other", this);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    InstanceOverrideTrace::kind = component.kind();
+    InstanceOverrideTrace::unaffected_kind = unaffected.kind();
+  endtask
+endclass
+
+module official_uvm_instance_factory_probe(
+  output int stage,
+  output int unaffected_stage
+);
+  initial begin
+    uvm_factory::get().set_inst_override_by_type(
+      direct_instance_base::get_type(),
+      direct_instance_derived::get_type(),
+      "direct_instance_env.leaf"
+    );
+    run_test("direct_instance_env");
+    stage = InstanceOverrideTrace::kind;
+    unaffected_stage = InstanceOverrideTrace::unaffected_kind;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM instance-override wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_instance_factory_probe"),
+            &options,
+        )
+        .expect("directly lower an instance-specific UVM factory override");
+    let mut simulator = Simulator::new(&design).expect("create instance-override simulator");
+    simulator
+        .run_until(0)
+        .expect("run the instance-overridden component");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("unaffected_stage").unwrap().to_u64(),
+        Some(1)
+    );
+}
+
+#[test]
 fn slang_direct_component_registry_creates_a_component() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

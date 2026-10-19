@@ -1309,6 +1309,25 @@ impl SlangAstLowerer {
                 .borrow_mut()
                 .insert(object_key.clone(), parent_key.clone());
         }
+        if let Some(ref declared_name) = declared_name {
+            let declared_full_name = match &parent_key {
+                Some(parent_key) => {
+                    let parent_full_name = self
+                        .class_object_declared_full_names
+                        .borrow()
+                        .get(parent_key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!("class parent '{parent_key}' has no declared full name")
+                        })?;
+                    format!("{parent_full_name}.{declared_name}")
+                }
+                None => declared_name.to_string(),
+            };
+            self.class_object_declared_full_names
+                .borrow_mut()
+                .insert(object_key.clone(), declared_full_name);
+        }
         if let (Some(parent_key), Some(declared_name)) = (&parent_key, declared_name) {
             let mut children = self.class_object_children.borrow_mut();
             let mut declared_names = self.class_object_declared_names.borrow_mut();

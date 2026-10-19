@@ -27,6 +27,8 @@ impl SlangAstLowerer {
         collect_run_test_calls(body, &mut calls);
         let mut override_calls = Vec::new();
         collect_uvm_factory_override_calls(body, &mut override_calls);
+        let mut instance_override_calls = Vec::new();
+        collect_uvm_factory_instance_override_calls(body, &mut instance_override_calls);
         let mut timeout_calls = Vec::new();
         collect_uvm_timeout_calls(body, &mut timeout_calls);
         for override_call in &override_calls {
@@ -60,6 +62,42 @@ impl SlangAstLowerer {
                     return Err(with_source_span(
                         override_call,
                         format!("conflicting UVM factory overrides for '{original}'"),
+                    ));
+                }
+            }
+        }
+        for override_call in &instance_override_calls {
+            let (original, override_name, instance_path) =
+                uvm_factory_instance_override_names(override_call)?;
+            let run_test_location = calls
+                .first()
+                .and_then(|call| source_location(call))
+                .ok_or_else(|| {
+                    with_source_span(
+                        override_call,
+                        "UVM instance override requires a following run_test call".into(),
+                    )
+                })?;
+            let override_location = source_location(override_call).ok_or_else(|| {
+                with_source_span(
+                    override_call,
+                    "UVM instance override has no source location".into(),
+                )
+            })?;
+            if override_location >= run_test_location {
+                return Err(with_source_span(
+                    override_call,
+                    "UVM instance override must be registered before run_test".into(),
+                ));
+            }
+            if let Some(previous) = self.uvm_factory_instance_overrides.insert(
+                instance_path.clone(),
+                (original.clone(), override_name.clone()),
+            ) {
+                if previous != (original.clone(), override_name.clone()) {
+                    return Err(with_source_span(
+                        override_call,
+                        format!("conflicting UVM instance overrides for '{instance_path}'"),
                     ));
                 }
             }
@@ -456,11 +494,33 @@ impl SlangAstLowerer {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Ok(None);
         };
+        let method = subroutine
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default();
         if !matches!(
-            subroutine.split_whitespace().next_back(),
-            Some("set_type_override_by_name" | "set_type_override_by_type")
+            method,
+            "set_type_override_by_name"
+                | "set_type_override_by_type"
+                | "set_inst_override_by_name"
+                | "set_inst_override_by_type"
         ) {
             return Ok(None);
+        }
+        if matches!(
+            method,
+            "set_inst_override_by_name" | "set_inst_override_by_type"
+        ) {
+            let (original, override_name, instance_path) =
+                uvm_factory_instance_override_names(value)?;
+            if self.uvm_factory_instance_overrides.get(&instance_path)
+                != Some(&(original.clone(), override_name.clone()))
+            {
+                return Err(format!(
+                    "UVM instance override '{original}' -> '{override_name}' at '{instance_path}' was not prepared"
+                ));
+            }
+            return Ok(Some(Stmt::Block(Vec::new())));
         }
         let (original, override_name) = uvm_factory_override_names(value)?;
         if self.uvm_factory_overrides.get(&original) != Some(&override_name) {
@@ -477,6 +537,93 @@ impl SlangAstLowerer {
         }
         uvm_timeout_value(value)?;
         Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    fn uvm_factory_instance_path(
+        &self,
+        name: &str,
+        parent: Option<&Value>,
+        context: Option<&Value>,
+        use_parent_context: bool,
+    ) -> Result<String, String> {
+        if let Some(context) = context {
+            let context = string_literal_allow_empty(unwrap_conversion(context))
+                .ok_or_else(|| "UVM factory context must be a string literal".to_string())?;
+            if !context.is_empty() {
+                return Ok(format!("{context}.{name}"));
+            }
+        }
+        if !use_parent_context {
+            return Ok(name.to_string());
+        }
+        let parent_key = parent
+            .map(|parent| {
+                let parent = unwrap_conversion(parent);
+                if string_field(parent, "kind").as_deref() == Some("NullLiteral") {
+                    return Ok(None);
+                }
+                self.class_object_key_for_value(parent)?
+                    .or_else(|| {
+                        is_this_reference(parent)
+                            .then(|| self.active_class_objects.borrow().last().cloned())
+                            .flatten()
+                    })
+                    .map(Some)
+                    .ok_or_else(|| "UVM factory parent must be a prepared class object".to_string())
+            })
+            .transpose()?
+            .flatten();
+        if let Some(parent_key) = parent_key {
+            let parent_full_name = self
+                .class_object_declared_full_names
+                .borrow()
+                .get(&parent_key)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("UVM factory parent '{parent_key}' has no declared full name")
+                })?;
+            Ok(format!("{parent_full_name}.{name}"))
+        } else {
+            Ok(name.to_string())
+        }
+    }
+
+    fn select_uvm_factory_class(
+        &self,
+        requested_name: &str,
+        instance_path: &str,
+    ) -> Result<String, String> {
+        if let Some((original, override_name)) = self
+            .uvm_factory_instance_overrides
+            .get(instance_path)
+            .cloned()
+        {
+            let requested_key = self.class_type_key(requested_name);
+            let original_key = self.class_type_key(&original);
+            let applies = requested_key == original_key
+                || self.class_chain(&requested_key)?.iter().any(|(owner, _)| {
+                    owner == &original_key
+                        || owner.split('@').next()
+                            == Some(original_key.split('@').next().unwrap_or(&original_key))
+                });
+            if !applies {
+                return Err(format!(
+                    "UVM instance override at '{instance_path}' expects '{original}', not '{requested_name}'"
+                ));
+            }
+            return Ok(override_name);
+        }
+        let mut selected_name = requested_name.to_string();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(override_name) = self.uvm_factory_overrides.get(&selected_name).cloned() {
+            if !visited.insert(selected_name.clone()) {
+                return Err(format!(
+                    "UVM factory override cycle at '{selected_name}' while creating a component"
+                ));
+            }
+            selected_name = override_name;
+        }
+        Ok(selected_name)
     }
 
     pub(super) fn lower_uvm_factory_create_assignment(
@@ -543,19 +690,19 @@ impl SlangAstLowerer {
                 (requested_name, &arguments[0], vec![arguments[0].clone()])
             }
         };
-        string_literal(unwrap_conversion(name_argument))
+        let component_name = string_literal(unwrap_conversion(name_argument))
             .ok_or_else(|| "UVM factory component name must be a string literal".to_string())?;
-
-        let mut selected_name = requested_name.clone();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(override_name) = self.uvm_factory_overrides.get(&selected_name).cloned() {
-            if !visited.insert(selected_name.clone()) {
-                return Err(format!(
-                    "UVM factory override cycle at '{selected_name}' while creating a component"
-                ));
-            }
-            selected_name = override_name;
-        }
+        let instance_path = if direct_factory_call {
+            self.uvm_factory_instance_path(&component_name, None, Some(&arguments[1]), false)?
+        } else {
+            self.uvm_factory_instance_path(
+                &component_name,
+                arguments.get(1),
+                arguments.get(2),
+                true,
+            )?
+        };
+        let selected_name = self.select_uvm_factory_class(&requested_name, &instance_path)?;
         let selected_key = self.class_type_key(&selected_name);
         let Some(target_key) = self.class_object_key_for_value(left)? else {
             return Err(with_source_span(
@@ -972,6 +1119,26 @@ fn collect_uvm_factory_override_calls<'value>(
     }
 }
 
+fn collect_uvm_factory_instance_override_calls<'value>(
+    value: &'value Value,
+    calls: &mut Vec<&'value Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if is_uvm_factory_instance_override_call(value) {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_uvm_factory_instance_override_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_uvm_factory_instance_override_calls(nested, calls);
+        }
+    }
+}
+
 fn collect_uvm_timeout_calls<'value>(value: &'value Value, calls: &mut Vec<&'value Value>) {
     if let Some(fields) = value.as_object() {
         if is_uvm_timeout_call(value) {
@@ -1055,6 +1222,39 @@ fn is_uvm_factory_override_call(value: &Value) -> bool {
                 matches!(
                     method,
                     "set_type_override_by_name" | "set_type_override_by_type"
+                )
+            })
+        && value.get("thisClass").is_some_and(|receiver| {
+            string_field(receiver, "kind").as_deref() == Some("Call")
+                && string_field(receiver, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("get")
+                && string_field(receiver, "type")
+                    .map(|type_name| type_name.contains("uvm_factory"))
+                    .unwrap_or(false)
+        })
+}
+
+fn is_uvm_factory_instance_override_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            .is_some_and(|method| {
+                matches!(
+                    method,
+                    "set_inst_override_by_name" | "set_inst_override_by_type"
                 )
             })
         && value.get("thisClass").is_some_and(|receiver| {
@@ -1212,6 +1412,59 @@ fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> 
         return Ok((original, override_name));
     }
     Err("unsupported UVM factory override method".into())
+}
+
+fn uvm_factory_instance_override_names(call: &Value) -> Result<(String, String, String), String> {
+    let empty_arguments = Vec::new();
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_arguments);
+    if arguments.len() != 3 {
+        return Err("UVM factory instance overrides require three arguments".into());
+    }
+    let method = string_field(call, "subroutine")
+        .and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    let (original, override_name) = if method == "set_inst_override_by_name" {
+        (
+            string_literal(unwrap_conversion(&arguments[0])).ok_or_else(|| {
+                "UVM factory original instance type must be a string literal".to_string()
+            })?,
+            string_literal(unwrap_conversion(&arguments[1])).ok_or_else(|| {
+                "UVM factory override instance type must be a string literal".to_string()
+            })?,
+        )
+    } else if method == "set_inst_override_by_type" {
+        (
+            wrapper_type_name(&arguments[0]).ok_or_else(|| {
+                "UVM factory original instance wrapper must be Class::get_type()".to_string()
+            })?,
+            wrapper_type_name(&arguments[1]).ok_or_else(|| {
+                "UVM factory override instance wrapper must be Class::get_type()".to_string()
+            })?,
+        )
+    } else {
+        return Err("unsupported UVM factory instance override method".into());
+    };
+    let instance_path = string_literal(unwrap_conversion(&arguments[2]))
+        .ok_or_else(|| "UVM factory instance path must be a string literal".to_string())?;
+    if instance_path.starts_with('.')
+        || instance_path.ends_with('.')
+        || instance_path.contains("..")
+        || instance_path.contains('*')
+        || instance_path.contains('?')
+    {
+        return Err(format!(
+            "UVM factory instance path '{instance_path}' must be an exact well-formed path"
+        ));
+    }
+    Ok((original, override_name, instance_path))
 }
 
 fn wrapper_type_name(value: &Value) -> Option<String> {

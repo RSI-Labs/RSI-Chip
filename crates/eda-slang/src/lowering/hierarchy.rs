@@ -1045,6 +1045,9 @@ impl super::SlangAstLowerer {
             class_object_parent_keys: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             class_object_children: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             class_object_declared_names: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            class_object_declared_full_names: std::cell::RefCell::new(
+                std::collections::BTreeMap::new(),
+            ),
             initialized_class_objects: std::collections::BTreeSet::new(),
             constructed_class_objects: std::collections::BTreeSet::new(),
             class_object_tags: std::collections::BTreeMap::new(),
@@ -1063,6 +1066,7 @@ impl super::SlangAstLowerer {
             class_property_initializers: std::collections::BTreeMap::new(),
             run_test_objects: std::collections::BTreeMap::new(),
             uvm_factory_overrides: std::collections::BTreeMap::new(),
+            uvm_factory_instance_overrides: std::collections::BTreeMap::new(),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
             active_composition_classes: std::collections::BTreeSet::new(),

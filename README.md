@@ -90,7 +90,8 @@ object identity across prepared registry slots, asynchronous drain before later
 phases, `uvm_root::get().set_timeout(...)` configuration, and rejection of wrong-owner
 objections, and name/type-based factory selection for `run_test` through
 official `uvm_factory::get().set_type_override_by_name` and
-`set_type_override_by_type(Class::get_type(), ...)`, and
+`set_type_override_by_type(Class::get_type(), ...)`, exact-path
+`set_inst_override_by_type(...)`/`set_inst_override_by_name(...)`, and
 `Class::type_id::create(...)` component/object construction through prepared
 class properties, including compatible derived overrides with runtime virtual
 dispatch, preserved constructor names for `get_name()`, parent-qualified `get_full_name()`, and `get_parent()` identity comparison plus checked parent-handle cast.
