@@ -133,6 +133,129 @@ impl SlangAstLowerer {
         }
     }
 
+    fn is_null_literal(value: &Value) -> bool {
+        let value = conversion_operand(value).unwrap_or(value);
+        string_field(value, "kind").as_deref() == Some("NullLiteral")
+    }
+
+    fn class_null_statement(&self, object_key: &str) -> Result<Stmt, String> {
+        let Some(fields) = self.class_objects.get(object_key) else {
+            return Ok(Stmt::Block(Vec::new()));
+        };
+        let mut statements = Vec::new();
+        for symbol in [
+            self.class_object_tags
+                .get(object_key)
+                .ok_or_else(|| format!("class object '{object_key}' has no runtime tag"))?,
+            self.class_object_ids
+                .get(object_key)
+                .ok_or_else(|| format!("class object '{object_key}' has no object id"))?,
+        ] {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(symbol),
+                e: Expr::Const(LogicWord::zero(symbol.width)),
+            });
+        }
+        for symbol in fields.values() {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(symbol),
+                e: Expr::Const(LogicWord::xes(symbol.width)),
+            });
+        }
+        Ok(Stmt::Block(statements))
+    }
+
+    pub(super) fn lower_class_null_assignment(
+        &self,
+        assignment: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(left) = assignment.get("left") else {
+            return Ok(None);
+        };
+        let Some(right) = assignment.get("right") else {
+            return Ok(None);
+        };
+        if !Self::is_null_literal(right) {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("non-blocking null class-handle assignment is not supported".into());
+        }
+        if let Some(selection) = self.dynamic_class_array_selection(left)? {
+            let statements = selection
+                .elements
+                .iter()
+                .map(|(index, object_key)| {
+                    Ok(Stmt::If {
+                        c: Self::class_array_condition(&selection.selector, *index),
+                        t: Box::new(self.class_null_statement(object_key)?),
+                        f: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(Some(Stmt::Block(statements)));
+        }
+        let Some(object_key) = self.class_object_key_for_value(left)? else {
+            return Ok(None);
+        };
+        self.class_null_statement(&object_key).map(Some)
+    }
+
+    fn class_handle_identity_expr(&self, value: &Value) -> Result<Option<Expr>, String> {
+        if Self::is_null_literal(value) {
+            return Ok(Some(Expr::Const(LogicWord::zero(64))));
+        }
+        if let Some(selection) = self.dynamic_class_array_selection(value)? {
+            let mut result = Expr::Const(LogicWord::zero(64));
+            for (index, object_key) in selection.elements.iter().rev() {
+                let Some(id) = self.class_object_ids.get(object_key) else {
+                    continue;
+                };
+                result = Expr::Cond {
+                    c: Box::new(Self::class_array_condition(&selection.selector, *index)),
+                    t: Box::new(class_expr(id)),
+                    f: Box::new(result),
+                };
+            }
+            return Ok(Some(result));
+        }
+        Ok(self
+            .class_object_key_for_value(value)?
+            .and_then(|object_key| self.class_object_ids.get(&object_key).cloned())
+            .map(|symbol| class_expr(&symbol)))
+    }
+
+    pub(super) fn lower_class_handle_comparison(
+        &self,
+        value: &Value,
+    ) -> Result<Option<Expr>, String> {
+        if string_field(value, "kind").as_deref() != Some("BinaryOp") {
+            return Ok(None);
+        }
+        let operator = match string_field(value, "op").as_deref() {
+            Some("Equality") => BinOp::Eq,
+            Some("Inequality") => BinOp::Ne,
+            _ => return Ok(None),
+        };
+        let Some(left) = value.get("left") else {
+            return Ok(None);
+        };
+        let Some(right) = value.get("right") else {
+            return Ok(None);
+        };
+        let Some(left_id) = self.class_handle_identity_expr(left)? else {
+            return Ok(None);
+        };
+        let Some(right_id) = self.class_handle_identity_expr(right)? else {
+            return Ok(None);
+        };
+        Ok(Some(Expr::Bin {
+            op: operator,
+            a: Box::new(left_id),
+            b: Box::new(right_id),
+        }))
+    }
+
     pub(super) fn collect_class_static_members(&mut self) -> Result<(), String> {
         let definitions = self
             .class_definitions
@@ -530,6 +653,16 @@ impl SlangAstLowerer {
                 self.declare_class_internal_net(&format!("__class_tag_{synthetic_prefix}"), 32);
             let id = self
                 .declare_class_internal_net(&format!("__class_object_id_{synthetic_prefix}"), 64);
+            self.design.initials.extend([
+                Stmt::Bl {
+                    lv: class_lvalue(&tag),
+                    e: Expr::Const(LogicWord::zero(tag.width)),
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&id),
+                    e: Expr::Const(LogicWord::zero(id.width)),
+                },
+            ]);
             self.class_object_tags.insert(object_key.clone(), tag);
             self.class_object_ids.insert(object_key.clone(), id);
             if let Some(index) = index {

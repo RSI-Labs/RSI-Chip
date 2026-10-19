@@ -460,6 +460,9 @@ impl super::SlangAstLowerer {
                 }
             }
             "BinaryOp" => {
+                if let Some(expression) = self.lower_class_handle_comparison(value)? {
+                    return Ok(expression);
+                }
                 if matches!(
                     string_field(value, "op").as_deref(),
                     Some(

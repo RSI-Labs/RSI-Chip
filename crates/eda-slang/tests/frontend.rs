@@ -487,6 +487,88 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_null_class_handles() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-null-class-handles");
+    let source_path = root.join("null_class_handles.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+endclass
+
+module null_class_handle_top(
+  input int selector,
+  output int default_null,
+  output int is_null,
+  output int not_null,
+  output int same,
+  output int different,
+  output int after_null,
+  output int detached,
+  output int array_null
+);
+  Item a;
+  Item b;
+  Item c;
+  Item items[0:1];
+
+  initial begin
+    #1;
+    default_null = (c == null);
+    a = new(10);
+    b = a;
+    is_null = (a == null);
+    not_null = (a != null);
+    same = (a == b);
+    different = (a != b);
+
+    a = null;
+    after_null = (a == null);
+    detached = (b == null);
+
+    items[0] = new(20);
+    items[1] = new(30);
+    items[selector] = null;
+    array_null = (items[selector] == null);
+  end
+endmodule
+"#,
+    )
+    .expect("write null-handle source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("null_class_handle_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower null class handles");
+    let mut simulator = Simulator::new(&design).expect("create null-handle simulator");
+    simulator
+        .set_input("selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run null-handle initial block");
+    assert_eq!(simulator.read("default_null").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("is_null").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("not_null").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("same").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("different").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("after_null").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("detached").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("array_null").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
