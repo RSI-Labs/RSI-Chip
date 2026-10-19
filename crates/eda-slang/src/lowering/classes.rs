@@ -74,7 +74,7 @@ impl SlangAstLowerer {
         Ok(())
     }
 
-    fn class_type_key(&self, type_name: &str) -> String {
+    pub(super) fn class_type_key(&self, type_name: &str) -> String {
         let Some(base_name) = class_name(type_name) else {
             return type_name.to_string();
         };
@@ -1692,7 +1692,7 @@ impl SlangAstLowerer {
         Ok(None)
     }
 
-    fn resolve_class_method(
+    pub(super) fn resolve_class_method(
         &self,
         class_name: &str,
         method_name: &str,
@@ -1868,7 +1868,7 @@ impl SlangAstLowerer {
             .ok_or_else(|| format!("unknown class '{class_name}'"))
     }
 
-    fn class_chain(&self, start: &str) -> Result<Vec<(String, Value)>, String> {
+    pub(super) fn class_chain(&self, start: &str) -> Result<Vec<(String, Value)>, String> {
         let mut chain = Vec::new();
         let mut current = start.to_string();
         loop {
@@ -2239,7 +2239,7 @@ fn constant_selector(value: &Value) -> Option<i64> {
         .and_then(|raw| raw.trim().parse::<i64>().ok())
 }
 
-fn method_return_type(method: &Value) -> String {
+pub(super) fn method_return_type(method: &Value) -> String {
     string_field(method, "returnType").unwrap_or_else(|| {
         method
             .get("returnType")

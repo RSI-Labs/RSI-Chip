@@ -79,10 +79,12 @@ validates lowered structure against the authoritative AST. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
 
-The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`, and
-a class derived from official `uvm_test` can be explicitly constructed with its
-overridden `run_phase` executed. This is still a bootstrap: `run_test`, UVM
-phasing, objections, factories, TLM, and sequences are not yet executed.
+The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`.
+A class derived from official `uvm_test` can be explicitly constructed with its
+overridden `run_phase` executed, and a minimal `run_test("class")` entry can
+construct such a class and execute its overridden phase method. This is still a
+bootstrap: the phase argument is null and UVM phasing, objections, factories,
+TLM, and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit

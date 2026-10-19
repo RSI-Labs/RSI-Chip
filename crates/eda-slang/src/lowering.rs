@@ -13,6 +13,7 @@ mod functions;
 mod hierarchy;
 mod interface_ports;
 mod statements;
+mod uvm;
 
 pub(crate) use interface_ports::{
     annotate_interface_array_port_connections, interface_array_port_member_count,
@@ -364,6 +365,11 @@ pub(super) struct DynamicClassSource {
     pub(super) class_name: String,
 }
 
+pub(super) struct AstRunTestObject {
+    pub(super) class_name: String,
+    pub(super) object_key: String,
+}
+
 pub(super) struct AstEventArraySelection {
     pub(super) base: usize,
     pub(super) dimensions: Vec<crate::types::AstPackedDimension>,
@@ -449,6 +455,7 @@ pub(super) struct SlangAstLowerer {
     class_property_temps: std::collections::BTreeMap<(String, String), AstLoweredSymbol>,
     class_property_initializers:
         std::collections::BTreeMap<String, Vec<(String, serde_json::Value)>>,
+    run_test_objects: std::collections::BTreeMap<String, AstRunTestObject>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
     active_composition_classes: std::collections::BTreeSet<String>,
@@ -586,6 +593,7 @@ impl SlangAstLowerer {
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
             class_property_initializers: std::collections::BTreeMap::new(),
+            run_test_objects: std::collections::BTreeMap::new(),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
             active_composition_classes: std::collections::BTreeSet::new(),
@@ -648,6 +656,7 @@ impl SlangAstLowerer {
         self.collect_dynamic_class_sources(body)?;
         self.validate_dynamic_class_sources()?;
         self.collect_class_static_members()?;
+        self.prepare_run_test_objects(body)?;
         let members = body
             .get("members")
             .and_then(serde_json::Value::as_array)

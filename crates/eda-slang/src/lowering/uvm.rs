@@ -1,0 +1,296 @@
+//! Minimal direct-lowering bootstrap for official-UVM `run_test`.
+
+use super::classes::method_return_type;
+use super::SlangAstLowerer;
+use crate::ast_util::{string_field, with_source_span};
+use eda_core::ir::Stmt;
+use serde_json::{json, Value};
+
+impl SlangAstLowerer {
+    pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
+        let mut calls = Vec::new();
+        collect_run_test_calls(body, &mut calls);
+        for call in calls {
+            if !self.run_test_objects.is_empty() {
+                return Err(with_source_span(
+                    call,
+                    "only one direct-lowering run_test call is supported per module".into(),
+                ));
+            }
+            let class_name = run_test_class_name(call)?;
+            let class_key = self.class_type_key(&class_name);
+            if !self.class_definitions.contains_key(&class_key) {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test class '{class_name}' is unknown"),
+                ));
+            }
+            let chain = self
+                .class_chain(&class_key)
+                .map_err(|error| with_source_span(call, error))?;
+            if !chain.iter().any(|(owner, class)| {
+                owner.split('@').next() == Some("uvm_test")
+                    && string_field(class, "source_file")
+                        .and_then(|file| file.split('/').next_back().map(str::to_string))
+                        .as_deref()
+                        == Some("uvm_test.svh")
+            }) {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test class '{class_name}' must derive from official uvm_test"),
+                ));
+            }
+            let Some((run_phase, _)) = self.resolve_class_method(&class_key, "run_phase")? else {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test class '{class_name}' has no run_phase"),
+                ));
+            };
+            if string_field(&run_phase, "subroutineKind").as_deref() != Some("Task")
+                || method_return_type(&run_phase) != "void"
+            {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test class '{class_name}' run_phase must be a void task"),
+                ));
+            }
+            let constructor = chain.iter().find_map(|(_, class)| {
+                let empty_members = Vec::new();
+                class
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_members)
+                    .iter()
+                    .find(|member| {
+                        string_field(member, "kind").as_deref() == Some("Subroutine")
+                            && string_field(member, "name").as_deref() == Some("new")
+                    })
+                    .cloned()
+            });
+            let Some(constructor) = constructor else {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test class '{class_name}' has no explicit constructor"),
+                ));
+            };
+            let empty_arguments = Vec::new();
+            let formals = constructor
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if formals
+                .iter()
+                .any(|formal| formal.get("defaultValue").is_none())
+            {
+                return Err(with_source_span(
+                    call,
+                    format!(
+                        "run_test class '{class_name}' constructor arguments must have defaults"
+                    ),
+                ));
+            }
+
+            let handle_address = self.next_synthetic_class_handle;
+            self.next_synthetic_class_handle = self
+                .next_synthetic_class_handle
+                .checked_sub(1)
+                .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
+            let object_name = format!(
+                "__uvm_run_test_{}",
+                class_name
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() {
+                            character
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>()
+            );
+            let synthetic_member = json!({
+                "name": object_name,
+                "kind": "Variable",
+                "type": class_key,
+                "lifetime": "Static",
+                "addr": handle_address,
+            });
+            if !self.declare_class_object(&synthetic_member, &object_name)? {
+                return Err(with_source_span(
+                    call,
+                    format!("run_test cannot allocate class '{class_name}'"),
+                ));
+            }
+            let object_key = format!("{handle_address} {object_name}");
+            self.initialized_class_objects.insert(object_key.clone());
+            self.run_test_objects.insert(
+                class_name,
+                super::AstRunTestObject {
+                    class_name: class_key,
+                    object_key,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn lower_run_test_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        if subroutine.split_whitespace().next_back() != Some("run_test") {
+            return Ok(None);
+        }
+        let class_name = run_test_class_name(value)?;
+        let Some(run_object) = self.run_test_objects.get(&class_name) else {
+            return Err(format!(
+                "run_test object for class '{class_name}' was not prepared"
+            ));
+        };
+        let chain = self.class_chain(&run_object.class_name)?;
+        let constructor = chain
+            .iter()
+            .find_map(|(_, class)| {
+                let empty_members = Vec::new();
+                class
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_members)
+                    .iter()
+                    .find(|member| {
+                        string_field(member, "kind").as_deref() == Some("Subroutine")
+                            && string_field(member, "name").as_deref() == Some("new")
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| format!("run_test class '{class_name}' has no explicit constructor"))?;
+        let empty_arguments = Vec::new();
+        let formals = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let actuals = formals
+            .iter()
+            .map(|formal| {
+                formal.get("defaultValue").cloned().ok_or_else(|| {
+                    format!("run_test class '{class_name}' constructor argument has no default")
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let constructor_address = constructor
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("run_test class '{class_name}' constructor has no address"))?;
+        let construction = json!({
+            "kind": "Assignment",
+            "left": {
+                "kind": "NamedValue",
+                "type": run_object.class_name,
+                "symbol": run_object.object_key,
+            },
+            "right": {
+                "kind": "NewClass",
+                "type": run_object.class_name,
+                "isSuperClass": false,
+                "constructorCall": {
+                    "kind": "Call",
+                    "subroutine": format!("{constructor_address} new"),
+                    "arguments": actuals,
+                },
+            },
+            "isNonBlocking": false,
+        });
+        let Some(construction) = self.lower_class_constructor(&construction)? else {
+            return Err(format!("run_test failed to construct class '{class_name}'"));
+        };
+
+        let Some((run_phase, _)) =
+            self.resolve_class_method(&run_object.class_name, "run_phase")?
+        else {
+            return Err(format!("run_test class '{class_name}' has no run_phase"));
+        };
+        let run_phase_address = run_phase
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("run_test class '{class_name}' run_phase has no address"))?;
+        let phase_call = json!({
+            "kind": "Call",
+            "subroutine": format!("{run_phase_address} run_phase"),
+            "thisClass": {
+                "kind": "NamedValue",
+                "type": run_object.class_name,
+                "symbol": run_object.object_key,
+            },
+            "arguments": [
+                {
+                    "kind": "NullLiteral",
+                    "type": {
+                        "name": "null",
+                        "kind": "NullType",
+                    },
+                },
+            ],
+        });
+        let Some(run_phase_statement) = self.lower_class_task_call(&phase_call)? else {
+            return Err(format!(
+                "run_test failed to execute run_phase for class '{class_name}'"
+            ));
+        };
+        Ok(Some(Stmt::Block(vec![construction, run_phase_statement])))
+    }
+}
+
+fn collect_run_test_calls<'value>(value: &'value Value, calls: &mut Vec<&'value Value>) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && value.get("thisClass").is_none()
+            && string_field(value, "subroutine")
+                .and_then(|subroutine| {
+                    subroutine
+                        .split_whitespace()
+                        .next_back()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("run_test")
+        {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_run_test_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_run_test_calls(nested, calls);
+        }
+    }
+}
+
+fn run_test_class_name(call: &Value) -> Result<String, String> {
+    let invalid = || {
+        with_source_span(
+            call,
+            "direct-lowering run_test requires one compile-time string literal argument".into(),
+        )
+    };
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    if arguments.len() != 1 {
+        return Err(invalid());
+    }
+    let mut argument = &arguments[0];
+    while string_field(argument, "kind").as_deref() == Some("Conversion") {
+        let Some(operand) = argument.get("operand") else {
+            break;
+        };
+        argument = operand;
+    }
+    let class_name = string_field(argument, "literal")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(invalid)?;
+    Ok(class_name.to_string())
+}

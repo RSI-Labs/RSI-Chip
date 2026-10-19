@@ -11770,6 +11770,115 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_bootstraps_a_minimal_official_uvm_class() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-run-test-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_run_test_probe extends uvm_test;
+  function new(string name = "direct_run_test_probe", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    #10;
+  endtask
+endclass
+
+module official_uvm_run_test_top(output int done);
+  initial begin
+    run_test("direct_run_test_probe");
+    done = 1;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM run_test wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_run_test_top"),
+            &options,
+        )
+        .expect("directly lower a run_test class derived from official UVM");
+    assert_eq!(design.name, "official_uvm_run_test_top");
+    let mut simulator = Simulator::new(&design).expect("create official-UVM run_test simulator");
+    simulator
+        .run_until(10)
+        .expect("run the official-UVM-derived run_phase");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_direct_run_test_rejects_a_class_outside_official_uvm() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-run-test-non-uvm");
+    let source_path = root.join("run_test_non_uvm.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Plain;
+  function new();
+  endfunction
+
+  virtual task run_phase();
+    #1;
+  endtask
+endclass
+
+task run_test(string class_name);
+endtask
+
+module run_test_non_uvm_top;
+  initial begin
+    run_test("Plain");
+  end
+endmodule
+"#,
+    )
+    .expect("write direct run_test non-UVM source");
+
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("run_test_non_uvm_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("run_test must fail closed outside official UVM");
+    assert!(
+        error.contains("run_test class 'Plain' must derive from official uvm_test"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_validates_the_repository_cpu_rtl_compilation_units() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

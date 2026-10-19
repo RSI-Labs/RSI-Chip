@@ -184,6 +184,9 @@ impl SlangAstLowerer {
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
+        if let Some(statement) = self.lower_run_test_call(value)? {
+            return Ok(Some(statement));
+        }
         if matches!(
             task_name.as_str(),
             "$display"
