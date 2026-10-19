@@ -12731,10 +12731,29 @@ class ComponentNameTrace;
   static int child_match = 0;
   static int child_identity = 0;
   static int child_count = 0;
+  static int lookup_match = 0;
+  static int lookup_identity = 0;
+  static int nested_match = 0;
+  static int nested_identity = 0;
+endclass
+
+class direct_named_leaf extends uvm_test;
+  `uvm_component_utils(direct_named_leaf)
+
+  function new(string name = "direct_named_leaf",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int identity();
+    return 4;
+  endfunction
 endclass
 
 class direct_named_component extends uvm_test;
   `uvm_component_utils(direct_named_component)
+
+  direct_named_leaf nested;
 
   function new(string name = "direct_named_component",
                uvm_component parent = null);
@@ -12764,6 +12783,7 @@ class direct_named_component_env extends direct_named_base;
 
   direct_named_component component;
   direct_named_component recovered_child;
+  direct_named_leaf recovered_nested;
   direct_named_base parent_handle;
 
   function new(string name = "direct_named_component_env",
@@ -12773,6 +12793,8 @@ class direct_named_component_env extends direct_named_base;
 
   virtual function void build_phase(uvm_phase phase);
     component = direct_named_component::type_id::create("leaf", this);
+    component.nested =
+      direct_named_leaf::type_id::create("nested", component);
   endfunction
 
   virtual function int identity();
@@ -12799,6 +12821,22 @@ class direct_named_component_env extends direct_named_base;
     end else begin
       ComponentNameTrace::child_identity = recovered_child.identity();
     end
+    if (this.lookup("leaf") == component) begin
+      ComponentNameTrace::lookup_match = 1;
+    end
+    if (!$cast(recovered_child, this.lookup("leaf"))) begin
+      ComponentNameTrace::lookup_identity = 0;
+    end else begin
+      ComponentNameTrace::lookup_identity = recovered_child.identity();
+    end
+    if (this.lookup("leaf.nested") == component.nested) begin
+      ComponentNameTrace::nested_match = 1;
+    end
+    if (!$cast(recovered_nested, this.lookup("leaf.nested"))) begin
+      ComponentNameTrace::nested_identity = 0;
+    end else begin
+      ComponentNameTrace::nested_identity = recovered_nested.identity();
+    end
   endtask
 endclass
 
@@ -12809,7 +12847,11 @@ module official_uvm_component_name_probe(
   output int parent_identity,
   output int child_match,
   output int child_identity,
-  output int child_count
+  output int child_count,
+  output int lookup_match,
+  output int lookup_identity,
+  output int nested_match,
+  output int nested_identity
 );
   initial begin
     run_test("direct_named_component_env");
@@ -12820,6 +12862,10 @@ module official_uvm_component_name_probe(
     child_match = ComponentNameTrace::child_match;
     child_identity = ComponentNameTrace::child_identity;
     child_count = ComponentNameTrace::child_count;
+    lookup_match = ComponentNameTrace::lookup_match;
+    lookup_identity = ComponentNameTrace::lookup_identity;
+    nested_match = ComponentNameTrace::nested_match;
+    nested_identity = ComponentNameTrace::nested_identity;
   end
 endmodule
 "#,
@@ -12855,6 +12901,8 @@ endmodule
     assert_eq!(simulator.read("child_match").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("child_identity").unwrap().to_u64(), Some(3));
     assert_eq!(simulator.read("child_count").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("lookup_match").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("lookup_identity").unwrap().to_u64(), Some(3));
 }
 
 #[test]

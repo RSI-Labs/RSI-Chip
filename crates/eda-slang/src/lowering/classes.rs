@@ -30,20 +30,21 @@ struct ClassHandleCandidates {
 }
 
 impl SlangAstLowerer {
+    fn class_call_receiver_key(&self, method: &str, receiver: &Value) -> Result<String, String> {
+        self.class_object_key_for_value(receiver)?
+            .or_else(|| {
+                is_this_reference(receiver)
+                    .then(|| self.active_class_objects.borrow().last().cloned())
+                    .flatten()
+            })
+            .ok_or_else(|| format!("class {method} receiver is not a prepared class object"))
+    }
+
     fn class_child_lookup_key(&self, call: &Value) -> Result<String, String> {
         let receiver = call
             .get("thisClass")
             .ok_or_else(|| "class get_child call has no receiver".to_string())?;
-        let parent_key = self
-            .class_object_key_for_value(receiver)?
-            .or_else(|| {
-                if is_this_reference(receiver) {
-                    self.active_class_objects.borrow().last().cloned()
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| "class get_child receiver is not a prepared class object".to_string())?;
+        let parent_key = self.class_call_receiver_key("get_child", receiver)?;
         let empty_arguments = Vec::new();
         let arguments = call
             .get("arguments")
@@ -75,6 +76,55 @@ impl SlangAstLowerer {
             .ok_or_else(|| {
                 format!("class parent '{parent_key}' has no child named '{requested_name}'")
             })
+    }
+
+    fn class_component_lookup_key(&self, call: &Value) -> Result<String, String> {
+        let receiver = call
+            .get("thisClass")
+            .ok_or_else(|| "class lookup call has no receiver".to_string())?;
+        let mut object_key = self.class_call_receiver_key("lookup", receiver)?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 1 {
+            return Err("class lookup requires one string argument".into());
+        }
+        let path = string_field(
+            conversion_operand(&arguments[0]).unwrap_or(&arguments[0]),
+            "literal",
+        )
+        .ok_or_else(|| "class lookup requires a string literal path".to_string())?;
+        if path.starts_with('.') || path.ends_with('.') || path.contains("..") {
+            return Err(format!(
+                "class lookup path '{path}' must be relative and well-formed"
+            ));
+        }
+        for segment in path.split('.') {
+            if segment.is_empty() {
+                return Err(format!("class lookup path '{path}' has an empty segment"));
+            }
+            let children = self
+                .class_object_children
+                .borrow()
+                .get(&object_key)
+                .cloned()
+                .unwrap_or_default();
+            object_key = children
+                .iter()
+                .find(|child_key| {
+                    self.class_object_declared_names
+                        .borrow()
+                        .get(*child_key)
+                        .is_some_and(|name| name == segment)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    format!("class object has no child '{segment}' in lookup path '{path}'")
+                })?;
+        }
+        Ok(object_key)
     }
 
     fn dynamic_sources_for(&self, object_key: &str) -> Vec<super::DynamicClassSource> {
@@ -340,6 +390,12 @@ impl SlangAstLowerer {
         if is_class_child_lookup_call(value) {
             let child_key = self.class_child_lookup_key(value)?;
             if let Some(id) = self.class_object_ids.get(&child_key) {
+                return Ok(Some(class_expr(id)));
+            }
+        }
+        if is_class_component_lookup_call(value) {
+            let component_key = self.class_component_lookup_key(value)?;
+            if let Some(id) = self.class_object_ids.get(&component_key) {
                 return Ok(Some(class_expr(id)));
             }
         }
@@ -1179,13 +1235,22 @@ impl SlangAstLowerer {
                         })
                         .as_deref()
                         == Some("this");
-                is_this.then(|| {
-                    self.active_class_objects
-                        .borrow()
-                        .last()
-                        .cloned()
-                        .ok_or_else(|| "class parent 'this' has no active receiver".to_string())
-                })
+                if is_this {
+                    Some(
+                        self.active_class_objects
+                            .borrow()
+                            .last()
+                            .cloned()
+                            .ok_or_else(|| {
+                                "class parent 'this' has no active receiver".to_string()
+                            }),
+                    )
+                } else {
+                    match self.class_object_key_for_value(parent) {
+                        Ok(parent_key) => parent_key.map(Ok),
+                        Err(error) => Some(Err(error)),
+                    }
+                }
             })
             .transpose()?;
         if let Some(parent_key) = &parent_key {
@@ -1467,6 +1532,8 @@ impl SlangAstLowerer {
         };
         let source_key = if is_class_child_lookup_call(source) {
             self.class_child_lookup_key(source)?
+        } else if is_class_component_lookup_call(source) {
+            self.class_component_lookup_key(source)?
         } else if is_class_parent_call(source) {
             let Some(receiver) = source.get("thisClass") else {
                 return Err("class get_parent call has no receiver".into());
@@ -3015,6 +3082,23 @@ fn is_class_child_lookup_call(value: &Value) -> bool {
             })
             .as_deref()
             == Some("get_child")
+        && value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .is_some_and(|arguments| arguments.len() == 1)
+}
+
+fn is_class_component_lookup_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("lookup")
         && value
             .get("arguments")
             .and_then(Value::as_array)
