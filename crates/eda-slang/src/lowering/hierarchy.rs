@@ -1048,6 +1048,7 @@ impl super::SlangAstLowerer {
             class_object_ids: std::collections::BTreeMap::new(),
             class_object_names: std::collections::BTreeMap::new(),
             class_object_full_names: std::collections::BTreeMap::new(),
+            class_object_parent_ids: std::collections::BTreeMap::new(),
             class_object_serial: None,
             class_static_methods: std::collections::BTreeMap::new(),
             class_static_properties: std::collections::BTreeMap::new(),

@@ -290,6 +290,44 @@ impl SlangAstLowerer {
             }
             return Ok(Some(result));
         }
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine")
+                .and_then(|subroutine| {
+                    subroutine
+                        .split_whitespace()
+                        .next_back()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("get_parent")
+        {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.is_empty() {
+                if let Some(receiver) = value.get("thisClass") {
+                    if let Some(object_key) = self.class_object_key_for_value(receiver)? {
+                        if let Some(parent_id) = self.class_object_parent_ids.get(&object_key) {
+                            return Ok(Some(class_expr(parent_id)));
+                        }
+                    }
+                }
+            }
+        }
+        if string_field(value, "kind").as_deref() == Some("NamedValue")
+            && string_field(value, "symbol")
+                .and_then(|symbol| symbol.split_whitespace().next_back().map(str::to_string))
+                .as_deref()
+                == Some("this")
+        {
+            if let Some(object_key) = self.active_class_objects.borrow().last().cloned() {
+                if let Some(id) = self.class_object_ids.get(&object_key) {
+                    return Ok(Some(class_expr(id)));
+                }
+            }
+        }
         Ok(self
             .class_object_key_for_value(value)?
             .and_then(|object_key| self.class_object_ids.get(&object_key).cloned())
@@ -799,6 +837,8 @@ impl SlangAstLowerer {
                 &format!("__class_object_full_name_{synthetic_prefix}"),
                 crate::types::STRING_WIDTH,
             );
+            let parent_id = self
+                .declare_class_internal_net(&format!("__class_parent_id_{synthetic_prefix}"), 64);
             self.design.initials.extend([
                 Stmt::Bl {
                     lv: class_lvalue(&tag),
@@ -812,6 +852,10 @@ impl SlangAstLowerer {
                     lv: class_lvalue(&object_full_name),
                     e: Expr::Const(LogicWord::zero(object_full_name.width)),
                 },
+                Stmt::Bl {
+                    lv: class_lvalue(&parent_id),
+                    e: Expr::Const(LogicWord::zero(parent_id.width)),
+                },
             ]);
             self.class_object_tags.insert(object_key.clone(), tag);
             self.class_object_ids.insert(object_key.clone(), id);
@@ -819,6 +863,8 @@ impl SlangAstLowerer {
                 .insert(object_key.clone(), object_name);
             self.class_object_full_names
                 .insert(object_key.clone(), object_full_name);
+            self.class_object_parent_ids
+                .insert(object_key.clone(), parent_id);
             if let Some(index) = index {
                 array_elements.insert(index, object_key.clone());
             }
@@ -1100,6 +1146,17 @@ impl SlangAstLowerer {
             (Some(name_expression), None) => Some(name_expression.clone()),
             (None, _) => None,
         };
+        let parent_id_expression = parent_key.as_ref().and_then(|parent_key| {
+            self.class_object_ids
+                .get(parent_key)
+                .cloned()
+                .map(|parent_id| class_expr(&parent_id))
+        });
+        let object_parent_id = self
+            .class_object_parent_ids
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no parent identity"))?;
         let initializer_statements = self.class_property_initializer_statements(&object_key)?;
         let body = if constructor_class != target_class {
             let Some((method, owner)) = self.resolve_class_method(&constructor_class, "new")?
@@ -1141,6 +1198,12 @@ impl SlangAstLowerer {
         if let Some(expression) = full_name_expression {
             statements.push(Stmt::Bl {
                 lv: class_lvalue(&object_full_name),
+                e: expression,
+            });
+        }
+        if let Some(expression) = parent_id_expression {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(&object_parent_id),
                 e: expression,
             });
         }
@@ -1399,6 +1462,10 @@ impl SlangAstLowerer {
             (
                 self.class_object_full_names[&target_key].clone(),
                 self.class_object_full_names[&source_key].clone(),
+            ),
+            (
+                self.class_object_parent_ids[&target_key].clone(),
+                self.class_object_parent_ids[&source_key].clone(),
             ),
         ] {
             copy.push(Stmt::Bl {
@@ -1712,6 +1779,10 @@ impl SlangAstLowerer {
             (
                 &self.class_object_full_names[target_key],
                 &self.class_object_full_names[source_key],
+            ),
+            (
+                &self.class_object_parent_ids[target_key],
+                &self.class_object_parent_ids[source_key],
             ),
         ] {
             statements.push(Stmt::Bl {
