@@ -12503,6 +12503,112 @@ endmodule
 }
 
 #[test]
+fn slang_direct_object_registry_applies_factory_overrides() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-object-override-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ObjectOverrideTrace;
+  static int kind = 0;
+endclass
+
+class direct_object_base extends uvm_test;
+  `uvm_object_utils(direct_object_base)
+
+  function new(string name = "direct_object_base");
+    super.new(name, null);
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class direct_object_derived extends direct_object_base;
+  `uvm_object_utils(direct_object_derived)
+
+  function new(string name = "direct_object_derived");
+    super.new(name);
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+class direct_object_env extends uvm_test;
+  `uvm_component_utils(direct_object_env)
+
+  direct_object_base item;
+
+  function new(string name = "direct_object_env", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    item = direct_object_base::type_id::create("item");
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    ObjectOverrideTrace::kind = item.kind();
+  endtask
+endclass
+
+module official_uvm_object_override_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_override_by_type(
+      direct_object_base::get_type(),
+      direct_object_derived::get_type()
+    );
+    run_test("direct_object_env");
+    stage = ObjectOverrideTrace::kind;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM object override wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_object_override_probe"),
+            &options,
+        )
+        .expect("directly lower a factory-overridden object creation");
+    let mut simulator = Simulator::new(&design).expect("create factory object override simulator");
+    simulator
+        .run_until(0)
+        .expect("run the factory-overridden object method");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_run_test_rejects_incompatible_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

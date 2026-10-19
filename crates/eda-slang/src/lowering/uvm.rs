@@ -437,8 +437,8 @@ impl SlangAstLowerer {
         right: &Value,
     ) -> Result<Option<Stmt>, String> {
         let direct_factory_call = is_uvm_factory_create_component_call(right);
-        let registry_create_call = is_uvm_registry_create_call(right);
-        if !direct_factory_call && !registry_create_call {
+        let registry_kind = uvm_registry_create_kind(right);
+        if !direct_factory_call && registry_kind.is_none() {
             return Ok(None);
         }
         let empty_arguments = Vec::new();
@@ -446,7 +446,7 @@ impl SlangAstLowerer {
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_arguments);
-        let (requested_name, name_argument, parent_argument) = if direct_factory_call {
+        let (requested_name, name_argument, constructor_arguments) = if direct_factory_call {
             if arguments.len() != 4 {
                 return Err("UVM factory create_component_by_type requires four arguments".into());
             }
@@ -457,25 +457,42 @@ impl SlangAstLowerer {
                     "UVM factory requested component type must be Class::get_type()".to_string()
                 })?,
                 &arguments[2],
-                &arguments[3],
+                vec![arguments[2].clone(), arguments[3].clone()],
             )
         } else {
-            if arguments.len() < 2 || arguments.len() > 3 {
-                return Err("UVM component registry create requires two or three arguments".into());
-            }
-            if let Some(context) = arguments.get(2) {
+            let registry_kind = registry_kind.expect("UVM registry create kind was just checked");
+            if registry_kind == "component" {
+                if arguments.len() < 2 || arguments.len() > 3 {
+                    return Err(
+                        "UVM component registry create requires two or three arguments".into(),
+                    );
+                }
+                if let Some(context) = arguments.get(2) {
+                    string_literal_allow_empty(unwrap_conversion(context)).ok_or_else(|| {
+                        "UVM component registry context must be a string literal".to_string()
+                    })?;
+                }
+            } else if arguments.is_empty() || arguments.len() > 3 {
+                return Err("UVM object registry create requires one to three arguments".into());
+            } else if let Some(context) = arguments.get(2) {
                 string_literal_allow_empty(unwrap_conversion(context)).ok_or_else(|| {
-                    "UVM component registry context must be a string literal".to_string()
+                    "UVM object registry context must be a string literal".to_string()
                 })?;
             }
-            (
-                registry_create_class_name(right, &self.class_definitions).ok_or_else(|| {
-                    "UVM component registry create could not resolve its requested class"
-                        .to_string()
-                })?,
-                &arguments[0],
-                &arguments[1],
-            )
+            let requested_name =
+                registry_create_class_name(right, &self.class_definitions, registry_kind)
+                    .ok_or_else(|| {
+                        "UVM registry create could not resolve its requested class".to_string()
+                    })?;
+            if registry_kind == "component" {
+                (
+                    requested_name,
+                    &arguments[0],
+                    vec![arguments[0].clone(), arguments[1].clone()],
+                )
+            } else {
+                (requested_name, &arguments[0], vec![arguments[0].clone()])
+            }
         };
         string_literal(unwrap_conversion(name_argument))
             .ok_or_else(|| "UVM factory component name must be a string literal".to_string())?;
@@ -540,9 +557,10 @@ impl SlangAstLowerer {
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_formals);
-        if formals.len() != 2 {
+        let expected_constructor_arguments = constructor_arguments.len();
+        if formals.len() != expected_constructor_arguments {
             return Err(format!(
-                "UVM factory component class '{selected_name}' must have two constructor arguments"
+                "UVM factory class '{selected_name}' must have {expected_constructor_arguments} constructor arguments"
             ));
         }
         let constructor_address =
@@ -562,10 +580,7 @@ impl SlangAstLowerer {
                 "constructorCall": {
                     "kind": "Call",
                     "subroutine": format!("{constructor_address} new"),
-                    "arguments": [
-                        name_argument.clone(),
-                        parent_argument.clone(),
-                    ],
+                    "arguments": constructor_arguments,
                 },
             },
             "isNonBlocking": bool_field(assignment, "isNonBlocking"),
@@ -969,25 +984,35 @@ fn is_uvm_factory_create_component_call(value: &Value) -> bool {
         })
 }
 
-fn is_uvm_registry_create_call(value: &Value) -> bool {
-    string_field(value, "kind").as_deref() == Some("Call")
-        && string_field(value, "subroutine")
-            .and_then(|subroutine| {
-                subroutine
-                    .split_whitespace()
-                    .next_back()
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some("create")
-        && string_field(value, "type")
-            .map(|type_name| type_name.contains("uvm_component_registry::T"))
-            .unwrap_or(false)
+fn uvm_registry_create_kind(value: &Value) -> Option<&'static str> {
+    if string_field(value, "kind").as_deref() != Some("Call") {
+        return None;
+    }
+    let subroutine = string_field(value, "subroutine")
+        .and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if subroutine != "create" {
+        return None;
+    }
+    let type_name = string_field(value, "type")?;
+    if type_name.contains("uvm_component_registry::T") {
+        Some("component")
+    } else if type_name.contains("uvm_object_registry::T") {
+        Some("object")
+    } else {
+        None
+    }
 }
 
 fn registry_create_class_name(
     call: &Value,
     class_definitions: &BTreeMap<String, Value>,
+    registry_kind: &str,
 ) -> Option<String> {
     let address = string_field(call, "subroutine")?
         .split_whitespace()
@@ -996,10 +1021,14 @@ fn registry_create_class_name(
         .ok()?;
     for class in class_definitions.values() {
         let generic_class = string_field(class, "genericClass").unwrap_or_default();
+        let expected_registry = match registry_kind {
+            "component" => "uvm_component_registry",
+            _ => "uvm_object_registry",
+        };
         if generic_class
             .split_whitespace()
             .next_back()
-            .is_none_or(|name| name != "uvm_component_registry")
+            .is_none_or(|name| name != expected_registry)
         {
             continue;
         }
