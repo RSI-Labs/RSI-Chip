@@ -795,6 +795,10 @@ impl SlangAstLowerer {
                 &format!("__class_object_name_{synthetic_prefix}"),
                 crate::types::STRING_WIDTH,
             );
+            let object_full_name = self.declare_class_internal_net(
+                &format!("__class_object_full_name_{synthetic_prefix}"),
+                crate::types::STRING_WIDTH,
+            );
             self.design.initials.extend([
                 Stmt::Bl {
                     lv: class_lvalue(&tag),
@@ -804,11 +808,17 @@ impl SlangAstLowerer {
                     lv: class_lvalue(&id),
                     e: Expr::Const(LogicWord::zero(id.width)),
                 },
+                Stmt::Bl {
+                    lv: class_lvalue(&object_full_name),
+                    e: Expr::Const(LogicWord::zero(object_full_name.width)),
+                },
             ]);
             self.class_object_tags.insert(object_key.clone(), tag);
             self.class_object_ids.insert(object_key.clone(), id);
             self.class_object_names
                 .insert(object_key.clone(), object_name);
+            self.class_object_full_names
+                .insert(object_key.clone(), object_full_name);
             if let Some(index) = index {
                 array_elements.insert(index, object_key.clone());
             }
@@ -1029,12 +1039,17 @@ impl SlangAstLowerer {
             .get(&object_key)
             .cloned()
             .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?;
+        let object_full_name = self
+            .class_object_full_names
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no full-name storage"))?;
         let empty_constructor_arguments = Vec::new();
         let constructor_arguments = constructor
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_constructor_arguments);
-        let name_statement = constructor_arguments
+        let name_expression = constructor_arguments
             .first()
             .filter(|actual| {
                 string_field(conversion_operand(actual).unwrap_or(actual), "kind").as_deref()
@@ -1042,12 +1057,49 @@ impl SlangAstLowerer {
             })
             .map(|actual| {
                 let expression = self.lower_expression(actual)?;
-                Ok::<Stmt, String>(Stmt::Bl {
-                    lv: class_lvalue(&object_name),
-                    e: expression,
+                Ok::<Expr, String>(expression)
+            })
+            .transpose()?;
+        let parent_key = constructor_arguments
+            .get(1)
+            .and_then(|parent| {
+                let parent = conversion_operand(parent).unwrap_or(parent);
+                let is_this = string_field(parent, "kind").as_deref() == Some("NamedValue")
+                    && string_field(parent, "symbol")
+                        .and_then(|symbol| {
+                            symbol.split_whitespace().next_back().map(str::to_string)
+                        })
+                        .as_deref()
+                        == Some("this");
+                is_this.then(|| {
+                    self.active_class_objects
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| "class parent 'this' has no active receiver".to_string())
                 })
             })
             .transpose()?;
+        let full_name_expression = match (&name_expression, &parent_key) {
+            (Some(name_expression), Some(parent_key)) => {
+                let parent_full_name = self
+                    .class_object_full_names
+                    .get(parent_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{parent_key}' has no full-name"))?;
+                let separator = crate::types::string_literal_word(".")
+                    .ok_or_else(|| "class-name separator is too long".to_string())?;
+                Some(Expr::StringConcat {
+                    left: Box::new(class_expr(&parent_full_name)),
+                    right: Box::new(Expr::StringConcat {
+                        left: Box::new(Expr::Const(separator)),
+                        right: Box::new(name_expression.clone()),
+                    }),
+                })
+            }
+            (Some(name_expression), None) => Some(name_expression.clone()),
+            (None, _) => None,
+        };
         let initializer_statements = self.class_property_initializer_statements(&object_key)?;
         let body = if constructor_class != target_class {
             let Some((method, owner)) = self.resolve_class_method(&constructor_class, "new")?
@@ -1080,8 +1132,17 @@ impl SlangAstLowerer {
                 },
             },
         ];
-        if let Some(statement) = name_statement {
-            statements.push(statement);
+        if let Some(expression) = name_expression {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(&object_name),
+                e: expression,
+            });
+        }
+        if let Some(expression) = full_name_expression {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(&object_full_name),
+                e: expression,
+            });
         }
         statements.extend(initializer_statements);
         statements.push(body);
@@ -1335,6 +1396,10 @@ impl SlangAstLowerer {
                 self.class_object_names[&target_key].clone(),
                 self.class_object_names[&source_key].clone(),
             ),
+            (
+                self.class_object_full_names[&target_key].clone(),
+                self.class_object_full_names[&source_key].clone(),
+            ),
         ] {
             copy.push(Stmt::Bl {
                 lv: class_lvalue(&target_symbol),
@@ -1453,11 +1518,19 @@ impl SlangAstLowerer {
             .unwrap_or(&empty_call_arguments);
         if matches!(method_name.as_str(), "get_name" | "get_full_name") && call_arguments.is_empty()
         {
-            let name = self
-                .class_object_names
-                .get(&object_key)
-                .cloned()
-                .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?;
+            let name = if method_name == "get_full_name" {
+                self.class_object_full_names
+                    .get(&object_key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("class object '{object_key}' has no full-name storage")
+                    })?
+            } else {
+                self.class_object_names
+                    .get(&object_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{object_key}' has no name storage"))?
+            };
             return Ok(Some(class_expr(&name)));
         }
         let Some((method, owner)) = self.class_method(&object_key, call)? else {
@@ -1477,6 +1550,15 @@ impl SlangAstLowerer {
             .get("expr")
             .ok_or_else(|| "class function return has no expression".to_string())?;
         self.lower_expression(expression).map(Some)
+    }
+
+    fn lower_class_method_statement(&self, object_key: &str, body: &Value) -> Result<Stmt, String> {
+        self.active_class_objects
+            .borrow_mut()
+            .push(object_key.to_string());
+        let result = self.lower_statement(body);
+        self.active_class_objects.borrow_mut().pop();
+        result
     }
 
     pub(super) fn lower_class_handle_assignment(
@@ -1626,6 +1708,10 @@ impl SlangAstLowerer {
             (
                 &self.class_object_names[target_key],
                 &self.class_object_names[source_key],
+            ),
+            (
+                &self.class_object_full_names[target_key],
+                &self.class_object_full_names[source_key],
             ),
         ] {
             statements.push(Stmt::Bl {
@@ -1976,7 +2062,7 @@ impl SlangAstLowerer {
             return Err("non-void class methods must be used as expressions".into());
         }
         let body = self.specialized_method_body(object_key, &owner, &method, call)?;
-        self.lower_statement(&body)
+        self.lower_class_method_statement(object_key, &body)
     }
 
     fn class_method(
@@ -2171,7 +2257,7 @@ impl SlangAstLowerer {
         call: &Value,
     ) -> Result<Stmt, String> {
         let body = self.specialized_method_body(object_key, owner_class, method, call)?;
-        self.lower_statement(&body)
+        self.lower_class_method_statement(object_key, &body)
     }
 
     fn receiver_class_name(&self, object_key: &str) -> Option<String> {

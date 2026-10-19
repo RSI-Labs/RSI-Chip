@@ -12725,6 +12725,7 @@ import uvm_pkg::*;
 
 class ComponentNameTrace;
   static string name = "";
+  static string full_name = "";
 endclass
 
 class direct_named_component extends uvm_test;
@@ -12755,13 +12756,18 @@ class direct_named_component_env extends uvm_test;
 
   virtual task run_phase(uvm_phase phase);
     ComponentNameTrace::name = component.get_name();
+    ComponentNameTrace::full_name = component.get_full_name();
   endtask
 endclass
 
-module official_uvm_component_name_probe(output string name);
+module official_uvm_component_name_probe(
+  output string name,
+  output string full_name
+);
   initial begin
     run_test("direct_named_component_env");
     name = ComponentNameTrace::name;
+    full_name = ComponentNameTrace::full_name;
   end
 endmodule
 "#,
@@ -12784,6 +12790,13 @@ endmodule
             .unwrap()
             .to_ascii_string_nul_terminated(),
         "leaf"
+    );
+    assert_eq!(
+        simulator
+            .read("full_name")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "direct_named_component_env.leaf"
     );
 }
 
