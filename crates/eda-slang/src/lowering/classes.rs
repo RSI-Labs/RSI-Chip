@@ -572,6 +572,9 @@ impl SlangAstLowerer {
             ));
         }
         let chain = self.class_chain(&class_key)?;
+        let official_uvm_derivation = chain
+            .iter()
+            .any(|(owner, _)| owner.split('@').next() == Some("uvm_test"));
         let empty_members = Vec::new();
         let mut declared_properties = BTreeMap::new();
         for (owner_name, class) in &chain {
@@ -658,6 +661,7 @@ impl SlangAstLowerer {
                 .map(|index| format!("{handle_address}_{index}"))
                 .unwrap_or_else(|| handle_address.to_string());
             let mut fields: BTreeMap<String, super::AstLoweredSymbol> = BTreeMap::new();
+            let mut property_initializers = Vec::new();
             let mut property_chains = vec![chain.clone()];
             if let Some(sources) = self.dynamic_class_sources.get(&object_key) {
                 for source in sources {
@@ -665,7 +669,7 @@ impl SlangAstLowerer {
                 }
             }
             for property_chain in &property_chains {
-                for (_, class) in property_chain.iter().rev() {
+                for (owner_name, class) in property_chain.iter().rev() {
                     let empty_members = Vec::new();
                     let members = class
                         .get("members")
@@ -678,12 +682,11 @@ impl SlangAstLowerer {
                         if string_field(property, "lifetime").as_deref() == Some("Static") {
                             continue;
                         }
-                        let property_name = declaration_name(property, "ClassProperty")?;
-                        if property.get("initializer").is_some() {
-                            return Err(format!(
-                            "class property '{class_name}.{property_name}' initializers are not supported; initialize in new()"
-                        ));
+                        if official_uvm_derivation && owner_name != &class_key {
+                            continue;
                         }
+                        let property_name = declaration_name(property, "ClassProperty")?;
+                        let initializer = property.get("initializer").cloned();
                         let property_address = property
                             .get("addr")
                             .and_then(Value::as_u64)
@@ -695,6 +698,9 @@ impl SlangAstLowerer {
                         let property_type = string_field(property, "type").unwrap_or_default();
                         let property_class_key = self.class_type_key(&property_type);
                         if self.class_definitions.contains_key(&property_class_key) {
+                            if owner_name != &class_key {
+                                continue;
+                            }
                             if !class_properties.iter().any(
                                 |candidate: &(String, Value, String)| candidate.0 == property_name,
                             ) {
@@ -706,7 +712,14 @@ impl SlangAstLowerer {
                             }
                             continue;
                         }
-                        let (shape, signed, _) = self.net_type(&property_type)?;
+                        let Ok((shape, signed, _)) = self.net_type(&property_type) else {
+                            if owner_name != &class_key {
+                                continue;
+                            }
+                            return Err(format!(
+                                "class property '{class_name}.{property_name}' has an unsupported type"
+                            ));
+                        };
                         let synthetic_symbol =
                             format!("eda_class_{synthetic_prefix}_{property_address}");
                         if let Some(existing) = fields.get(&property_name) {
@@ -733,11 +746,16 @@ impl SlangAstLowerer {
                         temporary.signed = signed;
                         self.class_property_temps
                             .insert((object_key.clone(), property_name.clone()), temporary);
-                        fields.insert(property_name, symbol);
+                        fields.insert(property_name.clone(), symbol);
+                        if let Some(initializer) = initializer {
+                            property_initializers.push((property_name.clone(), initializer));
+                        }
                     }
                 }
             }
             self.class_objects.insert(object_key.clone(), fields);
+            self.class_property_initializers
+                .insert(object_key.clone(), property_initializers);
             self.class_object_types
                 .insert(object_key.clone(), class_key.clone());
             let tag =
@@ -947,8 +965,9 @@ impl SlangAstLowerer {
             .class_object_serial
             .clone()
             .ok_or_else(|| "class object serial counter is missing".to_string())?;
+        let initializer_statements = self.class_property_initializer_statements(&object_key)?;
         let body = self.lower_class_method(&object_key, constructor, true)?;
-        Ok(Some(Stmt::Block(vec![
+        let mut statements = vec![
             Stmt::Bl {
                 lv: class_lvalue(&tag),
                 e: Expr::Const(LogicWord::from_u64(32, class_id)),
@@ -965,8 +984,31 @@ impl SlangAstLowerer {
                     b: Box::new(Expr::Const(LogicWord::from_u64(64, 1))),
                 },
             },
-            body,
-        ])))
+        ];
+        statements.extend(initializer_statements);
+        statements.push(body);
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    fn class_property_initializer_statements(&self, object_key: &str) -> Result<Vec<Stmt>, String> {
+        let Some(initializers) = self.class_property_initializers.get(object_key) else {
+            return Ok(Vec::new());
+        };
+        let Some(fields) = self.class_objects.get(object_key) else {
+            return Ok(Vec::new());
+        };
+        let mut statements = Vec::new();
+        for (field_name, initializer) in initializers {
+            let Some(symbol) = fields.get(field_name) else {
+                continue;
+            };
+            let expression = self.lower_expression(initializer)?;
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(symbol),
+                e: expression,
+            });
+        }
+        Ok(statements)
     }
 
     pub(super) fn lower_class_task_call(
@@ -2034,6 +2076,9 @@ impl SlangAstLowerer {
                             .and_then(class_name)
                     })
                     .ok_or_else(|| format!("class '{owner_class}' has no base constructor"))?;
+                if class_name(&base).as_deref() == Some("uvm_test") {
+                    return Ok(json!({"kind": "Empty"}));
+                }
                 let empty_members = Vec::new();
                 let mut base_constructor = None;
                 for (class_name, class) in self.class_chain(&base)? {

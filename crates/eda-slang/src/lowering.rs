@@ -447,6 +447,8 @@ pub(super) struct SlangAstLowerer {
         std::collections::BTreeMap<String, Vec<(String, AstLoweredSymbol)>>,
     class_property_owners: std::collections::BTreeMap<usize, (String, String)>,
     class_property_temps: std::collections::BTreeMap<(String, String), AstLoweredSymbol>,
+    class_property_initializers:
+        std::collections::BTreeMap<String, Vec<(String, serde_json::Value)>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
     active_composition_classes: std::collections::BTreeSet<String>,
@@ -583,6 +585,7 @@ impl SlangAstLowerer {
             class_array_constructor_temps: std::collections::BTreeMap::new(),
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
+            class_property_initializers: std::collections::BTreeMap::new(),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
             active_composition_classes: std::collections::BTreeSet::new(),

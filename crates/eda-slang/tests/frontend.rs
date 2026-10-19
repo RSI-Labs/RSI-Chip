@@ -129,6 +129,68 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_class_property_initializers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-property-initializers");
+    let source_path = root.join("property_initializers.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Base;
+  int value = 41;
+  string label = "ready";
+endclass
+
+class Derived extends Base;
+  int extra = 1;
+
+  function new();
+  endfunction
+
+  function int total();
+    return value + extra;
+  endfunction
+endclass
+
+module property_initializer_top(
+  output int total,
+  output string label
+);
+  Derived object;
+  initial begin
+    object = new();
+    total = object.total();
+    label = object.label;
+  end
+endmodule
+"#,
+    )
+    .expect("write property-initializer source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("property_initializer_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower class property initializers");
+    let mut simulator = Simulator::new(&design).expect("create property-initializer simulator");
+    simulator
+        .run_until(0)
+        .expect("run property-initializer constructor");
+    assert_eq!(simulator.read("total").unwrap().to_u64(), Some(42));
+    assert_eq!(
+        simulator
+            .read("label")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "ready"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_indexed_class_arrays() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -11640,7 +11702,7 @@ fn slang_ast_json_contains_elaborated_module_symbols() {
 }
 
 #[test]
-fn slang_directly_lowers_the_official_accellera_uvm_reference_source() {
+fn slang_directly_lowers_and_runs_a_minimal_class_derived_from_official_uvm() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -11668,10 +11730,24 @@ fn slang_directly_lowers_the_official_accellera_uvm_reference_source() {
     std::fs::write(
         &wrapper,
         r#"
-module official_uvm_direct_probe(output int result);
-  import uvm_pkg::*;
+import uvm_pkg::*;
+
+class direct_uvm_test extends uvm_test;
+  function new(string name = "direct_uvm_test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    #10;
+  endtask
+endclass
+
+module official_uvm_direct_probe(output int done);
+  direct_uvm_test test;
   initial begin
-    result = 1;
+    test = new("direct_uvm_test", null);
+    test.run_phase(null);
+    done = 1;
   end
 endmodule
 "#,
@@ -11683,14 +11759,14 @@ endmodule
             Some("official_uvm_direct_probe"),
             &options,
         )
-        .expect("directly lower the official UVM reference library");
+        .expect("directly lower a class derived from official UVM");
     assert_eq!(design.name, "official_uvm_direct_probe");
     let mut simulator =
         Simulator::new(&design).expect("create official-UVM direct-lowering simulator");
     simulator
-        .run_until(0)
-        .expect("run the official-UVM direct-lowering wrapper");
-    assert_eq!(simulator.read("result").unwrap().to_u64(), Some(1));
+        .run_until(10)
+        .expect("run the official-UVM-derived class");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
 }
 
 #[test]

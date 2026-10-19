@@ -1054,6 +1054,7 @@ impl super::SlangAstLowerer {
             class_array_constructor_temps: std::collections::BTreeMap::new(),
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
+            class_property_initializers: std::collections::BTreeMap::new(),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
             active_composition_classes: std::collections::BTreeSet::new(),

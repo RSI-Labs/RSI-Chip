@@ -72,16 +72,17 @@ specializations with method-body parameter substitution, scalar and
 one-dimensional class-valued composition arrays with nested
 construction/field/method access, constant-indexed and dynamic class-array
 read/write/handle-assignment subsets, null handle assignment/comparison, and
-simple integral/string type aliases,
+simple integral/string type aliases, class property initializers,
 first-class sparse memories, memory file tasks, and top-level and child
 memory-port sharing. It records slang source spans and
 validates lowered structure against the authoritative AST. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
 
-The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`
-beside a trivial importing wrapper, but official UVM phasing, objections,
-factories, TLM, and sequences are not yet executed.
+The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`, and
+a class derived from official `uvm_test` can be explicitly constructed with its
+overridden `run_phase` executed. This is still a bootstrap: `run_test`, UVM
+phasing, objections, factories, TLM, and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit
