@@ -567,6 +567,12 @@ impl SlangAstLowerer {
         let Some(target) = self.class_handle_candidates_from_ast(left)? else {
             return Ok(());
         };
+        if is_class_parent_call(right) {
+            for target_key in target.keys {
+                self.initialized_class_objects.insert(target_key);
+            }
+            return Ok(());
+        }
         if string_field(right, "kind").as_deref() == Some("NewClass") {
             for target_key in target.keys {
                 self.initialized_class_objects.insert(target_key.clone());
@@ -1126,6 +1132,11 @@ impl SlangAstLowerer {
                 })
             })
             .transpose()?;
+        if let Some(parent_key) = &parent_key {
+            self.class_object_parent_keys
+                .borrow_mut()
+                .insert(object_key.clone(), parent_key.clone());
+        }
         let full_name_expression = match (&name_expression, &parent_key) {
             (Some(name_expression), Some(parent_key)) => {
                 let parent_full_name = self
@@ -1375,8 +1386,24 @@ impl SlangAstLowerer {
         let Some(target_key) = self.class_object_key_for_value(target)? else {
             return Err("$cast destination is not a prepared class object".into());
         };
-        let Some(source_key) = self.class_object_key_for_value(source)? else {
-            return Err("$cast source is not a prepared class object".into());
+        let source_key = if is_class_parent_call(source) {
+            let Some(receiver) = source.get("thisClass") else {
+                return Err("class get_parent call has no receiver".into());
+            };
+            let Some(child_key) = self.class_object_key_for_value(receiver)? else {
+                return Err("class get_parent receiver is not a prepared class object".into());
+            };
+            self.require_initialized_class_object(&child_key)?;
+            self.class_object_parent_keys
+                .borrow()
+                .get(&child_key)
+                .cloned()
+                .ok_or_else(|| format!("class object '{child_key}' has no prepared parent"))?
+        } else {
+            let Some(source_key) = self.class_object_key_for_value(source)? else {
+                return Err("$cast source is not a prepared class object".into());
+            };
+            source_key
         };
         self.require_initialized_class_object(&source_key)?;
         if !self.class_objects.contains_key(&target_key)
@@ -1445,6 +1472,7 @@ impl SlangAstLowerer {
             });
         }
         let type_matches = type_matches.expect("acceptable $cast class list is nonempty");
+        self.record_runtime_dynamic_source(&target_key, &source_key, &source_type)?;
         let mut copy = Vec::new();
         for (target_symbol, source_symbol) in [
             (
@@ -1733,6 +1761,108 @@ impl SlangAstLowerer {
         self.require_initialized_class_object(&source_key)?;
         self.class_handle_copy_statement(&target_key, &source_key)
             .map(Some)
+    }
+
+    pub(super) fn lower_class_parent_assignment(
+        &self,
+        assignment: &Value,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        if !is_class_parent_call(right) {
+            return Ok(None);
+        }
+        let Some(receiver) = right.get("thisClass") else {
+            return Err("class get_parent call has no receiver".into());
+        };
+        let Some(child_key) = self.class_object_key_for_value(receiver)? else {
+            return Err("class get_parent receiver is not a prepared class object".into());
+        };
+        self.require_initialized_class_object(&child_key)?;
+        let Some(parent_key) = self
+            .class_object_parent_keys
+            .borrow()
+            .get(&child_key)
+            .cloned()
+        else {
+            return Err(format!("class object '{child_key}' has no prepared parent"));
+        };
+        let Some(target_key) = self.class_object_key_for_value(left)? else {
+            return Err("class parent assignment target is not a prepared class object".into());
+        };
+        self.class_parent_copy_statement(&target_key, &parent_key, assignment)
+            .map(Some)
+    }
+
+    fn class_parent_copy_statement(
+        &self,
+        target_key: &str,
+        source_key: &str,
+        assignment: &Value,
+    ) -> Result<Stmt, String> {
+        if !self.class_objects.contains_key(target_key)
+            || !self.class_objects.contains_key(source_key)
+        {
+            return Err(format!(
+                "cannot copy unknown class parent '{target_key}' from '{source_key}'"
+            ));
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("non-blocking class parent assignment is not supported".into());
+        }
+        let target_fields = self.class_objects[target_key].clone();
+        let source_fields = self.class_objects[source_key].clone();
+        let target_type = self.class_object_types[target_key].clone();
+        let source_type = self.class_object_types[source_key].clone();
+        let compatible = self.class_chain(&source_type)?.iter().any(|(owner, _)| {
+            owner == &target_type
+                || owner.split('@').next()
+                    == Some(target_type.split('@').next().unwrap_or(&target_type))
+        });
+        if !compatible {
+            return Err(format!(
+                "class parent source '{source_type}' is not compatible with target '{target_type}'"
+            ));
+        }
+        self.record_runtime_dynamic_source(target_key, source_key, &source_type)?;
+        let mut statements = Vec::new();
+        for (target_symbol, source_symbol) in [
+            (
+                self.class_object_tags[target_key].clone(),
+                self.class_object_tags[source_key].clone(),
+            ),
+            (
+                self.class_object_ids[target_key].clone(),
+                self.class_object_ids[source_key].clone(),
+            ),
+            (
+                self.class_object_names[target_key].clone(),
+                self.class_object_names[source_key].clone(),
+            ),
+            (
+                self.class_object_full_names[target_key].clone(),
+                self.class_object_full_names[source_key].clone(),
+            ),
+            (
+                self.class_object_parent_ids[target_key].clone(),
+                self.class_object_parent_ids[source_key].clone(),
+            ),
+        ] {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(&target_symbol),
+                e: class_expr(&source_symbol),
+            });
+        }
+        for (field_name, target_symbol) in target_fields {
+            let Some(source_symbol) = source_fields.get(&field_name) else {
+                continue;
+            };
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(&target_symbol),
+                e: class_expr(source_symbol),
+            });
+        }
+        Ok(Stmt::Block(statements))
     }
 
     fn class_handle_copy_statement(
@@ -2745,6 +2875,23 @@ fn conversion_operand(value: &Value) -> Option<&Value> {
 fn is_class_cast_call(value: &Value) -> bool {
     string_field(value, "kind").as_deref() == Some("Call")
         && string_field(value, "subroutine").as_deref() == Some("$cast")
+}
+
+fn is_class_parent_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("get_parent")
+        && value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
 }
 
 pub(super) fn class_expr(symbol: &super::AstLoweredSymbol) -> Expr {

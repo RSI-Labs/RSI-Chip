@@ -12727,6 +12727,7 @@ class ComponentNameTrace;
   static string name = "";
   static string full_name = "";
   static int parent_match = 0;
+  static int parent_identity = 0;
 endclass
 
 class direct_named_component extends uvm_test;
@@ -12741,10 +12742,21 @@ class direct_named_component extends uvm_test;
   endtask
 endclass
 
-class direct_named_component_env extends uvm_test;
+class direct_named_base extends uvm_test;
+  function new(string name = "direct_named_base", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int identity();
+    return 1;
+  endfunction
+endclass
+
+class direct_named_component_env extends direct_named_base;
   `uvm_component_utils(direct_named_component_env)
 
   direct_named_component component;
+  direct_named_base parent_handle;
 
   function new(string name = "direct_named_component_env",
                uvm_component parent = null);
@@ -12755,11 +12767,20 @@ class direct_named_component_env extends uvm_test;
     component = direct_named_component::type_id::create("leaf", this);
   endfunction
 
+  virtual function int identity();
+    return 2;
+  endfunction
+
   virtual task run_phase(uvm_phase phase);
     ComponentNameTrace::name = component.get_name();
     ComponentNameTrace::full_name = component.get_full_name();
     if (component.get_parent() == this) begin
       ComponentNameTrace::parent_match = 1;
+    end
+    if (!$cast(parent_handle, component.get_parent())) begin
+      ComponentNameTrace::parent_identity = 0;
+    end else begin
+      ComponentNameTrace::parent_identity = parent_handle.identity();
     end
   endtask
 endclass
@@ -12767,13 +12788,15 @@ endclass
 module official_uvm_component_name_probe(
   output string name,
   output string full_name,
-  output int parent_match
+  output int parent_match,
+  output int parent_identity
 );
   initial begin
     run_test("direct_named_component_env");
     name = ComponentNameTrace::name;
     full_name = ComponentNameTrace::full_name;
     parent_match = ComponentNameTrace::parent_match;
+    parent_identity = ComponentNameTrace::parent_identity;
   end
 endmodule
 "#,
@@ -12805,6 +12828,7 @@ endmodule
         "direct_named_component_env.leaf"
     );
     assert_eq!(simulator.read("parent_match").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("parent_identity").unwrap().to_u64(), Some(2));
 }
 
 #[test]

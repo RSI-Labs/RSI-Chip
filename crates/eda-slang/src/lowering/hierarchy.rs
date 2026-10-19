@@ -1042,6 +1042,7 @@ impl super::SlangAstLowerer {
             runtime_dynamic_class_sources: std::cell::RefCell::new(
                 std::collections::BTreeMap::new(),
             ),
+            class_object_parent_keys: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             initialized_class_objects: std::collections::BTreeSet::new(),
             constructed_class_objects: std::collections::BTreeSet::new(),
             class_object_tags: std::collections::BTreeMap::new(),
