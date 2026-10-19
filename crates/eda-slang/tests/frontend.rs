@@ -12127,6 +12127,163 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_applies_a_name_based_factory_override() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-factory-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class FactoryTrace;
+  static int stage = 0;
+endclass
+
+class direct_factory_base extends uvm_test;
+  function new(string name = "direct_factory_base", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    FactoryTrace::stage = 1;
+  endtask
+endclass
+
+class direct_factory_derived extends direct_factory_base;
+  function new(string name = "direct_factory_derived", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    FactoryTrace::stage = 2;
+  endtask
+endclass
+
+module official_uvm_factory_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_override_by_name(
+      "direct_factory_base",
+      "direct_factory_derived"
+    );
+    run_test("direct_factory_base");
+    stage = FactoryTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM factory wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_factory_probe"),
+            &options,
+        )
+        .expect("directly lower a name-based UVM factory override");
+    let mut simulator = Simulator::new(&design).expect("create UVM factory simulator");
+    simulator
+        .run_until(0)
+        .expect("run the factory-selected UVM test");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
+fn slang_direct_run_test_rejects_incompatible_factory_override() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-bad-factory-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_factory_base extends uvm_test;
+  function new(string name = "direct_factory_base", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+class direct_incompatible_factory extends uvm_test;
+  function new(string name = "direct_incompatible_factory",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_bad_factory_probe;
+  initial begin
+    uvm_factory::get().set_type_override_by_name(
+      "direct_factory_base",
+      "direct_incompatible_factory"
+    );
+    run_test("direct_factory_base");
+  end
+endmodule
+"#,
+    )
+    .expect("write incompatible official-UVM factory wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_bad_factory_probe"),
+            &options,
+        )
+        .expect_err("incompatible UVM factory overrides must fail closed");
+    assert!(
+        error.contains("is not derived from 'direct_factory_base'"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_tracks_objections_by_owner() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

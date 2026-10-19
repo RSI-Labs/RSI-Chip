@@ -25,6 +25,43 @@ impl SlangAstLowerer {
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
         let mut calls = Vec::new();
         collect_run_test_calls(body, &mut calls);
+        let mut override_calls = Vec::new();
+        collect_uvm_factory_override_calls(body, &mut override_calls);
+        for override_call in &override_calls {
+            let (original, override_name) = uvm_factory_override_names(override_call)?;
+            let run_test_location = calls
+                .first()
+                .and_then(|call| source_location(call))
+                .ok_or_else(|| {
+                    with_source_span(
+                        override_call,
+                        "UVM factory override requires a following run_test call".into(),
+                    )
+                })?;
+            let override_location = source_location(override_call).ok_or_else(|| {
+                with_source_span(
+                    override_call,
+                    "UVM factory override has no source location".into(),
+                )
+            })?;
+            if override_location >= run_test_location {
+                return Err(with_source_span(
+                    override_call,
+                    "UVM factory override must be registered before run_test".into(),
+                ));
+            }
+            if let Some(previous) = self
+                .uvm_factory_overrides
+                .insert(original.clone(), override_name.clone())
+            {
+                if previous != override_name {
+                    return Err(with_source_span(
+                        override_call,
+                        format!("conflicting UVM factory overrides for '{original}'"),
+                    ));
+                }
+            }
+        }
         for call in calls {
             if !self.run_test_objects.is_empty() {
                 return Err(with_source_span(
@@ -32,7 +69,19 @@ impl SlangAstLowerer {
                     "only one direct-lowering run_test call is supported per module".into(),
                 ));
             }
-            let class_name = run_test_class_name(call)?;
+            let requested_class_name = run_test_class_name(call)?;
+            let mut class_name = requested_class_name.clone();
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some(override_name) = self.uvm_factory_overrides.get(&class_name).cloned() {
+                if !visited.insert(class_name.clone()) {
+                    return Err(with_source_span(
+                        call,
+                        format!("UVM factory override cycle at '{class_name}'"),
+                    ));
+                }
+                class_name = override_name;
+            }
+            let requested_class_key = self.class_type_key(&requested_class_name);
             let class_key = self.class_type_key(&class_name);
             if !self.class_definitions.contains_key(&class_key) {
                 return Err(with_source_span(
@@ -43,6 +92,19 @@ impl SlangAstLowerer {
             let chain = self
                 .class_chain(&class_key)
                 .map_err(|error| with_source_span(call, error))?;
+            if class_name != requested_class_name
+                && !chain.iter().any(|(owner, _)| {
+                    owner == &requested_class_key
+                        || owner.split('@').next() == requested_class_key.split('@').next()
+                })
+            {
+                return Err(with_source_span(
+                    call,
+                    format!(
+                        "UVM factory override '{class_name}' is not derived from '{requested_class_name}'"
+                    ),
+                ));
+            }
             let Some(official_index) = official_uvm_test_index(&chain) else {
                 return Err(with_source_span(
                     call,
@@ -154,7 +216,7 @@ impl SlangAstLowerer {
             }
             self.initialized_class_objects.insert(object_key.clone());
             self.run_test_objects.insert(
-                class_name,
+                requested_class_name,
                 super::AstRunTestObject {
                     class_name: class_key,
                     object_key,
@@ -344,6 +406,25 @@ impl SlangAstLowerer {
             }
         }
         Ok(Some(Stmt::Block(statements)))
+    }
+
+    pub(super) fn lower_uvm_factory_override_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        if subroutine.split_whitespace().next_back() != Some("set_type_override_by_name") {
+            return Ok(None);
+        }
+        let (original, override_name) = uvm_factory_override_names(value)?;
+        if self.uvm_factory_overrides.get(&original) != Some(&override_name) {
+            return Err(format!(
+                "UVM factory override '{original}' -> '{override_name}' was not prepared"
+            ));
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
     }
 
     pub(super) fn lower_uvm_phase_objection_call(
@@ -658,6 +739,87 @@ fn collect_run_test_calls<'value>(value: &'value Value, calls: &mut Vec<&'value 
             collect_run_test_calls(nested, calls);
         }
     }
+}
+
+fn collect_uvm_factory_override_calls<'value>(
+    value: &'value Value,
+    calls: &mut Vec<&'value Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if is_uvm_factory_override_call(value) {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_uvm_factory_override_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_uvm_factory_override_calls(nested, calls);
+        }
+    }
+}
+
+fn is_uvm_factory_override_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("set_type_override_by_name")
+        && value.get("thisClass").is_some_and(|receiver| {
+            string_field(receiver, "kind").as_deref() == Some("Call")
+                && string_field(receiver, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("get")
+                && string_field(receiver, "type")
+                    .map(|type_name| type_name.contains("uvm_factory"))
+                    .unwrap_or(false)
+        })
+}
+
+fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> {
+    let empty_arguments = Vec::new();
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_arguments);
+    if arguments.len() < 2 || arguments.len() > 3 {
+        return Err("UVM factory set_type_override_by_name requires two or three arguments".into());
+    }
+    if let Some(replace) = arguments.get(2) {
+        if slang_constant_u64(replace)? == 0 {
+            return Err("non-replacing UVM factory overrides are not supported".into());
+        }
+    }
+    let original = string_literal(unwrap_conversion(&arguments[0]))
+        .ok_or_else(|| "UVM factory original type must be a string literal".to_string())?;
+    let override_name = string_literal(unwrap_conversion(&arguments[1]))
+        .ok_or_else(|| "UVM factory override type must be a string literal".to_string())?;
+    Ok((original, override_name))
+}
+
+fn string_literal(value: &Value) -> Option<String> {
+    string_field(value, "literal").filter(|literal| !literal.is_empty())
+}
+
+fn source_location(value: &Value) -> Option<(String, u64, u64)> {
+    Some((
+        string_field(value, "source_file_start")?,
+        value.get("source_line_start").and_then(Value::as_u64)?,
+        value.get("source_column_start").and_then(Value::as_u64)?,
+    ))
 }
 
 fn run_test_class_name(call: &Value) -> Result<String, String> {

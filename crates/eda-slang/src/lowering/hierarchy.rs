@@ -1056,6 +1056,7 @@ impl super::SlangAstLowerer {
             class_property_temps: std::collections::BTreeMap::new(),
             class_property_initializers: std::collections::BTreeMap::new(),
             run_test_objects: std::collections::BTreeMap::new(),
+            uvm_factory_overrides: std::collections::BTreeMap::new(),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
             active_composition_classes: std::collections::BTreeSet::new(),
