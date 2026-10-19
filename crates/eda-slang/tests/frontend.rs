@@ -12185,6 +12185,75 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_honors_configured_objection_timeout() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-custom-timeout-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_custom_timeout_probe extends uvm_test;
+  function new(string name = "direct_custom_timeout_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    fork
+      #1500 phase.drop_objection(this);
+    join_none
+  endtask
+endclass
+
+module official_uvm_custom_timeout_probe(output int done);
+  initial begin
+    uvm_root::get().set_timeout(2000ns);
+    run_test("direct_custom_timeout_probe");
+    done = 1;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM custom timeout wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_custom_timeout_probe"),
+            &options,
+        )
+        .expect("directly lower a configured UVM timeout");
+    let mut simulator = Simulator::new(&design).expect("create custom timeout simulator");
+    simulator
+        .run_until(1500)
+        .expect("configured UVM timeout must permit the delayed objection drop");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_direct_run_test_applies_a_name_based_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

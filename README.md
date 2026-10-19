@@ -87,7 +87,7 @@ construct such a class and sequentially execute its user-overridden common phase
 methods. Its bootstrap phase object supports constant-count
 `raise_objection`/`drop_objection` calls, per-owner counts selected by runtime
 object identity across prepared registry slots, asynchronous drain before later
-phases, a fixed 1000-tick bootstrap timeout, and rejection of wrong-owner
+phases, `uvm_root::get().set_timeout(...)` configuration, and rejection of wrong-owner
 objections, and name/type-based factory selection for `run_test` through
 official `uvm_factory::get().set_type_override_by_name` and
 `set_type_override_by_type(Class::get_type(), ...)`, and

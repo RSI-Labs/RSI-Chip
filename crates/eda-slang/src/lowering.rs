@@ -371,6 +371,7 @@ pub(super) struct AstRunTestObject {
     pub(super) phase_key: String,
     pub(super) objection_count: AstLoweredSymbol,
     pub(super) objection_drained: AstLoweredSymbol,
+    pub(super) objection_timeout: u64,
     pub(super) objection_owner_counts: std::collections::BTreeMap<String, AstLoweredSymbol>,
 }
 

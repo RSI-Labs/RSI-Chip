@@ -27,6 +27,8 @@ impl SlangAstLowerer {
         collect_run_test_calls(body, &mut calls);
         let mut override_calls = Vec::new();
         collect_uvm_factory_override_calls(body, &mut override_calls);
+        let mut timeout_calls = Vec::new();
+        collect_uvm_timeout_calls(body, &mut timeout_calls);
         for override_call in &override_calls {
             let (original, override_name) = uvm_factory_override_names(override_call)?;
             let run_test_location = calls
@@ -61,6 +63,31 @@ impl SlangAstLowerer {
                     ));
                 }
             }
+        }
+        let mut objection_timeout = UVM_BOOTSTRAP_OBJECTION_TIMEOUT;
+        for timeout_call in &timeout_calls {
+            let run_test_location = calls
+                .first()
+                .and_then(|call| source_location(call))
+                .ok_or_else(|| {
+                    with_source_span(
+                        timeout_call,
+                        "UVM timeout configuration requires a following run_test call".into(),
+                    )
+                })?;
+            let timeout_location = source_location(timeout_call).ok_or_else(|| {
+                with_source_span(
+                    timeout_call,
+                    "UVM timeout configuration has no source location".into(),
+                )
+            })?;
+            if timeout_location >= run_test_location {
+                return Err(with_source_span(
+                    timeout_call,
+                    "UVM timeout must be configured before run_test".into(),
+                ));
+            }
+            objection_timeout = uvm_timeout_value(timeout_call)?;
         }
         for call in calls {
             if !self.run_test_objects.is_empty() {
@@ -223,6 +250,7 @@ impl SlangAstLowerer {
                     phase_key,
                     objection_count,
                     objection_drained,
+                    objection_timeout,
                     objection_owner_counts,
                 },
             );
@@ -387,7 +415,7 @@ impl SlangAstLowerer {
                 };
                 statements.push(Stmt::Fork {
                     branches: vec![Stmt::Delay {
-                        ns: UVM_BOOTSTRAP_OBJECTION_TIMEOUT,
+                        ns: run_object.objection_timeout,
                         body: Box::new(timeout_check),
                     }],
                     mode: eda_core::ir::ForkMode::JoinNone,
@@ -427,6 +455,14 @@ impl SlangAstLowerer {
                 "UVM factory override '{original}' -> '{override_name}' was not prepared"
             ));
         }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_timeout_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        if !is_uvm_timeout_call(value) {
+            return Ok(None);
+        }
+        uvm_timeout_value(value)?;
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
@@ -921,6 +957,75 @@ fn collect_uvm_factory_override_calls<'value>(
             collect_uvm_factory_override_calls(nested, calls);
         }
     }
+}
+
+fn collect_uvm_timeout_calls<'value>(value: &'value Value, calls: &mut Vec<&'value Value>) {
+    if let Some(fields) = value.as_object() {
+        if is_uvm_timeout_call(value) {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_uvm_timeout_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_uvm_timeout_calls(nested, calls);
+        }
+    }
+}
+
+fn is_uvm_timeout_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("set_timeout")
+        && value.get("thisClass").is_some_and(|receiver| {
+            string_field(receiver, "kind").as_deref() == Some("Call")
+                && string_field(receiver, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("get")
+                && string_field(receiver, "type")
+                    .map(|type_name| type_name.contains("uvm_root"))
+                    .unwrap_or(false)
+        })
+}
+
+fn uvm_timeout_value(call: &Value) -> Result<u64, String> {
+    let empty_arguments = Vec::new();
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_arguments);
+    if arguments.is_empty() || arguments.len() > 2 {
+        return Err("UVM set_timeout requires one or two arguments".into());
+    }
+    let timeout = unwrap_conversion(&arguments[0]);
+    if string_field(timeout, "kind").as_deref() != Some("TimeLiteral") {
+        return Err("UVM timeout must be a time literal".into());
+    }
+    let raw_value = timeout
+        .get("value")
+        .and_then(Value::as_u64)
+        .or_else(|| string_field(timeout, "value").and_then(|raw| raw.trim().parse::<u64>().ok()))
+        .ok_or_else(|| "UVM timeout literal has no valid value".to_string())?;
+    if raw_value == 0 {
+        return Err("UVM timeout must be greater than zero".into());
+    }
+    Ok(raw_value)
 }
 
 fn is_uvm_factory_override_call(value: &Value) -> bool {
