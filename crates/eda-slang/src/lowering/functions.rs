@@ -82,6 +82,11 @@ impl SlangAstLowerer {
                 "direct UVM config DB get is supported only as a conditional expression".into(),
             );
         }
+        if self.uvm_config_db_type_name(value, "exists").is_some() {
+            return Err(
+                "direct UVM config DB exists is supported only as a conditional expression".into(),
+            );
+        }
         if let Some(expression) = self.lower_static_class_function_call(value)? {
             return Ok(expression);
         }

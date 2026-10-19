@@ -107,13 +107,14 @@ A minimal literal `uvm_config_db#(T)` bootstrap records integer and string
 values in typed scope/field resources, applies the official UVM-no-DPI glob
 subset (`*`, `?`, and the empty global pattern), honors build-time hierarchy
 precedence and runtime/default last-write selection, and resolves conditional
-`get(...)` calls, including missing-entry failure branches; unsupported
-non-literal values and direct value-returning `get(...)` forms fail closed.
+`get(...)` and `exists(...)` calls, including missing-entry failure branches;
+unsupported non-literal values, spell checking, and direct value-returning
+`get(...)`/`exists(...)` forms fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
 glob/precedence model is not the complete `uvm_resource_db` regex, callback,
-wait-modification, priority API, or dynamic resource-pool implementation,
+wait-modification, priority API, spell-check, or dynamic resource-pool implementation,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
 

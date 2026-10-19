@@ -895,6 +895,82 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(statements)))
     }
 
+    pub(super) fn lower_uvm_config_exists_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(condition) = statement
+            .get("conditions")
+            .and_then(Value::as_array)
+            .and_then(|conditions| conditions.first())
+            .and_then(|condition| condition.get("expr"))
+        else {
+            return Ok(None);
+        };
+        let (call, negated) = if string_field(condition, "kind").as_deref() == Some("UnaryOp")
+            && string_field(condition, "op").as_deref() == Some("LogicalNot")
+        {
+            (
+                condition
+                    .get("operand")
+                    .ok_or_else(|| "logical-not expression has no operand".to_string())?,
+                true,
+            )
+        } else {
+            (condition, false)
+        };
+        let Some(type_name) = self.uvm_config_db_type_name(call, "exists") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM config DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() < 3 || arguments.len() > 4 {
+            return Err(
+                "UVM config DB exists requires three arguments plus an optional spell check".into(),
+            );
+        }
+        if arguments.len() == 4
+            && !matches!(
+                (
+                    string_field(unwrap_conversion(&arguments[3]), "kind").as_deref(),
+                    string_field(unwrap_conversion(&arguments[3]), "value").as_deref(),
+                ),
+                (Some("IntegerLiteral"), Some("0"))
+            )
+        {
+            return Err("UVM config DB spell checking is not yet supported".into());
+        }
+        let scope = self.uvm_config_db_scope(
+            unwrap_conversion(&arguments[0]),
+            unwrap_conversion(&arguments[1]),
+        )?;
+        let field_name = string_literal(unwrap_conversion(&arguments[2]))
+            .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
+        let exists = self.uvm_config_entries.borrow().iter().any(|entry| {
+            entry.type_name == type_name
+                && entry.field_name == field_name
+                && Self::uvm_glob_match(&entry.scope, &scope.pattern)
+        });
+        let selects_if_true = exists != negated;
+        let selected = if selects_if_true {
+            statement.get("ifTrue")
+        } else {
+            statement.get("ifFalse")
+        };
+        selected
+            .map(|selected| self.lower_statement(selected).map(Some))
+            .transpose()
+            .map(|statement| statement.unwrap_or_else(|| Some(Stmt::Block(Vec::new()))))
+    }
+
     fn uvm_config_db_scope(
         &self,
         context: &Value,

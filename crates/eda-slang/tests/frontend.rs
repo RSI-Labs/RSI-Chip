@@ -12631,6 +12631,93 @@ endmodule
 }
 
 #[test]
+fn slang_direct_config_db_exists_checks_scoped_resources() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-exists-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ConfigExistsTrace;
+  static int present = 0;
+  static int missing = 0;
+endclass
+
+class direct_config_exists_probe extends uvm_test;
+  function new(string name = "direct_config_exists_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(null, "uvm_test_top*", "value", 42);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (uvm_config_db#(int)::exists(this, "", "value")) begin
+      ConfigExistsTrace::present = 1;
+    end else begin
+      ConfigExistsTrace::present = 0;
+    end
+
+    if (!uvm_config_db#(int)::exists(this, "", "missing")) begin
+      ConfigExistsTrace::missing = 1;
+    end else begin
+      ConfigExistsTrace::missing = 0;
+    end
+  endtask
+endclass
+
+module official_uvm_config_exists_probe(
+  output int present,
+  output int missing
+);
+  initial begin
+    run_test("direct_config_exists_probe");
+    present = ConfigExistsTrace::present;
+    missing = ConfigExistsTrace::missing;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM config exists wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_config_exists_probe"),
+            &options,
+        )
+        .expect("directly lower scoped UVM config exists checks");
+    let mut simulator = Simulator::new(&design).expect("create config exists simulator");
+    simulator.run_until(0).expect("run config exists phases");
+    assert_eq!(simulator.read("present").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("missing").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -12848,6 +12935,53 @@ endmodule
     assert!(
         error.contains("direct UVM config DB get is supported only as a conditional expression"),
         "unexpected direct config get error: {error}"
+    );
+
+    let direct_exists = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-direct-exists-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &direct_exists,
+        r#"
+import uvm_pkg::*;
+
+class direct_config_exists_call extends uvm_test;
+  bit present;
+
+  function new(string name = "direct_config_exists_call",
+               uvm_component parent = null);
+    super.new(name, parent);
+    present = 0;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    present = uvm_config_db#(int)::exists(this, "", "value");
+  endtask
+endclass
+
+module official_uvm_direct_config_exists_probe;
+  initial begin
+    run_test("direct_config_exists_call");
+  end
+endmodule
+"#,
+    )
+    .expect("write direct UVM config exists wrapper");
+    let error = slang
+        .compile_files(
+            &[source, direct_exists],
+            Some("official_uvm_direct_config_exists_probe"),
+            &options,
+        )
+        .expect_err("a direct config exists value must fail closed");
+    assert!(
+        error.contains("direct UVM config DB exists is supported only as a conditional expression"),
+        "unexpected direct config exists error: {error}"
     );
 }
 
