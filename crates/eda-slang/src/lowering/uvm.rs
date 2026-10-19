@@ -358,13 +358,28 @@ impl SlangAstLowerer {
                 )
             }
         };
-        let owner_count = run_object
-            .objection_owner_counts
+        let owner_id = self
+            .class_object_ids
             .get(&owner_key)
             .cloned()
             .ok_or_else(|| {
-                format!("UVM bootstrap objection owner '{owner_key}' was not prepared")
+                format!("UVM bootstrap objection owner '{owner_key}' has no object identity")
             })?;
+        let registry = run_object
+            .objection_owner_counts
+            .iter()
+            .filter_map(|(registry_key, count)| {
+                self.class_object_ids
+                    .get(registry_key)
+                    .map(|identity| (registry_key.clone(), count.clone(), identity.clone()))
+            })
+            .collect::<Vec<_>>();
+        if registry.is_empty() {
+            return Err(format!(
+                "UVM bootstrap objection owner registry for '{}' is empty",
+                run_object.class_name
+            ));
+        }
 
         let delta_value = match arguments.get(2) {
             Some(count) => slang_constant_u64(count)?,
@@ -380,33 +395,38 @@ impl SlangAstLowerer {
         let delta = Expr::Const(LogicWord::from_u64(32, u64::from(delta_value)));
         let add = method_name == "raise_objection";
         let total_current = class_expr(&run_object.objection_count);
-        let owner_current = class_expr(&owner_count);
-        let (next_total, next_owner) = if add {
-            (
-                Expr::Bin {
-                    op: BinOp::Add,
-                    a: Box::new(total_current.clone()),
-                    b: Box::new(delta.clone()),
+        let owner_id_current = class_expr(&owner_id);
+
+        let mut matched = None;
+        let mut selected_owner_current = Some(Expr::Const(LogicWord::zero(32)));
+        for (_, count, identity) in &registry {
+            let slot_match = Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(owner_id_current.clone()),
+                b: Box::new(class_expr(identity)),
+            };
+            matched = Some(match matched {
+                Some(previous) => Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(previous),
+                    b: Box::new(slot_match.clone()),
                 },
-                Expr::Bin {
-                    op: BinOp::Add,
-                    a: Box::new(owner_current.clone()),
-                    b: Box::new(delta),
-                },
-            )
-        } else {
-            (
-                Expr::Bin {
-                    op: BinOp::Sub,
-                    a: Box::new(total_current.clone()),
-                    b: Box::new(delta.clone()),
-                },
-                Expr::Bin {
-                    op: BinOp::Sub,
-                    a: Box::new(owner_current.clone()),
-                    b: Box::new(delta),
-                },
-            )
+                None => slot_match.clone(),
+            });
+            selected_owner_current = Some(Expr::Cond {
+                c: Box::new(slot_match),
+                t: Box::new(class_expr(count)),
+                f: Box::new(selected_owner_current.take().expect("owner current exists")),
+            });
+        }
+        let matched = matched.expect("objection registry is nonempty");
+        let selected_owner_current =
+            selected_owner_current.expect("objection registry is nonempty");
+
+        let next_total = Expr::Bin {
+            op: if add { BinOp::Add } else { BinOp::Sub },
+            a: Box::new(total_current.clone()),
+            b: Box::new(delta.clone()),
         };
         let (boundary_op, boundary) = if add {
             (BinOp::Gt, u32::MAX - delta_value)
@@ -414,25 +434,58 @@ impl SlangAstLowerer {
             (BinOp::Lt, delta_value)
         };
         let boundary = Expr::Const(LogicWord::from_u64(32, u64::from(boundary)));
+        let owner_invalid = Expr::Bin {
+            op: boundary_op,
+            a: Box::new(selected_owner_current),
+            b: Box::new(boundary.clone()),
+        };
         let total_invalid = Expr::Bin {
             op: boundary_op,
             a: Box::new(total_current),
-            b: Box::new(boundary.clone()),
-        };
-        let owner_invalid = Expr::Bin {
-            op: boundary_op,
-            a: Box::new(owner_current),
             b: Box::new(boundary),
+        };
+        let unknown_owner = Expr::Un {
+            op: eda_core::ir::UnOp::Not,
+            a: Box::new(matched),
         };
         let invalid = Expr::Bin {
             op: BinOp::LogOr,
-            a: Box::new(owner_invalid),
+            a: Box::new(Expr::Bin {
+                op: BinOp::LogOr,
+                a: Box::new(unknown_owner),
+                b: Box::new(owner_invalid),
+            }),
             b: Box::new(total_invalid),
         };
+
+        let mut owner_updates = Stmt::Assert {
+            cond: Expr::Const(LogicWord::zero(1)),
+            message: Some("UVM bootstrap objection owner identity is not registered".into()),
+        };
+        for (_, count, identity) in &registry {
+            let next_owner = Expr::Bin {
+                op: if add { BinOp::Add } else { BinOp::Sub },
+                a: Box::new(class_expr(count)),
+                b: Box::new(delta.clone()),
+            };
+            owner_updates = Stmt::If {
+                c: Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(owner_id_current.clone()),
+                    b: Box::new(class_expr(identity)),
+                },
+                t: Box::new(Stmt::Bl {
+                    lv: class_lvalue(count),
+                    e: next_owner,
+                }),
+                f: Some(Box::new(owner_updates)),
+            };
+        }
+
         let message = if add {
-            "UVM bootstrap objection counter overflowed".to_string()
+            "UVM bootstrap objection counter overflowed or owner is unknown".to_string()
         } else {
-            format!("UVM bootstrap owner '{owner_key}' dropped an objection it did not own")
+            "UVM bootstrap owner dropped an objection it did not own".to_string()
         };
         Ok(Some(Stmt::If {
             c: invalid,
@@ -445,10 +498,7 @@ impl SlangAstLowerer {
                     lv: class_lvalue(&run_object.objection_count),
                     e: next_total,
                 },
-                Stmt::Bl {
-                    lv: class_lvalue(&owner_count),
-                    e: next_owner,
-                },
+                owner_updates,
             ]))),
         }))
     }

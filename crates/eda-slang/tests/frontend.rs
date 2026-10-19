@@ -12129,6 +12129,87 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_selects_objection_owners_by_runtime_identity() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-runtime-owner-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_runtime_owner_object extends uvm_test;
+  function new(string name = "direct_runtime_owner_object",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+
+class direct_runtime_owner_probe extends uvm_test;
+  direct_runtime_owner_object first;
+  direct_runtime_owner_object second;
+  direct_runtime_owner_object selected;
+
+  function new(string name = "direct_runtime_owner_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    first = new("first", null);
+    second = new("second", null);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    selected = second;
+    phase.raise_objection(selected);
+    phase.drop_objection(second);
+  endtask
+endclass
+
+module official_uvm_runtime_owner_probe(output int done);
+  initial begin
+    run_test("direct_runtime_owner_probe");
+    done = 1;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM runtime-owner wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_runtime_owner_probe"),
+            &options,
+        )
+        .expect("directly lower a runtime-identity objection test");
+    let mut simulator =
+        Simulator::new(&design).expect("create runtime-identity objection simulator");
+    simulator
+        .run_until(0)
+        .expect("balanced runtime-selected UVM objections must drain");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_validates_the_repository_cpu_rtl_compilation_units() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
