@@ -93,7 +93,8 @@ official `uvm_factory::get().set_type_override_by_name` and
 `set_type_override_by_type(Class::get_type(), ...)` with replace semantics,
 `set_type_alias(...)`/`set_inst_alias(...)` name resolution, exact/wildcard-path
 `set_inst_override_by_type(...)`/`set_inst_override_by_name(...)`, and
-`Class::type_id::create(...)` component/object construction through prepared
+direct `create_component_by_name(...)`/`create_object_by_name(...)`,
+and `Class::type_id::create(...)` component/object construction through prepared
 class properties, including compatible derived overrides with runtime virtual
 dispatch, preserved constructor names for `get_name()`, parent-qualified `get_full_name()`, and `get_parent()` identity comparison plus checked parent-handle cast.
 It also records prepared children by literal constructor name, rejects

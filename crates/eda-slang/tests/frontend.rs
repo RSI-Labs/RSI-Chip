@@ -12616,6 +12616,249 @@ endmodule
 }
 
 #[test]
+fn slang_direct_factory_creates_components_by_name() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-component-by-name-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ComponentNameCreateTrace;
+  static int kind = 0;
+endclass
+
+class direct_name_create_base extends uvm_test;
+  `uvm_component_utils(direct_name_create_base)
+
+  function new(string name = "direct_name_create_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class direct_name_create_derived extends direct_name_create_base;
+  `uvm_component_utils(direct_name_create_derived)
+
+  function new(string name = "direct_name_create_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+class direct_name_create_env extends uvm_test;
+  `uvm_component_utils(direct_name_create_env)
+
+  direct_name_create_base component;
+
+  function new(string name = "direct_name_create_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    if (!$cast(
+      component,
+      uvm_factory::get().create_component_by_name(
+        "direct_name_alias",
+        "",
+        "leaf",
+        this
+      )
+    )) begin
+      ComponentNameCreateTrace::kind = 0;
+    end else begin
+      ComponentNameCreateTrace::kind = component.kind();
+    end
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_component_by_name_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_alias(
+      "direct_name_alias",
+      direct_name_create_base::get_type()
+    );
+    uvm_factory::get().set_type_override_by_name(
+      "direct_name_alias",
+      "direct_name_create_derived"
+    );
+    run_test("direct_name_create_env");
+    stage = ComponentNameCreateTrace::kind;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM create-component-by-name wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_component_by_name_probe"),
+            &options,
+        )
+        .expect("directly lower a factory component-by-name creation");
+    let mut simulator = Simulator::new(&design).expect("create component-by-name simulator");
+    simulator
+        .run_until(0)
+        .expect("run the name-created component");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
+fn slang_direct_factory_creates_objects_by_name() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-object-by-name-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ObjectNameCreateTrace;
+  static int kind = 0;
+endclass
+
+class direct_object_name_base extends uvm_test;
+  `uvm_object_utils(direct_object_name_base)
+
+  function new(string name = "direct_object_name_base");
+    super.new(name, null);
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class direct_object_name_derived extends direct_object_name_base;
+  `uvm_object_utils(direct_object_name_derived)
+
+  function new(string name = "direct_object_name_derived");
+    super.new(name);
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+class direct_object_name_env extends uvm_test;
+  `uvm_component_utils(direct_object_name_env)
+
+  direct_object_name_base item;
+
+  function new(string name = "direct_object_name_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    if (!$cast(
+      item,
+      uvm_factory::get().create_object_by_name(
+        "direct_object_name_alias",
+        "",
+        "item"
+      )
+    )) begin
+      ObjectNameCreateTrace::kind = 0;
+    end else begin
+      ObjectNameCreateTrace::kind = item.kind();
+    end
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_object_by_name_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_alias(
+      "direct_object_name_alias",
+      direct_object_name_base::get_type()
+    );
+    uvm_factory::get().set_type_override_by_name(
+      "direct_object_name_alias",
+      "direct_object_name_derived"
+    );
+    run_test("direct_object_name_env");
+    stage = ObjectNameCreateTrace::kind;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM create-object-by-name wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_object_by_name_probe"),
+            &options,
+        )
+        .expect("directly lower a factory object-by-name creation");
+    let mut simulator = Simulator::new(&design).expect("create object-by-name simulator");
+    simulator.run_until(0).expect("run the name-created object");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_component_registry_applies_instance_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
