@@ -838,7 +838,7 @@ impl SlangAstLowerer {
                         "UVM factory create_component_by_type requires four arguments".into(),
                     );
                 }
-                string_literal(unwrap_conversion(&arguments[1])).ok_or_else(|| {
+                string_literal_allow_empty(unwrap_conversion(&arguments[1])).ok_or_else(|| {
                     "UVM factory parent path must be a string literal".to_string()
                 })?;
                 (
@@ -874,6 +874,20 @@ impl SlangAstLowerer {
                 (
                     string_literal(unwrap_conversion(&arguments[0])).ok_or_else(|| {
                         "UVM factory requested object name must be a string literal".to_string()
+                    })?,
+                    &arguments[2],
+                    vec![arguments[2].clone()],
+                    None,
+                    false,
+                )
+            }
+            Some("object_by_type") => {
+                if arguments.len() != 3 {
+                    return Err("UVM factory create_object_by_type requires three arguments".into());
+                }
+                (
+                    wrapper_type_name(&arguments[0]).ok_or_else(|| {
+                        "UVM factory requested object type must be Class::get_type()".to_string()
                     })?,
                     &arguments[2],
                     vec![arguments[2].clone()],
@@ -1708,6 +1722,7 @@ fn uvm_factory_direct_create_kind(value: &Value) -> Option<&'static str> {
     let method = match method.as_str() {
         "create_component_by_type" => "component_by_type",
         "create_component_by_name" => "component_by_name",
+        "create_object_by_type" => "object_by_type",
         "create_object_by_name" => "object_by_name",
         _ => return None,
     };

@@ -12859,6 +12859,174 @@ endmodule
 }
 
 #[test]
+fn slang_direct_factory_creates_components_and_objects_by_type() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-create-by-type-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class DirectByTypeTrace;
+  static int component_kind = 0;
+  static int object_kind = 0;
+endclass
+
+class direct_by_type_component_base extends uvm_test;
+  `uvm_component_utils(direct_by_type_component_base)
+
+  function new(string name = "direct_by_type_component_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class direct_by_type_component_derived extends direct_by_type_component_base;
+  `uvm_component_utils(direct_by_type_component_derived)
+
+  function new(string name = "direct_by_type_component_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+class direct_by_type_object_base extends uvm_test;
+  `uvm_object_utils(direct_by_type_object_base)
+
+  function new(string name = "direct_by_type_object_base");
+    super.new(name, null);
+  endfunction
+
+  virtual function int kind();
+    return 3;
+  endfunction
+endclass
+
+class direct_by_type_object_derived extends direct_by_type_object_base;
+  `uvm_object_utils(direct_by_type_object_derived)
+
+  function new(string name = "direct_by_type_object_derived");
+    super.new(name);
+  endfunction
+
+  virtual function int kind();
+    return 4;
+  endfunction
+endclass
+
+class direct_by_type_env extends uvm_test;
+  `uvm_component_utils(direct_by_type_env)
+
+  direct_by_type_component_base component;
+  direct_by_type_object_base item;
+
+  function new(string name = "direct_by_type_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    if (!$cast(
+      component,
+      uvm_factory::get().create_component_by_type(
+        direct_by_type_component_base::get_type(),
+        "",
+        "leaf",
+        this
+      )
+    )) begin
+      DirectByTypeTrace::component_kind = 0;
+    end else begin
+      DirectByTypeTrace::component_kind = component.kind();
+    end
+
+    if (!$cast(
+      item,
+      uvm_factory::get().create_object_by_type(
+        direct_by_type_object_base::get_type(),
+        "",
+        "item"
+      )
+    )) begin
+      DirectByTypeTrace::object_kind = 0;
+    end else begin
+      DirectByTypeTrace::object_kind = item.kind();
+    end
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_create_by_type_probe(
+  output int component_stage,
+  output int object_stage
+);
+  initial begin
+    uvm_factory::get().set_type_override_by_type(
+      direct_by_type_component_base::get_type(),
+      direct_by_type_component_derived::get_type()
+    );
+    uvm_factory::get().set_type_override_by_type(
+      direct_by_type_object_base::get_type(),
+      direct_by_type_object_derived::get_type()
+    );
+    run_test("direct_by_type_env");
+    component_stage = DirectByTypeTrace::component_kind;
+    object_stage = DirectByTypeTrace::object_kind;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM create-by-type wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_create_by_type_probe"),
+            &options,
+        )
+        .expect("directly lower factory create-by-type calls");
+    let mut simulator = Simulator::new(&design).expect("create by-type simulator");
+    simulator
+        .run_until(0)
+        .expect("run the by-type-created component and object");
+    assert_eq!(simulator.read("component_stage").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("object_stage").unwrap().to_u64(), Some(4));
+}
+
+#[test]
 fn slang_direct_component_registry_applies_instance_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
