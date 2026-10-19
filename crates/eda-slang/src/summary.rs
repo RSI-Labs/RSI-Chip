@@ -489,6 +489,16 @@ impl SlangAstSummary {
                 _ => {}
             }
         }
+        if let Some(members) = root
+            .get("eda_compilation_unit_members")
+            .and_then(serde_json::Value::as_array)
+        {
+            for member in members {
+                if string_field(member, "kind").as_deref() == Some("Parameter") {
+                    parameters.push(parameter_summary(member)?);
+                }
+            }
+        }
         let mut kinds = std::collections::BTreeSet::new();
         collect_kinds(root, &mut kinds);
         Ok(Self {

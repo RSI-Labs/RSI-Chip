@@ -4,7 +4,7 @@ use crate::ast_util::{
     bool_field, expression_symbol, expression_target_names, instance_parameters,
     integer_literal_word, literal_word, named_constant_word, slang_constant_u64, string_field,
 };
-use crate::types::{simple_type_signed, simple_type_width};
+use crate::types::{simple_type_signed, simple_type_width, string_literal_word, STRING_WIDTH};
 use eda_core::ir::Design;
 use serde_json::Value;
 
@@ -299,9 +299,19 @@ pub(crate) fn contains_expected_shapes(actual: &[String], expected: &[String]) -
 }
 
 pub(crate) fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) -> Option<String> {
-    let word = literal_word(&parameter.type_name, &parameter.value)?;
-    let width = simple_type_width(&parameter.type_name)?;
-    let signed = simple_type_signed(&parameter.type_name)?;
+    let (word, width, signed) = if parameter.type_name == "string" {
+        (
+            string_literal_word(parameter.value.trim().trim_matches('"'))?,
+            STRING_WIDTH,
+            false,
+        )
+    } else {
+        (
+            literal_word(&parameter.type_name, &parameter.value)?,
+            simple_type_width(&parameter.type_name)?,
+            simple_type_signed(&parameter.type_name)?,
+        )
+    };
     let signed_label = if signed { "s" } else { "u" };
     Some(format!(
         "Const:{width}:{signed_label}[{}:{}]",

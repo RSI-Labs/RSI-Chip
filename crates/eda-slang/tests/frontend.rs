@@ -2347,6 +2347,57 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_simple_type_aliases_and_string_parameters() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-simple-type-aliases");
+    let source_path = root.join("simple_type_aliases.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package types_pkg;
+  typedef logic [15:0] wide_t;
+  typedef int count_t;
+  parameter string MESSAGE = "UVM";
+endpackage
+
+module type_alias_top
+  import types_pkg::*;
+(
+  output wide_t wide,
+  output count_t count,
+  output string message
+);
+  assign wide = 16'h1234;
+  assign count = 42;
+  assign message = MESSAGE;
+endmodule
+"#,
+    )
+    .expect("write simple-type-alias source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("type_alias_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simple type aliases");
+    let mut simulator = Simulator::new(&design).expect("create type-alias simulator");
+    simulator.run_until(0).expect("run type-alias assignments");
+    assert_eq!(simulator.read("wide").unwrap().to_u64(), Some(0x1234));
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(42));
+    assert_eq!(
+        simulator
+            .read("message")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "UVM"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_package_typedefs_and_enums() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -11589,7 +11640,7 @@ fn slang_ast_json_contains_elaborated_module_symbols() {
 }
 
 #[test]
-fn slang_accepts_the_official_accellera_uvm_reference_source() {
+fn slang_directly_lowers_the_official_accellera_uvm_reference_source() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -11606,9 +11657,40 @@ fn slang_accepts_the_official_accellera_uvm_reference_source() {
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
     };
-    slang
-        .check_files_with_options(&[source], None, &options)
-        .expect("slang elaborates the official UVM reference library");
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-direct-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+module official_uvm_direct_probe(output int result);
+  import uvm_pkg::*;
+  initial begin
+    result = 1;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM direct-lowering wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_direct_probe"),
+            &options,
+        )
+        .expect("directly lower the official UVM reference library");
+    assert_eq!(design.name, "official_uvm_direct_probe");
+    let mut simulator =
+        Simulator::new(&design).expect("create official-UVM direct-lowering simulator");
+    simulator
+        .run_until(0)
+        .expect("run the official-UVM direct-lowering wrapper");
+    assert_eq!(simulator.read("result").unwrap().to_u64(), Some(1));
 }
 
 #[test]

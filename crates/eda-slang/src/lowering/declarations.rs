@@ -8,7 +8,8 @@ use crate::ast_util::{
 };
 use crate::types::{
     memory_type, memory_type_with_element, simple_type_shape, simple_type_signed,
-    simple_type_width, AstMemoryType, AstPackedDimension, AstTypeShape,
+    simple_type_width, string_literal_word, AstMemoryType, AstPackedDimension, AstTypeShape,
+    STRING_WIDTH,
 };
 
 impl SlangAstLowerer {
@@ -102,6 +103,24 @@ impl SlangAstLowerer {
             if self.type_enums.contains_key(target_name) {
                 return Ok(());
             }
+            let target_type = target.as_str().unwrap_or_default();
+            if let Some(shape) = simple_type_shape(target_type) {
+                let signed = simple_type_signed(target_type).ok_or_else(|| {
+                    format!("direct lowering cannot resolve signedness of type alias '{name}'")
+                })?;
+                self.type_aliases.insert(
+                    name,
+                    AstStructType {
+                        width: shape.width,
+                        signed,
+                        fields: std::collections::BTreeMap::new(),
+                        is_union: false,
+                        is_unpacked: false,
+                    },
+                );
+                return Ok(());
+            }
+            return Ok(());
         }
         let target_kind = string_field(target, "kind").unwrap_or_default();
         let is_union = matches!(
@@ -112,13 +131,45 @@ impl SlangAstLowerer {
             target_kind.as_str(),
             "UnpackedStructType" | "UnpackedUnionType"
         );
+        if matches!(
+            target_kind.as_str(),
+            "ScalarType" | "PackedArrayType" | "PredefinedIntegerType" | "StringType"
+        ) {
+            let target_type = if target_kind == "PackedArrayType" {
+                String::new()
+            } else {
+                string_field(target, "name").unwrap_or_default()
+            };
+            let shape = if target_kind == "PackedArrayType" {
+                None
+            } else {
+                simple_type_shape(&target_type)
+            };
+            let (width, signed) = match shape {
+                Some(shape) => (
+                    shape.width,
+                    simple_type_signed(&target_type)
+                        .ok_or_else(|| format!("type alias '{name}' has unknown signedness"))?,
+                ),
+                None => (detailed_type_width(target)?, detailed_type_signed(target)),
+            };
+            self.type_aliases.insert(
+                name,
+                AstStructType {
+                    width,
+                    signed,
+                    fields: std::collections::BTreeMap::new(),
+                    is_union: false,
+                    is_unpacked: false,
+                },
+            );
+            return Ok(());
+        }
         if !matches!(
             target_kind.as_str(),
             "PackedStructType" | "PackedUnionType" | "UnpackedStructType" | "UnpackedUnionType"
         ) {
-            return Err(format!(
-                "direct slang-AST lowering does not support type alias '{name}' target"
-            ));
+            return Ok(());
         }
         if bool_field(target, "isTagged") {
             return Err(format!(
@@ -154,10 +205,16 @@ impl SlangAstLowerer {
                 .get("type")
                 .ok_or_else(|| format!("packed struct field '{name}.{field_name}' has no type"))?;
             let field_width = if field_type.is_object() {
-                detailed_type_width(field_type)?
+                let Ok(field_width) = detailed_type_width(field_type) else {
+                    return Ok(());
+                };
+                field_width
             } else {
                 let type_name = string_field(field, "type").unwrap_or_default();
-                self.net_type(&type_name)?.0.width
+                let Ok(shape) = self.net_type(&type_name) else {
+                    return Ok(());
+                };
+                shape.0.width
             };
             width = width.max(offset.saturating_add(field_width));
             if is_union && offset != 0 {
@@ -195,8 +252,15 @@ impl SlangAstLowerer {
         let base = member
             .get("baseType")
             .ok_or_else(|| format!("enum type '{name}' has no base type"))?;
-        let width = detailed_type_width(base)?;
-        let signed = detailed_type_signed(base);
+        let (width, signed) = if base.is_object() {
+            (detailed_type_width(base)?, detailed_type_signed(base))
+        } else {
+            let base_type = base.as_str().unwrap_or_default();
+            let shape = self
+                .net_type(base_type)
+                .map_err(|error| format!("enum type '{name}' base type: {error}"))?;
+            (shape.0.width, shape.1)
+        };
         let value_type = if width == 1 {
             "logic".to_string()
         } else {
@@ -547,8 +611,13 @@ impl SlangAstLowerer {
         } else {
             format!("logic[{}:0]", shape.width.saturating_sub(1))
         };
-        let word = literal_word(&value_type, &value)
-            .ok_or_else(|| format!("parameter '{name}' has unsupported value '{value}'"))?;
+        let word = if type_name == "string" {
+            let literal = value.trim().trim_matches('"');
+            string_literal_word(literal)
+        } else {
+            literal_word(&value_type, &value)
+        }
+        .ok_or_else(|| format!("parameter '{name}' has unsupported value '{value}'"))?;
         if word.width() != shape.width {
             return Err(format!(
                 "parameter '{name}' value width {} does not match type width {}",
@@ -564,6 +633,12 @@ impl SlangAstLowerer {
 fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> {
     match string_field(type_value, "kind").as_deref() {
         Some("ScalarType") => Ok(1),
+        Some("StringType") => Ok(STRING_WIDTH),
+        Some("PredefinedIntegerType") => {
+            let type_name = string_field(type_value, "name").unwrap_or_default();
+            simple_type_width(&type_name)
+                .ok_or_else(|| format!("unsupported predefined integer type '{type_name}'"))
+        }
         Some("PackedArrayType") => {
             let element = type_value
                 .get("elementType")

@@ -1,8 +1,13 @@
 //! Packed scalar/vector and sparse-memory type parsing for slang AST JSON.
 
 use eda_core::ir::MemoryDimension;
+use eda_core::logic::LogicWord;
 
 pub(super) const STRING_WIDTH: usize = 64 * 8;
+
+pub(super) fn string_literal_word(value: &str) -> Option<LogicWord> {
+    Some(LogicWord::from_bytes_le(STRING_WIDTH, value.as_bytes()))
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct AstPackedDimension {

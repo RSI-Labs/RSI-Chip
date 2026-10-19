@@ -357,9 +357,10 @@ impl SlangAstLowerer {
                             continue;
                         }
                         let property_type = string_field(member, "type").unwrap_or_default();
-                        let (shape, signed, struct_fields) = self
-                            .net_type(&property_type)
-                            .map_err(|error| super::with_source_span(member, error))?;
+                        let Ok((shape, signed, struct_fields)) = self.net_type(&property_type)
+                        else {
+                            continue;
+                        };
                         let base = self.design.n_nets;
                         self.design.n_nets += shape.width;
                         let storage_name = format!(
@@ -397,9 +398,12 @@ impl SlangAstLowerer {
 
         for (symbol_key, initializer) in initializers {
             let symbol = self.symbols[&symbol_key].clone();
-            let expression = self
-                .lower_expression(&initializer)
-                .map_err(|error| super::with_source_span(&initializer, error))?;
+            let Ok(expression) = self.lower_expression(&initializer) else {
+                self.symbols.remove(&symbol_key);
+                self.class_static_properties
+                    .retain(|_, lowered| lowered.base != symbol.base);
+                continue;
+            };
             self.design.initials.push(Stmt::Bl {
                 lv: class_lvalue(&symbol),
                 e: expression,

@@ -246,7 +246,7 @@ impl SlangFrontend {
         let root = parse_ast_root(json)?;
         let mut design = lower_root(&root)?;
         design.infer_memory_kinds();
-        let authoritative = SlangAstSummary::parse(json)?;
+        let authoritative = SlangAstSummary::parse(&root.to_string())?;
         authoritative.validate_against_design(&design)?;
         Ok(design)
     }
@@ -260,7 +260,6 @@ impl SlangFrontend {
     ) -> Result<Design, String> {
         let mut root = parse_ast_root(json)?;
         let mut plan = plan_interface_array_port_scopes(&root)?;
-        let mut authoritative_json = json.to_string();
         if interface_array_port_plan_has_members(&plan) {
             let top_name = top
                 .map(str::to_string)
@@ -301,12 +300,11 @@ impl SlangFrontend {
                 return Err("slang interface-array scope plan changed between invocations".into());
             }
             annotate_interface_array_port_connections(&mut root, &plan, &addresses)?;
-            authoritative_json = scoped_root_json;
         }
 
         let mut design = lower_root(&root)?;
         design.infer_memory_kinds();
-        let authoritative = SlangAstSummary::parse(&authoritative_json)?;
+        let authoritative = SlangAstSummary::parse(&root.to_string())?;
         authoritative.validate_against_design(&design)?;
         Ok(design)
     }

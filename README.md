@@ -68,15 +68,20 @@ receiver-resolved virtual calls, direct base/derived handle reassignment with
 object-identity propagation, runtime virtual dispatch through a base handle,
 hierarchy-global static class properties/methods shared by object and module
 instances, package-qualified classes, elaborated value-parameterized class
-specializations with method-body parameter substitution, scalar class composition
-with nested construction/field/method access, constant-indexed and dynamic
-class-array read/write/handle-assignment subsets, and null handle
-assignment/comparison,
+specializations with method-body parameter substitution, scalar and
+one-dimensional class-valued composition arrays with nested
+construction/field/method access, constant-indexed and dynamic class-array
+read/write/handle-assignment subsets, null handle assignment/comparison, and
+simple integral/string type aliases,
 first-class sparse memories, memory file tasks, and top-level and child
 memory-port sharing. It records slang source spans and
 validates lowered structure against the authoritative AST. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
+
+The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`
+beside a trivial importing wrapper, but official UVM phasing, objections,
+factories, TLM, and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit
