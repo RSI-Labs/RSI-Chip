@@ -249,6 +249,67 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_cast_conditions() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-cast-condition");
+    let source_path = root.join("class_cast_condition.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class CastConditionBase;
+  function new();
+  endfunction
+
+  virtual function int kind();
+    return 3;
+  endfunction
+endclass
+
+class CastConditionDerived extends CastConditionBase;
+  function new();
+  endfunction
+
+  virtual function int kind();
+    return 4;
+  endfunction
+endclass
+
+module class_cast_condition_top(output int observed);
+  CastConditionDerived object;
+  CastConditionBase source;
+  CastConditionDerived destination;
+
+  initial begin
+    object = new();
+    source = object;
+    if (!$cast(destination, source)) begin
+      observed = 0;
+    end else begin
+      observed = destination.kind();
+    end
+  end
+endmodule
+"#,
+    )
+    .expect("write class-cast condition source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("class_cast_condition_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower a class-cast condition");
+    let mut simulator = Simulator::new(&design).expect("create class-cast condition simulator");
+    simulator
+        .run_until(0)
+        .expect("run the conditional class cast");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(4));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_indexed_class_arrays() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -662,6 +662,9 @@ impl SlangAstLowerer {
             ),
             "Disable" => self.lower_named_disable(statement),
             "Conditional" => {
+                if let Some(statement) = self.lower_class_cast_conditional(statement)? {
+                    return Ok(statement);
+                }
                 self.lower_conditional_statement(statement)
             }
             "Case" => {

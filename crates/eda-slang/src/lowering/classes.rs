@@ -1124,6 +1124,85 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn lower_class_cast_call(&self, call: &Value) -> Result<Option<Stmt>, String> {
+        let Some((type_matches, copy)) = self.class_cast_plan(call)? else {
+            return Ok(None);
+        };
+        Ok(Some(Stmt::If {
+            c: type_matches,
+            t: Box::new(Stmt::Block(copy)),
+            f: None,
+        }))
+    }
+
+    pub(super) fn lower_class_cast_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(condition) = statement
+            .get("conditions")
+            .and_then(Value::as_array)
+            .and_then(|conditions| conditions.first())
+            .and_then(|condition| condition.get("expr"))
+        else {
+            return Ok(None);
+        };
+        let (condition, negated) = if string_field(condition, "kind").as_deref() == Some("UnaryOp")
+            && string_field(condition, "op").as_deref() == Some("LogicalNot")
+            && condition.get("operand").is_some_and(is_class_cast_call)
+        {
+            (
+                condition
+                    .get("operand")
+                    .ok_or_else(|| "logical-not expression has no operand".to_string())?,
+                true,
+            )
+        } else if is_class_cast_call(condition) {
+            (condition, false)
+        } else {
+            return Ok(None);
+        };
+        let Some((type_matches, copy)) = self.class_cast_plan(condition)? else {
+            return Ok(None);
+        };
+        let if_true = statement
+            .get("ifTrue")
+            .ok_or_else(|| "conditional statement has no then branch".to_string())?;
+        let if_false = statement.get("ifFalse");
+        let original_then = self.lower_statement(if_true)?;
+        let original_else = match if_false {
+            Some(if_false) => Some(self.lower_statement(if_false)?),
+            None => None,
+        };
+        let (lowered_then, lowered_else) = if negated {
+            (
+                original_else.map(|body| {
+                    let mut statements = copy;
+                    statements.push(body);
+                    Stmt::Block(statements)
+                }),
+                Some(original_then),
+            )
+        } else {
+            (
+                Some({
+                    let mut statements = copy;
+                    statements.push(original_then);
+                    Stmt::Block(statements)
+                }),
+                original_else,
+            )
+        };
+        Ok(Some(Stmt::If {
+            c: type_matches,
+            t: Box::new(lowered_then.unwrap_or(Stmt::Block(Vec::new()))),
+            f: lowered_else.map(Box::new),
+        }))
+    }
+
+    fn class_cast_plan(&self, call: &Value) -> Result<Option<(Expr, Vec<Stmt>)>, String> {
+        if !is_class_cast_call(call) {
+            return Ok(None);
+        }
         let empty_arguments = Vec::new();
         let arguments = call
             .get("arguments")
@@ -1148,8 +1227,8 @@ impl SlangAstLowerer {
         {
             return Err("$cast source and destination must have prepared storage".into());
         }
-        let target_fields = &self.class_objects[&target_key];
-        let source_fields = &self.class_objects[&source_key];
+        let target_fields = self.class_objects[&target_key].clone();
+        let source_fields = self.class_objects[&source_key].clone();
         if target_fields
             .keys()
             .any(|field| !source_fields.contains_key(field))
@@ -1158,8 +1237,7 @@ impl SlangAstLowerer {
                 "$cast destination has fields absent from the prepared source storage".into(),
             );
         }
-
-        let target_type = &self.class_object_types[&target_key];
+        let target_type = self.class_object_types[&target_key].clone();
         let source_type = self.class_object_types[&source_key].clone();
         let mut possible_source_types = vec![source_type.clone()];
         possible_source_types.extend(
@@ -1169,7 +1247,7 @@ impl SlangAstLowerer {
         );
         if !possible_source_types.iter().any(|source_type| {
             self.class_chain(source_type)
-                .is_ok_and(|chain| chain.iter().any(|(owner, _)| owner == target_type))
+                .is_ok_and(|chain| chain.iter().any(|(owner, _)| *owner == target_type))
         }) {
             return Err(format!(
                 "$cast source '{source_key}' has no possible '{target_type}' object"
@@ -1180,7 +1258,7 @@ impl SlangAstLowerer {
             .keys()
             .filter(|candidate| {
                 self.class_chain(candidate)
-                    .is_ok_and(|chain| chain.iter().any(|(owner, _)| owner == target_type))
+                    .is_ok_and(|chain| chain.iter().any(|(owner, _)| *owner == target_type))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1210,39 +1288,33 @@ impl SlangAstLowerer {
             });
         }
         let type_matches = type_matches.expect("acceptable $cast class list is nonempty");
-
         let mut copy = Vec::new();
         for (target_symbol, source_symbol) in [
             (
-                &self.class_object_tags[&target_key],
-                &self.class_object_tags[&source_key],
+                self.class_object_tags[&target_key].clone(),
+                self.class_object_tags[&source_key].clone(),
             ),
             (
-                &self.class_object_ids[&target_key],
-                &self.class_object_ids[&source_key],
+                self.class_object_ids[&target_key].clone(),
+                self.class_object_ids[&source_key].clone(),
             ),
         ] {
             copy.push(Stmt::Bl {
-                lv: class_lvalue(target_symbol),
-                e: class_expr(source_symbol),
+                lv: class_lvalue(&target_symbol),
+                e: class_expr(&source_symbol),
             });
         }
         for (field_name, target_symbol) in target_fields {
-            let Some(source_symbol) = source_fields.get(field_name) else {
+            let Some(source_symbol) = source_fields.get(&field_name) else {
                 continue;
             };
             copy.push(Stmt::Bl {
-                lv: class_lvalue(target_symbol),
+                lv: class_lvalue(&target_symbol),
                 e: class_expr(source_symbol),
             });
         }
-        Ok(Some(Stmt::If {
-            c: type_matches,
-            t: Box::new(Stmt::Block(copy)),
-            f: None,
-        }))
+        Ok(Some((type_matches, copy)))
     }
-
     pub(super) fn lower_static_class_function_call(
         &self,
         value: &Value,
@@ -2453,6 +2525,11 @@ fn conversion_operand(value: &Value) -> Option<&Value> {
         return None;
     }
     value.get("operand")
+}
+
+fn is_class_cast_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine").as_deref() == Some("$cast")
 }
 
 pub(super) fn class_expr(symbol: &super::AstLoweredSymbol) -> Expr {
