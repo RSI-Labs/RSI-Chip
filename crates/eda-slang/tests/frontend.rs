@@ -694,6 +694,100 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_class_valued_array_properties() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-composition-array");
+    let source_path = root.join("composition_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+endclass
+
+class Group;
+  Item items[0:2];
+
+  function new(int a, int b, int c);
+    items[0] = new(a);
+    items[1] = new(b);
+    items[2] = new(c);
+  endfunction
+
+  function int sum();
+    return items[0].get() + items[1].get() + items[2].get();
+  endfunction
+endclass
+
+module composition_array_top(
+  input int a,
+  input int b,
+  input int c,
+  input int selector,
+  output int first,
+  output int last,
+  output int selected,
+  output int group_sum,
+  output int updated
+);
+  Group group;
+
+  initial begin
+    #1;
+    group = new(a, b, c);
+    first = group.items[0].get();
+    last = group.items[2].get();
+    selected = group.items[selector].get();
+    group_sum = group.sum();
+    group.items[selector].value = 77;
+    updated = group.items[selector].get();
+  end
+endmodule
+"#,
+    )
+    .expect("write class-valued array-property source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("composition_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower class-valued array properties");
+    let mut simulator = Simulator::new(&design).expect("create composition-array simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(32, 10))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(32, 20))
+        .unwrap();
+    simulator
+        .set_input("c", &LogicWord::from_u64(32, 30))
+        .unwrap();
+    simulator
+        .set_input("selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run composition-array initial block");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("last").unwrap().to_u64(), Some(30));
+    assert_eq!(simulator.read("selected").unwrap().to_u64(), Some(20));
+    assert_eq!(simulator.read("group_sum").unwrap().to_u64(), Some(60));
+    assert_eq!(simulator.read("updated").unwrap().to_u64(), Some(77));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

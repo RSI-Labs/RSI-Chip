@@ -93,8 +93,12 @@ impl SlangAstLowerer {
 
     fn class_object_key_for_value(&self, value: &Value) -> Result<Option<String>, String> {
         match string_field(value, "kind").as_deref() {
-            Some("NamedValue" | "HierarchicalValue") => Ok(string_field(value, "symbol")
-                .filter(|symbol_key| self.class_objects.contains_key(symbol_key))),
+            Some("NamedValue" | "HierarchicalValue") => {
+                Ok(string_field(value, "symbol").filter(|symbol_key| {
+                    self.class_objects.contains_key(symbol_key)
+                        || self.class_object_arrays.contains_key(symbol_key)
+                }))
+            }
             Some("MemberAccess") => {
                 let Some(receiver) = value.get("value") else {
                     return Ok(None);
@@ -119,7 +123,7 @@ impl SlangAstLowerer {
                 let Some(selected) = value.get("value") else {
                     return Ok(None);
                 };
-                let Some(base_key) = string_field(selected, "symbol") else {
+                let Some(base_key) = self.class_object_key_for_value(selected)? else {
                     return Ok(None);
                 };
                 if !self.class_object_arrays.contains_key(&base_key) {
@@ -154,7 +158,7 @@ impl SlangAstLowerer {
         let Some(selected) = value.get("value") else {
             return Ok(None);
         };
-        let Some(base_key) = string_field(selected, "symbol") else {
+        let Some(base_key) = self.class_object_key_for_value(selected)? else {
             return Ok(None);
         };
         let Some(elements) = self.class_object_arrays.get(&base_key) else {
@@ -687,11 +691,6 @@ impl SlangAstLowerer {
                         let property_type = string_field(property, "type").unwrap_or_default();
                         let property_class_key = self.class_type_key(&property_type);
                         if self.class_definitions.contains_key(&property_class_key) {
-                            if class_array_indexes(&property_type).is_some() {
-                                return Err(format!(
-                                "class-valued array property '{class_name}.{property_name}' is not supported"
-                            ));
-                            }
                             if !class_properties.iter().any(
                                 |candidate: &(String, Value, String)| candidate.0 == property_name,
                             ) {
@@ -778,7 +777,13 @@ impl SlangAstLowerer {
                     child_key.clone(),
                 );
                 self.class_composition_parents
-                    .insert(child_key, object_key.clone());
+                    .insert(child_key.clone(), object_key.clone());
+                if let Some(elements) = self.class_object_arrays.get(&child_key) {
+                    for element_key in elements.values() {
+                        self.class_composition_parents
+                            .insert(element_key.clone(), object_key.clone());
+                    }
+                }
             }
         }
         if !array_elements.is_empty() {
