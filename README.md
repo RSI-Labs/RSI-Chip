@@ -87,10 +87,11 @@ methods. Its bootstrap phase object supports constant-count
 `raise_objection`/`drop_objection` calls, per-owner counts selected by runtime
 object identity across prepared registry slots, asynchronous drain before later
 phases, a fixed 1000-tick bootstrap timeout, and rejection of wrong-owner
-objections, and name-based factory selection for `run_test` through official
-`uvm_factory::get().set_type_override_by_name`. This is still a bootstrap: the
-registry and timeout are finite, phase objects are synthetic, factory overrides
-are compile-time string mappings, there is no parallel phase graph or
+objections, and name/type-based factory selection for `run_test` through
+official `uvm_factory::get().set_type_override_by_name` and
+`set_type_override_by_type(Class::get_type(), ...)`. This is still a bootstrap:
+the registry and timeout are finite, phase objects are synthetic, factory
+overrides are compile-time mappings, there is no parallel phase graph or
 callback-based objection scheduler, and TLM and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and

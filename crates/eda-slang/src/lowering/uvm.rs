@@ -415,7 +415,10 @@ impl SlangAstLowerer {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Ok(None);
         };
-        if subroutine.split_whitespace().next_back() != Some("set_type_override_by_name") {
+        if !matches!(
+            subroutine.split_whitespace().next_back(),
+            Some("set_type_override_by_name" | "set_type_override_by_type")
+        ) {
             return Ok(None);
         }
         let (original, override_name) = uvm_factory_override_names(value)?;
@@ -771,7 +774,12 @@ fn is_uvm_factory_override_call(value: &Value) -> bool {
                     .map(str::to_string)
             })
             .as_deref()
-            == Some("set_type_override_by_name")
+            .is_some_and(|method| {
+                matches!(
+                    method,
+                    "set_type_override_by_name" | "set_type_override_by_type"
+                )
+            })
         && value.get("thisClass").is_some_and(|receiver| {
             string_field(receiver, "kind").as_deref() == Some("Call")
                 && string_field(receiver, "subroutine")
@@ -803,11 +811,56 @@ fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> 
             return Err("non-replacing UVM factory overrides are not supported".into());
         }
     }
-    let original = string_literal(unwrap_conversion(&arguments[0]))
-        .ok_or_else(|| "UVM factory original type must be a string literal".to_string())?;
-    let override_name = string_literal(unwrap_conversion(&arguments[1]))
-        .ok_or_else(|| "UVM factory override type must be a string literal".to_string())?;
-    Ok((original, override_name))
+    let method = string_field(call, "subroutine")
+        .and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if method == "set_type_override_by_name" {
+        let original = string_literal(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM factory original type must be a string literal".to_string())?;
+        let override_name = string_literal(unwrap_conversion(&arguments[1]))
+            .ok_or_else(|| "UVM factory override type must be a string literal".to_string())?;
+        return Ok((original, override_name));
+    }
+    if method == "set_type_override_by_type" {
+        let original = wrapper_type_name(&arguments[0])
+            .ok_or_else(|| "UVM factory original wrapper must be Class::get_type()".to_string())?;
+        let override_name = wrapper_type_name(&arguments[1])
+            .ok_or_else(|| "UVM factory override wrapper must be Class::get_type()".to_string())?;
+        return Ok((original, override_name));
+    }
+    Err("unsupported UVM factory override method".into())
+}
+
+fn wrapper_type_name(value: &Value) -> Option<String> {
+    let wrapper = unwrap_conversion(value);
+    if string_field(wrapper, "kind").as_deref() != Some("Call") {
+        return None;
+    }
+    let subroutine = string_field(wrapper, "subroutine")
+        .and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if subroutine != "get_type" {
+        return None;
+    }
+    let wrapper_type = string_field(wrapper, "type")?;
+    let (class_type, wrapper_name) = wrapper_type.rsplit_once("::")?;
+    if wrapper_name != "type_id" {
+        return None;
+    }
+    class_type
+        .split_whitespace()
+        .next_back()
+        .map(str::to_string)
 }
 
 fn string_literal(value: &Value) -> Option<String> {
