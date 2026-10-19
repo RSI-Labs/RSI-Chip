@@ -185,6 +185,18 @@ impl SlangAstLowerer {
                     ),
                 ));
             }
+            let root_name = formals
+                .first()
+                .and_then(|formal| formal.get("defaultValue").cloned())
+                .and_then(|default| string_field(unwrap_conversion(&default), "literal"))
+                .ok_or_else(|| {
+                    with_source_span(
+                        call,
+                        format!(
+                            "run_test class '{class_name}' constructor requires a literal name default"
+                        ),
+                    )
+                })?;
 
             let handle_address = self.next_synthetic_class_handle;
             self.next_synthetic_class_handle = self
@@ -246,6 +258,7 @@ impl SlangAstLowerer {
                 requested_class_name,
                 super::AstRunTestObject {
                     class_name: class_key,
+                    root_name,
                     object_key,
                     phase_key,
                     objection_count,

@@ -12735,6 +12735,8 @@ class ComponentNameTrace;
   static int lookup_identity = 0;
   static int nested_match = 0;
   static int nested_identity = 0;
+  static int absolute_match = 0;
+  static int absolute_identity = 0;
 endclass
 
 class direct_named_leaf extends uvm_test;
@@ -12837,6 +12839,17 @@ class direct_named_component_env extends direct_named_base;
     end else begin
       ComponentNameTrace::nested_identity = recovered_nested.identity();
     end
+    if (component.nested.lookup(".direct_named_component_env.leaf") == component) begin
+      ComponentNameTrace::absolute_match = 1;
+    end
+    if (!$cast(
+      recovered_child,
+      component.nested.lookup(".direct_named_component_env.leaf")
+    )) begin
+      ComponentNameTrace::absolute_identity = 0;
+    end else begin
+      ComponentNameTrace::absolute_identity = recovered_child.identity();
+    end
   endtask
 endclass
 
@@ -12851,7 +12864,9 @@ module official_uvm_component_name_probe(
   output int lookup_match,
   output int lookup_identity,
   output int nested_match,
-  output int nested_identity
+  output int nested_identity,
+  output int absolute_match,
+  output int absolute_identity
 );
   initial begin
     run_test("direct_named_component_env");
@@ -12866,6 +12881,8 @@ module official_uvm_component_name_probe(
     lookup_identity = ComponentNameTrace::lookup_identity;
     nested_match = ComponentNameTrace::nested_match;
     nested_identity = ComponentNameTrace::nested_identity;
+    absolute_match = ComponentNameTrace::absolute_match;
+    absolute_identity = ComponentNameTrace::absolute_identity;
   end
 endmodule
 "#,

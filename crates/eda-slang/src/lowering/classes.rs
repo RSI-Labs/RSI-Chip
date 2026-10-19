@@ -96,12 +96,40 @@ impl SlangAstLowerer {
             "literal",
         )
         .ok_or_else(|| "class lookup requires a string literal path".to_string())?;
-        if path.starts_with('.') || path.ends_with('.') || path.contains("..") {
-            return Err(format!(
-                "class lookup path '{path}' must be relative and well-formed"
-            ));
+        let absolute = path.starts_with('.');
+        let path = path
+            .strip_prefix('.')
+            .unwrap_or(path.as_str())
+            .trim_start_matches('.');
+        if path.is_empty() || path.ends_with('.') || path.contains("..") {
+            return Err(format!("class lookup path '{path}' is malformed"));
         }
-        for segment in path.split('.') {
+        if absolute {
+            object_key = self
+                .run_test_objects
+                .values()
+                .next()
+                .map(|run_object| run_object.object_key.clone())
+                .ok_or_else(|| "absolute class lookup has no run_test root".to_string())?;
+        }
+        let mut segments = path.split('.');
+        if absolute {
+            let root_name = segments
+                .next()
+                .ok_or_else(|| "absolute class lookup path is empty".to_string())?;
+            let run_test_name = self
+                .run_test_objects
+                .values()
+                .next()
+                .map(|run_object| run_object.root_name.clone())
+                .ok_or_else(|| "absolute class lookup root has no name".to_string())?;
+            if root_name != run_test_name {
+                return Err(format!(
+                    "absolute class lookup root '{root_name}' does not match run_test '{run_test_name}'"
+                ));
+            }
+        }
+        for segment in segments {
             if segment.is_empty() {
                 return Err(format!("class lookup path '{path}' has an empty segment"));
             }
