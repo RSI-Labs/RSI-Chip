@@ -30,6 +30,50 @@ struct ClassHandleCandidates {
 }
 
 impl SlangAstLowerer {
+    fn dynamic_sources_for(&self, object_key: &str) -> Vec<super::DynamicClassSource> {
+        let mut sources = self
+            .dynamic_class_sources
+            .get(object_key)
+            .cloned()
+            .unwrap_or_default();
+        sources.extend(
+            self.runtime_dynamic_class_sources
+                .borrow()
+                .get(object_key)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        sources
+    }
+
+    fn record_runtime_dynamic_source(
+        &self,
+        target_key: &str,
+        source_key: &str,
+        source_class: &str,
+    ) -> Result<(), String> {
+        let target_class = self
+            .class_object_types
+            .get(target_key)
+            .ok_or_else(|| format!("unknown class handle '{target_key}'"))?;
+        if !self
+            .class_chain(source_class)?
+            .iter()
+            .any(|(class_name, _)| class_name == target_class)
+        {
+            return Ok(());
+        }
+        let mut sources = self.runtime_dynamic_class_sources.borrow_mut();
+        let entries = sources.entry(target_key.to_string()).or_default();
+        if !entries.iter().any(|source| source.object_key == source_key) {
+            entries.push(super::DynamicClassSource {
+                object_key: source_key.to_string(),
+                class_name: source_class.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn class_type_key(&self, type_name: &str) -> String {
         let Some(base_name) = class_name(type_name) else {
             return type_name.to_string();
@@ -51,6 +95,26 @@ impl SlangAstLowerer {
         match string_field(value, "kind").as_deref() {
             Some("NamedValue" | "HierarchicalValue") => Ok(string_field(value, "symbol")
                 .filter(|symbol_key| self.class_objects.contains_key(symbol_key))),
+            Some("MemberAccess") => {
+                let Some(receiver) = value.get("value") else {
+                    return Ok(None);
+                };
+                if self.dynamic_class_array_selection(receiver)?.is_some() {
+                    return Ok(None);
+                }
+                let Some(receiver_key) = self.class_object_key_for_value(receiver)? else {
+                    return Ok(None);
+                };
+                let Some(member_name) = string_field(value, "member")
+                    .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+                else {
+                    return Ok(None);
+                };
+                Ok(self
+                    .class_composition_children
+                    .get(&(receiver_key, member_name))
+                    .cloned())
+            }
             Some("ElementSelect") => {
                 let Some(selected) = value.get("value") else {
                     return Ok(None);
@@ -494,6 +558,11 @@ impl SlangAstLowerer {
         {
             return Err(format!("class '{class_name}' interfaces are not supported"));
         }
+        if !self.active_composition_classes.insert(class_key.clone()) {
+            return Err(format!(
+                "recursive class composition through '{class_name}' is not supported"
+            ));
+        }
         let chain = self.class_chain(&class_key)?;
         let empty_members = Vec::new();
         let mut declared_properties = BTreeMap::new();
@@ -571,6 +640,7 @@ impl SlangAstLowerer {
             }
         }
         let mut array_elements = BTreeMap::new();
+        let mut class_properties = Vec::new();
         for index in indexes {
             let element_name = index
                 .map(|index| format!("{name}[{index}]"))
@@ -615,6 +685,24 @@ impl SlangAstLowerer {
                                 )
                             })?;
                         let property_type = string_field(property, "type").unwrap_or_default();
+                        let property_class_key = self.class_type_key(&property_type);
+                        if self.class_definitions.contains_key(&property_class_key) {
+                            if class_array_indexes(&property_type).is_some() {
+                                return Err(format!(
+                                "class-valued array property '{class_name}.{property_name}' is not supported"
+                            ));
+                            }
+                            if !class_properties.iter().any(
+                                |candidate: &(String, Value, String)| candidate.0 == property_name,
+                            ) {
+                                class_properties.push((
+                                    property_name.clone(),
+                                    property.clone(),
+                                    property_class_key,
+                                ));
+                            }
+                            continue;
+                        }
                         let (shape, signed, _) = self.net_type(&property_type)?;
                         let synthetic_symbol =
                             format!("eda_class_{synthetic_prefix}_{property_address}");
@@ -666,13 +754,38 @@ impl SlangAstLowerer {
             self.class_object_tags.insert(object_key.clone(), tag);
             self.class_object_ids.insert(object_key.clone(), id);
             if let Some(index) = index {
-                array_elements.insert(index, object_key);
+                array_elements.insert(index, object_key.clone());
+            }
+            for (property_name, property, _) in &class_properties {
+                let synthetic_handle = self.next_synthetic_class_handle;
+                self.next_synthetic_class_handle = self
+                    .next_synthetic_class_handle
+                    .checked_sub(1)
+                    .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
+                let mut child_member = property.clone();
+                if let Some(fields) = child_member.as_object_mut() {
+                    fields.insert("addr".into(), Value::from(synthetic_handle));
+                }
+                let child_name = format!("{element_name}.{property_name}");
+                if !self.declare_class_object(&child_member, &child_name)? {
+                    return Err(format!(
+                        "class property '{object_key}.{property_name}' has an invalid class type"
+                    ));
+                }
+                let child_key = format!("{synthetic_handle} {child_name}");
+                self.class_composition_children.insert(
+                    (object_key.clone(), property_name.clone()),
+                    child_key.clone(),
+                );
+                self.class_composition_parents
+                    .insert(child_key, object_key.clone());
             }
         }
         if !array_elements.is_empty() {
             self.class_object_arrays
                 .insert(base_object_key, array_elements);
         }
+        self.active_composition_classes.remove(&class_key);
         Ok(true)
     }
 
@@ -1013,24 +1126,20 @@ impl SlangAstLowerer {
         };
         let source = conversion_operand(right).unwrap_or(right);
         let target_selection = self.dynamic_class_array_selection(left)?;
-        let source_selection = self.dynamic_class_array_selection(source)?;
         let target_fixed_key = if target_selection.is_none() {
             self.class_object_key_for_value(left)?
         } else {
             None
         };
+        if target_selection.is_none() && target_fixed_key.is_none() {
+            return Ok(None);
+        }
+        let source_selection = self.dynamic_class_array_selection(source)?;
         let source_fixed_key = if source_selection.is_none() {
             self.class_object_key_for_value(source)?
         } else {
             None
         };
-        if target_selection.is_none()
-            && target_fixed_key.is_none()
-            && source_selection.is_none()
-            && source_fixed_key.is_none()
-        {
-            return Ok(None);
-        }
         if bool_field(assignment, "isNonBlocking") {
             return Err("non-blocking class handle assignment is not supported".into());
         }
@@ -1126,6 +1235,19 @@ impl SlangAstLowerer {
         }
         let target_fields = &self.class_objects[target_key];
         let source_fields = &self.class_objects[source_key];
+        let target_type = &self.class_object_types[target_key];
+        let source_type = &self.class_object_types[source_key];
+        if target_type == source_type {
+            self.record_runtime_dynamic_source(target_key, source_key, source_type)?;
+        } else if !self
+            .dynamic_class_sources
+            .get(target_key)
+            .is_some_and(|sources| sources.iter().any(|source| source.object_key == source_key))
+        {
+            return Err(format!(
+                "class handle assignment from '{source_type}' to '{target_type}' requires pre-declared dynamic storage"
+            ));
+        }
         let mut statements = Vec::new();
         for (target_symbol, source_symbol) in [
             (
@@ -1327,11 +1449,16 @@ impl SlangAstLowerer {
         let mut queue = std::collections::VecDeque::from([object_key.to_string()]);
         while let Some(current) = queue.pop_front() {
             let mut neighbors = Vec::new();
-            if let Some(sources) = self.dynamic_class_sources.get(&current) {
-                neighbors.extend(sources.iter().map(|source| source.object_key.clone()));
-            }
-            for (candidate, sources) in &self.dynamic_class_sources {
-                if sources.iter().any(|source| source.object_key == current) {
+            neighbors.extend(
+                self.dynamic_sources_for(&current)
+                    .iter()
+                    .map(|source| source.object_key.clone()),
+            );
+            let runtime_sources = self.runtime_dynamic_class_sources.borrow();
+            for (candidate, sources) in runtime_sources.iter().chain(&self.dynamic_class_sources) {
+                if candidate != &current
+                    && sources.iter().any(|source| source.object_key == current)
+                {
                     neighbors.push(candidate.clone());
                 }
             }
@@ -1375,8 +1502,12 @@ impl SlangAstLowerer {
     }
 
     fn require_initialized_class_object(&self, object_key: &str) -> Result<(), String> {
-        if self.initialized_class_objects.contains(object_key) {
+        if self.initialized_class_objects.contains(object_key)
+            || !self.dynamic_sources_for(object_key).is_empty()
+        {
             Ok(())
+        } else if let Some(parent_key) = self.class_composition_parents.get(object_key).cloned() {
+            self.require_initialized_class_object(&parent_key)
         } else {
             Err(format!(
                 "class object '{object_key}' may be null; null object access is not supported"
@@ -1539,9 +1670,7 @@ impl SlangAstLowerer {
         let Some(receiver_type) = self.receiver_class_name(object_key) else {
             return Ok(None);
         };
-        let Some(sources) = self.dynamic_class_sources.get(object_key) else {
-            return Ok(None);
-        };
+        let sources = self.dynamic_sources_for(object_key);
         if sources.is_empty() {
             return Ok(None);
         }
@@ -1772,6 +1901,20 @@ impl SlangAstLowerer {
                     .get("addr")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| format!("class property '{property_name}' has no address"))?;
+                if let Some(child_key) = self
+                    .class_composition_children
+                    .get(&(object_key.to_string(), property_name.clone()))
+                {
+                    replacements.insert(
+                        format!("{property_address} {property_name}"),
+                        json!({
+                            "kind": "NamedValue",
+                            "type": string_field(property, "type").unwrap_or_default(),
+                            "symbol": child_key,
+                        }),
+                    );
+                    continue;
+                }
                 let synthetic = format!("eda_class_{synthetic_prefix}_{property_address}");
                 replacements.insert(
                     format!("{property_address} {property_name}"),

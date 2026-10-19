@@ -68,8 +68,10 @@ receiver-resolved virtual calls, direct base/derived handle reassignment with
 object-identity propagation, runtime virtual dispatch through a base handle,
 hierarchy-global static class properties/methods shared by object and module
 instances, package-qualified classes, elaborated value-parameterized class
-specializations with method-body parameter substitution, and constant/dynamic-read
-class-array subsets,
+specializations with method-body parameter substitution, scalar class composition
+with nested construction/field/method access, constant-indexed and dynamic
+class-array read/write/handle-assignment subsets, and null handle
+assignment/comparison,
 first-class sparse memories, memory file tasks, and top-level and child
 memory-port sharing. It records slang source spans and
 validates lowered structure against the authoritative AST. Unsupported

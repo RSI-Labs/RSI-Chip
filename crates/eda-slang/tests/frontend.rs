@@ -569,6 +569,131 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_class_composition() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-composition");
+    let source_path = root.join("class_composition.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Inner;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+endclass
+
+class Outer;
+  Inner inner;
+
+  function new(int v);
+    inner = new(v);
+  endfunction
+
+  function int get();
+    return inner.get();
+  endfunction
+
+  function void set(int v);
+    inner.value = v;
+  endfunction
+endclass
+
+module class_composition_top(
+  input int v,
+  output int method_result,
+  output int property_result,
+  output int updated_result,
+  output int method_set_result,
+  output int source_after_write,
+  output int identity_result
+);
+  Outer outer;
+  Inner source;
+
+  initial begin
+    #1;
+    outer = new(v);
+    source = outer.inner;
+    method_result = outer.get();
+    property_result = outer.inner.value;
+    outer.inner.value = v + 5;
+    updated_result = outer.inner.get();
+    outer.set(v + 6);
+    method_set_result = outer.inner.get();
+    source_after_write = source.get();
+    identity_result = (outer.inner == source);
+  end
+endmodule
+"#,
+    )
+    .expect("write class-composition source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("class_composition_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower class composition");
+    let mut simulator = Simulator::new(&design).expect("create class-composition simulator");
+    simulator
+        .set_input("v", &LogicWord::from_u64(32, 37))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run class-composition initial block");
+    assert_eq!(simulator.read("method_result").unwrap().to_u64(), Some(37));
+    assert_eq!(
+        simulator.read("property_result").unwrap().to_u64(),
+        Some(37)
+    );
+    assert_eq!(simulator.read("updated_result").unwrap().to_u64(), Some(42));
+    assert_eq!(
+        simulator.read("method_set_result").unwrap().to_u64(),
+        Some(43)
+    );
+    assert_eq!(
+        simulator.read("source_after_write").unwrap().to_u64(),
+        Some(43)
+    );
+    assert_eq!(simulator.read("identity_result").unwrap().to_u64(), Some(1));
+
+    let recursive_path = root.join("recursive_class_composition.sv");
+    std::fs::write(
+        &recursive_path,
+        r#"
+class Recursive;
+  Recursive child;
+endclass
+
+module recursive_composition_top;
+  Recursive object;
+endmodule
+"#,
+    )
+    .expect("write recursive class-composition source");
+    let recursive_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&recursive_path),
+            Some("recursive_composition_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("recursive class composition must fail closed");
+    assert!(
+        recursive_error.contains("recursive class composition"),
+        "unexpected recursive-composition error: {recursive_error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
