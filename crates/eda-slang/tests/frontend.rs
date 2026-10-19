@@ -12315,6 +12315,411 @@ endmodule
 }
 
 #[test]
+fn slang_direct_config_db_sets_and_gets_literals() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ConfigDbTrace;
+  static int integer_found = 0;
+  static int integer_value = -1;
+  static int string_found = 0;
+  static string string_value = "";
+endclass
+
+class direct_config_db_probe extends uvm_test;
+  int integer_value;
+  string string_value;
+
+  function new(string name = "direct_config_db_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    integer_value = -1;
+    string_value = "";
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(
+      null,
+      "uvm_test_top",
+      "integer_value",
+      42
+    );
+    uvm_config_db#(string)::set(
+      null,
+      "uvm_test_top",
+      "string_value",
+      "configured"
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "integer_value",
+      integer_value
+    )) begin
+      ConfigDbTrace::integer_found = 0;
+    end else begin
+      ConfigDbTrace::integer_found = 1;
+      ConfigDbTrace::integer_value = integer_value;
+    end
+
+    if (!uvm_config_db#(string)::get(
+      this,
+      "",
+      "string_value",
+      string_value
+    )) begin
+      ConfigDbTrace::string_found = 0;
+    end else begin
+      ConfigDbTrace::string_found = 1;
+      ConfigDbTrace::string_value = string_value;
+    end
+  endtask
+endclass
+
+module official_uvm_config_db_probe(
+  output int integer_found,
+  output int integer_value,
+  output int string_found,
+  output string string_value
+);
+  initial begin
+    run_test("direct_config_db_probe");
+    integer_found = ConfigDbTrace::integer_found;
+    integer_value = ConfigDbTrace::integer_value;
+    string_found = ConfigDbTrace::string_found;
+    string_value = ConfigDbTrace::string_value;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM config DB wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_config_db_probe"),
+            &options,
+        )
+        .expect("directly lower literal UVM config DB entries");
+    let mut simulator = Simulator::new(&design).expect("create UVM config DB simulator");
+    simulator
+        .run_until(0)
+        .expect("run the UVM config DB phases");
+    assert_eq!(simulator.read("integer_found").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("integer_value").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("string_found").unwrap().to_u64(), Some(1));
+    let observed_string = simulator.read("string_value").expect("read config string");
+    assert_eq!(
+        observed_string.to_ascii_string_nul_terminated(),
+        "configured"
+    );
+}
+
+#[test]
+fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-missing-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class MissingConfigTrace;
+  static int failure_executed = 0;
+  static int value = -1;
+endclass
+
+class direct_missing_config_probe extends uvm_test;
+  int value;
+
+  function new(string name = "direct_missing_config_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "missing_value",
+      value
+    )) begin
+      MissingConfigTrace::failure_executed = 1;
+      MissingConfigTrace::value = value;
+    end else begin
+      MissingConfigTrace::failure_executed = 0;
+      MissingConfigTrace::value = value;
+    end
+  endtask
+endclass
+
+module official_uvm_missing_config_probe(
+  output int failure_executed,
+  output int value
+);
+  initial begin
+    run_test("direct_missing_config_probe");
+    failure_executed = MissingConfigTrace::failure_executed;
+    value = MissingConfigTrace::value;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM missing config wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_missing_config_probe"),
+            &options,
+        )
+        .expect("directly lower a missing UVM config lookup");
+    let mut simulator = Simulator::new(&design).expect("create missing config simulator");
+    simulator.run_until(0).expect("run the failure branch");
+    assert_eq!(
+        simulator.read("failure_executed").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator.read("value").unwrap().to_u64(),
+        Some(u32::MAX as u64)
+    );
+}
+
+#[test]
+fn slang_direct_config_db_fails_closed_on_unsupported_forms() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let nonliteral = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-nonliteral-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &nonliteral,
+        r#"
+import uvm_pkg::*;
+
+class direct_nonliteral_config extends uvm_test;
+  int value;
+
+  function new(string name = "direct_nonliteral_config",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = 42;
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(
+      null,
+      "uvm_test_top",
+      "value",
+      value
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_nonliteral_config_probe;
+  initial begin
+    run_test("direct_nonliteral_config");
+  end
+endmodule
+"#,
+    )
+    .expect("write nonliteral UVM config wrapper");
+    let error = slang
+        .compile_files(
+            &[source.clone(), nonliteral],
+            Some("official_uvm_nonliteral_config_probe"),
+            &options,
+        )
+        .expect_err("nonliteral config values must fail closed");
+    assert!(
+        error.contains("UVM config DB bootstrap values must be integer or string literals"),
+        "unexpected nonliteral config error: {error}"
+    );
+
+    let direct_get = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-direct-get-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &direct_get,
+        r#"
+import uvm_pkg::*;
+
+class direct_config_get_call extends uvm_test;
+  int value;
+  bit found;
+
+  function new(string name = "direct_config_get_call",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+    found = 0;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    found = uvm_config_db#(int)::get(
+      this,
+      "",
+      "value",
+      value
+    );
+  endtask
+endclass
+
+module official_uvm_direct_config_get_probe;
+  initial begin
+    run_test("direct_config_get_call");
+  end
+endmodule
+"#,
+    )
+    .expect("write direct UVM config get wrapper");
+    let error = slang
+        .compile_files(
+            &[source.clone(), direct_get],
+            Some("official_uvm_direct_config_get_probe"),
+            &options,
+        )
+        .expect_err("a direct config get must fail closed instead of losing its output");
+    assert!(
+        error.contains("direct UVM config DB get is supported only as a conditional expression"),
+        "unexpected direct config get error: {error}"
+    );
+
+    let wildcard_scope = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-wildcard-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wildcard_scope,
+        r#"
+import uvm_pkg::*;
+
+class direct_wildcard_config extends uvm_test;
+  int value;
+
+  function new(string name = "direct_wildcard_config",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(
+      null,
+      "*",
+      "value",
+      42
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_wildcard_config_probe;
+  initial begin
+    run_test("direct_wildcard_config");
+  end
+endmodule
+"#,
+    )
+    .expect("write wildcard-scope UVM config wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wildcard_scope],
+            Some("official_uvm_wildcard_config_probe"),
+            &options,
+        )
+        .expect_err("wildcard config scopes must fail closed");
+    assert!(
+        error.contains("UVM config DB wildcard scopes are not yet supported"),
+        "unexpected wildcard-scope config error: {error}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_applies_a_name_based_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

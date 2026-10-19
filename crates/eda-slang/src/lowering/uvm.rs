@@ -751,6 +751,229 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_config_set_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        let Some(type_name) = self.uvm_config_db_type_name(value, "set") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM config DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 4 {
+            return Err("UVM config DB set requires four arguments".into());
+        }
+        let scope = self.uvm_config_db_scope(
+            unwrap_conversion(&arguments[0]),
+            unwrap_conversion(&arguments[1]),
+        )?;
+        let field_name = string_literal(unwrap_conversion(&arguments[2]))
+            .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
+        let config_value = unwrap_conversion(&arguments[3]).clone();
+        if !matches!(
+            string_field(&config_value, "kind").as_deref(),
+            Some("IntegerLiteral" | "StringLiteral")
+        ) {
+            return Err("UVM config DB bootstrap values must be integer or string literals".into());
+        }
+        let mut entries = self.uvm_config_entries.borrow_mut();
+        entries.retain(|entry| {
+            !(entry.type_name == type_name
+                && entry.scope == scope
+                && entry.field_name == field_name)
+        });
+        entries.push(super::AstUvmConfigEntry {
+            type_name,
+            scope,
+            field_name,
+            value: config_value,
+        });
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_config_get_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(condition) = statement
+            .get("conditions")
+            .and_then(Value::as_array)
+            .and_then(|conditions| conditions.first())
+            .and_then(|condition| condition.get("expr"))
+        else {
+            return Ok(None);
+        };
+        let (call, negated) = if string_field(condition, "kind").as_deref() == Some("UnaryOp")
+            && string_field(condition, "op").as_deref() == Some("LogicalNot")
+        {
+            (
+                condition
+                    .get("operand")
+                    .ok_or_else(|| "logical-not expression has no operand".to_string())?,
+                true,
+            )
+        } else {
+            (condition, false)
+        };
+        let Some(type_name) = self.uvm_config_db_type_name(call, "get") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM config DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 4 {
+            return Err("UVM config DB get requires four arguments".into());
+        }
+        let scope = self.uvm_config_db_scope(
+            unwrap_conversion(&arguments[0]),
+            unwrap_conversion(&arguments[1]),
+        )?;
+        let field_name = string_literal(unwrap_conversion(&arguments[2]))
+            .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
+        let target = arguments[3]
+            .get("left")
+            .ok_or_else(|| "UVM config DB get output must be assignable".to_string())?;
+        let entry = self
+            .uvm_config_entries
+            .borrow()
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.type_name == type_name
+                    && entry.scope == scope
+                    && entry.field_name == field_name
+            })
+            .map(|entry| entry.value.clone());
+        let Some(entry) = entry else {
+            let failure = if negated {
+                statement.get("ifTrue")
+            } else {
+                statement.get("ifFalse")
+            };
+            return failure
+                .map(|failure| self.lower_statement(failure).map(Some))
+                .transpose()
+                .map(|statement| statement.unwrap_or_else(|| Some(Stmt::Block(Vec::new()))));
+        };
+        let assignment = Stmt::Bl {
+            lv: self.lower_lvalue(target)?,
+            e: self.lower_expression(&entry)?,
+        };
+        let success = if negated {
+            statement.get("ifFalse")
+        } else {
+            statement.get("ifTrue")
+        };
+        let success = success
+            .map(|success| self.lower_statement(success))
+            .transpose()?;
+        let mut statements = vec![assignment];
+        statements.extend(success);
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    fn uvm_config_db_scope(&self, context: &Value, inst_name: &Value) -> Result<String, String> {
+        let inst_name = string_literal_allow_empty(inst_name)
+            .ok_or_else(|| "UVM config DB instance names must be string literals".to_string())?;
+        if inst_name.contains('*') || inst_name.contains('?') {
+            return Err("UVM config DB wildcard scopes are not yet supported".into());
+        }
+        let context_key = if string_field(context, "kind").as_deref() == Some("NullLiteral") {
+            None
+        } else if is_this_reference(context) {
+            self.active_class_objects
+                .borrow()
+                .last()
+                .cloned()
+                .map(Ok::<String, String>)
+        } else {
+            self.class_object_key_for_value(context)?.map(Ok)
+        }
+        .transpose()?;
+        if context_key.is_none() && inst_name.is_empty() {
+            return Err("UVM config DB global scopes are not yet supported".into());
+        }
+        let base = if let Some(context_key) = context_key {
+            self.class_object_declared_full_names
+                .borrow()
+                .get(&context_key)
+                .cloned()
+                .ok_or_else(|| format!("UVM config DB context '{context_key}' has no full name"))?
+        } else {
+            String::new()
+        };
+        if base.is_empty() {
+            Ok(inst_name)
+        } else if inst_name.is_empty() {
+            Ok(base)
+        } else {
+            Ok(format!("{base}.{inst_name}"))
+        }
+    }
+
+    pub(super) fn uvm_config_db_type_name(
+        &self,
+        call: &Value,
+        method_name: &str,
+    ) -> Option<String> {
+        let address = string_field(call, "subroutine")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        for class in self.class_definitions.values() {
+            if string_field(class, "genericClass")
+                .unwrap_or_default()
+                .split_whitespace()
+                .next_back()
+                != Some("uvm_config_db")
+            {
+                continue;
+            }
+            let empty_members = Vec::new();
+            let members = class
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            if !members.iter().any(|member| {
+                string_field(member, "kind").as_deref() == Some("Subroutine")
+                    && string_field(member, "name").as_deref() == Some(method_name)
+                    && member.get("addr").and_then(Value::as_u64) == Some(address)
+            }) {
+                continue;
+            }
+            let parameter = members.iter().find(|member| {
+                string_field(member, "kind").as_deref() == Some("TypeParameter")
+                    && string_field(member, "name").as_deref() == Some("T")
+            })?;
+            let parameter_type = parameter.get("type")?;
+            return string_field(parameter_type, "name")
+                .or_else(|| string_field(parameter_type, "type"))
+                .or_else(|| Some(parameter_type.to_string()))
+                .map(|type_name| {
+                    type_name
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string()
+                });
+        }
+        None
+    }
+
     fn resolve_uvm_type_alias(&self, type_name: &str) -> Result<String, String> {
         let mut current = type_name.to_string();
         let mut visited = std::collections::BTreeSet::new();

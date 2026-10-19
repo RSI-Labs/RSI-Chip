@@ -77,6 +77,11 @@ impl SlangAstLowerer {
             }
             _ => {}
         }
+        if self.uvm_config_db_type_name(value, "get").is_some() {
+            return Err(
+                "direct UVM config DB get is supported only as a conditional expression".into(),
+            );
+        }
         if let Some(expression) = self.lower_static_class_function_call(value)? {
             return Ok(expression);
         }
@@ -197,6 +202,9 @@ impl SlangAstLowerer {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_uvm_factory_override_call(value)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_config_set_call(value)? {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_run_test_call(value)? {

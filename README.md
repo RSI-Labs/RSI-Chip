@@ -103,10 +103,16 @@ duplicate sibling names, supports `get_child(...)`, relative and leading-dot abs
 checked component-handle recovery, rejects duplicate sibling names, reports the prepared child count through
 `get_num_children()`, checks literal `has_child(...)`, and returns prepared
 hierarchy depth through `get_depth()`.
+A minimal literal `uvm_config_db#(T)` bootstrap records integer and string
+values under exact type/scope/field keys and resolves conditional `get(...)`
+calls, including missing-entry failure branches; unsupported non-literal
+values and direct value-returning `get(...)` forms fail closed.
 This is still a bootstrap:
-the registry and timeout are finite, phase objects are synthetic, factory
-overrides are compile-time mappings, there is no parallel phase graph or
-callback-based objection scheduler, and TLM and sequences are not yet executed.
+the registry, config entries, and timeout are finite, phase objects are
+synthetic, factory overrides and config entries are compile-time mappings,
+config scope matching is exact rather than wildcard/resource-pool semantics,
+there is no parallel phase graph or callback-based objection scheduler, and
+TLM and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit

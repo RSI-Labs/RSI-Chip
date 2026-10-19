@@ -662,6 +662,9 @@ impl SlangAstLowerer {
             ),
             "Disable" => self.lower_named_disable(statement),
             "Conditional" => {
+                if let Some(statement) = self.lower_uvm_config_get_conditional(statement)? {
+                    return Ok(statement);
+                }
                 if let Some(statement) = self.lower_uvm_factory_cast_conditional(statement)? {
                     return Ok(statement);
                 }
