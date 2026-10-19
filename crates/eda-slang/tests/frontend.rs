@@ -12444,6 +12444,193 @@ endmodule
 }
 
 #[test]
+fn slang_direct_config_db_matches_wildcards_and_precedence() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-priority-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ConfigPriorityTrace;
+  static int global_value = -1;
+  static int wildcard_value = -1;
+  static int question_value = -1;
+  static int precedence_value = -1;
+  static int latest_value = -1;
+  static int runtime_value = -1;
+endclass
+
+class direct_config_priority_probe extends uvm_test;
+  int global_value;
+  int wildcard_value;
+  int question_value;
+  int precedence_value;
+  int latest_value;
+  int runtime_value;
+
+  function new(string name = "direct_config_priority_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    global_value = -1;
+    wildcard_value = -1;
+    question_value = -1;
+    precedence_value = -1;
+    latest_value = -1;
+    runtime_value = -1;
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(null, "", "global_value", 30);
+    uvm_config_db#(int)::set(null, "*", "wildcard_value", 10);
+    uvm_config_db#(int)::set(null, "uvm_test_to?", "question_value", 20);
+    uvm_config_db#(int)::set(
+      null,
+      "uvm_test_top*",
+      "precedence_value",
+      100
+    );
+    uvm_config_db#(int)::set(this, "", "precedence_value", 200);
+    uvm_config_db#(int)::set(null, "uvm_test_top", "latest_value", 1);
+    uvm_config_db#(int)::set(null, "uvm_test_top", "latest_value", 2);
+    uvm_config_db#(int)::set(null, "uvm_test_top", "runtime_value", 400);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "global_value",
+      global_value
+    )) begin
+      ConfigPriorityTrace::global_value = -1;
+    end else begin
+      ConfigPriorityTrace::global_value = global_value;
+    end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "wildcard_value",
+      wildcard_value
+    )) begin
+      ConfigPriorityTrace::wildcard_value = -1;
+    end else begin
+      ConfigPriorityTrace::wildcard_value = wildcard_value;
+    end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "question_value",
+      question_value
+    )) begin
+      ConfigPriorityTrace::question_value = -1;
+    end else begin
+      ConfigPriorityTrace::question_value = question_value;
+    end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "precedence_value",
+      precedence_value
+    )) begin
+      ConfigPriorityTrace::precedence_value = -1;
+    end else begin
+      ConfigPriorityTrace::precedence_value = precedence_value;
+    end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "latest_value",
+      latest_value
+    )) begin
+      ConfigPriorityTrace::latest_value = -1;
+    end else begin
+      ConfigPriorityTrace::latest_value = latest_value;
+    end
+
+    uvm_config_db#(int)::set(this, "", "runtime_value", 300);
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "runtime_value",
+      runtime_value
+    )) begin
+      ConfigPriorityTrace::runtime_value = -1;
+    end else begin
+      ConfigPriorityTrace::runtime_value = runtime_value;
+    end
+  endtask
+endclass
+
+module official_uvm_config_priority_probe(
+  output int global_value,
+  output int wildcard_value,
+  output int question_value,
+  output int precedence_value,
+  output int latest_value,
+  output int runtime_value
+);
+  initial begin
+    run_test("direct_config_priority_probe");
+    global_value = ConfigPriorityTrace::global_value;
+    wildcard_value = ConfigPriorityTrace::wildcard_value;
+    question_value = ConfigPriorityTrace::question_value;
+    precedence_value = ConfigPriorityTrace::precedence_value;
+    latest_value = ConfigPriorityTrace::latest_value;
+    runtime_value = ConfigPriorityTrace::runtime_value;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM config priority wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_config_priority_probe"),
+            &options,
+        )
+        .expect("directly lower scoped UVM config resources");
+    let mut simulator = Simulator::new(&design).expect("create config priority simulator");
+    simulator.run_until(0).expect("run config priority phases");
+    assert_eq!(simulator.read("global_value").unwrap().to_u64(), Some(30));
+    assert_eq!(simulator.read("wildcard_value").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("question_value").unwrap().to_u64(), Some(20));
+    assert_eq!(
+        simulator.read("precedence_value").unwrap().to_u64(),
+        Some(100)
+    );
+    assert_eq!(simulator.read("latest_value").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("runtime_value").unwrap().to_u64(), Some(300));
+}
+
+#[test]
 fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -12661,61 +12848,6 @@ endmodule
     assert!(
         error.contains("direct UVM config DB get is supported only as a conditional expression"),
         "unexpected direct config get error: {error}"
-    );
-
-    let wildcard_scope = std::env::temp_dir().join(format!(
-        "eda-official-uvm-config-db-wildcard-{}-{}.sv",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::write(
-        &wildcard_scope,
-        r#"
-import uvm_pkg::*;
-
-class direct_wildcard_config extends uvm_test;
-  int value;
-
-  function new(string name = "direct_wildcard_config",
-               uvm_component parent = null);
-    super.new(name, parent);
-    value = -1;
-  endfunction
-
-  virtual function void build_phase(uvm_phase phase);
-    uvm_config_db#(int)::set(
-      null,
-      "*",
-      "value",
-      42
-    );
-  endfunction
-
-  virtual task run_phase(uvm_phase phase);
-  endtask
-endclass
-
-module official_uvm_wildcard_config_probe;
-  initial begin
-    run_test("direct_wildcard_config");
-  end
-endmodule
-"#,
-    )
-    .expect("write wildcard-scope UVM config wrapper");
-    let error = slang
-        .compile_files(
-            &[source, wildcard_scope],
-            Some("official_uvm_wildcard_config_probe"),
-            &options,
-        )
-        .expect_err("wildcard config scopes must fail closed");
-    assert!(
-        error.contains("UVM config DB wildcard scopes are not yet supported"),
-        "unexpected wildcard-scope config error: {error}"
     );
 }
 

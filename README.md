@@ -104,13 +104,16 @@ checked component-handle recovery, rejects duplicate sibling names, reports the 
 `get_num_children()`, checks literal `has_child(...)`, and returns prepared
 hierarchy depth through `get_depth()`.
 A minimal literal `uvm_config_db#(T)` bootstrap records integer and string
-values under exact type/scope/field keys and resolves conditional `get(...)`
-calls, including missing-entry failure branches; unsupported non-literal
-values and direct value-returning `get(...)` forms fail closed.
+values in typed scope/field resources, applies the official UVM-no-DPI glob
+subset (`*`, `?`, and the empty global pattern), honors build-time hierarchy
+precedence and runtime/default last-write selection, and resolves conditional
+`get(...)` calls, including missing-entry failure branches; unsupported
+non-literal values and direct value-returning `get(...)` forms fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
-synthetic, factory overrides and config entries are compile-time mappings,
-config scope matching is exact rather than wildcard/resource-pool semantics,
+synthetic, factory overrides and config entries are compile-time mappings, the
+glob/precedence model is not the complete `uvm_resource_db` regex, callback,
+wait-modification, priority API, or dynamic resource-pool implementation,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
 

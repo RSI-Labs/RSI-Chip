@@ -161,7 +161,7 @@ impl SlangAstLowerer {
         Ok(object_key)
     }
 
-    fn class_object_depth(&self, object_key: &str) -> Result<u64, String> {
+    pub(super) fn class_object_depth(&self, object_key: &str) -> Result<u64, String> {
         if self
             .run_test_objects
             .values()

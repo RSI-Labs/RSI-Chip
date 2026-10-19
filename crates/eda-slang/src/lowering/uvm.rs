@@ -20,6 +20,12 @@ const UVM_BOOTSTRAP_PHASES: [&str; 9] = [
     "final_phase",
 ];
 const UVM_BOOTSTRAP_OBJECTION_TIMEOUT: u64 = 1_000;
+const UVM_CONFIG_DB_DEFAULT_PRECEDENCE: u32 = 1_000;
+
+struct AstUvmConfigScope {
+    pattern: String,
+    depth: u64,
+}
 
 impl SlangAstLowerer {
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
@@ -608,7 +614,10 @@ impl SlangAstLowerer {
                     },
                 ],
             });
-            let Some(phase_statement) = self.lower_class_task_call(&phase_call)? else {
+            *self.active_uvm_phase.borrow_mut() = Some(phase_name.to_string());
+            let phase_statement = self.lower_class_task_call(&phase_call);
+            self.active_uvm_phase.borrow_mut().take();
+            let Some(phase_statement) = phase_statement? else {
                 return Err(format!(
                     "run_test failed to execute {phase_name} for class '{class_name}'"
                 ));
@@ -772,6 +781,7 @@ impl SlangAstLowerer {
             unwrap_conversion(&arguments[0]),
             unwrap_conversion(&arguments[1]),
         )?;
+        let precedence = self.uvm_config_db_precedence(scope.depth)?;
         let field_name = string_literal(unwrap_conversion(&arguments[2]))
             .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
         let config_value = unwrap_conversion(&arguments[3]).clone();
@@ -784,13 +794,14 @@ impl SlangAstLowerer {
         let mut entries = self.uvm_config_entries.borrow_mut();
         entries.retain(|entry| {
             !(entry.type_name == type_name
-                && entry.scope == scope
+                && entry.scope == scope.pattern
                 && entry.field_name == field_name)
         });
         entries.push(super::AstUvmConfigEntry {
             type_name,
-            scope,
+            scope: scope.pattern,
             field_name,
+            precedence,
             value: config_value,
         });
         Ok(Some(Stmt::Block(Vec::new())))
@@ -849,12 +860,12 @@ impl SlangAstLowerer {
             .uvm_config_entries
             .borrow()
             .iter()
-            .rev()
-            .find(|entry| {
+            .filter(|entry| {
                 entry.type_name == type_name
-                    && entry.scope == scope
                     && entry.field_name == field_name
+                    && Self::uvm_glob_match(&entry.scope, &scope.pattern)
             })
+            .max_by_key(|entry| entry.precedence)
             .map(|entry| entry.value.clone());
         let Some(entry) = entry else {
             let failure = if negated {
@@ -884,12 +895,13 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(statements)))
     }
 
-    fn uvm_config_db_scope(&self, context: &Value, inst_name: &Value) -> Result<String, String> {
+    fn uvm_config_db_scope(
+        &self,
+        context: &Value,
+        inst_name: &Value,
+    ) -> Result<AstUvmConfigScope, String> {
         let inst_name = string_literal_allow_empty(inst_name)
             .ok_or_else(|| "UVM config DB instance names must be string literals".to_string())?;
-        if inst_name.contains('*') || inst_name.contains('?') {
-            return Err("UVM config DB wildcard scopes are not yet supported".into());
-        }
         let context_key = if string_field(context, "kind").as_deref() == Some("NullLiteral") {
             None
         } else if is_this_reference(context) {
@@ -902,9 +914,11 @@ impl SlangAstLowerer {
             self.class_object_key_for_value(context)?.map(Ok)
         }
         .transpose()?;
-        if context_key.is_none() && inst_name.is_empty() {
-            return Err("UVM config DB global scopes are not yet supported".into());
-        }
+        let depth = if let Some(context_key) = &context_key {
+            self.class_object_depth(context_key)?
+        } else {
+            0
+        };
         let base = if let Some(context_key) = context_key {
             self.class_object_declared_full_names
                 .borrow()
@@ -914,13 +928,42 @@ impl SlangAstLowerer {
         } else {
             String::new()
         };
-        if base.is_empty() {
-            Ok(inst_name)
+        let pattern = if base.is_empty() {
+            inst_name
         } else if inst_name.is_empty() {
-            Ok(base)
+            base
         } else {
-            Ok(format!("{base}.{inst_name}"))
+            format!("{base}.{inst_name}")
+        };
+        Ok(AstUvmConfigScope { pattern, depth })
+    }
+
+    fn uvm_config_db_precedence(&self, context_depth: u64) -> Result<u32, String> {
+        if self.active_uvm_phase.borrow().as_deref() != Some("build_phase") {
+            return Ok(UVM_CONFIG_DB_DEFAULT_PRECEDENCE);
         }
+        let context_depth = u32::try_from(context_depth)
+            .map_err(|_| "UVM component depth overflows".to_string())?;
+        UVM_CONFIG_DB_DEFAULT_PRECEDENCE
+            .checked_sub(context_depth)
+            .ok_or_else(|| {
+                format!("UVM component depth {context_depth} exceeds config DB default precedence")
+            })
+    }
+
+    fn uvm_glob_match(pattern: &str, text: &str) -> bool {
+        fn match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+            match pattern.first() {
+                None => true,
+                Some(b'*') => {
+                    match_bytes(&pattern[1..], text)
+                        || (!text.is_empty() && match_bytes(pattern, &text[1..]))
+                }
+                Some(b'?') => !text.is_empty() && match_bytes(&pattern[1..], &text[1..]),
+                Some(byte) => text.first() == Some(byte) && match_bytes(&pattern[1..], &text[1..]),
+            }
+        }
+        match_bytes(pattern.as_bytes(), text.as_bytes())
     }
 
     pub(super) fn uvm_config_db_type_name(
