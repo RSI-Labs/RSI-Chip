@@ -12670,6 +12670,177 @@ endmodule
 }
 
 #[test]
+fn slang_direct_resource_db_sets_and_reads_literals() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-resource-db-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ResourceDbTrace;
+  static int integer_found = 0;
+  static int integer_value = -1;
+  static int string_found = 0;
+  static string string_value = "";
+  static int shared_found = 0;
+  static int shared_value = -1;
+  static int missing_executed = 0;
+endclass
+
+class direct_resource_db_probe extends uvm_test;
+  int integer_value;
+  string string_value;
+  int shared_value;
+  int missing_value;
+
+  function new(string name = "direct_resource_db_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    integer_value = -1;
+    string_value = "";
+    shared_value = -1;
+    missing_value = -1;
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_resource_db#(int)::set(
+      "uvm_test_top",
+      "integer_value",
+      42
+    );
+    uvm_resource_db#(string)::set(
+      "uvm_test_top",
+      "string_value",
+      "resource"
+    );
+    uvm_config_db#(int)::set(
+      null,
+      "uvm_test_top",
+      "shared_value",
+      77
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top",
+      "integer_value",
+      integer_value
+    )) begin
+      ResourceDbTrace::integer_found = 0;
+    end else begin
+      ResourceDbTrace::integer_found = 1;
+      ResourceDbTrace::integer_value = integer_value;
+    end
+
+    if (!uvm_resource_db#(string)::read_by_name(
+      "uvm_test_top",
+      "string_value",
+      string_value
+    )) begin
+      ResourceDbTrace::string_found = 0;
+    end else begin
+      ResourceDbTrace::string_found = 1;
+      ResourceDbTrace::string_value = string_value;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top",
+      "shared_value",
+      shared_value
+    )) begin
+      ResourceDbTrace::shared_found = 0;
+    end else begin
+      ResourceDbTrace::shared_found = 1;
+      ResourceDbTrace::shared_value = shared_value;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top",
+      "missing_value",
+      missing_value
+    )) begin
+      ResourceDbTrace::missing_executed = 1;
+    end else begin
+      ResourceDbTrace::missing_executed = 0;
+    end
+  endtask
+endclass
+
+module official_uvm_resource_db_probe(
+  output int integer_found,
+  output int integer_value,
+  output int string_found,
+  output string string_value,
+  output int shared_found,
+  output int shared_value,
+  output int missing_executed
+);
+  initial begin
+    run_test("direct_resource_db_probe");
+    integer_found = ResourceDbTrace::integer_found;
+    integer_value = ResourceDbTrace::integer_value;
+    string_found = ResourceDbTrace::string_found;
+    string_value = ResourceDbTrace::string_value;
+    shared_found = ResourceDbTrace::shared_found;
+    shared_value = ResourceDbTrace::shared_value;
+    missing_executed = ResourceDbTrace::missing_executed;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM resource DB wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_resource_db_probe"),
+            &options,
+        )
+        .expect("directly lower literal UVM resource DB entries");
+    let mut simulator = Simulator::new(&design).expect("create UVM resource DB simulator");
+    simulator.run_until(0).expect("run UVM resource DB phases");
+    assert_eq!(simulator.read("integer_found").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("integer_value").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("string_found").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator
+            .read("string_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "resource"
+    );
+    assert_eq!(simulator.read("shared_found").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("shared_value").unwrap().to_u64(), Some(77));
+    assert_eq!(
+        simulator.read("missing_executed").unwrap().to_u64(),
+        Some(1)
+    );
+}
+
+#[test]
 fn slang_direct_config_db_exists_checks_scoped_resources() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -13195,7 +13366,7 @@ endmodule
     .expect("write invalid UVM config regex wrapper");
     let error = slang
         .compile_files(
-            &[source, invalid_regex],
+            &[source.clone(), invalid_regex],
             Some("official_uvm_invalid_regex_config_probe"),
             &options,
         )
@@ -13203,6 +13374,61 @@ endmodule
     assert!(
         error.contains("invalid UVM config DB regex scope"),
         "unexpected invalid config regex error: {error}"
+    );
+
+    let direct_resource_read = std::env::temp_dir().join(format!(
+        "eda-official-uvm-direct-resource-read-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &direct_resource_read,
+        r#"
+import uvm_pkg::*;
+
+class direct_resource_read_call extends uvm_test;
+  int value;
+  bit found;
+
+  function new(string name = "direct_resource_read_call",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+    found = 0;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    found = uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top",
+      "value",
+      value
+    );
+  endtask
+endclass
+
+module official_uvm_direct_resource_read_probe;
+  initial begin
+    run_test("direct_resource_read_call");
+  end
+endmodule
+"#,
+    )
+    .expect("write direct UVM resource read wrapper");
+    let error = slang
+        .compile_files(
+            &[source, direct_resource_read],
+            Some("official_uvm_direct_resource_read_probe"),
+            &options,
+        )
+        .expect_err("a direct resource read must fail closed");
+    assert!(
+        error.contains(
+            "direct UVM resource DB read_by_name is supported only as a conditional expression"
+        ),
+        "unexpected direct resource read error: {error}"
     );
 }
 

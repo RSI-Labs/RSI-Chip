@@ -87,6 +87,15 @@ impl SlangAstLowerer {
                 "direct UVM config DB exists is supported only as a conditional expression".into(),
             );
         }
+        if self
+            .uvm_resource_db_type_name(value, "read_by_name")
+            .is_some()
+        {
+            return Err(
+                "direct UVM resource DB read_by_name is supported only as a conditional expression"
+                    .into(),
+            );
+        }
         if let Some(expression) = self.lower_static_class_function_call(value)? {
             return Ok(expression);
         }
@@ -213,6 +222,9 @@ impl SlangAstLowerer {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_uvm_config_set_call(value)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_resource_set_call(value)? {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_run_test_call(value)? {

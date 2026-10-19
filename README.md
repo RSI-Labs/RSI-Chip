@@ -112,15 +112,18 @@ matches, and resolves conditional `get(...)` and `exists(...)` calls, including
 missing-entry failure branches;
 prepared `wait_modified(...)` calls wake when a later matching `set(...)`
 executes, and literal spell-check mode emits a UVM information message with
-global cross-type Levenshtein alternatives. Unsupported non-literal values,
-non-literal spell-check arguments, direct value-returning `get(...)`/`exists(...)`
-forms, and unprepared waiters fail closed.
+global cross-type Levenshtein alternatives. A minimal literal
+`uvm_resource_db#(T)::set/read_by_name` bootstrap now shares those typed
+resources, including cross-reads from `uvm_config_db` entries. Unsupported
+non-literal values, non-literal spell-check arguments, accessors, direct
+value-returning `get(...)`/`exists(...)`/`read_by_name(...)` forms, and
+unprepared waiters fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
 glob/regex/precedence/wait/spell model does not prove complete official POSIX
-dialect equivalence or the complete `uvm_resource_db` callback, waiter-pool,
-priority API, resource-wide dictionary, or dynamic resource-pool behavior,
+dialect equivalence or all `uvm_resource_db` APIs, callbacks, waiter pools,
+priority controls, resource-wide dictionaries, or dynamic resource-pool behavior,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
 
