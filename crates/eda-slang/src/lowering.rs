@@ -439,6 +439,8 @@ pub(super) struct SlangAstLowerer {
     class_static_methods: std::collections::BTreeMap<String, String>,
     class_static_properties: std::collections::BTreeMap<String, AstLoweredSymbol>,
     class_static_initializer_count: usize,
+    class_object_arrays:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<i64, String>>,
     class_property_owners: std::collections::BTreeMap<usize, (String, String)>,
     class_property_temps: std::collections::BTreeMap<(String, String), AstLoweredSymbol>,
     enum_constants: std::collections::BTreeMap<String, LogicWord>,
@@ -561,6 +563,7 @@ impl SlangAstLowerer {
             class_static_methods: std::collections::BTreeMap::new(),
             class_static_properties: std::collections::BTreeMap::new(),
             class_static_initializer_count: 0,
+            class_object_arrays: std::collections::BTreeMap::new(),
             class_property_owners: std::collections::BTreeMap::new(),
             class_property_temps: std::collections::BTreeMap::new(),
             enum_constants: std::collections::BTreeMap::new(),

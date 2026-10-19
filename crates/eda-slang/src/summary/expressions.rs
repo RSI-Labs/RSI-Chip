@@ -226,6 +226,12 @@ fn is_class_handle_target(
             .map(|selected| is_class_handle_target(selected, class_handles))
             .unwrap_or(false);
     }
+    if string_field(value, "kind").as_deref() == Some("ElementSelect") {
+        return value
+            .get("value")
+            .map(|selected| is_class_handle_target(selected, class_handles))
+            .unwrap_or(false);
+    }
     let Some(symbol) = string_field(value, "symbol") else {
         return false;
     };

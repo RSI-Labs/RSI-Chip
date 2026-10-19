@@ -8,11 +8,18 @@ use eda_core::logic::LogicWord;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+const MAX_CLASS_ARRAY_ELEMENTS: usize = 4096;
+
 #[derive(Clone)]
 struct ClassMethodCandidate {
     class_name: String,
     method: Value,
     owner: String,
+}
+
+struct DynamicClassArraySelection {
+    selector: Expr,
+    elements: Vec<(i64, String)>,
 }
 
 impl SlangAstLowerer {
@@ -31,6 +38,88 @@ impl SlangAstLowerer {
             }
         }
         base_name
+    }
+
+    fn class_object_key_for_value(&self, value: &Value) -> Result<Option<String>, String> {
+        match string_field(value, "kind").as_deref() {
+            Some("NamedValue" | "HierarchicalValue") => Ok(string_field(value, "symbol")
+                .filter(|symbol_key| self.class_objects.contains_key(symbol_key))),
+            Some("ElementSelect") => {
+                let Some(selected) = value.get("value") else {
+                    return Ok(None);
+                };
+                let Some(base_key) = string_field(selected, "symbol") else {
+                    return Ok(None);
+                };
+                if !self.class_object_arrays.contains_key(&base_key) {
+                    return Ok(None);
+                }
+                let Some(selector) = value.get("selector") else {
+                    return Err(format!("class array '{base_key}' element has no selector"));
+                };
+                let Some(index) = constant_selector(selector) else {
+                    return Err(format!(
+                        "dynamic class-array element selection through '{base_key}' is not supported"
+                    ));
+                };
+                self.class_object_arrays
+                    .get(&base_key)
+                    .and_then(|elements| elements.get(&index))
+                    .cloned()
+                    .map(Ok)
+                    .transpose()
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn dynamic_class_array_selection(
+        &self,
+        value: &Value,
+    ) -> Result<Option<DynamicClassArraySelection>, String> {
+        if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+            return Ok(None);
+        }
+        let Some(selected) = value.get("value") else {
+            return Ok(None);
+        };
+        let Some(base_key) = string_field(selected, "symbol") else {
+            return Ok(None);
+        };
+        let Some(elements) = self.class_object_arrays.get(&base_key) else {
+            return Ok(None);
+        };
+        let Some(selector) = value.get("selector") else {
+            return Err(format!("class array '{base_key}' element has no selector"));
+        };
+        if constant_selector(selector).is_some() {
+            return Ok(None);
+        }
+        let selector = self.lower_expression(selector)?;
+        let elements = elements
+            .iter()
+            .map(|(index, key)| (*index, key.clone()))
+            .collect();
+        Ok(Some(DynamicClassArraySelection { selector, elements }))
+    }
+
+    fn class_array_element_receiver(element_key: &str, value: &Value) -> Value {
+        let mut receiver = value.clone();
+        if let Some(fields) = receiver.as_object_mut() {
+            fields.insert("kind".into(), Value::String("NamedValue".into()));
+            fields.insert("symbol".into(), Value::String(element_key.to_string()));
+            fields.remove("value");
+            fields.remove("selector");
+        }
+        receiver
+    }
+
+    fn class_array_condition(selector: &Expr, index: i64) -> Expr {
+        Expr::Bin {
+            op: BinOp::Eq,
+            a: Box::new(selector.clone()),
+            b: Box::new(Expr::Const(LogicWord::from_u64(32, index as u64))),
+        }
     }
 
     pub(super) fn collect_class_static_members(&mut self) -> Result<(), String> {
@@ -295,80 +384,107 @@ impl SlangAstLowerer {
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("class object '{name}' has no symbol address"))?;
         self.ensure_class_object_serial()?;
-        let empty_members = Vec::new();
-        let mut fields: BTreeMap<String, super::AstLoweredSymbol> = BTreeMap::new();
-        let mut property_chains = vec![chain.clone()];
-        let object_key = format!("{handle_address} {name}");
-        if let Some(sources) = self.dynamic_class_sources.get(&object_key) {
-            for source in sources {
-                property_chains.push(self.class_chain(&source.class_name)?);
-            }
+        let base_object_key = format!("{handle_address} {name}");
+        let indexes = class_array_indexes(&type_name).unwrap_or_else(|| vec![None]);
+        if indexes.len() > MAX_CLASS_ARRAY_ELEMENTS {
+            return Err(format!(
+                "class object array '{name}' has {} elements; the direct path supports at most {MAX_CLASS_ARRAY_ELEMENTS}",
+                indexes.len()
+            ));
         }
-        for property_chain in &property_chains {
-            for (_, class) in property_chain.iter().rev() {
-                let members = class
-                    .get("members")
-                    .and_then(Value::as_array)
-                    .unwrap_or(&empty_members);
-                for property in members {
-                    if string_field(property, "kind").as_deref() != Some("ClassProperty") {
-                        continue;
-                    }
-                    if string_field(property, "lifetime").as_deref() == Some("Static") {
-                        continue;
-                    }
-                    let property_name = declaration_name(property, "ClassProperty")?;
-                    if property.get("initializer").is_some() {
-                        return Err(format!(
-                            "class property '{class_name}.{property_name}' initializers are not supported; initialize in new()"
-                        ));
-                    }
-                    let property_address = property
-                        .get("addr")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| {
-                            format!("class property '{class_name}.{property_name}' has no address")
-                        })?;
-                    let property_type = string_field(property, "type").unwrap_or_default();
-                    let (shape, signed, _) = self.net_type(&property_type)?;
-                    let synthetic_symbol = format!("eda_class_{handle_address}_{property_address}");
-                    if let Some(existing) = fields.get(&property_name) {
-                        if existing.width != shape.width
-                            || existing.signed != signed
-                            || existing.bounds != shape.bounds
-                        {
-                            return Err(format!(
-                                "dynamic class storage for '{name}.{property_name}' has conflicting layouts"
-                            ));
-                        }
-                        self.symbols.insert(synthetic_symbol, existing.clone());
-                        continue;
-                    }
-                    let field_name = format!("{name}.{property_name}");
-                    let symbol = self.declare_net(property, &field_name, "Variable")?;
-                    self.symbols.insert(synthetic_symbol, symbol.clone());
-                    self.class_property_owners
-                        .insert(symbol.base, (object_key.clone(), property_name.clone()));
-                    let mut temporary = self.declare_class_internal_net(
-                        &format!("__class_tmp_{handle_address}_{property_address}"),
-                        shape.width,
-                    );
-                    temporary.signed = signed;
-                    self.class_property_temps
-                        .insert((object_key.clone(), property_name.clone()), temporary);
-                    fields.insert(property_name, symbol);
+        let mut array_elements = BTreeMap::new();
+        for index in indexes {
+            let element_name = index
+                .map(|index| format!("{name}[{index}]"))
+                .unwrap_or_else(|| name.to_string());
+            let object_key = format!("{handle_address} {element_name}");
+            let synthetic_prefix = index
+                .map(|index| format!("{handle_address}_{index}"))
+                .unwrap_or_else(|| handle_address.to_string());
+            let mut fields: BTreeMap<String, super::AstLoweredSymbol> = BTreeMap::new();
+            let mut property_chains = vec![chain.clone()];
+            if let Some(sources) = self.dynamic_class_sources.get(&object_key) {
+                for source in sources {
+                    property_chains.push(self.class_chain(&source.class_name)?);
                 }
             }
+            for property_chain in &property_chains {
+                for (_, class) in property_chain.iter().rev() {
+                    let empty_members = Vec::new();
+                    let members = class
+                        .get("members")
+                        .and_then(Value::as_array)
+                        .unwrap_or(&empty_members);
+                    for property in members {
+                        if string_field(property, "kind").as_deref() != Some("ClassProperty") {
+                            continue;
+                        }
+                        if string_field(property, "lifetime").as_deref() == Some("Static") {
+                            continue;
+                        }
+                        let property_name = declaration_name(property, "ClassProperty")?;
+                        if property.get("initializer").is_some() {
+                            return Err(format!(
+                            "class property '{class_name}.{property_name}' initializers are not supported; initialize in new()"
+                        ));
+                        }
+                        let property_address = property
+                            .get("addr")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| {
+                                format!(
+                                    "class property '{class_name}.{property_name}' has no address"
+                                )
+                            })?;
+                        let property_type = string_field(property, "type").unwrap_or_default();
+                        let (shape, signed, _) = self.net_type(&property_type)?;
+                        let synthetic_symbol =
+                            format!("eda_class_{synthetic_prefix}_{property_address}");
+                        if let Some(existing) = fields.get(&property_name) {
+                            if existing.width != shape.width
+                                || existing.signed != signed
+                                || existing.bounds != shape.bounds
+                            {
+                                return Err(format!(
+                                "dynamic class storage for '{element_name}.{property_name}' has conflicting layouts"
+                            ));
+                            }
+                            self.symbols.insert(synthetic_symbol, existing.clone());
+                            continue;
+                        }
+                        let field_name = format!("{element_name}.{property_name}");
+                        let symbol = self.declare_net(property, &field_name, "Variable")?;
+                        self.symbols.insert(synthetic_symbol, symbol.clone());
+                        self.class_property_owners
+                            .insert(symbol.base, (object_key.clone(), property_name.clone()));
+                        let mut temporary = self.declare_class_internal_net(
+                            &format!("__class_tmp_{synthetic_prefix}_{property_address}"),
+                            shape.width,
+                        );
+                        temporary.signed = signed;
+                        self.class_property_temps
+                            .insert((object_key.clone(), property_name.clone()), temporary);
+                        fields.insert(property_name, symbol);
+                    }
+                }
+            }
+            self.class_objects.insert(object_key.clone(), fields);
+            self.class_object_types
+                .insert(object_key.clone(), class_key.clone());
+            let tag =
+                self.declare_class_internal_net(&format!("__class_tag_{synthetic_prefix}"), 32);
+            let id = self
+                .declare_class_internal_net(&format!("__class_object_id_{synthetic_prefix}"), 64);
+            self.class_object_tags.insert(object_key.clone(), tag);
+            self.class_object_ids.insert(object_key.clone(), id);
+            if let Some(index) = index {
+                array_elements.insert(index, object_key);
+            }
         }
-        self.class_objects.insert(object_key.clone(), fields);
-        self.class_object_types
-            .insert(object_key.clone(), class_key);
-        let tag =
-            self.declare_class_internal_net(&format!("__class_tag_{handle_address}_{name}"), 32);
-        let id = self
-            .declare_class_internal_net(&format!("__class_object_id_{handle_address}_{name}"), 64);
-        self.class_object_tags.insert(object_key.clone(), tag);
-        self.class_object_ids.insert(object_key, id);
+        if !array_elements.is_empty() {
+            self.class_object_arrays
+                .insert(base_object_key, array_elements);
+        }
         Ok(true)
     }
 
@@ -419,7 +535,7 @@ impl SlangAstLowerer {
         let Some(left) = assignment.get("left") else {
             return Ok(None);
         };
-        let Some(object_key) = left.get("symbol").and_then(Value::as_str) else {
+        let Some(object_key) = self.class_object_key_for_value(left)? else {
             return Ok(None);
         };
         let constructor = right
@@ -427,24 +543,24 @@ impl SlangAstLowerer {
             .ok_or_else(|| "class construction has no constructor call".to_string())?;
         let class_name = self
             .class_object_types
-            .get(object_key)
+            .get(&object_key)
             .ok_or_else(|| format!("unknown class object '{object_key}'"))?;
         let class_id = self.class_id(class_name)?;
         let tag = self
             .class_object_tags
-            .get(object_key)
+            .get(&object_key)
             .ok_or_else(|| format!("class object '{object_key}' has no runtime tag"))?
             .clone();
         let id = self
             .class_object_ids
-            .get(object_key)
+            .get(&object_key)
             .ok_or_else(|| format!("class object '{object_key}' has no object id"))?
             .clone();
         let serial = self
             .class_object_serial
             .clone()
             .ok_or_else(|| "class object serial counter is missing".to_string())?;
-        let body = self.lower_class_method(object_key, constructor, true)?;
+        let body = self.lower_class_method(&object_key, constructor, true)?;
         Ok(Some(Stmt::Block(vec![
             Stmt::Bl {
                 lv: class_lvalue(&tag),
@@ -473,17 +589,40 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        let Some(object_key) = receiver.get("symbol").and_then(Value::as_str) else {
+        if let Some(DynamicClassArraySelection { selector, elements }) =
+            self.dynamic_class_array_selection(receiver)?
+        {
+            let mut statements = Vec::new();
+            for (index, element_key) in elements {
+                let mut specialized = call.clone();
+                if let Some(fields) = specialized.as_object_mut() {
+                    fields.insert(
+                        "thisClass".into(),
+                        Self::class_array_element_receiver(&element_key, receiver),
+                    );
+                }
+                let Some(statement) = self.lower_class_task_call(&specialized)? else {
+                    continue;
+                };
+                statements.push(Stmt::If {
+                    c: Self::class_array_condition(&selector, index),
+                    t: Box::new(statement),
+                    f: None,
+                });
+            }
+            return Ok(Some(Stmt::Block(statements)));
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
             return Ok(None);
         };
-        if !self.is_class_object_key(object_key) {
+        if !self.is_class_object_key(&object_key) {
             return Ok(None);
         }
-        self.require_initialized_class_object(object_key)?;
-        if let Some(statement) = self.lower_dynamic_class_task(object_key, call)? {
+        self.require_initialized_class_object(&object_key)?;
+        if let Some(statement) = self.lower_dynamic_class_task(&object_key, call)? {
             return Ok(Some(statement));
         }
-        self.lower_class_method(object_key, call, false).map(Some)
+        self.lower_class_method(&object_key, call, false).map(Some)
     }
 
     pub(super) fn lower_static_class_function_call(
@@ -538,23 +677,54 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        let Some(object_key) = receiver.get("symbol").and_then(Value::as_str) else {
+        if let Some(DynamicClassArraySelection { selector, elements }) =
+            self.dynamic_class_array_selection(receiver)?
+        {
+            let mut candidates = Vec::new();
+            for (index, element_key) in elements {
+                let mut specialized = call.clone();
+                if let Some(fields) = specialized.as_object_mut() {
+                    fields.insert(
+                        "thisClass".into(),
+                        Self::class_array_element_receiver(&element_key, receiver),
+                    );
+                }
+                let Some(expression) = self.lower_class_function_call(&specialized)? else {
+                    continue;
+                };
+                candidates.push((index, expression));
+            }
+            let Some((_, result)) = candidates.last() else {
+                return Ok(None);
+            };
+            let result_width = result.width();
+            let mut result = Expr::Const(LogicWord::xes(result_width));
+            for (index, expression) in candidates.iter().rev() {
+                result = Expr::Cond {
+                    c: Box::new(Self::class_array_condition(&selector, *index)),
+                    t: Box::new(expression.clone()),
+                    f: Box::new(result),
+                };
+            }
+            return Ok(Some(result));
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
             return Ok(None);
         };
-        if !self.is_class_object_key(object_key) {
+        if !self.is_class_object_key(&object_key) {
             return Ok(None);
         }
-        self.require_initialized_class_object(object_key)?;
-        let Some((method, owner)) = self.class_method(object_key, call)? else {
+        self.require_initialized_class_object(&object_key)?;
+        let Some((method, owner)) = self.class_method(&object_key, call)? else {
             return Ok(None);
         };
         if method_return_type(&method) == "void" {
             return Ok(None);
         }
-        if let Some(expression) = self.lower_dynamic_class_function(object_key, call)? {
+        if let Some(expression) = self.lower_dynamic_class_function(&object_key, call)? {
             return Ok(Some(expression));
         }
-        let body = self.specialized_method_body(object_key, &owner, &method, call)?;
+        let body = self.specialized_method_body(&object_key, &owner, &method, call)?;
         if string_field(&body, "kind").as_deref() != Some("Return") {
             return Err("class function must have a single direct return expression".into());
         }
@@ -632,7 +802,7 @@ impl SlangAstLowerer {
         left: &Value,
         right: &Value,
     ) -> Result<Option<Stmt>, String> {
-        let Some((object_key, field_name, symbol)) = self.class_property_target(left) else {
+        let Some((object_key, field_name, symbol)) = self.class_property_target(left)? else {
             return Ok(None);
         };
         self.require_initialized_class_object(&object_key)?;
@@ -703,30 +873,48 @@ impl SlangAstLowerer {
     fn class_property_target(
         &self,
         value: &Value,
-    ) -> Option<(String, String, super::AstLoweredSymbol)> {
+    ) -> Result<Option<(String, String, super::AstLoweredSymbol)>, String> {
         if string_field(value, "kind").as_deref() == Some("NamedValue") {
-            let symbol_name = string_field(value, "symbol")?;
+            let Some(symbol_name) = string_field(value, "symbol") else {
+                return Ok(None);
+            };
             if !symbol_name.starts_with("eda_class_") {
-                return None;
+                return Ok(None);
             }
-            let symbol = self.symbols.get(&symbol_name)?.clone();
-            let (object_key, field_name) = self.class_property_owners.get(&symbol.base)?.clone();
-            return Some((object_key, field_name, symbol));
+            let Some(symbol) = self.symbols.get(&symbol_name) else {
+                return Ok(None);
+            };
+            let Some((object_key, field_name)) =
+                self.class_property_owners.get(&symbol.base).cloned()
+            else {
+                return Ok(None);
+            };
+            let symbol = symbol.clone();
+            return Ok(Some((object_key, field_name, symbol)));
         }
         if string_field(value, "kind").as_deref() != Some("MemberAccess") {
-            return None;
+            return Ok(None);
         }
-        let receiver = value.get("value")?;
-        let object_key = receiver.get("symbol").and_then(Value::as_str)?;
-        self.require_class_object_key(object_key)?;
+        let Some(receiver) = value.get("value") else {
+            return Ok(None);
+        };
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        self.require_class_object_key(&object_key).ok_or_else(|| {
+            format!("class property target has unknown class object '{object_key}'")
+        })?;
         let field_name = string_field(value, "member")
-            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))?;
-        let symbol = self
-            .class_objects
-            .get(object_key)?
-            .get(&field_name)?
-            .clone();
-        Some((object_key.to_string(), field_name, symbol))
+            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "class property target has no member name".to_string())?;
+        let Some(fields) = self.class_objects.get(&object_key) else {
+            return Ok(None);
+        };
+        let Some(symbol) = fields.get(&field_name) else {
+            return Ok(None);
+        };
+        let symbol = symbol.clone();
+        Ok(Some((object_key, field_name, symbol)))
     }
 
     fn related_class_handles(&self, object_key: &str) -> Vec<String> {
@@ -784,19 +972,50 @@ impl SlangAstLowerer {
         let Some(receiver) = value.get("value") else {
             return Ok(None);
         };
-        let Some(object_key) = receiver.get("symbol").and_then(Value::as_str) else {
+        if let Some(DynamicClassArraySelection { selector, elements }) =
+            self.dynamic_class_array_selection(receiver)?
+        {
+            let mut candidates = Vec::new();
+            for (index, element_key) in elements {
+                let mut specialized = value.clone();
+                if let Some(fields) = specialized.as_object_mut() {
+                    fields.insert(
+                        "value".into(),
+                        Self::class_array_element_receiver(&element_key, receiver),
+                    );
+                }
+                let Some(expression) = self.lower_class_property_access(&specialized)? else {
+                    continue;
+                };
+                candidates.push((index, expression));
+            }
+            let Some((_, result)) = candidates.last() else {
+                return Ok(None);
+            };
+            let result_width = result.width();
+            let mut result = Expr::Const(LogicWord::xes(result_width));
+            for (index, expression) in candidates.iter().rev() {
+                result = Expr::Cond {
+                    c: Box::new(Self::class_array_condition(&selector, *index)),
+                    t: Box::new(expression.clone()),
+                    f: Box::new(result),
+                };
+            }
+            return Ok(Some(result));
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
             return Ok(None);
         };
-        if !self.is_class_object_key(object_key) {
+        if !self.is_class_object_key(&object_key) {
             return Ok(None);
         }
-        self.require_initialized_class_object(object_key)?;
+        self.require_initialized_class_object(&object_key)?;
         let Some(field_name) = string_field(value, "member")
             .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
         else {
             return Ok(None);
         };
-        let Some(fields) = self.class_objects.get(object_key) else {
+        let Some(fields) = self.class_objects.get(&object_key) else {
             return Ok(None);
         };
         let Some(symbol) = fields.get(&field_name) else {
@@ -1076,6 +1295,11 @@ impl SlangAstLowerer {
             .next()
             .and_then(|address| address.parse::<u64>().ok())
             .ok_or_else(|| format!("invalid class object '{object_key}'"))?;
+        let synthetic_prefix = object_key
+            .split_once('[')
+            .and_then(|(_, suffix)| suffix.split(']').next())
+            .map(|index| format!("{handle_address}_{index}"))
+            .unwrap_or_else(|| handle_address.to_string());
         let empty_members = Vec::new();
         for (_, class) in self.class_chain(class_name)? {
             for property in class
@@ -1083,6 +1307,26 @@ impl SlangAstLowerer {
                 .and_then(Value::as_array)
                 .unwrap_or(&empty_members)
             {
+                if string_field(property, "kind").as_deref() == Some("Parameter") {
+                    if let Some(value) = string_field(property, "value") {
+                        let parameter_name = declaration_name(property, "class Parameter")?;
+                        let parameter_address = property
+                            .get("addr")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| {
+                                format!("class parameter '{parameter_name}' has no address")
+                            })?;
+                        replacements.insert(
+                            format!("{parameter_address} {parameter_name}"),
+                            json!({
+                                "kind": "IntegerLiteral",
+                                "type": string_field(property, "type").unwrap_or_default(),
+                                "value": value,
+                            }),
+                        );
+                    }
+                    continue;
+                }
                 if string_field(property, "kind").as_deref() != Some("ClassProperty") {
                     continue;
                 }
@@ -1094,7 +1338,7 @@ impl SlangAstLowerer {
                     .get("addr")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| format!("class property '{property_name}' has no address"))?;
-                let synthetic = format!("eda_class_{handle_address}_{property_address}");
+                let synthetic = format!("eda_class_{synthetic_prefix}_{property_address}");
                 replacements.insert(
                     format!("{property_address} {property_name}"),
                     json!({
@@ -1278,8 +1522,31 @@ impl SlangAstLowerer {
 
 fn class_name(type_name: &str) -> Option<String> {
     let raw_name = type_name.split_whitespace().next_back()?;
-    let base_name = raw_name.split('#').next()?.trim();
+    let base_name = raw_name.split(['#', '$']).next()?.trim();
     (!base_name.is_empty()).then(|| base_name.to_string())
+}
+
+fn class_array_indexes(type_name: &str) -> Option<Vec<Option<i64>>> {
+    let start = type_name.find("$[")? + 2;
+    let end = type_name.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    let range = &type_name[start..end];
+    let (left, right) = range.split_once(':')?;
+    let left = left.trim().parse::<i64>().ok()?;
+    let right = right.trim().parse::<i64>().ok()?;
+    if left <= right {
+        Some((left..=right).map(Some).collect())
+    } else {
+        Some((right..=left).rev().map(Some).collect())
+    }
+}
+
+fn constant_selector(value: &Value) -> Option<i64> {
+    string_field(value, "constant")
+        .or_else(|| string_field(value, "value"))
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
 }
 
 fn method_return_type(method: &Value) -> String {
@@ -1304,6 +1571,14 @@ fn method_is_static(method: &Value) -> bool {
 }
 
 fn named_class_handle(value: &Value) -> Option<(String, String)> {
+    if string_field(value, "kind").as_deref() == Some("ElementSelect") {
+        let selected = value.get("value")?;
+        let base_key = string_field(selected, "symbol")?;
+        let selector = value.get("selector")?;
+        let index = constant_selector(selector)?;
+        let type_name = string_field(value, "type")?;
+        return Some((format!("{base_key}[{index}]"), type_name));
+    }
     if string_field(value, "kind").as_deref() != Some("NamedValue") {
         return None;
     }

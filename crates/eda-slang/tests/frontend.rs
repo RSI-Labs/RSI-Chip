@@ -129,6 +129,257 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_constant_indexed_class_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-array");
+    let source_path = root.join("class_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+
+  function void set(int v);
+    value = v;
+  endfunction
+endclass
+
+module class_array_top(
+  output int first,
+  output int second,
+  output int third,
+  output int updated
+);
+  Item items[0:2];
+
+  initial begin
+    #1;
+    items[0] = new(10);
+    items[1] = new(20);
+    items[2] = new(30);
+    first = items[0].get();
+    second = items[1].get();
+    third = items[2].get();
+    items[2].value = 77;
+    updated = items[2].get();
+  end
+endmodule
+"#,
+    )
+    .expect("write class-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("class_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower constant-indexed class arrays");
+    let mut simulator = Simulator::new(&design).expect("create class-array simulator");
+    simulator
+        .run_until(1)
+        .expect("run class-array initial block");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(20));
+    assert_eq!(simulator.read("third").unwrap().to_u64(), Some(30));
+    assert_eq!(simulator.read("updated").unwrap().to_u64(), Some(77));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_class_array_method_reads() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-class-array");
+    let source_path = root.join("dynamic_class_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+
+  function void set(int v);
+    value = v;
+  endfunction
+endclass
+
+module dynamic_class_array_top(
+  input int selector,
+  output int result,
+  output int selected_value
+);
+  Item items[0:1];
+
+  initial begin
+    #1;
+    items[0] = new(10);
+    items[1] = new(20);
+    result = items[selector].get();
+    items[selector].set(77);
+    selected_value = items[selector].value;
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic class-array source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic class-array method reads");
+    let mut simulator = Simulator::new(&design).expect("create dynamic class-array simulator");
+    simulator
+        .set_input("selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run dynamic class-array initial block");
+    assert_eq!(simulator.read("result").unwrap().to_u64(), Some(20));
+    assert_eq!(simulator.read("selected_value").unwrap().to_u64(), Some(77));
+
+    let mut out_of_range =
+        Simulator::new(&design).expect("create out-of-range class-array simulator");
+    out_of_range
+        .set_input("selector", &LogicWord::from_u64(32, 2))
+        .unwrap();
+    out_of_range
+        .run_until(1)
+        .expect("run out-of-range class-array initial block");
+    assert_eq!(out_of_range.read("result").unwrap().to_u64(), None);
+    assert_eq!(out_of_range.read("selected_value").unwrap().to_u64(), None);
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_excessive_class_arrays() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-excessive-class-array");
+    let source_path = root.join("excessive_class_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+endclass
+
+module excessive_class_array_top;
+  Item items[0:4096];
+endmodule
+"#,
+    )
+    .expect("write excessive class-array source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("excessive_class_array_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("excessive class arrays must fail closed");
+    assert!(
+        error.contains("the direct path supports at most 4096"),
+        "unexpected excessive class-array error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_dynamic_class_array_writes_for_now() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-class-array-write");
+    let constructor_path = root.join("dynamic_class_array_constructor.sv");
+    std::fs::write(
+        &constructor_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+endclass
+
+module dynamic_constructor_top(
+  input int selector,
+  input int v
+);
+  Item items[0:1];
+
+  initial begin
+    items[selector] = new(v);
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic class-array constructor source");
+    let constructor_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&constructor_path),
+            Some("dynamic_constructor_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("dynamic class-array construction must fail closed");
+    assert!(
+        constructor_error.contains("dynamic class-array element selection"),
+        "unexpected dynamic constructor error: {constructor_error}"
+    );
+
+    let property_path = root.join("dynamic_class_array_property.sv");
+    std::fs::write(
+        &property_path,
+        r#"
+class Item;
+  int value;
+endclass
+
+module dynamic_property_top(
+  input int selector,
+  input int v
+);
+  Item items[0:1];
+
+  initial begin
+    items[selector].value = v;
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic class-array property source");
+    let property_error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&property_path),
+            Some("dynamic_property_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("dynamic class-array property writes must fail closed");
+    assert!(
+        property_error.contains("dynamic class-array element selection"),
+        "unexpected dynamic property error: {property_error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -191,6 +442,7 @@ class Base;
   virtual function int kind();
     return 1;
   endfunction
+
 endclass
 
 class Derived extends Base;
@@ -533,7 +785,7 @@ fn slang_ast_direct_lowering_supports_parameterized_classes() {
     std::fs::write(
         &source_path,
         r#"
-class Box #(parameter int WIDTH = 8);
+class Box #(parameter int WIDTH = 8, parameter int OFFSET = 3);
   logic [WIDTH-1:0] value;
 
   function new(logic [WIDTH-1:0] v);
@@ -545,7 +797,7 @@ class Box #(parameter int WIDTH = 8);
   endfunction
 
   virtual function int kind();
-    return 1;
+    return WIDTH + OFFSET;
   endfunction
 endclass
 
@@ -562,7 +814,7 @@ class DerivedBox #(parameter int WIDTH = 8) extends Box #(WIDTH);
   endfunction
 
   virtual function int kind();
-    return 2;
+    return WIDTH + OFFSET + 1;
   endfunction
 endclass
 
@@ -573,6 +825,8 @@ module parameterized_class_top(
   output logic [7:0] observed8,
   output logic [15:0] observed16,
   output logic [8:0] observed_sum,
+  output int direct_kind8,
+  output int direct_kind16,
   output int dynamic_kind
 );
   Box #(.WIDTH(8)) box8;
@@ -588,6 +842,8 @@ module parameterized_class_top(
     observed8 = box8.get();
     observed16 = box16.get();
     observed_sum = derived_box.sum();
+    direct_kind8 = box8.kind();
+    direct_kind16 = box16.kind();
     base_box = derived_box;
     dynamic_kind = base_box.kind();
   end
@@ -622,7 +878,9 @@ endmodule
         simulator.read("observed_sum").unwrap().to_u64(),
         Some(0x100)
     );
-    assert_eq!(simulator.read("dynamic_kind").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("direct_kind8").unwrap().to_u64(), Some(11));
+    assert_eq!(simulator.read("direct_kind16").unwrap().to_u64(), Some(19));
+    assert_eq!(simulator.read("dynamic_kind").unwrap().to_u64(), Some(12));
 }
 
 #[test]

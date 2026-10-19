@@ -25,7 +25,7 @@ fn collect_class_handle_names(
         let class_name = type_name
             .split_whitespace()
             .next_back()
-            .and_then(|raw_name| raw_name.split('#').next())
+            .and_then(|raw_name| raw_name.split(['#', '$']).next())
             .map(str::trim)
             .filter(|name| !name.is_empty());
         if class_type_is_selected(value, class_name, class_types) {
