@@ -502,15 +502,21 @@ impl SlangAstLowerer {
             .get(&target_key)
             .cloned()
             .ok_or_else(|| format!("unknown UVM factory component target '{target_key}'"))?;
-        let selected_base = selected_key.split('@').next().unwrap_or(&selected_key);
-        let target_base = target_class.split('@').next().unwrap_or(&target_class);
-        if selected_key != target_class && selected_base != target_base {
+        let selected_compatible = self.class_chain(&selected_key)?.iter().any(|(owner, _)| {
+            owner == &target_class
+                || owner.split('@').next()
+                    == Some(target_class.split('@').next().unwrap_or(&target_class))
+        });
+        if selected_key != target_class && !selected_compatible {
             return Err(with_source_span(
                 assignment,
                 format!(
                     "UVM factory create selected '{selected_name}', which does not match prepared target type '{target_class}'"
                 ),
             ));
+        }
+        if selected_key != target_class {
+            self.record_runtime_dynamic_source(&target_key, &target_key, &selected_key)?;
         }
         let constructor = self
             .class_chain(&selected_key)?

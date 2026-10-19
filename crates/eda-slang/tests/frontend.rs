@@ -12393,6 +12393,116 @@ endmodule
 }
 
 #[test]
+fn slang_direct_component_registry_applies_factory_overrides() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-component-override-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ComponentOverrideTrace;
+  static int stage = 0;
+endclass
+
+class direct_component_base extends uvm_test;
+  `uvm_component_utils(direct_component_base)
+
+  function new(string name = "direct_component_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    ComponentOverrideTrace::stage = 1;
+  endtask
+endclass
+
+class direct_component_derived extends direct_component_base;
+  `uvm_component_utils(direct_component_derived)
+
+  function new(string name = "direct_component_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    ComponentOverrideTrace::stage = 2;
+  endtask
+endclass
+
+class direct_component_env extends uvm_test;
+  `uvm_component_utils(direct_component_env)
+
+  direct_component_base component;
+
+  function new(string name = "direct_component_env",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    component = direct_component_base::type_id::create("component", this);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    component.run_phase(phase);
+  endtask
+endclass
+
+module official_uvm_component_override_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_override_by_type(
+      direct_component_base::get_type(),
+      direct_component_derived::get_type()
+    );
+    run_test("direct_component_env");
+    stage = ComponentOverrideTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM component override wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_component_override_probe"),
+            &options,
+        )
+        .expect("directly lower a factory-overridden component creation");
+    let mut simulator =
+        Simulator::new(&design).expect("create factory component override simulator");
+    simulator
+        .run_until(0)
+        .expect("run the factory-overridden component phase");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_run_test_rejects_incompatible_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

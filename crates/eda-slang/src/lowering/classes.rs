@@ -46,7 +46,7 @@ impl SlangAstLowerer {
         sources
     }
 
-    fn record_runtime_dynamic_source(
+    pub(super) fn record_runtime_dynamic_source(
         &self,
         target_key: &str,
         source_key: &str,
@@ -953,11 +953,31 @@ impl SlangAstLowerer {
         let constructor = right
             .get("constructorCall")
             .ok_or_else(|| "class construction has no constructor call".to_string())?;
-        let class_name = self
+        let target_class = self
             .class_object_types
             .get(&object_key)
+            .cloned()
             .ok_or_else(|| format!("unknown class object '{object_key}'"))?;
-        let class_id = self.class_id(class_name)?;
+        let runtime_class = string_field(right, "type")
+            .map(|type_name| self.class_type_key(&type_name))
+            .unwrap_or_else(|| target_class.clone());
+        let target_base = target_class.split('@').next().unwrap_or(&target_class);
+        let runtime_compatible = runtime_class != target_class
+            && self.class_definitions.contains_key(&runtime_class)
+            && self.class_chain(&runtime_class)?.iter().any(|(owner, _)| {
+                owner == &target_class || owner.split('@').next() == Some(target_base)
+            });
+        if runtime_class != target_class && !runtime_compatible {
+            return Err(format!(
+                "class object '{object_key}' of type '{target_class}' cannot construct incompatible runtime class '{runtime_class}'"
+            ));
+        }
+        let constructor_class = if runtime_compatible {
+            runtime_class.clone()
+        } else {
+            target_class.clone()
+        };
+        let class_id = self.class_id(&constructor_class)?;
         let tag = self
             .class_object_tags
             .get(&object_key)
@@ -973,7 +993,19 @@ impl SlangAstLowerer {
             .clone()
             .ok_or_else(|| "class object serial counter is missing".to_string())?;
         let initializer_statements = self.class_property_initializer_statements(&object_key)?;
-        let body = self.lower_class_method(&object_key, constructor, true)?;
+        let body = if constructor_class != target_class {
+            let Some((method, owner)) = self.resolve_class_method(&constructor_class, "new")?
+            else {
+                return Err(format!(
+                    "class '{constructor_class}' has no constructor for object '{object_key}'"
+                ));
+            };
+            let specialized =
+                self.specialized_method_body(&object_key, &owner, &method, constructor)?;
+            self.lower_statement(&specialized)?
+        } else {
+            self.lower_class_method(&object_key, constructor, true)?
+        };
         let mut statements = vec![
             Stmt::Bl {
                 lv: class_lvalue(&tag),
