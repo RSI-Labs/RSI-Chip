@@ -12554,6 +12554,19 @@ class direct_instance_derived extends direct_instance_base;
   endfunction
 endclass
 
+class direct_instance_second extends direct_instance_base;
+  `uvm_component_utils(direct_instance_second)
+
+  function new(string name = "direct_instance_second",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function int kind();
+    return 3;
+  endfunction
+endclass
+
 class direct_instance_env extends uvm_test;
   `uvm_component_utils(direct_instance_env)
 
@@ -12593,6 +12606,11 @@ module official_uvm_instance_factory_probe(
     uvm_factory::get().set_inst_override_by_type(
       direct_instance_base::get_type(),
       direct_instance_derived::get_type(),
+      "direct_instance_env.wild*"
+    );
+    uvm_factory::get().set_inst_override_by_type(
+      direct_instance_base::get_type(),
+      direct_instance_second::get_type(),
       "direct_instance_env.wild*"
     );
     run_test("direct_instance_env");

@@ -90,16 +90,18 @@ impl SlangAstLowerer {
                     "UVM instance override must be registered before run_test".into(),
                 ));
             }
-            if let Some(previous) = self.uvm_factory_instance_overrides.insert(
-                instance_path.clone(),
-                (original.clone(), override_name.clone()),
-            ) {
-                if previous != (original.clone(), override_name.clone()) {
-                    return Err(with_source_span(
-                        override_call,
-                        format!("conflicting UVM instance overrides for '{instance_path}'"),
-                    ));
-                }
+            let already_registered = self.uvm_factory_instance_overrides.iter().any(|existing| {
+                existing.pattern == instance_path
+                    && existing.original == original
+                    && existing.override_name == override_name
+            });
+            if !already_registered {
+                self.uvm_factory_instance_overrides
+                    .push(super::AstUvmInstanceOverride {
+                        pattern: instance_path.clone(),
+                        original: original.clone(),
+                        override_name: override_name.clone(),
+                    });
             }
         }
         let mut objection_timeout = UVM_BOOTSTRAP_OBJECTION_TIMEOUT;
@@ -513,9 +515,11 @@ impl SlangAstLowerer {
         ) {
             let (original, override_name, instance_path) =
                 uvm_factory_instance_override_names(value)?;
-            if self.uvm_factory_instance_overrides.get(&instance_path)
-                != Some(&(original.clone(), override_name.clone()))
-            {
+            if !self.uvm_factory_instance_overrides.iter().any(|existing| {
+                existing.pattern == instance_path
+                    && existing.original == original
+                    && existing.override_name == override_name
+            }) {
                 return Err(format!(
                     "UVM instance override '{original}' -> '{override_name}' at '{instance_path}' was not prepared"
                 ));
@@ -593,15 +597,17 @@ impl SlangAstLowerer {
         requested_name: &str,
         instance_path: &str,
     ) -> Result<String, String> {
-        let selected_instance_override =
-            match self.uvm_factory_instance_overrides.get(instance_path) {
-                Some((original, override_name)) => Some((
-                    instance_path.to_string(),
-                    original.clone(),
-                    override_name.clone(),
-                )),
-                None => self.select_wildcard_instance_override(instance_path)?,
-            };
+        let selected_instance_override = self
+            .uvm_factory_instance_overrides
+            .iter()
+            .find(|existing| wildcard_matches(&existing.pattern, instance_path))
+            .map(|existing| {
+                (
+                    existing.pattern.clone(),
+                    existing.original.clone(),
+                    existing.override_name.clone(),
+                )
+            });
         if let Some((pattern, original, override_name)) = selected_instance_override {
             let requested_key = self.class_type_key(requested_name);
             let original_key = self.class_type_key(&original);
@@ -629,47 +635,6 @@ impl SlangAstLowerer {
             selected_name = override_name;
         }
         Ok(selected_name)
-    }
-
-    fn select_wildcard_instance_override(
-        &self,
-        instance_path: &str,
-    ) -> Result<Option<(String, String, String)>, String> {
-        let mut selected = None;
-        let mut best_score = (0_usize, 0_usize);
-        for (pattern, (original, override_name)) in &self.uvm_factory_instance_overrides {
-            if !pattern.contains('*') && !pattern.contains('?') {
-                continue;
-            }
-            if !wildcard_matches(pattern, instance_path) {
-                continue;
-            }
-            let score = (
-                pattern
-                    .chars()
-                    .filter(|character| *character != '*' && *character != '?')
-                    .count(),
-                pattern.chars().count(),
-            );
-            let candidate = (pattern.clone(), original.clone(), override_name.clone());
-            match &selected {
-                None => {
-                    selected = Some(candidate);
-                    best_score = score;
-                }
-                Some(previous) if score > best_score => {
-                    selected = Some(candidate);
-                    best_score = score;
-                }
-                Some(previous) if score == best_score && *previous != candidate => {
-                    return Err(format!(
-                        "ambiguous equally specific UVM instance overrides '{pattern}' for '{instance_path}'"
-                    ));
-                }
-                _ => {}
-            }
-        }
-        Ok(selected)
     }
 
     pub(super) fn lower_uvm_factory_create_assignment(
