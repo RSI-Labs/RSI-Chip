@@ -12522,6 +12522,7 @@ import uvm_pkg::*;
 class InstanceOverrideTrace;
   static int kind = 0;
   static int unaffected_kind = 0;
+  static int wildcard_kind = 0;
 endclass
 
 class direct_instance_base extends uvm_test;
@@ -12558,6 +12559,7 @@ class direct_instance_env extends uvm_test;
 
   direct_instance_base component;
   direct_instance_base unaffected;
+  direct_instance_base wildcarded;
 
   function new(string name = "direct_instance_env",
                uvm_component parent = null);
@@ -12567,17 +12569,20 @@ class direct_instance_env extends uvm_test;
   virtual function void build_phase(uvm_phase phase);
     component = direct_instance_base::type_id::create("leaf", this);
     unaffected = direct_instance_base::type_id::create("other", this);
+    wildcarded = direct_instance_base::type_id::create("wildcarded", this);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
     InstanceOverrideTrace::kind = component.kind();
     InstanceOverrideTrace::unaffected_kind = unaffected.kind();
+    InstanceOverrideTrace::wildcard_kind = wildcarded.kind();
   endtask
 endclass
 
 module official_uvm_instance_factory_probe(
   output int stage,
-  output int unaffected_stage
+  output int unaffected_stage,
+  output int wildcard_stage
 );
   initial begin
     uvm_factory::get().set_inst_override_by_type(
@@ -12585,9 +12590,15 @@ module official_uvm_instance_factory_probe(
       direct_instance_derived::get_type(),
       "direct_instance_env.leaf"
     );
+    uvm_factory::get().set_inst_override_by_type(
+      direct_instance_base::get_type(),
+      direct_instance_derived::get_type(),
+      "direct_instance_env.wild*"
+    );
     run_test("direct_instance_env");
     stage = InstanceOverrideTrace::kind;
     unaffected_stage = InstanceOverrideTrace::unaffected_kind;
+    wildcard_stage = InstanceOverrideTrace::wildcard_kind;
   end
 endmodule
 "#,
@@ -12609,6 +12620,7 @@ endmodule
         simulator.read("unaffected_stage").unwrap().to_u64(),
         Some(1)
     );
+    assert_eq!(simulator.read("wildcard_stage").unwrap().to_u64(), Some(2));
 }
 
 #[test]

@@ -593,11 +593,16 @@ impl SlangAstLowerer {
         requested_name: &str,
         instance_path: &str,
     ) -> Result<String, String> {
-        if let Some((original, override_name)) = self
-            .uvm_factory_instance_overrides
-            .get(instance_path)
-            .cloned()
-        {
+        let selected_instance_override =
+            match self.uvm_factory_instance_overrides.get(instance_path) {
+                Some((original, override_name)) => Some((
+                    instance_path.to_string(),
+                    original.clone(),
+                    override_name.clone(),
+                )),
+                None => self.select_wildcard_instance_override(instance_path)?,
+            };
+        if let Some((pattern, original, override_name)) = selected_instance_override {
             let requested_key = self.class_type_key(requested_name);
             let original_key = self.class_type_key(&original);
             let applies = requested_key == original_key
@@ -608,7 +613,7 @@ impl SlangAstLowerer {
                 });
             if !applies {
                 return Err(format!(
-                    "UVM instance override at '{instance_path}' expects '{original}', not '{requested_name}'"
+                    "UVM instance override '{pattern}' expects '{original}', not '{requested_name}'"
                 ));
             }
             return Ok(override_name);
@@ -624,6 +629,47 @@ impl SlangAstLowerer {
             selected_name = override_name;
         }
         Ok(selected_name)
+    }
+
+    fn select_wildcard_instance_override(
+        &self,
+        instance_path: &str,
+    ) -> Result<Option<(String, String, String)>, String> {
+        let mut selected = None;
+        let mut best_score = (0_usize, 0_usize);
+        for (pattern, (original, override_name)) in &self.uvm_factory_instance_overrides {
+            if !pattern.contains('*') && !pattern.contains('?') {
+                continue;
+            }
+            if !wildcard_matches(pattern, instance_path) {
+                continue;
+            }
+            let score = (
+                pattern
+                    .chars()
+                    .filter(|character| *character != '*' && *character != '?')
+                    .count(),
+                pattern.chars().count(),
+            );
+            let candidate = (pattern.clone(), original.clone(), override_name.clone());
+            match &selected {
+                None => {
+                    selected = Some(candidate);
+                    best_score = score;
+                }
+                Some(previous) if score > best_score => {
+                    selected = Some(candidate);
+                    best_score = score;
+                }
+                Some(previous) if score == best_score && *previous != candidate => {
+                    return Err(format!(
+                        "ambiguous equally specific UVM instance overrides '{pattern}' for '{instance_path}'"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(selected)
     }
 
     pub(super) fn lower_uvm_factory_create_assignment(
@@ -1457,14 +1503,38 @@ fn uvm_factory_instance_override_names(call: &Value) -> Result<(String, String, 
     if instance_path.starts_with('.')
         || instance_path.ends_with('.')
         || instance_path.contains("..")
-        || instance_path.contains('*')
-        || instance_path.contains('?')
     {
         return Err(format!(
-            "UVM factory instance path '{instance_path}' must be an exact well-formed path"
+            "UVM factory instance path '{instance_path}' must be a well-formed path"
         ));
     }
     Ok((original, override_name, instance_path))
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; text.len() + 1];
+    previous[0] = true;
+    if let Some(&first) = pattern.first() {
+        for index in 1..=text.len() {
+            previous[index] = first == '*' && previous[index - 1];
+        }
+    }
+    for &pattern_character in &pattern {
+        let mut current = vec![false; text.len() + 1];
+        current[0] = previous[0] && pattern_character == '*';
+        for index in 1..=text.len() {
+            current[index] = if pattern_character == '*' {
+                previous[index] || current[index - 1]
+            } else {
+                (pattern_character == '?' || pattern_character == text[index - 1])
+                    && previous[index - 1]
+            };
+        }
+        previous = current;
+    }
+    previous[text.len()]
 }
 
 fn wrapper_type_name(value: &Value) -> Option<String> {
