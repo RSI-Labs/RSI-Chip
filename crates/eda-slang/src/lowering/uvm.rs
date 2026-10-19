@@ -335,6 +335,66 @@ impl SlangAstLowerer {
             // name default is only a validation contract for this bootstrap.
             let root_name = "uvm_test_top".to_string();
 
+            let root_handle_address = self.next_synthetic_class_handle;
+            self.next_synthetic_class_handle = self
+                .next_synthetic_class_handle
+                .checked_sub(1)
+                .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
+            let root_object_key = format!("{root_handle_address} __uvm_root");
+            self.ensure_class_object_serial()?;
+            let root_name_symbol = self.declare_class_internal_net(
+                &format!("__uvm_root_name_{root_handle_address}"),
+                crate::types::STRING_WIDTH,
+            );
+            let root_full_name_symbol = self.declare_class_internal_net(
+                &format!("__uvm_root_full_name_{root_handle_address}"),
+                crate::types::STRING_WIDTH,
+            );
+            let root_tag = self
+                .declare_class_internal_net(&format!("__uvm_root_tag_{root_handle_address}"), 32);
+            let root_id = self
+                .declare_class_internal_net(&format!("__uvm_root_id_{root_handle_address}"), 64);
+            self.design.initials.extend([
+                Stmt::Bl {
+                    lv: class_lvalue(&root_name_symbol),
+                    e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&root_full_name_symbol),
+                    e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&root_tag),
+                    e: Expr::Const(LogicWord::zero(32)),
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&root_id),
+                    e: Expr::Const(LogicWord::zero(64)),
+                },
+            ]);
+            self.class_objects
+                .insert(root_object_key.clone(), BTreeMap::new());
+            self.class_object_types
+                .insert(root_object_key.clone(), "uvm_root".to_string());
+            self.class_object_names
+                .insert(root_object_key.clone(), root_name_symbol);
+            self.class_object_full_names
+                .insert(root_object_key.clone(), root_full_name_symbol);
+            self.class_object_tags
+                .insert(root_object_key.clone(), root_tag);
+            self.class_object_ids
+                .insert(root_object_key.clone(), root_id.clone());
+            self.class_object_parent_ids
+                .insert(root_object_key.clone(), root_id);
+            self.class_object_declared_names
+                .borrow_mut()
+                .insert(root_object_key.clone(), "__top__".to_string());
+            self.class_object_declared_full_names
+                .borrow_mut()
+                .insert(root_object_key.clone(), String::new());
+            self.initialized_class_objects
+                .insert(root_object_key.clone());
+
             let handle_address = self.next_synthetic_class_handle;
             self.next_synthetic_class_handle = self
                 .next_synthetic_class_handle
@@ -367,6 +427,18 @@ impl SlangAstLowerer {
                 ));
             }
             let object_key = format!("{handle_address} {object_name}");
+            self.class_object_parent_keys
+                .borrow_mut()
+                .insert(object_key.clone(), root_object_key.clone());
+            self.class_object_declared_names
+                .borrow_mut()
+                .insert(object_key.clone(), root_name.clone());
+            self.class_object_declared_full_names
+                .borrow_mut()
+                .insert(object_key.clone(), root_name.clone());
+            self.class_object_children
+                .borrow_mut()
+                .insert(root_object_key.clone(), vec![object_key.clone()]);
             let phase_key = format!("{handle_address} __uvm_phase");
             let objection_count = self.declare_class_internal_net(
                 &format!("__uvm_run_test_objections_{handle_address}"),
@@ -395,7 +467,7 @@ impl SlangAstLowerer {
                 requested_class_name,
                 super::AstRunTestObject {
                     class_name: class_key,
-                    root_name,
+                    root_object_key,
                     object_key,
                     phase_key,
                     objection_count,

@@ -13449,10 +13449,15 @@ class ComponentNameTrace;
   static int nested_identity = 0;
   static int absolute_match = 0;
   static int absolute_identity = 0;
+  static int root_child_match = 0;
+  static int root_child_count = 0;
+  static int root_depth = -1;
+  static int root_has_child = 0;
+  static int root_lookup_match = 0;
   static int has_leaf = 0;
   static int has_nested = 0;
   static int missing_child = 1;
-  static int root_depth = 0;
+  static int test_depth = 0;
   static int component_depth = 0;
   static int nested_depth = 0;
 endclass
@@ -13561,6 +13566,15 @@ class direct_named_component_env extends direct_named_base;
     if (component.nested.lookup(".uvm_test_top.leaf") == component) begin
       ComponentNameTrace::absolute_match = 1;
     end
+    if (uvm_root::get().get_child("uvm_test_top") == this) begin
+      ComponentNameTrace::root_child_match = 1;
+    end
+    ComponentNameTrace::root_child_count = uvm_root::get().get_num_children();
+    ComponentNameTrace::root_depth = uvm_root::get().get_depth();
+    ComponentNameTrace::root_has_child = uvm_root::get().has_child("uvm_test_top");
+    if (uvm_root::get().lookup(".uvm_test_top.leaf") == component) begin
+      ComponentNameTrace::root_lookup_match = 1;
+    end
     if (!$cast(
       recovered_child,
       component.nested.lookup(".uvm_test_top.leaf")
@@ -13572,7 +13586,7 @@ class direct_named_component_env extends direct_named_base;
     ComponentNameTrace::has_leaf = this.has_child("leaf");
     ComponentNameTrace::has_nested = component.has_child("nested");
     ComponentNameTrace::missing_child = this.has_child("missing");
-    ComponentNameTrace::root_depth = this.get_depth();
+    ComponentNameTrace::test_depth = this.get_depth();
     ComponentNameTrace::component_depth = component.get_depth();
     ComponentNameTrace::nested_depth = component.nested.get_depth();
   endtask
@@ -13593,10 +13607,15 @@ module official_uvm_component_name_probe(
   output int nested_identity,
   output int absolute_match,
   output int absolute_identity,
+  output int root_child_match,
+  output int root_child_count,
+  output int root_depth,
+  output int root_has_child,
+  output int root_lookup_match,
   output int has_leaf,
   output int has_nested,
   output int missing_child,
-  output int root_depth,
+  output int test_depth,
   output int component_depth,
   output int nested_depth
 );
@@ -13616,10 +13635,15 @@ module official_uvm_component_name_probe(
     nested_identity = ComponentNameTrace::nested_identity;
     absolute_match = ComponentNameTrace::absolute_match;
     absolute_identity = ComponentNameTrace::absolute_identity;
+    root_child_match = ComponentNameTrace::root_child_match;
+    root_child_count = ComponentNameTrace::root_child_count;
+    root_depth = ComponentNameTrace::root_depth;
+    root_has_child = ComponentNameTrace::root_has_child;
+    root_lookup_match = ComponentNameTrace::root_lookup_match;
     has_leaf = ComponentNameTrace::has_leaf;
     has_nested = ComponentNameTrace::has_nested;
     missing_child = ComponentNameTrace::missing_child;
-    root_depth = ComponentNameTrace::root_depth;
+    test_depth = ComponentNameTrace::test_depth;
     component_depth = ComponentNameTrace::component_depth;
     nested_depth = ComponentNameTrace::nested_depth;
   end
@@ -13673,10 +13697,24 @@ endmodule
         simulator.read("absolute_identity").unwrap().to_u64(),
         Some(3)
     );
+    assert_eq!(
+        simulator.read("root_child_match").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator.read("root_child_count").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(simulator.read("root_depth").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("root_has_child").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("root_lookup_match").unwrap().to_u64(),
+        Some(1)
+    );
     assert_eq!(simulator.read("has_leaf").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("has_nested").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("missing_child").unwrap().to_u64(), Some(0));
-    assert_eq!(simulator.read("root_depth").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("test_depth").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("component_depth").unwrap().to_u64(), Some(2));
     assert_eq!(simulator.read("nested_depth").unwrap().to_u64(), Some(3));
 }

@@ -30,8 +30,30 @@ struct ClassHandleCandidates {
 }
 
 impl SlangAstLowerer {
+    fn synthetic_uvm_root_key(&self, receiver: &Value) -> Option<String> {
+        if string_field(receiver, "kind").as_deref() != Some("Call")
+            || string_field(receiver, "subroutine")
+                .and_then(|subroutine| {
+                    subroutine
+                        .split_whitespace()
+                        .next_back()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                != Some("get")
+            || !string_field(receiver, "type")?.contains("uvm_root")
+        {
+            return None;
+        }
+        self.run_test_objects
+            .values()
+            .next()
+            .map(|run_object| run_object.root_object_key.clone())
+    }
+
     fn class_call_receiver_key(&self, method: &str, receiver: &Value) -> Result<String, String> {
         self.class_object_key_for_value(receiver)?
+            .or_else(|| self.synthetic_uvm_root_key(receiver))
             .or_else(|| {
                 is_this_reference(receiver)
                     .then(|| self.active_class_objects.borrow().last().cloned())
@@ -109,26 +131,10 @@ impl SlangAstLowerer {
                 .run_test_objects
                 .values()
                 .next()
-                .map(|run_object| run_object.object_key.clone())
-                .ok_or_else(|| "absolute class lookup has no run_test root".to_string())?;
+                .map(|run_object| run_object.root_object_key.clone())
+                .ok_or_else(|| "absolute class lookup has no synthetic uvm_root".to_string())?;
         }
-        let mut segments = path.split('.');
-        if absolute {
-            let root_name = segments
-                .next()
-                .ok_or_else(|| "absolute class lookup path is empty".to_string())?;
-            let run_test_name = self
-                .run_test_objects
-                .values()
-                .next()
-                .map(|run_object| run_object.root_name.clone())
-                .ok_or_else(|| "absolute class lookup root has no name".to_string())?;
-            if root_name != run_test_name {
-                return Err(format!(
-                    "absolute class lookup root '{root_name}' does not match run_test '{run_test_name}'"
-                ));
-            }
-        }
+        let segments = path.split('.');
         for segment in segments {
             if segment.is_empty() {
                 return Err(format!("class lookup path '{path}' has an empty segment"));
@@ -156,6 +162,13 @@ impl SlangAstLowerer {
     }
 
     fn class_object_depth(&self, object_key: &str) -> Result<u64, String> {
+        if self
+            .run_test_objects
+            .values()
+            .any(|run_object| run_object.root_object_key == object_key)
+        {
+            return Ok(0);
+        }
         let mut current = object_key.to_string();
         let mut visited = std::collections::BTreeSet::new();
         let mut depth = 1_u64;
@@ -171,6 +184,13 @@ impl SlangAstLowerer {
             else {
                 return Ok(depth);
             };
+            if self
+                .run_test_objects
+                .values()
+                .any(|run_object| run_object.root_object_key == parent)
+            {
+                return Ok(depth);
+            }
             depth = depth
                 .checked_add(1)
                 .ok_or_else(|| "class component depth overflows".to_string())?;
@@ -1073,7 +1093,7 @@ impl SlangAstLowerer {
         Ok(true)
     }
 
-    fn ensure_class_object_serial(&mut self) -> Result<(), String> {
+    pub(super) fn ensure_class_object_serial(&mut self) -> Result<(), String> {
         if self.class_object_serial.is_some() {
             return Ok(());
         }
@@ -1488,9 +1508,11 @@ impl SlangAstLowerer {
             return Ok(Some(Stmt::Block(statements)));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
-            is_this_reference(receiver)
-                .then(|| self.active_class_objects.borrow().last().cloned())
-                .flatten()
+            self.synthetic_uvm_root_key(receiver).or_else(|| {
+                is_this_reference(receiver)
+                    .then(|| self.active_class_objects.borrow().last().cloned())
+                    .flatten()
+            })
         });
         let Some(object_key) = object_key else {
             return Ok(None);
@@ -1827,9 +1849,11 @@ impl SlangAstLowerer {
             return Ok(Some(result));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
-            is_this_reference(receiver)
-                .then(|| self.active_class_objects.borrow().last().cloned())
-                .flatten()
+            self.synthetic_uvm_root_key(receiver).or_else(|| {
+                is_this_reference(receiver)
+                    .then(|| self.active_class_objects.borrow().last().cloned())
+                    .flatten()
+            })
         });
         let Some(object_key) = object_key else {
             return Ok(None);
