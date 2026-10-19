@@ -32,7 +32,7 @@ impl SlangAstLowerer {
         let mut timeout_calls = Vec::new();
         collect_uvm_timeout_calls(body, &mut timeout_calls);
         for override_call in &override_calls {
-            let (original, override_name) = uvm_factory_override_names(override_call)?;
+            let (original, override_name, replace) = uvm_factory_override_names(override_call)?;
             let run_test_location = calls
                 .first()
                 .and_then(|call| source_location(call))
@@ -54,16 +54,22 @@ impl SlangAstLowerer {
                     "UVM factory override must be registered before run_test".into(),
                 ));
             }
-            if let Some(previous) = self
+            if original == override_name {
+                continue;
+            }
+            if let Some(existing) = self
                 .uvm_factory_overrides
-                .insert(original.clone(), override_name.clone())
+                .iter_mut()
+                .find(|existing| existing.original == original)
             {
-                if previous != override_name {
-                    return Err(with_source_span(
-                        override_call,
-                        format!("conflicting UVM factory overrides for '{original}'"),
-                    ));
+                if replace {
+                    existing.override_name = override_name;
                 }
+            } else {
+                self.uvm_factory_overrides.push(super::AstUvmTypeOverride {
+                    original,
+                    override_name,
+                });
             }
         }
         for override_call in &instance_override_calls {
@@ -137,17 +143,7 @@ impl SlangAstLowerer {
                 ));
             }
             let requested_class_name = run_test_class_name(call)?;
-            let mut class_name = requested_class_name.clone();
-            let mut visited = std::collections::BTreeSet::new();
-            while let Some(override_name) = self.uvm_factory_overrides.get(&class_name).cloned() {
-                if !visited.insert(class_name.clone()) {
-                    return Err(with_source_span(
-                        call,
-                        format!("UVM factory override cycle at '{class_name}'"),
-                    ));
-                }
-                class_name = override_name;
-            }
+            let class_name = self.resolve_global_uvm_factory_class(&requested_class_name)?;
             let requested_class_key = self.class_type_key(&requested_class_name);
             let class_key = self.class_type_key(&class_name);
             if !self.class_definitions.contains_key(&class_key) {
@@ -526,12 +522,7 @@ impl SlangAstLowerer {
             }
             return Ok(Some(Stmt::Block(Vec::new())));
         }
-        let (original, override_name) = uvm_factory_override_names(value)?;
-        if self.uvm_factory_overrides.get(&original) != Some(&override_name) {
-            return Err(format!(
-                "UVM factory override '{original}' -> '{override_name}' was not prepared"
-            ));
-        }
+        uvm_factory_override_names(value)?;
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
@@ -541,6 +532,25 @@ impl SlangAstLowerer {
         }
         uvm_timeout_value(value)?;
         Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    fn resolve_global_uvm_factory_class(&self, requested_name: &str) -> Result<String, String> {
+        let mut selected_name = requested_name.to_string();
+        let mut visited = std::collections::BTreeSet::new();
+        loop {
+            let Some(next_name) = self
+                .uvm_factory_overrides
+                .iter()
+                .find(|existing| existing.original == selected_name)
+                .map(|existing| existing.override_name.clone())
+            else {
+                return Ok(selected_name);
+            };
+            if !visited.insert(selected_name.clone()) {
+                return Err(format!("UVM factory override cycle at '{selected_name}'"));
+            }
+            selected_name = next_name;
+        }
     }
 
     fn uvm_factory_instance_path(
@@ -624,17 +634,7 @@ impl SlangAstLowerer {
             }
             return Ok(override_name);
         }
-        let mut selected_name = requested_name.to_string();
-        let mut visited = std::collections::BTreeSet::new();
-        while let Some(override_name) = self.uvm_factory_overrides.get(&selected_name).cloned() {
-            if !visited.insert(selected_name.clone()) {
-                return Err(format!(
-                    "UVM factory override cycle at '{selected_name}' while creating a component"
-                ));
-            }
-            selected_name = override_name;
-        }
-        Ok(selected_name)
+        self.resolve_global_uvm_factory_class(requested_name)
     }
 
     pub(super) fn lower_uvm_factory_create_assignment(
@@ -1386,7 +1386,7 @@ fn registry_create_class_name(
     None
 }
 
-fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> {
+fn uvm_factory_override_names(call: &Value) -> Result<(String, String, bool), String> {
     let empty_arguments = Vec::new();
     let arguments = call
         .get("arguments")
@@ -1395,11 +1395,10 @@ fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> 
     if arguments.len() < 2 || arguments.len() > 3 {
         return Err("UVM factory set_type_override_by_name requires two or three arguments".into());
     }
-    if let Some(replace) = arguments.get(2) {
-        if slang_constant_u64(replace)? == 0 {
-            return Err("non-replacing UVM factory overrides are not supported".into());
-        }
-    }
+    let replace = match arguments.get(2) {
+        Some(replace) => slang_constant_u64(replace)? != 0,
+        None => true,
+    };
     let method = string_field(call, "subroutine")
         .and_then(|subroutine| {
             subroutine
@@ -1413,14 +1412,14 @@ fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> 
             .ok_or_else(|| "UVM factory original type must be a string literal".to_string())?;
         let override_name = string_literal(unwrap_conversion(&arguments[1]))
             .ok_or_else(|| "UVM factory override type must be a string literal".to_string())?;
-        return Ok((original, override_name));
+        return Ok((original, override_name, replace));
     }
     if method == "set_type_override_by_type" {
         let original = wrapper_type_name(&arguments[0])
             .ok_or_else(|| "UVM factory original wrapper must be Class::get_type()".to_string())?;
         let override_name = wrapper_type_name(&arguments[1])
             .ok_or_else(|| "UVM factory override wrapper must be Class::get_type()".to_string())?;
-        return Ok((original, override_name));
+        return Ok((original, override_name, replace));
     }
     Err("unsupported UVM factory override method".into())
 }
