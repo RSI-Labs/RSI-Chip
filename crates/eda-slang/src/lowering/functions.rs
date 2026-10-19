@@ -193,6 +193,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_factory_type_alias_call(value)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_factory_instance_alias_call(value)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_factory_override_call(value)? {
             return Ok(Some(statement));
         }

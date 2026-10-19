@@ -382,6 +382,12 @@ pub(super) struct AstUvmInstanceOverride {
     pub(super) override_name: String,
 }
 
+pub(super) struct AstUvmInstanceAlias {
+    pub(super) alias_name: String,
+    pub(super) original_name: String,
+    pub(super) pattern: String,
+}
+
 pub(super) struct AstUvmTypeOverride {
     pub(super) original: String,
     pub(super) override_name: String,
@@ -488,6 +494,7 @@ pub(super) struct SlangAstLowerer {
         std::collections::BTreeMap<String, Vec<(String, serde_json::Value)>>,
     run_test_objects: std::collections::BTreeMap<String, AstRunTestObject>,
     uvm_factory_type_aliases: Vec<AstUvmTypeAlias>,
+    uvm_factory_instance_aliases: Vec<AstUvmInstanceAlias>,
     uvm_factory_overrides: Vec<AstUvmTypeOverride>,
     uvm_factory_instance_overrides: Vec<AstUvmInstanceOverride>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
@@ -639,6 +646,7 @@ impl SlangAstLowerer {
             class_property_initializers: std::collections::BTreeMap::new(),
             run_test_objects: std::collections::BTreeMap::new(),
             uvm_factory_type_aliases: Vec::new(),
+            uvm_factory_instance_aliases: Vec::new(),
             uvm_factory_overrides: Vec::new(),
             uvm_factory_instance_overrides: Vec::new(),
             class_composition_children: std::collections::BTreeMap::new(),

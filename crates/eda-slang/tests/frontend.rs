@@ -12652,6 +12652,7 @@ class InstanceOverrideTrace;
   static int kind = 0;
   static int unaffected_kind = 0;
   static int wildcard_kind = 0;
+  static int alias_kind = 0;
 endclass
 
 class direct_instance_base extends uvm_test;
@@ -12702,6 +12703,7 @@ class direct_instance_env extends uvm_test;
   direct_instance_base component;
   direct_instance_base unaffected;
   direct_instance_base wildcarded;
+  direct_instance_base aliased;
 
   function new(string name = "direct_instance_env",
                uvm_component parent = null);
@@ -12712,21 +12714,34 @@ class direct_instance_env extends uvm_test;
     component = direct_instance_base::type_id::create("leaf", this);
     unaffected = direct_instance_base::type_id::create("other", this);
     wildcarded = direct_instance_base::type_id::create("wildcarded", this);
+    aliased = direct_instance_base::type_id::create("aliased", this);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
     InstanceOverrideTrace::kind = component.kind();
     InstanceOverrideTrace::unaffected_kind = unaffected.kind();
     InstanceOverrideTrace::wildcard_kind = wildcarded.kind();
+    InstanceOverrideTrace::alias_kind = aliased.kind();
   endtask
 endclass
 
 module official_uvm_instance_factory_probe(
   output int stage,
   output int unaffected_stage,
-  output int wildcard_stage
+  output int wildcard_stage,
+  output int alias_stage
 );
   initial begin
+    uvm_factory::get().set_inst_alias(
+      "direct_instance_base_alias",
+      direct_instance_base::get_type(),
+      "direct_instance_env.aliased"
+    );
+    uvm_factory::get().set_inst_override_by_name(
+      "direct_instance_base_alias",
+      "direct_instance_derived",
+      "direct_instance_env.aliased"
+    );
     uvm_factory::get().set_inst_override_by_type(
       direct_instance_base::get_type(),
       direct_instance_derived::get_type(),
@@ -12746,6 +12761,7 @@ module official_uvm_instance_factory_probe(
     stage = InstanceOverrideTrace::kind;
     unaffected_stage = InstanceOverrideTrace::unaffected_kind;
     wildcard_stage = InstanceOverrideTrace::wildcard_kind;
+    alias_stage = InstanceOverrideTrace::alias_kind;
   end
 endmodule
 "#,

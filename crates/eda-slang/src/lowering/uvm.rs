@@ -27,6 +27,8 @@ impl SlangAstLowerer {
         collect_run_test_calls(body, &mut calls);
         let mut type_alias_calls = Vec::new();
         collect_uvm_factory_type_alias_calls(body, &mut type_alias_calls);
+        let mut instance_alias_calls = Vec::new();
+        collect_uvm_factory_instance_alias_calls(body, &mut instance_alias_calls);
         let mut override_calls = Vec::new();
         collect_uvm_factory_override_calls(body, &mut override_calls);
         let mut instance_override_calls = Vec::new();
@@ -70,6 +72,51 @@ impl SlangAstLowerer {
                     alias_name,
                     original_name,
                 });
+            }
+        }
+        for alias_call in &instance_alias_calls {
+            let (alias_name, original_name, pattern) =
+                uvm_factory_instance_alias_names(alias_call)?;
+            let run_test_location = calls
+                .first()
+                .and_then(|call| source_location(call))
+                .ok_or_else(|| {
+                    with_source_span(
+                        alias_call,
+                        "UVM instance alias requires a following run_test call".into(),
+                    )
+                })?;
+            let alias_location = source_location(alias_call).ok_or_else(|| {
+                with_source_span(
+                    alias_call,
+                    "UVM instance alias has no source location".into(),
+                )
+            })?;
+            if alias_location >= run_test_location {
+                return Err(with_source_span(
+                    alias_call,
+                    "UVM instance alias must be registered before run_test".into(),
+                ));
+            }
+            let original_name = self.resolve_uvm_type_alias(&original_name)?;
+            if let Some(existing) = self
+                .uvm_factory_instance_aliases
+                .iter()
+                .find(|existing| existing.alias_name == alias_name && existing.pattern == pattern)
+            {
+                if existing.original_name != original_name {
+                    return Err(with_source_span(
+                        alias_call,
+                        format!("conflicting UVM instance alias '{alias_name}'"),
+                    ));
+                }
+            } else {
+                self.uvm_factory_instance_aliases
+                    .push(super::AstUvmInstanceAlias {
+                        alias_name,
+                        original_name,
+                        pattern,
+                    });
             }
         }
         for override_call in &override_calls {
@@ -144,6 +191,7 @@ impl SlangAstLowerer {
                     "UVM instance override must be registered before run_test".into(),
                 ));
             }
+            let original = self.resolve_uvm_instance_alias(&original, &instance_path)?;
             let already_registered = self.uvm_factory_instance_overrides.iter().any(|existing| {
                 existing.pattern == instance_path
                     && existing.original == original
@@ -560,6 +608,7 @@ impl SlangAstLowerer {
         ) {
             let (original, override_name, instance_path) =
                 uvm_factory_instance_override_names(value)?;
+            let original = self.resolve_uvm_instance_alias(&original, &instance_path)?;
             if !self.uvm_factory_instance_overrides.iter().any(|existing| {
                 existing.pattern == instance_path
                     && existing.original == original
@@ -594,6 +643,27 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_factory_instance_alias_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        if !is_uvm_factory_instance_alias_call(value) {
+            return Ok(None);
+        }
+        let (alias_name, original_name, pattern) = uvm_factory_instance_alias_names(value)?;
+        let original_name = self.resolve_uvm_type_alias(&original_name)?;
+        if !self.uvm_factory_instance_aliases.iter().any(|existing| {
+            existing.alias_name == alias_name
+                && existing.original_name == original_name
+                && existing.pattern == pattern
+        }) {
+            return Err(format!(
+                "UVM instance alias '{alias_name}' -> '{original_name}' at '{pattern}' was not prepared"
+            ));
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
     fn resolve_uvm_type_alias(&self, type_name: &str) -> Result<String, String> {
         let mut current = type_name.to_string();
         let mut visited = std::collections::BTreeSet::new();
@@ -608,6 +678,24 @@ impl SlangAstLowerer {
             current = alias.original_name.clone();
         }
         Ok(current)
+    }
+
+    fn resolve_uvm_instance_alias(
+        &self,
+        type_name: &str,
+        instance_path: &str,
+    ) -> Result<String, String> {
+        let mut current = type_name.to_string();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(alias) = self.uvm_factory_instance_aliases.iter().find(|alias| {
+            alias.alias_name == current && wildcard_matches(&alias.pattern, instance_path)
+        }) {
+            if !visited.insert(current.clone()) {
+                return Err(format!("UVM instance alias cycle at '{current}'"));
+            }
+            current = alias.original_name.clone();
+        }
+        self.resolve_uvm_type_alias(&current)
     }
 
     pub(super) fn lower_uvm_timeout_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
@@ -1234,6 +1322,26 @@ fn collect_uvm_factory_type_alias_calls<'value>(
     }
 }
 
+fn collect_uvm_factory_instance_alias_calls<'value>(
+    value: &'value Value,
+    calls: &mut Vec<&'value Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if is_uvm_factory_instance_alias_call(value) {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_uvm_factory_instance_alias_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_uvm_factory_instance_alias_calls(nested, calls);
+        }
+    }
+}
+
 fn collect_uvm_factory_instance_override_calls<'value>(
     value: &'value Value,
     calls: &mut Vec<&'value Value>,
@@ -1354,6 +1462,38 @@ fn is_uvm_factory_override_call(value: &Value) -> bool {
                     .map(|type_name| type_name.contains("uvm_factory"))
                     .unwrap_or(false)
         })
+}
+
+fn is_uvm_factory_instance_alias_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("set_inst_alias")
+        && value.get("thisClass").is_some_and(|receiver| {
+            string_field(receiver, "kind").as_deref() == Some("Call")
+                && string_field(receiver, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("get")
+                && string_field(receiver, "type")
+                    .map(|type_name| type_name.contains("uvm_factory"))
+                    .unwrap_or(false)
+        })
+        && value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .is_some_and(|arguments| arguments.len() == 3)
 }
 
 fn is_uvm_factory_type_alias_call(value: &Value) -> bool {
@@ -1574,6 +1714,24 @@ fn uvm_factory_type_alias_names(call: &Value) -> Result<(String, String), String
     let original_name = wrapper_type_name(&arguments[1])
         .ok_or_else(|| "UVM type alias original must be Class::get_type()".to_string())?;
     Ok((alias_name, original_name))
+}
+
+fn uvm_factory_instance_alias_names(call: &Value) -> Result<(String, String, String), String> {
+    let empty_arguments = Vec::new();
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_arguments);
+    if arguments.len() != 3 {
+        return Err("UVM instance alias requires three arguments".into());
+    }
+    let alias_name = string_literal(unwrap_conversion(&arguments[0]))
+        .ok_or_else(|| "UVM instance alias name must be a string literal".to_string())?;
+    let original_name = wrapper_type_name(&arguments[1])
+        .ok_or_else(|| "UVM instance alias original must be Class::get_type()".to_string())?;
+    let pattern = string_literal(unwrap_conversion(&arguments[2]))
+        .ok_or_else(|| "UVM instance alias path must be a string literal".to_string())?;
+    Ok((alias_name, original_name, pattern))
 }
 
 fn uvm_factory_instance_override_names(call: &Value) -> Result<(String, String, String), String> {
