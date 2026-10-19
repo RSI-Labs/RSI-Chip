@@ -401,6 +401,92 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_dynamic_class_array_handle_assignment() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-class-handle");
+    let source_path = root.join("dynamic_class_handle.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class Item;
+  int value;
+
+  function new(int v);
+    value = v;
+  endfunction
+
+  function int get();
+    return value;
+  endfunction
+endclass
+
+module dynamic_class_handle_top(
+  input int target_selector,
+  input int source_selector,
+  output int scalar_to_array,
+  output int array_to_scalar,
+  output int array_to_array
+);
+  Item destination[0:1];
+  Item source[0:1];
+  Item scalar;
+  Item selected;
+
+  initial begin
+    #1;
+    destination[0] = new(10);
+    destination[1] = new(20);
+    source[0] = new(30);
+    source[1] = new(40);
+    scalar = new(50);
+
+    destination[target_selector] = scalar;
+    scalar_to_array = destination[target_selector].get();
+
+    selected = source[source_selector];
+    source[source_selector].value = 61;
+    array_to_scalar = selected.get();
+
+    destination[target_selector] = source[source_selector];
+    source[source_selector].value = 70;
+    array_to_array = destination[target_selector].get();
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic class-handle source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_handle_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic class-array handle assignment");
+    let mut simulator = Simulator::new(&design).expect("create dynamic class-handle simulator");
+    simulator
+        .set_input("target_selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .set_input("source_selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run dynamic class-handle initial block");
+    assert_eq!(
+        simulator.read("scalar_to_array").unwrap().to_u64(),
+        Some(50)
+    );
+    assert_eq!(
+        simulator.read("array_to_scalar").unwrap().to_u64(),
+        Some(61)
+    );
+    assert_eq!(simulator.read("array_to_array").unwrap().to_u64(), Some(70));
+}
+
+#[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

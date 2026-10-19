@@ -23,6 +23,12 @@ struct DynamicClassArraySelection {
     elements: Vec<(i64, String)>,
 }
 
+#[derive(Clone)]
+struct ClassHandleCandidates {
+    keys: Vec<String>,
+    class_name: String,
+}
+
 impl SlangAstLowerer {
     fn class_type_key(&self, type_name: &str) -> String {
         let Some(base_name) = class_name(type_name) else {
@@ -296,62 +302,42 @@ impl SlangAstLowerer {
         let Some(right) = assignment.get("right") else {
             return Ok(());
         };
-        if string_field(left, "kind").as_deref() == Some("ElementSelect")
-            && string_field(right, "kind").as_deref() == Some("NewClass")
-        {
-            if let Some(selected) = left.get("value") {
-                if let (Some(base_key), Some(type_name), Some(selector)) = (
-                    string_field(selected, "symbol"),
-                    string_field(selected, "type"),
-                    left.get("selector"),
-                ) {
-                    if constant_selector(selector).is_none() {
-                        for index in class_array_indexes(&type_name)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .flatten()
-                        {
-                            let element_key = format!("{base_key}[{index}]");
-                            self.initialized_class_objects.insert(element_key.clone());
-                            self.constructed_class_objects.insert(element_key);
-                        }
-                    }
-                }
-            }
-        }
-        let Some((target_key, target_class)) = named_class_handle(left) else {
+        let Some(target) = self.class_handle_candidates_from_ast(left)? else {
             return Ok(());
         };
-        let target_class = self.class_type_key(&target_class);
         if string_field(right, "kind").as_deref() == Some("NewClass") {
-            self.initialized_class_objects.insert(target_key.clone());
-            self.constructed_class_objects.insert(target_key);
+            for target_key in target.keys {
+                self.initialized_class_objects.insert(target_key.clone());
+                self.constructed_class_objects.insert(target_key);
+            }
             return Ok(());
         }
         let source = conversion_operand(right).unwrap_or(right);
-        let Some((source_key, source_class)) = named_class_handle(source) else {
+        let Some(source) = self.class_handle_candidates_from_ast(source)? else {
             return Ok(());
         };
-        let source_class = self.class_type_key(&source_class);
-        if !self.class_definitions.contains_key(&target_class)
-            || !self.class_definitions.contains_key(&source_class)
-        {
-            return Ok(());
-        }
-        let chain = self.class_chain(&source_class)?;
+        let chain = self.class_chain(&source.class_name)?;
         if !chain
             .iter()
-            .any(|(class_name, _)| *class_name == target_class)
+            .any(|(class_name, _)| *class_name == target.class_name)
         {
             return Ok(());
         }
-        self.initialized_class_objects.insert(target_key.clone());
-        let sources = self.dynamic_class_sources.entry(target_key).or_default();
-        if !sources.iter().any(|source| source.object_key == source_key) {
-            sources.push(super::DynamicClassSource {
-                object_key: source_key,
-                class_name: source_class,
-            });
+        for target_key in target.keys {
+            self.initialized_class_objects.insert(target_key.clone());
+            let sources = self.dynamic_class_sources.entry(target_key).or_default();
+            for source_key in &source.keys {
+                if sources
+                    .iter()
+                    .any(|source| source.object_key == *source_key)
+                {
+                    continue;
+                }
+                sources.push(super::DynamicClassSource {
+                    object_key: source_key.clone(),
+                    class_name: source.class_name.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -892,39 +878,130 @@ impl SlangAstLowerer {
         let Some(right) = assignment.get("right") else {
             return Ok(None);
         };
-        let Some((target_key, target_class)) = named_class_handle(left) else {
-            return Ok(None);
-        };
-        let target_class = self.class_type_key(&target_class);
-        if !self.class_definitions.contains_key(&target_class) {
-            return Ok(None);
-        }
         let source = conversion_operand(right).unwrap_or(right);
-        let Some((source_key, _)) = named_class_handle(source) else {
-            return Err(
-                "class handle assignment supports constructor and object-handle sources only"
-                    .into(),
-            );
+        let target_selection = self.dynamic_class_array_selection(left)?;
+        let source_selection = self.dynamic_class_array_selection(source)?;
+        let target_fixed_key = if target_selection.is_none() {
+            self.class_object_key_for_value(left)?
+        } else {
+            None
         };
-        if !self.class_objects.contains_key(&target_key)
-            || !self.class_objects.contains_key(&source_key)
+        let source_fixed_key = if source_selection.is_none() {
+            self.class_object_key_for_value(source)?
+        } else {
+            None
+        };
+        if target_selection.is_none()
+            && target_fixed_key.is_none()
+            && source_selection.is_none()
+            && source_fixed_key.is_none()
         {
             return Ok(None);
         }
         if bool_field(assignment, "isNonBlocking") {
             return Err("non-blocking class handle assignment is not supported".into());
         }
-        let target_fields = &self.class_objects[&target_key];
-        let source_fields = &self.class_objects[&source_key];
+
+        if let Some(target_selection) = target_selection {
+            let target_statements = target_selection
+                .elements
+                .iter()
+                .map(|(target_index, target_key)| {
+                    let target_condition =
+                        Self::class_array_condition(&target_selection.selector, *target_index);
+                    let body = if let Some(source_selection) = &source_selection {
+                        Stmt::Block(
+                            source_selection
+                                .elements
+                                .iter()
+                                .map(|(source_index, source_key)| {
+                                    self.require_initialized_class_object(source_key)?;
+                                    Ok(Stmt::If {
+                                        c: Self::class_array_condition(
+                                            &source_selection.selector,
+                                            *source_index,
+                                        ),
+                                        t: Box::new(
+                                            self.class_handle_copy_statement(
+                                                target_key, source_key,
+                                            )?,
+                                        ),
+                                        f: None,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, String>>()?,
+                        )
+                    } else if let Some(source_key) = &source_fixed_key {
+                        self.require_initialized_class_object(source_key)?;
+                        self.class_handle_copy_statement(target_key, source_key)?
+                    } else {
+                        return Err(
+                            "class handle assignment requires a constructed source handle".into(),
+                        );
+                    };
+                    Ok(Stmt::If {
+                        c: target_condition,
+                        t: Box::new(body),
+                        f: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(Some(Stmt::Block(target_statements)));
+        }
+
+        let Some(target_key) = target_fixed_key else {
+            return Ok(None);
+        };
+        if let Some(source_selection) = source_selection {
+            let statements = source_selection
+                .elements
+                .iter()
+                .map(|(source_index, source_key)| {
+                    self.require_initialized_class_object(source_key)?;
+                    Ok(Stmt::If {
+                        c: Self::class_array_condition(&source_selection.selector, *source_index),
+                        t: Box::new(self.class_handle_copy_statement(&target_key, source_key)?),
+                        f: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(Some(Stmt::Block(statements)));
+        }
+
+        let Some(source_key) = source_fixed_key else {
+            return Err(
+                "class handle assignment supports constructor and object-handle sources only"
+                    .into(),
+            );
+        };
+        self.require_initialized_class_object(&source_key)?;
+        self.class_handle_copy_statement(&target_key, &source_key)
+            .map(Some)
+    }
+
+    fn class_handle_copy_statement(
+        &self,
+        target_key: &str,
+        source_key: &str,
+    ) -> Result<Stmt, String> {
+        if !self.class_objects.contains_key(target_key)
+            || !self.class_objects.contains_key(source_key)
+        {
+            return Err(format!(
+                "cannot copy unknown class handle '{target_key}' from '{source_key}'"
+            ));
+        }
+        let target_fields = &self.class_objects[target_key];
+        let source_fields = &self.class_objects[source_key];
         let mut statements = Vec::new();
         for (target_symbol, source_symbol) in [
             (
-                &self.class_object_tags[&target_key],
-                &self.class_object_tags[&source_key],
+                &self.class_object_tags[target_key],
+                &self.class_object_tags[source_key],
             ),
             (
-                &self.class_object_ids[&target_key],
-                &self.class_object_ids[&source_key],
+                &self.class_object_ids[target_key],
+                &self.class_object_ids[source_key],
             ),
         ] {
             statements.push(Stmt::Bl {
@@ -941,7 +1018,7 @@ impl SlangAstLowerer {
                 e: class_expr(source_symbol),
             });
         }
-        Ok(Some(Stmt::Block(statements)))
+        Ok(Stmt::Block(statements))
     }
 
     pub(super) fn lower_class_property_assignment(
@@ -1742,6 +1819,65 @@ impl SlangAstLowerer {
         }
         Ok(Value::Object(rewritten))
     }
+
+    fn class_handle_candidates_from_ast(
+        &self,
+        value: &Value,
+    ) -> Result<Option<ClassHandleCandidates>, String> {
+        match string_field(value, "kind").as_deref() {
+            Some("NamedValue" | "HierarchicalValue") => {
+                let Some(type_name) = string_field(value, "type") else {
+                    return Ok(None);
+                };
+                let class_name = self.class_type_key(&type_name);
+                if !self.class_definitions.contains_key(&class_name) {
+                    return Ok(None);
+                }
+                let Some(key) = string_field(value, "symbol") else {
+                    return Ok(None);
+                };
+                Ok(Some(ClassHandleCandidates {
+                    keys: vec![key],
+                    class_name,
+                }))
+            }
+            Some("ElementSelect") => {
+                let Some(selected) = value.get("value") else {
+                    return Ok(None);
+                };
+                let Some(base_key) = string_field(selected, "symbol") else {
+                    return Ok(None);
+                };
+                let Some(type_name) = string_field(selected, "type") else {
+                    return Ok(None);
+                };
+                let class_name = self.class_type_key(&type_name);
+                if !self.class_definitions.contains_key(&class_name) {
+                    return Ok(None);
+                }
+                let indexes = class_array_indexes(&type_name).unwrap_or_default();
+                let Some(selector) = value.get("selector") else {
+                    return Ok(None);
+                };
+                let keys = if let Some(selected_index) = constant_selector(selector) {
+                    indexes
+                        .into_iter()
+                        .flatten()
+                        .filter(|index| *index == selected_index)
+                        .map(|index| format!("{base_key}[{index}]"))
+                        .collect()
+                } else {
+                    indexes
+                        .into_iter()
+                        .flatten()
+                        .map(|index| format!("{base_key}[{index}]"))
+                        .collect()
+                };
+                Ok(Some(ClassHandleCandidates { keys, class_name }))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 fn class_name(type_name: &str) -> Option<String> {
@@ -1792,23 +1928,6 @@ fn method_is_static(method: &Value) -> bool {
     string_field(method, "flags")
         .map(|flags| flags.split(',').any(|flag| flag.trim() == "static"))
         .unwrap_or(false)
-}
-
-fn named_class_handle(value: &Value) -> Option<(String, String)> {
-    if string_field(value, "kind").as_deref() == Some("ElementSelect") {
-        let selected = value.get("value")?;
-        let base_key = string_field(selected, "symbol")?;
-        let selector = value.get("selector")?;
-        let index = constant_selector(selector)?;
-        let type_name = string_field(value, "type")?;
-        return Some((format!("{base_key}[{index}]"), type_name));
-    }
-    if string_field(value, "kind").as_deref() != Some("NamedValue") {
-        return None;
-    }
-    let object_key = string_field(value, "symbol")?;
-    let type_name = string_field(value, "type")?;
-    Some((object_key, type_name))
 }
 
 fn conversion_operand(value: &Value) -> Option<&Value> {
