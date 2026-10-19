@@ -71,7 +71,8 @@ instances, package-qualified classes, elaborated value-parameterized class
 specializations with method-body parameter substitution, scalar and
 one-dimensional class-valued composition arrays with nested
 construction/field/method access, constant-indexed and dynamic class-array
-read/write/handle-assignment subsets, null handle assignment/comparison, and
+read/write/handle-assignment subsets, null handle assignment/comparison,
+checked `$cast` between prepared handles with a provable dynamic source, and
 simple integral/string type aliases, class property initializers,
 first-class sparse memories, memory file tasks, and top-level and child
 memory-port sharing. It records slang source spans and

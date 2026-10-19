@@ -479,6 +479,11 @@ impl SlangAstLowerer {
 
     pub(super) fn collect_dynamic_class_sources(&mut self, value: &Value) -> Result<(), String> {
         if let Some(fields) = value.as_object() {
+            if string_field(value, "kind").as_deref() == Some("Call")
+                && string_field(value, "subroutine").as_deref() == Some("$cast")
+            {
+                return self.record_class_cast_destination(value);
+            }
             if string_field(value, "kind").as_deref() == Some("Assignment") {
                 self.record_dynamic_class_assignment(value)?;
             }
@@ -489,6 +494,27 @@ impl SlangAstLowerer {
             for nested in values {
                 self.collect_dynamic_class_sources(nested)?;
             }
+        }
+        Ok(())
+    }
+
+    fn record_class_cast_destination(&mut self, call: &Value) -> Result<(), String> {
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Err("$cast requires exactly two class-handle arguments".into());
+        }
+        let Some(target) = arguments[0].get("left") else {
+            return Ok(());
+        };
+        let Some(target) = self.class_handle_candidates_from_ast(target)? else {
+            return Ok(());
+        };
+        for target_key in target.keys {
+            self.initialized_class_objects.insert(target_key);
         }
         Ok(())
     }
@@ -1095,6 +1121,126 @@ impl SlangAstLowerer {
             return Ok(Some(statement));
         }
         self.lower_class_method(&object_key, call, false).map(Some)
+    }
+
+    pub(super) fn lower_class_cast_call(&self, call: &Value) -> Result<Option<Stmt>, String> {
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Err("$cast requires exactly two class-handle arguments".into());
+        }
+        let target = arguments[0]
+            .get("left")
+            .ok_or_else(|| "$cast destination must be an assignable class handle".to_string())?;
+        let source = conversion_operand(&arguments[1]).unwrap_or(&arguments[1]);
+        let Some(target_key) = self.class_object_key_for_value(target)? else {
+            return Err("$cast destination is not a prepared class object".into());
+        };
+        let Some(source_key) = self.class_object_key_for_value(source)? else {
+            return Err("$cast source is not a prepared class object".into());
+        };
+        self.require_initialized_class_object(&source_key)?;
+        if !self.class_objects.contains_key(&target_key)
+            || !self.class_objects.contains_key(&source_key)
+        {
+            return Err("$cast source and destination must have prepared storage".into());
+        }
+        let target_fields = &self.class_objects[&target_key];
+        let source_fields = &self.class_objects[&source_key];
+        if target_fields
+            .keys()
+            .any(|field| !source_fields.contains_key(field))
+        {
+            return Err(
+                "$cast destination has fields absent from the prepared source storage".into(),
+            );
+        }
+
+        let target_type = &self.class_object_types[&target_key];
+        let source_type = self.class_object_types[&source_key].clone();
+        let mut possible_source_types = vec![source_type.clone()];
+        possible_source_types.extend(
+            self.dynamic_sources_for(&source_key)
+                .into_iter()
+                .map(|source| source.class_name),
+        );
+        if !possible_source_types.iter().any(|source_type| {
+            self.class_chain(source_type)
+                .is_ok_and(|chain| chain.iter().any(|(owner, _)| owner == target_type))
+        }) {
+            return Err(format!(
+                "$cast source '{source_key}' has no possible '{target_type}' object"
+            ));
+        }
+        let acceptable_classes = self
+            .class_definitions
+            .keys()
+            .filter(|candidate| {
+                self.class_chain(candidate)
+                    .is_ok_and(|chain| chain.iter().any(|(owner, _)| owner == target_type))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if acceptable_classes.is_empty() {
+            return Err(format!("$cast target class '{target_type}' is unknown"));
+        }
+        let source_tag = self
+            .class_object_tags
+            .get(&source_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{source_key}' has no runtime tag"))?;
+        let mut type_matches = None;
+        for class_name in &acceptable_classes {
+            let class_id = self.class_id(class_name)?;
+            let matches = Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(class_expr(&source_tag)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(32, class_id))),
+            };
+            type_matches = Some(match type_matches {
+                Some(previous) => Expr::Bin {
+                    op: BinOp::LogOr,
+                    a: Box::new(previous),
+                    b: Box::new(matches),
+                },
+                None => matches,
+            });
+        }
+        let type_matches = type_matches.expect("acceptable $cast class list is nonempty");
+
+        let mut copy = Vec::new();
+        for (target_symbol, source_symbol) in [
+            (
+                &self.class_object_tags[&target_key],
+                &self.class_object_tags[&source_key],
+            ),
+            (
+                &self.class_object_ids[&target_key],
+                &self.class_object_ids[&source_key],
+            ),
+        ] {
+            copy.push(Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            });
+        }
+        for (field_name, target_symbol) in target_fields {
+            let Some(source_symbol) = source_fields.get(field_name) else {
+                continue;
+            };
+            copy.push(Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            });
+        }
+        Ok(Some(Stmt::If {
+            c: type_matches,
+            t: Box::new(Stmt::Block(copy)),
+            f: None,
+        }))
     }
 
     pub(super) fn lower_static_class_function_call(

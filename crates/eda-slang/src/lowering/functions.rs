@@ -184,6 +184,9 @@ impl SlangAstLowerer {
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
+        if task_name == "$cast" {
+            return self.lower_class_cast_call(value);
+        }
         if let Some(statement) = self.lower_uvm_factory_override_call(value)? {
             return Ok(Some(statement));
         }

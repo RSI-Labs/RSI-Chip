@@ -191,6 +191,64 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_successful_class_casts() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-class-cast");
+    let source_path = root.join("class_cast.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+class CastBase;
+  function new();
+  endfunction
+
+  virtual function int kind();
+    return 1;
+  endfunction
+endclass
+
+class CastDerived extends CastBase;
+  function new();
+  endfunction
+
+  virtual function int kind();
+    return 2;
+  endfunction
+endclass
+
+module class_cast_top(output int observed);
+  CastDerived object;
+  CastBase source;
+  CastDerived destination;
+
+  initial begin
+    object = new();
+    source = object;
+    $cast(destination, source);
+    observed = destination.kind();
+  end
+endmodule
+"#,
+    )
+    .expect("write class-cast source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("class_cast_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower a successful class cast");
+    let mut simulator = Simulator::new(&design).expect("create class-cast simulator");
+    simulator
+        .run_until(0)
+        .expect("run the class cast and dispatched method");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_constant_indexed_class_arrays() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
