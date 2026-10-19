@@ -829,7 +829,11 @@ impl SlangAstLowerer {
         Ok(())
     }
 
-    fn declare_class_internal_net(&mut self, name: &str, width: usize) -> super::AstLoweredSymbol {
+    pub(super) fn declare_class_internal_net(
+        &mut self,
+        name: &str,
+        width: usize,
+    ) -> super::AstLoweredSymbol {
         let base = self.design.n_nets;
         self.design.n_nets += width;
         self.design.net_decls.push(eda_core::ir::NetDecl {
@@ -1018,6 +1022,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
+        if let Some(statement) = self.lower_uvm_phase_objection_call(call)? {
+            return Ok(Some(statement));
+        }
         if let Some(DynamicClassArraySelection {
             selector, elements, ..
         }) = self.dynamic_class_array_selection(receiver)?
@@ -2267,7 +2274,7 @@ fn conversion_operand(value: &Value) -> Option<&Value> {
     value.get("operand")
 }
 
-fn class_expr(symbol: &super::AstLoweredSymbol) -> Expr {
+pub(super) fn class_expr(symbol: &super::AstLoweredSymbol) -> Expr {
     Expr::Ref {
         net: symbol.base,
         decl_width: symbol.width,
@@ -2276,7 +2283,7 @@ fn class_expr(symbol: &super::AstLoweredSymbol) -> Expr {
     }
 }
 
-fn class_lvalue(symbol: &super::AstLoweredSymbol) -> eda_core::ir::LValue {
+pub(super) fn class_lvalue(symbol: &super::AstLoweredSymbol) -> eda_core::ir::LValue {
     eda_core::ir::LValue {
         net: symbol.base,
         decl_width: symbol.width,

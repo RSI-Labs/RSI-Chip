@@ -368,6 +368,8 @@ pub(super) struct DynamicClassSource {
 pub(super) struct AstRunTestObject {
     pub(super) class_name: String,
     pub(super) object_key: String,
+    pub(super) phase_key: String,
+    pub(super) objection_count: AstLoweredSymbol,
 }
 
 pub(super) struct AstEventArraySelection {

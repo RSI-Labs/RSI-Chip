@@ -1,9 +1,10 @@
 //! Minimal direct-lowering bootstrap for official-UVM `run_test`.
 
-use super::classes::method_return_type;
+use super::classes::{class_expr, class_lvalue, method_return_type};
 use super::SlangAstLowerer;
-use crate::ast_util::{string_field, with_source_span};
-use eda_core::ir::Stmt;
+use crate::ast_util::{slang_constant_u64, string_field, with_source_span};
+use eda_core::ir::{BinOp, Expr, Stmt};
+use eda_core::logic::LogicWord;
 use serde_json::{json, Value};
 
 const UVM_BOOTSTRAP_PHASES: [&str; 9] = [
@@ -126,12 +127,19 @@ impl SlangAstLowerer {
                 ));
             }
             let object_key = format!("{handle_address} {object_name}");
+            let phase_key = format!("{handle_address} __uvm_phase");
+            let objection_count = self.declare_class_internal_net(
+                &format!("__uvm_run_test_objections_{handle_address}"),
+                32,
+            );
             self.initialized_class_objects.insert(object_key.clone());
             self.run_test_objects.insert(
                 class_name,
                 super::AstRunTestObject {
                     class_name: class_key,
                     object_key,
+                    phase_key,
+                    objection_count,
                 },
             );
         }
@@ -211,7 +219,13 @@ impl SlangAstLowerer {
         let chain = self.class_chain(&run_object.class_name)?;
         let official_index = official_uvm_test_index(&chain)
             .ok_or_else(|| format!("run_test class '{class_name}' is not official UVM"))?;
-        let mut statements = vec![construction];
+        let mut statements = vec![
+            construction,
+            Stmt::Bl {
+                lv: class_lvalue(&run_object.objection_count),
+                e: Expr::Const(LogicWord::zero(32)),
+            },
+        ];
         for phase_name in UVM_BOOTSTRAP_PHASES {
             let Some(method) = user_phase_method(&chain, official_index, phase_name) else {
                 if phase_name == "run_phase" {
@@ -235,11 +249,9 @@ impl SlangAstLowerer {
                 },
                 "arguments": [
                     {
-                        "kind": "NullLiteral",
-                        "type": {
-                            "name": "null",
-                            "kind": "NullType",
-                        },
+                        "kind": "NamedValue",
+                        "type": "uvm_phase",
+                        "symbol": run_object.phase_key,
                     },
                 ],
             });
@@ -249,8 +261,116 @@ impl SlangAstLowerer {
                 ));
             };
             statements.push(phase_statement);
+            if phase_name == "run_phase" {
+                statements.push(Stmt::Assert {
+                    cond: Expr::Bin {
+                        op: BinOp::Eq,
+                        a: Box::new(class_expr(&run_object.objection_count)),
+                        b: Box::new(Expr::Const(LogicWord::zero(32))),
+                    },
+                    message: Some("run_phase completed with raised UVM objections".into()),
+                });
+            }
         }
         Ok(Some(Stmt::Block(statements)))
+    }
+
+    pub(super) fn lower_uvm_phase_objection_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(receiver) = call.get("thisClass") else {
+            return Ok(None);
+        };
+        let mut receiver = receiver;
+        while string_field(receiver, "kind").as_deref() == Some("Conversion") {
+            let Some(operand) = receiver.get("operand") else {
+                break;
+            };
+            receiver = operand;
+        }
+        let Some(phase_key) = string_field(receiver, "symbol") else {
+            return Ok(None);
+        };
+        let Some(run_object) = self
+            .run_test_objects
+            .values()
+            .find(|object| object.phase_key == phase_key)
+        else {
+            return Ok(None);
+        };
+        let method_name = string_field(call, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if !matches!(method_name.as_str(), "raise_objection" | "drop_objection") {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() || arguments.len() > 3 {
+            return Err(format!(
+                "UVM bootstrap {method_name} takes one to three arguments, found {}",
+                arguments.len()
+            ));
+        }
+        let current = class_expr(&run_object.objection_count);
+        let delta_value = match arguments.get(2) {
+            Some(count) => slang_constant_u64(count)?,
+            None => 1,
+        };
+        if delta_value == 0 || delta_value > u64::from(u32::MAX) {
+            return Err(format!(
+                "UVM bootstrap {method_name} count must be between 1 and {}",
+                u32::MAX
+            ));
+        }
+        let delta_value = u32::try_from(delta_value).expect("checked UVM objection count");
+        let delta = Expr::Const(LogicWord::from_u64(32, u64::from(delta_value)));
+        let next = match method_name.as_str() {
+            "raise_objection" => Expr::Bin {
+                op: BinOp::Add,
+                a: Box::new(current.clone()),
+                b: Box::new(delta.clone()),
+            },
+            _ => Expr::Bin {
+                op: BinOp::Sub,
+                a: Box::new(current.clone()),
+                b: Box::new(delta.clone()),
+            },
+        };
+        let (boundary_op, boundary) = if method_name == "raise_objection" {
+            (BinOp::Gt, u32::MAX - delta_value)
+        } else {
+            (BinOp::Lt, delta_value)
+        };
+        let message = if method_name == "raise_objection" {
+            "UVM bootstrap objection counter overflowed".to_string()
+        } else {
+            "UVM bootstrap dropped an objection that was not raised".to_string()
+        };
+        Ok(Some(Stmt::If {
+            c: Expr::Bin {
+                op: boundary_op,
+                a: Box::new(current),
+                b: Box::new(Expr::Const(LogicWord::from_u64(32, u64::from(boundary)))),
+            },
+            t: Box::new(Stmt::Assert {
+                cond: Expr::Const(LogicWord::zero(1)),
+                message: Some(message),
+            }),
+            f: Some(Box::new(Stmt::Bl {
+                lv: class_lvalue(&run_object.objection_count),
+                e: next,
+            })),
+        }))
     }
 }
 

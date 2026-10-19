@@ -11939,8 +11939,10 @@ class direct_phase_probe extends uvm_test;
   endfunction
 
   virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
     #3;
     PhaseTrace::mark(5);
+    phase.drop_objection(this);
   endtask
 
   virtual function void extract_phase(uvm_phase phase);
@@ -11981,6 +11983,73 @@ endmodule
         .run_until(3)
         .expect("run the minimal UVM phase schedule");
     assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(123_456_789));
+}
+
+#[test]
+fn slang_direct_run_test_fails_closed_on_undrained_objections() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-objection-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_unbalanced_probe extends uvm_test;
+  function new(string name = "direct_unbalanced_probe", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    #1;
+  endtask
+endclass
+
+module official_uvm_objection_probe;
+  initial begin
+    run_test("direct_unbalanced_probe");
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM objection wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_objection_probe"),
+            &options,
+        )
+        .expect("directly lower an unbalanced objection test");
+    let mut simulator = Simulator::new(&design).expect("create unbalanced objection simulator");
+    let error = simulator
+        .run_until(1)
+        .expect_err("undrained UVM objections must fail the simulation");
+    assert!(
+        error.contains("run_phase completed with raised UVM objections"),
+        "{error}"
+    );
 }
 
 #[test]
