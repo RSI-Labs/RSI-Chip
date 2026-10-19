@@ -12665,6 +12665,7 @@ class ConfigExistsTrace;
   static int present = 0;
   static int missing = 0;
   static int spell_checked = 0;
+  static int cross_type_spell_checked = 0;
 endclass
 
 class direct_config_exists_probe extends uvm_test;
@@ -12675,6 +12676,12 @@ class direct_config_exists_probe extends uvm_test;
 
   virtual function void build_phase(uvm_phase phase);
     uvm_config_db#(int)::set(null, "uvm_test_top*", "value", 42);
+    uvm_config_db#(string)::set(
+      null,
+      "uvm_test_top*",
+      "description",
+      "prepared"
+    );
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -12695,19 +12702,27 @@ class direct_config_exists_probe extends uvm_test;
     end else begin
       ConfigExistsTrace::spell_checked = 0;
     end
+
+    if (!uvm_config_db#(int)::exists(this, "", "descriptoin", 1)) begin
+      ConfigExistsTrace::cross_type_spell_checked = 1;
+    end else begin
+      ConfigExistsTrace::cross_type_spell_checked = 0;
+    end
   endtask
 endclass
 
 module official_uvm_config_exists_probe(
   output int present,
   output int missing,
-  output int spell_checked
+  output int spell_checked,
+  output int cross_type_spell_checked
 );
   initial begin
     run_test("direct_config_exists_probe");
     present = ConfigExistsTrace::present;
     missing = ConfigExistsTrace::missing;
     spell_checked = ConfigExistsTrace::spell_checked;
+    cross_type_spell_checked = ConfigExistsTrace::cross_type_spell_checked;
   end
 endmodule
 "#,
@@ -12724,11 +12739,19 @@ endmodule
         format!("{design:?}").contains("valeu not located, did you mean value"),
         "expected the config spell checker to suggest the prepared field"
     );
+    assert!(
+        format!("{design:?}").contains("descriptoin not located, did you mean description"),
+        "expected the config spell checker to use the global resource dictionary"
+    );
     let mut simulator = Simulator::new(&design).expect("create config exists simulator");
     simulator.run_until(0).expect("run config exists phases");
     assert_eq!(simulator.read("present").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("missing").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("spell_checked").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("cross_type_spell_checked").unwrap().to_u64(),
+        Some(1)
+    );
 }
 
 #[test]

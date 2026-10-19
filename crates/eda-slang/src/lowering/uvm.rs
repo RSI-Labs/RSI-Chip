@@ -1132,7 +1132,7 @@ impl SlangAstLowerer {
             .transpose()?;
         let mut statements = Vec::new();
         if !exists && spell_check {
-            let alternatives = self.uvm_config_spell_alternatives(&type_name, &field_name);
+            let alternatives = self.uvm_config_spell_alternatives(&field_name);
             let suggestion = if alternatives.is_empty() {
                 format!("{field_name} not located, no alternatives to suggest")
             } else {
@@ -1155,13 +1155,10 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(statements)))
     }
 
-    fn uvm_config_spell_alternatives(&self, type_name: &str, field_name: &str) -> Vec<String> {
+    fn uvm_config_spell_alternatives(&self, field_name: &str) -> Vec<String> {
         let mut minimum = usize::MAX;
         let mut alternatives = Vec::new();
         for entry in self.uvm_config_entries.borrow().iter() {
-            if entry.type_name != type_name {
-                continue;
-            }
             let distance = Self::levenshtein_distance(&entry.field_name, field_name);
             if distance == minimum {
                 if !alternatives.contains(&entry.field_name) {

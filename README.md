@@ -110,14 +110,14 @@ precedence and runtime/default last-write selection, and resolves conditional
 `get(...)` and `exists(...)` calls, including missing-entry failure branches;
 prepared `wait_modified(...)` calls wake when a later matching `set(...)`
 executes, and literal spell-check mode emits a UVM information message with
-Levenshtein-distance alternatives. Unsupported non-literal values, non-literal
-spell-check arguments, direct value-returning `get(...)`/`exists(...)` forms,
-and unprepared waiters fail closed.
+global cross-type Levenshtein alternatives. Unsupported non-literal values,
+non-literal spell-check arguments, direct value-returning `get(...)`/`exists(...)`
+forms, and unprepared waiters fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
 glob/precedence/wait/spell model is not the complete `uvm_resource_db` regex,
-callback, waiter-pool, priority API, global cross-type dictionary, or dynamic
+callback, waiter-pool, priority API, resource-wide dictionary, or dynamic
 resource-pool implementation,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
