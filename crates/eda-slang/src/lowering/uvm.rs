@@ -5,6 +5,7 @@ use super::SlangAstLowerer;
 use crate::ast_util::{bool_field, slang_constant_u64, string_field, with_source_span};
 use eda_core::ir::{BinOp, EventEdge, EventWatch, Expr, Stmt};
 use eda_core::logic::LogicWord;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -933,6 +934,7 @@ impl SlangAstLowerer {
             unwrap_conversion(&arguments[1]),
         )?;
         let precedence = self.uvm_config_db_precedence(scope.depth)?;
+        Self::uvm_config_scope_match(&scope.pattern, "")?;
         let field_name = string_literal(unwrap_conversion(&arguments[2]))
             .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
         let config_value = unwrap_conversion(&arguments[3]).clone();
@@ -942,17 +944,15 @@ impl SlangAstLowerer {
         ) {
             return Err("UVM config DB bootstrap values must be integer or string literals".into());
         }
-        let triggers = self
-            .uvm_config_waits
-            .borrow()
-            .values()
-            .filter(|wait| {
-                wait.type_name == type_name
-                    && wait.field_name == field_name
-                    && Self::uvm_glob_match(&scope.pattern, &wait.scope)
-            })
-            .map(|wait| Self::uvm_config_event_trigger(wait.net))
-            .collect::<Vec<_>>();
+        let mut triggers = Vec::new();
+        for wait in self.uvm_config_waits.borrow().values() {
+            if wait.type_name == type_name
+                && wait.field_name == field_name
+                && Self::uvm_config_scope_match(&scope.pattern, &wait.scope)?
+            {
+                triggers.push(Self::uvm_config_event_trigger(wait.net));
+            }
+        }
         let mut entries = self.uvm_config_entries.borrow_mut();
         entries.retain(|entry| {
             !(entry.type_name == type_name
@@ -1018,17 +1018,20 @@ impl SlangAstLowerer {
         let target = arguments[3]
             .get("left")
             .ok_or_else(|| "UVM config DB get output must be assignable".to_string())?;
-        let entry = self
-            .uvm_config_entries
-            .borrow()
-            .iter()
-            .filter(|entry| {
-                entry.type_name == type_name
-                    && entry.field_name == field_name
-                    && Self::uvm_glob_match(&entry.scope, &scope.pattern)
-            })
-            .max_by_key(|entry| entry.precedence)
-            .map(|entry| entry.value.clone());
+        let mut selected_entry: Option<&super::AstUvmConfigEntry> = None;
+        let entries = self.uvm_config_entries.borrow();
+        for entry in entries.iter() {
+            if entry.type_name == type_name
+                && entry.field_name == field_name
+                && Self::uvm_config_scope_match(&entry.scope, &scope.pattern)?
+                && selected_entry
+                    .as_ref()
+                    .is_none_or(|selected| entry.precedence >= selected.precedence)
+            {
+                selected_entry = Some(entry);
+            }
+        }
+        let entry = selected_entry.map(|entry| entry.value.clone());
         let Some(entry) = entry else {
             let failure = if negated {
                 statement.get("ifTrue")
@@ -1116,11 +1119,16 @@ impl SlangAstLowerer {
         )?;
         let field_name = string_literal(unwrap_conversion(&arguments[2]))
             .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
-        let exists = self.uvm_config_entries.borrow().iter().any(|entry| {
-            entry.type_name == type_name
+        let mut exists = false;
+        for entry in self.uvm_config_entries.borrow().iter() {
+            if entry.type_name == type_name
                 && entry.field_name == field_name
-                && Self::uvm_glob_match(&entry.scope, &scope.pattern)
-        });
+                && Self::uvm_config_scope_match(&entry.scope, &scope.pattern)?
+            {
+                exists = true;
+                break;
+            }
+        }
         let selects_if_true = exists != negated;
         let selected = if selects_if_true {
             statement.get("ifTrue")
@@ -1206,7 +1214,19 @@ impl SlangAstLowerer {
         } else {
             String::new()
         };
-        let pattern = if base.is_empty() {
+        let regex_body =
+            if inst_name.len() > 2 && inst_name.starts_with('/') && inst_name.ends_with('/') {
+                Some(inst_name[1..inst_name.len() - 1].to_string())
+            } else {
+                None
+            };
+        let pattern = if let Some(regex_body) = regex_body {
+            if base.is_empty() {
+                format!("/{regex_body}/")
+            } else {
+                format!("/{base}\\.({regex_body})/")
+            }
+        } else if base.is_empty() {
             inst_name
         } else if inst_name.is_empty() {
             base
@@ -1242,6 +1262,18 @@ impl SlangAstLowerer {
             }
         }
         match_bytes(pattern.as_bytes(), text.as_bytes())
+    }
+
+    fn uvm_config_scope_match(pattern: &str, text: &str) -> Result<bool, String> {
+        let Some(regex_body) =
+            (pattern.len() > 2 && pattern.starts_with('/') && pattern.ends_with('/'))
+                .then(|| &pattern[1..pattern.len() - 1])
+        else {
+            return Ok(Self::uvm_glob_match(pattern, text));
+        };
+        let regex = Regex::new(&format!("^(?:{regex_body})$"))
+            .map_err(|error| format!("invalid UVM config DB regex scope: {error}"))?;
+        Ok(regex.is_match(text))
     }
 
     fn levenshtein_distance(left: &str, right: &str) -> usize {

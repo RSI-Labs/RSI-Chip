@@ -12481,6 +12481,8 @@ class ConfigPriorityTrace;
   static int precedence_value = -1;
   static int latest_value = -1;
   static int runtime_value = -1;
+  static int regex_value = -1;
+  static int regex_child_value = -1;
 endclass
 
 class direct_config_priority_probe extends uvm_test;
@@ -12490,6 +12492,8 @@ class direct_config_priority_probe extends uvm_test;
   int precedence_value;
   int latest_value;
   int runtime_value;
+  int regex_value;
+  int regex_child_value;
 
   function new(string name = "direct_config_priority_probe",
                uvm_component parent = null);
@@ -12500,6 +12504,8 @@ class direct_config_priority_probe extends uvm_test;
     precedence_value = -1;
     latest_value = -1;
     runtime_value = -1;
+    regex_value = -1;
+    regex_child_value = -1;
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
@@ -12516,6 +12522,8 @@ class direct_config_priority_probe extends uvm_test;
     uvm_config_db#(int)::set(null, "uvm_test_top", "latest_value", 1);
     uvm_config_db#(int)::set(null, "uvm_test_top", "latest_value", 2);
     uvm_config_db#(int)::set(null, "uvm_test_top", "runtime_value", 400);
+    uvm_config_db#(int)::set(null, "/uvm_test_to./", "regex_value", 70);
+    uvm_config_db#(int)::set(this, "/.*/", "regex_child_value", 71);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -12586,6 +12594,28 @@ class direct_config_priority_probe extends uvm_test;
     end else begin
       ConfigPriorityTrace::runtime_value = runtime_value;
     end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "",
+      "regex_value",
+      regex_value
+    )) begin
+      ConfigPriorityTrace::regex_value = -1;
+    end else begin
+      ConfigPriorityTrace::regex_value = regex_value;
+    end
+
+    if (!uvm_config_db#(int)::get(
+      this,
+      "leaf",
+      "regex_child_value",
+      regex_child_value
+    )) begin
+      ConfigPriorityTrace::regex_child_value = -1;
+    end else begin
+      ConfigPriorityTrace::regex_child_value = regex_child_value;
+    end
   endtask
 endclass
 
@@ -12595,7 +12625,9 @@ module official_uvm_config_priority_probe(
   output int question_value,
   output int precedence_value,
   output int latest_value,
-  output int runtime_value
+  output int runtime_value,
+  output int regex_value,
+  output int regex_child_value
 );
   initial begin
     run_test("direct_config_priority_probe");
@@ -12605,6 +12637,8 @@ module official_uvm_config_priority_probe(
     precedence_value = ConfigPriorityTrace::precedence_value;
     latest_value = ConfigPriorityTrace::latest_value;
     runtime_value = ConfigPriorityTrace::runtime_value;
+    regex_value = ConfigPriorityTrace::regex_value;
+    regex_child_value = ConfigPriorityTrace::regex_child_value;
   end
 endmodule
 "#,
@@ -12628,6 +12662,11 @@ endmodule
     );
     assert_eq!(simulator.read("latest_value").unwrap().to_u64(), Some(2));
     assert_eq!(simulator.read("runtime_value").unwrap().to_u64(), Some(300));
+    assert_eq!(simulator.read("regex_value").unwrap().to_u64(), Some(70));
+    assert_eq!(
+        simulator.read("regex_child_value").unwrap().to_u64(),
+        Some(71)
+    );
 }
 
 #[test]
@@ -13109,7 +13148,7 @@ endmodule
     .expect("write direct UVM config exists wrapper");
     let error = slang
         .compile_files(
-            &[source, direct_exists],
+            &[source.clone(), direct_exists],
             Some("official_uvm_direct_config_exists_probe"),
             &options,
         )
@@ -13117,6 +13156,53 @@ endmodule
     assert!(
         error.contains("direct UVM config DB exists is supported only as a conditional expression"),
         "unexpected direct config exists error: {error}"
+    );
+
+    let invalid_regex = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-invalid-regex-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &invalid_regex,
+        r#"
+import uvm_pkg::*;
+
+class direct_invalid_regex_config extends uvm_test;
+  function new(string name = "direct_invalid_regex_config",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_config_db#(int)::set(null, "/[/", "value", 42);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_invalid_regex_config_probe;
+  initial begin
+    run_test("direct_invalid_regex_config");
+  end
+endmodule
+"#,
+    )
+    .expect("write invalid UVM config regex wrapper");
+    let error = slang
+        .compile_files(
+            &[source, invalid_regex],
+            Some("official_uvm_invalid_regex_config_probe"),
+            &options,
+        )
+        .expect_err("invalid config regexes must fail closed");
+    assert!(
+        error.contains("invalid UVM config DB regex scope"),
+        "unexpected invalid config regex error: {error}"
     );
 }
 

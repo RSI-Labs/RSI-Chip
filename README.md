@@ -106,8 +106,10 @@ hierarchy depth through `get_depth()`.
 A minimal literal `uvm_config_db#(T)` bootstrap records integer and string
 values in typed scope/field resources, applies the official UVM-no-DPI glob
 subset (`*`, `?`, and the empty global pattern), honors build-time hierarchy
-precedence and runtime/default last-write selection, and resolves conditional
-`get(...)` and `exists(...)` calls, including missing-entry failure branches;
+precedence and runtime/default last-write selection, accepts slash-delimited
+literal regex scopes with official-style context composition and anchored full
+matches, and resolves conditional `get(...)` and `exists(...)` calls, including
+missing-entry failure branches;
 prepared `wait_modified(...)` calls wake when a later matching `set(...)`
 executes, and literal spell-check mode emits a UVM information message with
 global cross-type Levenshtein alternatives. Unsupported non-literal values,
@@ -116,9 +118,9 @@ forms, and unprepared waiters fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
-glob/precedence/wait/spell model is not the complete `uvm_resource_db` regex,
-callback, waiter-pool, priority API, resource-wide dictionary, or dynamic
-resource-pool implementation,
+glob/regex/precedence/wait/spell model does not prove complete official POSIX
+dialect equivalence or the complete `uvm_resource_db` callback, waiter-pool,
+priority API, resource-wide dictionary, or dynamic resource-pool behavior,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
 
