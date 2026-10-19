@@ -82,9 +82,10 @@ fallback.
 The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`.
 A class derived from official `uvm_test` can be explicitly constructed with its
 overridden `run_phase` executed, and a minimal `run_test("class")` entry can
-construct such a class and execute its overridden phase method. This is still a
-bootstrap: the phase argument is null and UVM phasing, objections, factories,
-TLM, and sequences are not yet executed.
+construct such a class and sequentially execute its user-overridden common phase
+methods. This is still a bootstrap: phase arguments are null, there is no
+parallel phase graph, and UVM objections, factories, TLM, and sequences are not
+yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit

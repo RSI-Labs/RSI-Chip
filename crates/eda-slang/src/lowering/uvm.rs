@@ -6,6 +6,18 @@ use crate::ast_util::{string_field, with_source_span};
 use eda_core::ir::Stmt;
 use serde_json::{json, Value};
 
+const UVM_BOOTSTRAP_PHASES: [&str; 9] = [
+    "build_phase",
+    "connect_phase",
+    "end_of_elaboration_phase",
+    "start_of_simulation_phase",
+    "run_phase",
+    "extract_phase",
+    "check_phase",
+    "report_phase",
+    "final_phase",
+];
+
 impl SlangAstLowerer {
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
         let mut calls = Vec::new();
@@ -28,30 +40,22 @@ impl SlangAstLowerer {
             let chain = self
                 .class_chain(&class_key)
                 .map_err(|error| with_source_span(call, error))?;
-            if !chain.iter().any(|(owner, class)| {
-                owner.split('@').next() == Some("uvm_test")
-                    && string_field(class, "source_file")
-                        .and_then(|file| file.split('/').next_back().map(str::to_string))
-                        .as_deref()
-                        == Some("uvm_test.svh")
-            }) {
+            let Some(official_index) = official_uvm_test_index(&chain) else {
                 return Err(with_source_span(
                     call,
                     format!("run_test class '{class_name}' must derive from official uvm_test"),
                 ));
-            }
-            let Some((run_phase, _)) = self.resolve_class_method(&class_key, "run_phase")? else {
+            };
+            let Some(run_phase) = user_phase_method(&chain, official_index, "run_phase") else {
                 return Err(with_source_span(
                     call,
                     format!("run_test class '{class_name}' has no run_phase"),
                 ));
             };
-            if string_field(&run_phase, "subroutineKind").as_deref() != Some("Task")
-                || method_return_type(&run_phase) != "void"
-            {
+            if let Err(error) = validate_bootstrap_phase_method(run_phase, "run_phase") {
                 return Err(with_source_span(
                     call,
-                    format!("run_test class '{class_name}' run_phase must be a void task"),
+                    format!("run_test class '{class_name}' run_phase is invalid: {error}"),
                 ));
             }
             let constructor = chain.iter().find_map(|(_, class)| {
@@ -204,40 +208,101 @@ impl SlangAstLowerer {
             return Err(format!("run_test failed to construct class '{class_name}'"));
         };
 
-        let Some((run_phase, _)) =
-            self.resolve_class_method(&run_object.class_name, "run_phase")?
-        else {
-            return Err(format!("run_test class '{class_name}' has no run_phase"));
-        };
-        let run_phase_address = run_phase
-            .get("addr")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("run_test class '{class_name}' run_phase has no address"))?;
-        let phase_call = json!({
-            "kind": "Call",
-            "subroutine": format!("{run_phase_address} run_phase"),
-            "thisClass": {
-                "kind": "NamedValue",
-                "type": run_object.class_name,
-                "symbol": run_object.object_key,
-            },
-            "arguments": [
-                {
-                    "kind": "NullLiteral",
-                    "type": {
-                        "name": "null",
-                        "kind": "NullType",
-                    },
+        let chain = self.class_chain(&run_object.class_name)?;
+        let official_index = official_uvm_test_index(&chain)
+            .ok_or_else(|| format!("run_test class '{class_name}' is not official UVM"))?;
+        let mut statements = vec![construction];
+        for phase_name in UVM_BOOTSTRAP_PHASES {
+            let Some(method) = user_phase_method(&chain, official_index, phase_name) else {
+                if phase_name == "run_phase" {
+                    return Err(format!("run_test class '{class_name}' has no run_phase"));
+                }
+                continue;
+            };
+            validate_bootstrap_phase_method(method, phase_name).map_err(|error| {
+                format!("run_test class '{class_name}' {phase_name} is invalid: {error}")
+            })?;
+            let method_address = method.get("addr").and_then(Value::as_u64).ok_or_else(|| {
+                format!("run_test class '{class_name}' {phase_name} has no address")
+            })?;
+            let phase_call = json!({
+                "kind": "Call",
+                "subroutine": format!("{method_address} {phase_name}"),
+                "thisClass": {
+                    "kind": "NamedValue",
+                    "type": run_object.class_name,
+                    "symbol": run_object.object_key,
                 },
-            ],
-        });
-        let Some(run_phase_statement) = self.lower_class_task_call(&phase_call)? else {
-            return Err(format!(
-                "run_test failed to execute run_phase for class '{class_name}'"
-            ));
-        };
-        Ok(Some(Stmt::Block(vec![construction, run_phase_statement])))
+                "arguments": [
+                    {
+                        "kind": "NullLiteral",
+                        "type": {
+                            "name": "null",
+                            "kind": "NullType",
+                        },
+                    },
+                ],
+            });
+            let Some(phase_statement) = self.lower_class_task_call(&phase_call)? else {
+                return Err(format!(
+                    "run_test failed to execute {phase_name} for class '{class_name}'"
+                ));
+            };
+            statements.push(phase_statement);
+        }
+        Ok(Some(Stmt::Block(statements)))
     }
+}
+
+fn official_uvm_test_index(chain: &[(String, Value)]) -> Option<usize> {
+    chain.iter().position(|(owner, class)| {
+        owner.split('@').next() == Some("uvm_test")
+            && string_field(class, "source_file")
+                .and_then(|file| file.split('/').next_back().map(str::to_string))
+                .as_deref()
+                == Some("uvm_test.svh")
+    })
+}
+
+fn user_phase_method<'chain>(
+    chain: &'chain [(String, Value)],
+    official_index: usize,
+    phase_name: &str,
+) -> Option<&'chain Value> {
+    chain.iter().take(official_index).find_map(|(_, class)| {
+        class
+            .get("members")
+            .and_then(Value::as_array)
+            .and_then(|members| {
+                members.iter().find(|member| {
+                    string_field(member, "kind").as_deref() == Some("Subroutine")
+                        && string_field(member, "name").as_deref() == Some(phase_name)
+                })
+            })
+    })
+}
+
+fn validate_bootstrap_phase_method(method: &Value, phase_name: &str) -> Result<(), String> {
+    let expected_kind = if phase_name == "run_phase" {
+        "Task"
+    } else {
+        "Function"
+    };
+    if string_field(method, "subroutineKind").as_deref() != Some(expected_kind) {
+        return Err(format!("must be a void {expected_kind}").to_lowercase());
+    }
+    if method_return_type(method) != "void" {
+        return Err("must return void".into());
+    }
+    let empty_arguments = Vec::new();
+    let arguments = method
+        .get("arguments")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_arguments);
+    if arguments.len() != 1 {
+        return Err("must take one uvm_phase argument".into());
+    }
+    Ok(())
 }
 
 fn collect_run_test_calls<'value>(value: &'value Value, calls: &mut Vec<&'value Value>) {
