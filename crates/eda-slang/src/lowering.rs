@@ -385,6 +385,7 @@ pub(super) struct AstUvmInstanceOverride {
 pub(super) struct AstUvmTypeOverride {
     pub(super) original: String,
     pub(super) override_name: String,
+    pub(super) replace: bool,
 }
 
 pub(super) struct AstEventArraySelection {

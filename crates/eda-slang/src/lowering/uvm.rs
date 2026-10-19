@@ -64,12 +64,17 @@ impl SlangAstLowerer {
             {
                 if replace {
                     existing.override_name = override_name;
+                    existing.replace = true;
                 }
             } else {
-                self.uvm_factory_overrides.push(super::AstUvmTypeOverride {
-                    original,
-                    override_name,
-                });
+                self.uvm_factory_overrides.insert(
+                    0,
+                    super::AstUvmTypeOverride {
+                        original,
+                        override_name,
+                        replace,
+                    },
+                );
             }
         }
         for override_call in &instance_override_calls {

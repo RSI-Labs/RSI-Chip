@@ -12472,6 +12472,19 @@ class direct_type_factory_second extends direct_type_factory_base;
   endtask
 endclass
 
+class direct_type_factory_third extends direct_type_factory_base;
+  `uvm_component_utils(direct_type_factory_third)
+
+  function new(string name = "direct_type_factory_third",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    TypeFactoryTrace::stage = 4;
+  endtask
+endclass
+
 module official_uvm_type_factory_probe(output int stage);
   initial begin
     uvm_factory::get().set_type_override_by_type(
@@ -12482,6 +12495,10 @@ module official_uvm_type_factory_probe(output int stage);
       direct_type_factory_base::get_type(),
       direct_type_factory_second::get_type(),
       1'b0
+    );
+    uvm_factory::get().set_type_override_by_type(
+      direct_type_factory_base::get_type(),
+      direct_type_factory_third::get_type()
     );
     run_test("direct_type_factory_base");
     stage = TypeFactoryTrace::stage;
@@ -12501,7 +12518,7 @@ endmodule
     simulator
         .run_until(0)
         .expect("run the type-factory-selected UVM test");
-    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(4));
 }
 
 #[test]
