@@ -209,6 +209,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_factory_override_call(value)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_config_wait_call(value)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_config_set_call(value)? {
             return Ok(Some(statement));
         }

@@ -108,13 +108,16 @@ values in typed scope/field resources, applies the official UVM-no-DPI glob
 subset (`*`, `?`, and the empty global pattern), honors build-time hierarchy
 precedence and runtime/default last-write selection, and resolves conditional
 `get(...)` and `exists(...)` calls, including missing-entry failure branches;
-unsupported non-literal values, spell checking, and direct value-returning
-`get(...)`/`exists(...)` forms fail closed.
+prepared `wait_modified(...)` calls wake when a later matching `set(...)`
+executes. Unsupported non-literal values, spell checking, direct
+value-returning `get(...)`/`exists(...)` forms, and unprepared waiters fail
+closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
-glob/precedence model is not the complete `uvm_resource_db` regex, callback,
-wait-modification, priority API, spell-check, or dynamic resource-pool implementation,
+glob/precedence/wait model is not the complete `uvm_resource_db` regex,
+callback, waiter-pool, priority API, spell-check, or dynamic resource-pool
+implementation,
 there is no parallel phase graph or callback-based objection scheduler, and
 TLM and sequences are not yet executed.
 

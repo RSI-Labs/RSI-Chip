@@ -12718,6 +12718,104 @@ endmodule
 }
 
 #[test]
+fn slang_direct_config_db_wait_modified_wakes_on_matching_set() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-config-db-wait-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ConfigWaitTrace;
+  static int woken = 0;
+  static int value = -1;
+endclass
+
+class direct_config_wait_probe extends uvm_test;
+  int value;
+
+  function new(string name = "direct_config_wait_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    value = -1;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fork
+      begin
+        #10;
+        uvm_config_db#(int)::set(this, "", "value", 42);
+      end
+
+      begin
+        uvm_config_db#(int)::wait_modified(this, "", "value");
+        ConfigWaitTrace::woken = 1;
+        if (!uvm_config_db#(int)::get(
+          this,
+          "",
+          "value",
+          value
+        )) begin
+          ConfigWaitTrace::value = -1;
+        end else begin
+          ConfigWaitTrace::value = value;
+        end
+      end
+    join
+  endtask
+endclass
+
+module official_uvm_config_wait_probe(
+  output int woken,
+  output int value
+);
+  initial begin
+    run_test("direct_config_wait_probe");
+    woken = ConfigWaitTrace::woken;
+    value = ConfigWaitTrace::value;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM config wait wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_config_wait_probe"),
+            &options,
+        )
+        .expect("directly lower a scoped UVM config wait");
+    let mut simulator = Simulator::new(&design).expect("create config wait simulator");
+    simulator
+        .run_until(10)
+        .expect("run until the matching UVM config set");
+    assert_eq!(simulator.read("woken").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("value").unwrap().to_u64(), Some(42));
+}
+
+#[test]
 fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

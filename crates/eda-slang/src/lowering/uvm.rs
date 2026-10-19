@@ -3,7 +3,7 @@
 use super::classes::{class_expr, class_lvalue, method_return_type};
 use super::SlangAstLowerer;
 use crate::ast_util::{bool_field, slang_constant_u64, string_field, with_source_span};
-use eda_core::ir::{BinOp, Expr, Stmt};
+use eda_core::ir::{BinOp, EventEdge, EventWatch, Expr, Stmt};
 use eda_core::logic::LogicWord;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -445,6 +445,7 @@ impl SlangAstLowerer {
             self.class_object_children
                 .borrow_mut()
                 .insert(root_object_key.clone(), vec![object_key.clone()]);
+            self.prepare_uvm_config_waits(&chain, &object_key, handle_address)?;
             let phase_key = format!("{handle_address} __uvm_phase");
             let objection_count = self.declare_class_internal_net(
                 &format!("__uvm_run_test_objections_{handle_address}"),
@@ -480,6 +481,100 @@ impl SlangAstLowerer {
                     objection_drained,
                     objection_timeout,
                     objection_owner_counts,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_uvm_config_waits(
+        &mut self,
+        chain: &[(String, Value)],
+        object_key: &str,
+        handle_address: u64,
+    ) -> Result<(), String> {
+        let mut calls = Vec::new();
+        for (_, class) in chain {
+            let empty_members = Vec::new();
+            let members = class
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            for member in members {
+                let mut nested_calls = Vec::new();
+                collect_uvm_config_wait_calls(member, &mut nested_calls);
+                calls.extend(nested_calls.into_iter().cloned());
+            }
+        }
+        for (index, call) in calls.iter().enumerate() {
+            let Some(type_name) = self.uvm_config_db_type_name(call, "wait_modified") else {
+                continue;
+            };
+            if !matches!(type_name.as_str(), "int" | "string") {
+                return Err(with_source_span(
+                    call,
+                    format!(
+                        "UVM config DB type '{type_name}' is unsupported; expected int or string"
+                    ),
+                ));
+            }
+            let empty_arguments = Vec::new();
+            let arguments = call
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 3 {
+                return Err(with_source_span(
+                    call,
+                    "UVM config DB wait_modified requires three arguments".into(),
+                ));
+            }
+            let context = unwrap_conversion(&arguments[0]);
+            if string_field(context, "kind").as_deref() != Some("NullLiteral")
+                && !is_this_reference(context)
+            {
+                return Err(with_source_span(
+                    call,
+                    "UVM config DB wait_modified supports only null or this contexts".into(),
+                ));
+            }
+            let field_name = string_literal(unwrap_conversion(&arguments[2])).ok_or_else(|| {
+                with_source_span(
+                    call,
+                    "UVM config DB field names must be string literals".into(),
+                )
+            })?;
+            let previous_active = std::mem::take(&mut *self.active_class_objects.borrow_mut());
+            self.active_class_objects
+                .borrow_mut()
+                .push(object_key.to_string());
+            let scope = self.uvm_config_db_scope(
+                unwrap_conversion(&arguments[0]),
+                unwrap_conversion(&arguments[1]),
+            );
+            *self.active_class_objects.borrow_mut() = previous_active;
+            let scope = scope.map_err(|error| with_source_span(call, error))?;
+            let location = source_location(call).ok_or_else(|| {
+                with_source_span(
+                    call,
+                    "UVM config DB wait call has no source location".into(),
+                )
+            })?;
+            let event = self.declare_class_internal_net(
+                &format!("__uvm_config_wait_{handle_address}_{index}"),
+                1,
+            );
+            self.design.initials.push(Stmt::Bl {
+                lv: class_lvalue(&event),
+                e: Expr::Const(LogicWord::zero(1)),
+            });
+            self.uvm_config_waits.borrow_mut().insert(
+                location,
+                super::AstUvmConfigWait {
+                    type_name,
+                    scope: scope.pattern,
+                    field_name,
+                    net: event.base,
                 },
             );
         }
@@ -760,6 +855,62 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_config_wait_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        let Some(type_name) = self.uvm_config_db_type_name(value, "wait_modified") else {
+            return Ok(None);
+        };
+        if !matches!(type_name.as_str(), "int" | "string") {
+            return Err(format!(
+                "UVM config DB type '{type_name}' is unsupported; expected int or string"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 3 {
+            return Err("UVM config DB wait_modified requires three arguments".into());
+        }
+        let context = unwrap_conversion(&arguments[0]);
+        if string_field(context, "kind").as_deref() != Some("NullLiteral")
+            && !is_this_reference(context)
+        {
+            return Err("UVM config DB wait_modified supports only null or this contexts".into());
+        }
+        let scope = self.uvm_config_db_scope(
+            unwrap_conversion(&arguments[0]),
+            unwrap_conversion(&arguments[1]),
+        )?;
+        let field_name = string_literal(unwrap_conversion(&arguments[2]))
+            .ok_or_else(|| "UVM config DB field names must be string literals".to_string())?;
+        let location = source_location(value)
+            .ok_or_else(|| "UVM config DB wait call has no source location".to_string())?;
+        let wait = self.uvm_config_waits.borrow().get(&location).cloned();
+        let Some(wait) = wait else {
+            return Err(with_source_span(
+                value,
+                "UVM config DB wait_modified was not prepared by run_test".into(),
+            ));
+        };
+        if wait.type_name != type_name
+            || wait.scope != scope.pattern
+            || wait.field_name != field_name
+        {
+            return Err(with_source_span(
+                value,
+                "UVM config DB wait_modified changed after run_test preparation".into(),
+            ));
+        }
+        Ok(Some(Stmt::EventWait {
+            watches: vec![EventWatch {
+                net: wait.net,
+                edge: EventEdge::Any,
+            }],
+            body: Box::new(Stmt::Block(Vec::new())),
+        }))
+    }
+
     pub(super) fn lower_uvm_config_set_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
         let Some(type_name) = self.uvm_config_db_type_name(value, "set") else {
             return Ok(None);
@@ -791,6 +942,17 @@ impl SlangAstLowerer {
         ) {
             return Err("UVM config DB bootstrap values must be integer or string literals".into());
         }
+        let triggers = self
+            .uvm_config_waits
+            .borrow()
+            .values()
+            .filter(|wait| {
+                wait.type_name == type_name
+                    && wait.field_name == field_name
+                    && Self::uvm_glob_match(&scope.pattern, &wait.scope)
+            })
+            .map(|wait| Self::uvm_config_event_trigger(wait.net))
+            .collect::<Vec<_>>();
         let mut entries = self.uvm_config_entries.borrow_mut();
         entries.retain(|entry| {
             !(entry.type_name == type_name
@@ -804,7 +966,7 @@ impl SlangAstLowerer {
             precedence,
             value: config_value,
         });
-        Ok(Some(Stmt::Block(Vec::new())))
+        Ok(Some(Stmt::Block(triggers)))
     }
 
     pub(super) fn lower_uvm_config_get_conditional(
@@ -1040,6 +1202,39 @@ impl SlangAstLowerer {
             }
         }
         match_bytes(pattern.as_bytes(), text.as_bytes())
+    }
+
+    fn uvm_config_event_trigger(net: usize) -> Stmt {
+        let range = super::hierarchy::full_range(1);
+        let current = Expr::Ref {
+            net,
+            decl_width: 1,
+            range: range.clone(),
+            signed: false,
+        };
+        let next = Expr::Cond {
+            c: Box::new(Expr::Bin {
+                op: BinOp::CaseEq,
+                a: Box::new(current.clone()),
+                b: Box::new(Expr::Const(LogicWord::new_const(
+                    1,
+                    eda_core::logic::LogicValue::X,
+                ))),
+            }),
+            t: Box::new(Expr::Const(LogicWord::zero(1))),
+            f: Box::new(Expr::Un {
+                op: eda_core::ir::UnOp::Not,
+                a: Box::new(current),
+            }),
+        };
+        Stmt::Bl {
+            lv: eda_core::ir::LValue {
+                net,
+                decl_width: 1,
+                range,
+            },
+            e: next,
+        }
     }
 
     pub(super) fn uvm_config_db_type_name(
@@ -1950,6 +2145,33 @@ fn collect_uvm_timeout_calls<'value>(value: &'value Value, calls: &mut Vec<&'val
     if let Some(values) = value.as_array() {
         for nested in values {
             collect_uvm_timeout_calls(nested, calls);
+        }
+    }
+}
+
+fn collect_uvm_config_wait_calls<'value>(value: &'value Value, calls: &mut Vec<&'value Value>) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine")
+                .and_then(|subroutine| {
+                    subroutine
+                        .split_whitespace()
+                        .next_back()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some("wait_modified")
+        {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_uvm_config_wait_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_uvm_config_wait_calls(nested, calls);
         }
     }
 }

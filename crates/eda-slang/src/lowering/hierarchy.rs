@@ -1070,6 +1070,7 @@ impl super::SlangAstLowerer {
             uvm_factory_overrides: Vec::new(),
             uvm_factory_instance_overrides: Vec::new(),
             uvm_config_entries: std::cell::RefCell::new(Vec::new()),
+            uvm_config_waits: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
