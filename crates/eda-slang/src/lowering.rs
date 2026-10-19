@@ -445,6 +445,8 @@ pub(super) struct SlangAstLowerer {
     runtime_dynamic_class_sources:
         std::cell::RefCell<std::collections::BTreeMap<String, Vec<DynamicClassSource>>>,
     class_object_parent_keys: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    class_object_children: std::cell::RefCell<std::collections::BTreeMap<String, Vec<String>>>,
+    class_object_declared_names: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     initialized_class_objects: std::collections::BTreeSet<String>,
     constructed_class_objects: std::collections::BTreeSet<String>,
     class_object_tags: std::collections::BTreeMap<String, AstLoweredSymbol>,
@@ -592,6 +594,8 @@ impl SlangAstLowerer {
                 std::collections::BTreeMap::new(),
             ),
             class_object_parent_keys: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            class_object_children: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            class_object_declared_names: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             initialized_class_objects: std::collections::BTreeSet::new(),
             constructed_class_objects: std::collections::BTreeSet::new(),
             class_object_tags: std::collections::BTreeMap::new(),

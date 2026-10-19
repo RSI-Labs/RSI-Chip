@@ -94,6 +94,8 @@ official `uvm_factory::get().set_type_override_by_name` and
 `Class::type_id::create(...)` component/object construction through prepared
 class properties, including compatible derived overrides with runtime virtual
 dispatch, preserved constructor names for `get_name()`, parent-qualified `get_full_name()`, and `get_parent()` identity comparison plus checked parent-handle cast.
+It also records prepared children by literal constructor name and supports
+`get_child_by_name(...)` lookup and checked child-handle recovery.
 This is still a bootstrap:
 the registry and timeout are finite, phase objects are synthetic, factory
 overrides are compile-time mappings, there is no parallel phase graph or

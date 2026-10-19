@@ -12728,6 +12728,8 @@ class ComponentNameTrace;
   static string full_name = "";
   static int parent_match = 0;
   static int parent_identity = 0;
+  static int child_match = 0;
+  static int child_identity = 0;
 endclass
 
 class direct_named_component extends uvm_test;
@@ -12740,6 +12742,10 @@ class direct_named_component extends uvm_test;
 
   virtual task run_phase(uvm_phase phase);
   endtask
+
+  virtual function int identity();
+    return 3;
+  endfunction
 endclass
 
 class direct_named_base extends uvm_test;
@@ -12756,6 +12762,7 @@ class direct_named_component_env extends direct_named_base;
   `uvm_component_utils(direct_named_component_env)
 
   direct_named_component component;
+  direct_named_component recovered_child;
   direct_named_base parent_handle;
 
   function new(string name = "direct_named_component_env",
@@ -12789,7 +12796,9 @@ module official_uvm_component_name_probe(
   output string name,
   output string full_name,
   output int parent_match,
-  output int parent_identity
+  output int parent_identity,
+  output int child_match,
+  output int child_identity
 );
   initial begin
     run_test("direct_named_component_env");
@@ -12797,6 +12806,8 @@ module official_uvm_component_name_probe(
     full_name = ComponentNameTrace::full_name;
     parent_match = ComponentNameTrace::parent_match;
     parent_identity = ComponentNameTrace::parent_identity;
+    child_match = ComponentNameTrace::child_match;
+    child_identity = ComponentNameTrace::child_identity;
   end
 endmodule
 "#,
