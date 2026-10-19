@@ -18,6 +18,7 @@ struct ClassMethodCandidate {
 }
 
 struct DynamicClassArraySelection {
+    base_key: String,
     selector: Expr,
     elements: Vec<(i64, String)>,
 }
@@ -100,7 +101,11 @@ impl SlangAstLowerer {
             .iter()
             .map(|(index, key)| (*index, key.clone()))
             .collect();
-        Ok(Some(DynamicClassArraySelection { selector, elements }))
+        Ok(Some(DynamicClassArraySelection {
+            base_key,
+            selector,
+            elements,
+        }))
     }
 
     fn class_array_element_receiver(element_key: &str, value: &Value) -> Value {
@@ -291,6 +296,29 @@ impl SlangAstLowerer {
         let Some(right) = assignment.get("right") else {
             return Ok(());
         };
+        if string_field(left, "kind").as_deref() == Some("ElementSelect")
+            && string_field(right, "kind").as_deref() == Some("NewClass")
+        {
+            if let Some(selected) = left.get("value") {
+                if let (Some(base_key), Some(type_name), Some(selector)) = (
+                    string_field(selected, "symbol"),
+                    string_field(selected, "type"),
+                    left.get("selector"),
+                ) {
+                    if constant_selector(selector).is_none() {
+                        for index in class_array_indexes(&type_name)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flatten()
+                        {
+                            let element_key = format!("{base_key}[{index}]");
+                            self.initialized_class_objects.insert(element_key.clone());
+                            self.constructed_class_objects.insert(element_key);
+                        }
+                    }
+                }
+            }
+        }
         let Some((target_key, target_class)) = named_class_handle(left) else {
             return Ok(());
         };
@@ -391,6 +419,47 @@ impl SlangAstLowerer {
                 "class object array '{name}' has {} elements; the direct path supports at most {MAX_CLASS_ARRAY_ELEMENTS}",
                 indexes.len()
             ));
+        }
+        if indexes.iter().any(Option::is_some) {
+            let empty_members = Vec::new();
+            let constructor = chain.iter().find_map(|(_, class)| {
+                class
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_members)
+                    .iter()
+                    .find(|member| {
+                        string_field(member, "kind").as_deref() == Some("Subroutine")
+                            && string_field(member, "name").as_deref() == Some("new")
+                    })
+                    .cloned()
+            });
+            if let Some(constructor) = constructor {
+                let empty_arguments = Vec::new();
+                let formals = constructor
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_arguments);
+                let mut temps = Vec::new();
+                for (position, formal) in formals.iter().enumerate() {
+                    let address = formal
+                        .get("addr")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(position as u64);
+                    let type_name = string_field(formal, "type").unwrap_or_default();
+                    let (shape, signed, _) = self.net_type(&type_name)?;
+                    let mut temporary = self.declare_class_internal_net(
+                        &format!("__class_array_new_{handle_address}_{address}"),
+                        shape.width,
+                    );
+                    temporary.signed = signed;
+                    let symbol_name = format!("__class_array_new_value_{handle_address}_{address}");
+                    self.symbols.insert(symbol_name.clone(), temporary.clone());
+                    temps.push((symbol_name, temporary));
+                }
+                self.class_array_constructor_temps
+                    .insert(base_object_key.clone(), temps);
+            }
         }
         let mut array_elements = BTreeMap::new();
         for index in indexes {
@@ -535,6 +604,83 @@ impl SlangAstLowerer {
         let Some(left) = assignment.get("left") else {
             return Ok(None);
         };
+        if let Some(DynamicClassArraySelection {
+            base_key,
+            selector,
+            elements,
+        }) = self.dynamic_class_array_selection(left)?
+        {
+            let constructor_call = right
+                .get("constructorCall")
+                .ok_or_else(|| "class construction has no constructor call".to_string())?;
+            let empty_arguments = Vec::new();
+            let actuals = constructor_call
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            let temps = self
+                .class_array_constructor_temps
+                .get(&base_key)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("class object array '{base_key}' has no sampled constructor storage")
+                })?;
+            if actuals.len() != temps.len() {
+                return Err(format!(
+                    "class object array '{base_key}' constructor expects {} arguments, found {}",
+                    temps.len(),
+                    actuals.len()
+                ));
+            }
+
+            let mut statements = Vec::new();
+            let mut sampled_actuals = Vec::new();
+            for ((symbol_name, temporary), actual) in temps.iter().zip(actuals) {
+                let expression = self.lower_expression(actual)?;
+                statements.push(Stmt::Bl {
+                    lv: class_lvalue(temporary),
+                    e: expression,
+                });
+                sampled_actuals.push(json!({
+                    "kind": "NamedValue",
+                    "type": string_field(actual, "type").unwrap_or_default(),
+                    "symbol": symbol_name,
+                }));
+            }
+
+            for (index, element_key) in elements {
+                let mut specialized = assignment.clone();
+                let Some(right) = specialized.get_mut("right") else {
+                    continue;
+                };
+                let Some(constructor_call) = right.get_mut("constructorCall") else {
+                    continue;
+                };
+                if let Some(arguments) = constructor_call
+                    .get_mut("arguments")
+                    .and_then(Value::as_array_mut)
+                {
+                    for (argument, sampled) in arguments.iter_mut().zip(sampled_actuals.iter()) {
+                        *argument = sampled.clone();
+                    }
+                }
+                if let Some(fields) = specialized.as_object_mut() {
+                    fields.insert(
+                        "left".into(),
+                        Self::class_array_element_receiver(&element_key, left),
+                    );
+                }
+                let Some(statement) = self.lower_class_constructor(&specialized)? else {
+                    continue;
+                };
+                statements.push(Stmt::If {
+                    c: Self::class_array_condition(&selector, index),
+                    t: Box::new(statement),
+                    f: None,
+                });
+            }
+            return Ok(Some(Stmt::Block(statements)));
+        }
         let Some(object_key) = self.class_object_key_for_value(left)? else {
             return Ok(None);
         };
@@ -589,8 +735,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        if let Some(DynamicClassArraySelection { selector, elements }) =
-            self.dynamic_class_array_selection(receiver)?
+        if let Some(DynamicClassArraySelection {
+            selector, elements, ..
+        }) = self.dynamic_class_array_selection(receiver)?
         {
             let mut statements = Vec::new();
             for (index, element_key) in elements {
@@ -677,8 +824,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        if let Some(DynamicClassArraySelection { selector, elements }) =
-            self.dynamic_class_array_selection(receiver)?
+        if let Some(DynamicClassArraySelection {
+            selector, elements, ..
+        }) = self.dynamic_class_array_selection(receiver)?
         {
             let mut candidates = Vec::new();
             for (index, element_key) in elements {
@@ -802,6 +950,76 @@ impl SlangAstLowerer {
         left: &Value,
         right: &Value,
     ) -> Result<Option<Stmt>, String> {
+        if string_field(left, "kind").as_deref() == Some("MemberAccess") {
+            if let Some(receiver) = left.get("value") {
+                if let Some(DynamicClassArraySelection {
+                    selector, elements, ..
+                }) = self.dynamic_class_array_selection(receiver)?
+                {
+                    let field_name = string_field(left, "member")
+                        .and_then(|member| {
+                            member.split_whitespace().next_back().map(str::to_string)
+                        })
+                        .ok_or_else(|| "class property target has no member name".to_string())?;
+                    let Some((_, first_key)) = elements.first() else {
+                        return Ok(None);
+                    };
+                    self.require_initialized_class_object(first_key)?;
+                    let expression = self.lower_expression(right)?;
+                    let nonblocking = bool_field(assignment, "isNonBlocking");
+                    let temporary = self
+                        .class_property_temps
+                        .get(&(first_key.clone(), field_name.clone()))
+                        .ok_or_else(|| {
+                            format!("class property '{first_key}.{field_name}' has no temporary")
+                        })?
+                        .clone();
+                    let sampled_expression = class_expr(&temporary);
+                    let mut statements = vec![Stmt::Bl {
+                        lv: class_lvalue(&temporary),
+                        e: expression,
+                    }];
+
+                    for (index, element_key) in &elements {
+                        self.require_initialized_class_object(element_key)?;
+                        let Some(fields) = self.class_objects.get(element_key) else {
+                            continue;
+                        };
+                        let Some(symbol) = fields.get(&field_name) else {
+                            continue;
+                        };
+                        let mut body = vec![class_field_assignment(
+                            symbol,
+                            &sampled_expression,
+                            nonblocking,
+                        )];
+                        for related_key in self.related_class_handles(element_key) {
+                            let Some(related_fields) = self.class_objects.get(&related_key) else {
+                                continue;
+                            };
+                            let Some(related_symbol) = related_fields.get(&field_name) else {
+                                continue;
+                            };
+                            body.push(Stmt::If {
+                                c: self.class_alias_condition(element_key, &related_key),
+                                t: Box::new(class_field_assignment(
+                                    related_symbol,
+                                    &sampled_expression,
+                                    nonblocking,
+                                )),
+                                f: None,
+                            });
+                        }
+                        statements.push(Stmt::If {
+                            c: Self::class_array_condition(&selector, *index),
+                            t: Box::new(Stmt::Block(body)),
+                            f: None,
+                        });
+                    }
+                    return Ok(Some(Stmt::Block(statements)));
+                }
+            }
+        }
         let Some((object_key, field_name, symbol)) = self.class_property_target(left)? else {
             return Ok(None);
         };
@@ -830,33 +1048,10 @@ impl SlangAstLowerer {
             let Some(related_symbol) = related_fields.get(&field_name) else {
                 continue;
             };
-            let Some(related_id) = self.class_object_ids.get(&related_key) else {
+            if !self.class_object_ids.contains_key(&related_key) {
                 continue;
-            };
-            let object_id = &self.class_object_ids[&object_key];
-            let object_tag = &self.class_object_tags[&object_key];
-            let related_tag = &self.class_object_tags[&related_key];
-            let condition = Expr::Bin {
-                op: BinOp::LogAnd,
-                a: Box::new(Expr::Bin {
-                    op: BinOp::LogAnd,
-                    a: Box::new(Expr::Bin {
-                        op: BinOp::Ne,
-                        a: Box::new(class_expr(object_id)),
-                        b: Box::new(Expr::Const(LogicWord::zero(object_id.width))),
-                    }),
-                    b: Box::new(Expr::Bin {
-                        op: BinOp::Eq,
-                        a: Box::new(class_expr(object_id)),
-                        b: Box::new(class_expr(related_id)),
-                    }),
-                }),
-                b: Box::new(Expr::Bin {
-                    op: BinOp::Eq,
-                    a: Box::new(class_expr(object_tag)),
-                    b: Box::new(class_expr(related_tag)),
-                }),
-            };
+            }
+            let condition = self.class_alias_condition(&object_key, &related_key);
             statements.push(Stmt::If {
                 c: condition,
                 t: Box::new(class_field_assignment(
@@ -941,6 +1136,34 @@ impl SlangAstLowerer {
         visited.into_iter().collect()
     }
 
+    fn class_alias_condition(&self, object_key: &str, related_key: &str) -> Expr {
+        let object_id = &self.class_object_ids[object_key];
+        let object_tag = &self.class_object_tags[object_key];
+        let related_id = &self.class_object_ids[related_key];
+        let related_tag = &self.class_object_tags[related_key];
+        Expr::Bin {
+            op: BinOp::LogAnd,
+            a: Box::new(Expr::Bin {
+                op: BinOp::LogAnd,
+                a: Box::new(Expr::Bin {
+                    op: BinOp::Ne,
+                    a: Box::new(class_expr(object_id)),
+                    b: Box::new(Expr::Const(LogicWord::zero(object_id.width))),
+                }),
+                b: Box::new(Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(class_expr(object_id)),
+                    b: Box::new(class_expr(related_id)),
+                }),
+            }),
+            b: Box::new(Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(class_expr(object_tag)),
+                b: Box::new(class_expr(related_tag)),
+            }),
+        }
+    }
+
     fn require_initialized_class_object(&self, object_key: &str) -> Result<(), String> {
         if self.initialized_class_objects.contains(object_key) {
             Ok(())
@@ -972,8 +1195,9 @@ impl SlangAstLowerer {
         let Some(receiver) = value.get("value") else {
             return Ok(None);
         };
-        if let Some(DynamicClassArraySelection { selector, elements }) =
-            self.dynamic_class_array_selection(receiver)?
+        if let Some(DynamicClassArraySelection {
+            selector, elements, ..
+        }) = self.dynamic_class_array_selection(receiver)?
         {
             let mut candidates = Vec::new();
             for (index, element_key) in elements {

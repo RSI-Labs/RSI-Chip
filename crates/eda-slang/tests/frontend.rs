@@ -303,80 +303,101 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_rejects_dynamic_class_array_writes_for_now() {
+fn slang_ast_direct_lowering_supports_dynamic_class_array_writes() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-class-array-write");
-    let constructor_path = root.join("dynamic_class_array_constructor.sv");
+    let source_path = root.join("dynamic_class_array_write.sv");
     std::fs::write(
-        &constructor_path,
+        &source_path,
         r#"
+class Factory;
+  static int calls = 0;
+
+  static function int next(int value);
+    calls = calls + 1;
+    return value;
+  endfunction
+endclass
+
 class Item;
   int value;
 
   function new(int v);
     value = v;
   endfunction
+
+  function int get();
+    return value;
+  endfunction
 endclass
 
-module dynamic_constructor_top(
+module dynamic_class_array_write_top(
   input int selector,
-  input int v
+  input int v,
+  output int constructor_result,
+  output int property_result,
+  output int call_count
 );
   Item items[0:1];
 
   initial begin
-    items[selector] = new(v);
+    #1;
+    items[selector] = new(Factory::next(v));
+    items[selector].value = v + 23;
+    constructor_result = items[selector].get();
+    property_result = items[selector].value;
+    call_count = Factory::calls;
   end
 endmodule
 "#,
     )
-    .expect("write dynamic class-array constructor source");
-    let constructor_error = slang
+    .expect("write dynamic class-array write source");
+
+    let design = slang
         .compile_files_via_ast(
-            std::slice::from_ref(&constructor_path),
-            Some("dynamic_constructor_top"),
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_array_write_top"),
             &PreprocessOptions::default(),
         )
-        .expect_err("dynamic class-array construction must fail closed");
-    assert!(
-        constructor_error.contains("dynamic class-array element selection"),
-        "unexpected dynamic constructor error: {constructor_error}"
+        .expect("directly lower dynamic class-array writes");
+    let mut simulator =
+        Simulator::new(&design).expect("create dynamic class-array-write simulator");
+    simulator
+        .set_input("selector", &LogicWord::from_u64(32, 1))
+        .unwrap();
+    simulator
+        .set_input("v", &LogicWord::from_u64(32, 19))
+        .unwrap();
+    simulator
+        .run_until(1)
+        .expect("run dynamic class-array-write initial block");
+    assert_eq!(
+        simulator.read("constructor_result").unwrap().to_u64(),
+        Some(42)
+    );
+    assert_eq!(
+        simulator.read("property_result").unwrap().to_u64(),
+        Some(42)
     );
 
-    let property_path = root.join("dynamic_class_array_property.sv");
-    std::fs::write(
-        &property_path,
-        r#"
-class Item;
-  int value;
-endclass
-
-module dynamic_property_top(
-  input int selector,
-  input int v
-);
-  Item items[0:1];
-
-  initial begin
-    items[selector].value = v;
-  end
-endmodule
-"#,
-    )
-    .expect("write dynamic class-array property source");
-    let property_error = slang
-        .compile_files_via_ast(
-            std::slice::from_ref(&property_path),
-            Some("dynamic_property_top"),
-            &PreprocessOptions::default(),
-        )
-        .expect_err("dynamic class-array property writes must fail closed");
-    assert!(
-        property_error.contains("dynamic class-array element selection"),
-        "unexpected dynamic property error: {property_error}"
+    let mut out_of_range =
+        Simulator::new(&design).expect("create out-of-range dynamic class-array-write simulator");
+    out_of_range
+        .set_input("selector", &LogicWord::from_u64(32, 2))
+        .unwrap();
+    out_of_range
+        .set_input("v", &LogicWord::from_u64(32, 19))
+        .unwrap();
+    out_of_range
+        .run_until(1)
+        .expect("run out-of-range dynamic class-array-write initial block");
+    assert_eq!(
+        out_of_range.read("constructor_result").unwrap().to_u64(),
+        None
     );
+    assert_eq!(out_of_range.read("property_result").unwrap().to_u64(), None);
 }
 
 #[test]
