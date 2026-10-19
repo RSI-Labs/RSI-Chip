@@ -91,7 +91,10 @@ impl SlangAstLowerer {
         base_name
     }
 
-    fn class_object_key_for_value(&self, value: &Value) -> Result<Option<String>, String> {
+    pub(super) fn class_object_key_for_value(
+        &self,
+        value: &Value,
+    ) -> Result<Option<String>, String> {
         match string_field(value, "kind").as_deref() {
             Some("NamedValue" | "HierarchicalValue") => {
                 Ok(string_field(value, "symbol").filter(|symbol_key| {

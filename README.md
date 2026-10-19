@@ -83,11 +83,11 @@ The official Accellera UVM 2020.3.1 source direct-lowers with `UVM_NO_DPI`.
 A class derived from official `uvm_test` can be explicitly constructed with its
 overridden `run_phase` executed, and a minimal `run_test("class")` entry can
 construct such a class and sequentially execute its user-overridden common phase
-methods. Its bootstrap phase object supports balanced constant-count
-`raise_objection`/`drop_objection` calls and rejects an undrained `run_phase`.
-This is still a bootstrap: phase arguments are synthetic, there is no parallel
-phase graph or per-owner objection model, and factories, TLM, and sequences are
-not yet executed.
+methods. Its bootstrap phase object supports constant-count
+`raise_objection`/`drop_objection` calls, per-owner counts for prepared class
+objects, and rejection of undrained or wrong-owner objections. This is still a
+bootstrap: phase objects are synthetic, there is no parallel phase graph or
+dynamic owner registry, and factories, TLM, and sequences are not yet executed.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit

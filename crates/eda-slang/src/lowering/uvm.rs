@@ -6,6 +6,7 @@ use crate::ast_util::{slang_constant_u64, string_field, with_source_span};
 use eda_core::ir::{BinOp, Expr, Stmt};
 use eda_core::logic::LogicWord;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 const UVM_BOOTSTRAP_PHASES: [&str; 9] = [
     "build_phase",
@@ -132,6 +133,20 @@ impl SlangAstLowerer {
                 &format!("__uvm_run_test_objections_{handle_address}"),
                 32,
             );
+            let owner_keys = self.uvm_objection_owner_keys(&object_key);
+            let mut objection_owner_counts = BTreeMap::new();
+            for (owner_index, owner_key) in owner_keys.into_iter().enumerate() {
+                let owner_address = owner_key
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .replace(['[', ']'], "_");
+                let count = self.declare_class_internal_net(
+                    &format!("__uvm_objection_owner_{owner_address}_{owner_index}"),
+                    32,
+                );
+                objection_owner_counts.insert(owner_key, count);
+            }
             self.initialized_class_objects.insert(object_key.clone());
             self.run_test_objects.insert(
                 class_name,
@@ -140,6 +155,7 @@ impl SlangAstLowerer {
                     object_key,
                     phase_key,
                     objection_count,
+                    objection_owner_counts,
                 },
             );
         }
@@ -219,13 +235,17 @@ impl SlangAstLowerer {
         let chain = self.class_chain(&run_object.class_name)?;
         let official_index = official_uvm_test_index(&chain)
             .ok_or_else(|| format!("run_test class '{class_name}' is not official UVM"))?;
-        let mut statements = vec![
-            construction,
-            Stmt::Bl {
-                lv: class_lvalue(&run_object.objection_count),
+        let mut statements = vec![construction];
+        statements.push(Stmt::Bl {
+            lv: class_lvalue(&run_object.objection_count),
+            e: Expr::Const(LogicWord::zero(32)),
+        });
+        for owner_count in run_object.objection_owner_counts.values() {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(owner_count),
                 e: Expr::Const(LogicWord::zero(32)),
-            },
-        ];
+            });
+        }
         for phase_name in UVM_BOOTSTRAP_PHASES {
             let Some(method) = user_phase_method(&chain, official_index, phase_name) else {
                 if phase_name == "run_phase" {
@@ -270,6 +290,18 @@ impl SlangAstLowerer {
                     },
                     message: Some("run_phase completed with raised UVM objections".into()),
                 });
+                for owner_count in run_object.objection_owner_counts.values() {
+                    statements.push(Stmt::Assert {
+                        cond: Expr::Bin {
+                            op: BinOp::Eq,
+                            a: Box::new(class_expr(owner_count)),
+                            b: Box::new(Expr::Const(LogicWord::zero(32))),
+                        },
+                        message: Some(
+                            "run_phase completed with a per-owner UVM objection imbalance".into(),
+                        ),
+                    });
+                }
             }
         }
         Ok(Some(Stmt::Block(statements)))
@@ -282,13 +314,7 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        let mut receiver = receiver;
-        while string_field(receiver, "kind").as_deref() == Some("Conversion") {
-            let Some(operand) = receiver.get("operand") else {
-                break;
-            };
-            receiver = operand;
-        }
+        let receiver = unwrap_conversion(receiver);
         let Some(phase_key) = string_field(receiver, "symbol") else {
             return Ok(None);
         };
@@ -321,7 +347,25 @@ impl SlangAstLowerer {
                 arguments.len()
             ));
         }
-        let current = class_expr(&run_object.objection_count);
+
+        let owner_argument = unwrap_conversion(&arguments[0]);
+        let owner_key = match self.class_object_key_for_value(owner_argument)? {
+            Some(owner_key) => owner_key,
+            None if is_this_reference(owner_argument) => run_object.object_key.clone(),
+            None => {
+                return Err(
+                    "UVM bootstrap objection owner must be a known class object or this".into(),
+                )
+            }
+        };
+        let owner_count = run_object
+            .objection_owner_counts
+            .get(&owner_key)
+            .cloned()
+            .ok_or_else(|| {
+                format!("UVM bootstrap objection owner '{owner_key}' was not prepared")
+            })?;
+
         let delta_value = match arguments.get(2) {
             Some(count) => slang_constant_u64(count)?,
             None => 1,
@@ -334,44 +378,118 @@ impl SlangAstLowerer {
         }
         let delta_value = u32::try_from(delta_value).expect("checked UVM objection count");
         let delta = Expr::Const(LogicWord::from_u64(32, u64::from(delta_value)));
-        let next = match method_name.as_str() {
-            "raise_objection" => Expr::Bin {
-                op: BinOp::Add,
-                a: Box::new(current.clone()),
-                b: Box::new(delta.clone()),
-            },
-            _ => Expr::Bin {
-                op: BinOp::Sub,
-                a: Box::new(current.clone()),
-                b: Box::new(delta.clone()),
-            },
+        let add = method_name == "raise_objection";
+        let total_current = class_expr(&run_object.objection_count);
+        let owner_current = class_expr(&owner_count);
+        let (next_total, next_owner) = if add {
+            (
+                Expr::Bin {
+                    op: BinOp::Add,
+                    a: Box::new(total_current.clone()),
+                    b: Box::new(delta.clone()),
+                },
+                Expr::Bin {
+                    op: BinOp::Add,
+                    a: Box::new(owner_current.clone()),
+                    b: Box::new(delta),
+                },
+            )
+        } else {
+            (
+                Expr::Bin {
+                    op: BinOp::Sub,
+                    a: Box::new(total_current.clone()),
+                    b: Box::new(delta.clone()),
+                },
+                Expr::Bin {
+                    op: BinOp::Sub,
+                    a: Box::new(owner_current.clone()),
+                    b: Box::new(delta),
+                },
+            )
         };
-        let (boundary_op, boundary) = if method_name == "raise_objection" {
+        let (boundary_op, boundary) = if add {
             (BinOp::Gt, u32::MAX - delta_value)
         } else {
             (BinOp::Lt, delta_value)
         };
-        let message = if method_name == "raise_objection" {
+        let boundary = Expr::Const(LogicWord::from_u64(32, u64::from(boundary)));
+        let total_invalid = Expr::Bin {
+            op: boundary_op,
+            a: Box::new(total_current),
+            b: Box::new(boundary.clone()),
+        };
+        let owner_invalid = Expr::Bin {
+            op: boundary_op,
+            a: Box::new(owner_current),
+            b: Box::new(boundary),
+        };
+        let invalid = Expr::Bin {
+            op: BinOp::LogOr,
+            a: Box::new(owner_invalid),
+            b: Box::new(total_invalid),
+        };
+        let message = if add {
             "UVM bootstrap objection counter overflowed".to_string()
         } else {
-            "UVM bootstrap dropped an objection that was not raised".to_string()
+            format!("UVM bootstrap owner '{owner_key}' dropped an objection it did not own")
         };
         Ok(Some(Stmt::If {
-            c: Expr::Bin {
-                op: boundary_op,
-                a: Box::new(current),
-                b: Box::new(Expr::Const(LogicWord::from_u64(32, u64::from(boundary)))),
-            },
+            c: invalid,
             t: Box::new(Stmt::Assert {
                 cond: Expr::Const(LogicWord::zero(1)),
                 message: Some(message),
             }),
-            f: Some(Box::new(Stmt::Bl {
-                lv: class_lvalue(&run_object.objection_count),
-                e: next,
-            })),
+            f: Some(Box::new(Stmt::Block(vec![
+                Stmt::Bl {
+                    lv: class_lvalue(&run_object.objection_count),
+                    e: next_total,
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&owner_count),
+                    e: next_owner,
+                },
+            ]))),
         }))
     }
+
+    fn uvm_objection_owner_keys(&self, root: &str) -> Vec<String> {
+        let mut pending = vec![root.to_string()];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(object_key) = pending.pop() {
+            if !visited.insert(object_key.clone()) {
+                continue;
+            }
+            if let Some(elements) = self.class_object_arrays.get(&object_key) {
+                pending.extend(elements.values().cloned());
+            }
+            pending.extend(
+                self.class_composition_children
+                    .iter()
+                    .filter(|((parent, _), _)| parent == &object_key)
+                    .map(|(_, child)| child.clone()),
+            );
+        }
+        visited.into_iter().collect()
+    }
+}
+
+fn unwrap_conversion(mut value: &Value) -> &Value {
+    while string_field(value, "kind").as_deref() == Some("Conversion") {
+        let Some(operand) = value.get("operand") else {
+            break;
+        };
+        value = operand;
+    }
+    value
+}
+
+fn is_this_reference(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("NamedValue")
+        && string_field(value, "symbol")
+            .and_then(|symbol| symbol.split_whitespace().next_back().map(str::to_string))
+            .as_deref()
+            == Some("this")
 }
 
 fn official_uvm_test_index(chain: &[(String, Value)]) -> Option<usize> {

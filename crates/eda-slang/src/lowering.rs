@@ -370,6 +370,7 @@ pub(super) struct AstRunTestObject {
     pub(super) object_key: String,
     pub(super) phase_key: String,
     pub(super) objection_count: AstLoweredSymbol,
+    pub(super) objection_owner_counts: std::collections::BTreeMap<String, AstLoweredSymbol>,
 }
 
 pub(super) struct AstEventArraySelection {

@@ -12053,6 +12053,82 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_tracks_objections_by_owner() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-owner-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_other_object extends uvm_test;
+  function new(string name = "direct_other_object", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+
+class direct_owner_probe extends uvm_test;
+  direct_other_object other;
+
+  function new(string name = "direct_owner_probe", uvm_component parent = null);
+    super.new(name, parent);
+    other = new("direct_other_object", null);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(other);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_owner_probe;
+  initial begin
+    run_test("direct_owner_probe");
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM owner wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_owner_probe"),
+            &options,
+        )
+        .expect("directly lower a per-owner objection test");
+    let mut simulator = Simulator::new(&design).expect("create per-owner objection simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("dropping another owner's objection must fail closed");
+    assert!(
+        error.contains("dropped an objection it did not own"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_validates_the_repository_cpu_rtl_compilation_units() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
