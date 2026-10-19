@@ -1736,6 +1736,11 @@ impl SlangAstLowerer {
         if self.is_external_input_lvalue(left)? {
             return Err("modport input variable cannot be assigned directly".into());
         }
+        if let Some(statement) =
+            self.lower_uvm_factory_create_assignment(assignment, left, right)?
+        {
+            return Ok(statement);
+        }
         if let Some(statement) = self.lower_class_null_assignment(assignment)? {
             return Ok(statement);
         }

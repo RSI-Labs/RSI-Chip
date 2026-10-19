@@ -12299,6 +12299,100 @@ endmodule
 }
 
 #[test]
+fn slang_direct_component_registry_creates_a_component() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-create-component-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class CreateTrace;
+  static int stage = 0;
+endclass
+
+class direct_created_component extends uvm_test;
+  `uvm_component_utils(direct_created_component)
+
+  function new(string name = "direct_created_component",
+               uvm_component parent = null);
+    super.new(name, parent);
+    CreateTrace::stage = 7;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+class direct_component_creator extends uvm_test;
+  `uvm_component_utils(direct_component_creator)
+
+  direct_created_component component;
+
+  function new(string name = "direct_component_creator",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    component = direct_created_component::type_id::create(
+      "component",
+      this
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+  endtask
+endclass
+
+module official_uvm_create_component_probe(output int stage);
+  initial begin
+    run_test("direct_component_creator");
+    stage = CreateTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM create-component wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_create_component_probe"),
+            &options,
+        )
+        .expect("directly lower a factory component creation");
+    let mut simulator = Simulator::new(&design).expect("create factory component simulator");
+    simulator
+        .run_until(0)
+        .expect("run build_phase and the factory-created component constructor");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(7));
+}
+
+#[test]
 fn slang_direct_run_test_rejects_incompatible_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

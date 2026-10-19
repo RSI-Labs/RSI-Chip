@@ -2,7 +2,7 @@
 
 use super::classes::{class_expr, class_lvalue, method_return_type};
 use super::SlangAstLowerer;
-use crate::ast_util::{slang_constant_u64, string_field, with_source_span};
+use crate::ast_util::{bool_field, slang_constant_u64, string_field, with_source_span};
 use eda_core::ir::{BinOp, Expr, Stmt};
 use eda_core::logic::LogicWord;
 use serde_json::{json, Value};
@@ -430,6 +430,144 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_factory_create_assignment(
+        &self,
+        assignment: &Value,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let direct_factory_call = is_uvm_factory_create_component_call(right);
+        let registry_create_call = is_uvm_registry_create_call(right);
+        if !direct_factory_call && !registry_create_call {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let (requested_name, name_argument, parent_argument) = if direct_factory_call {
+            if arguments.len() != 4 {
+                return Err("UVM factory create_component_by_type requires four arguments".into());
+            }
+            string_literal(unwrap_conversion(&arguments[1]))
+                .ok_or_else(|| "UVM factory parent path must be a string literal".to_string())?;
+            (
+                wrapper_type_name(&arguments[0]).ok_or_else(|| {
+                    "UVM factory requested component type must be Class::get_type()".to_string()
+                })?,
+                &arguments[2],
+                &arguments[3],
+            )
+        } else {
+            if arguments.len() < 2 || arguments.len() > 3 {
+                return Err("UVM component registry create requires two or three arguments".into());
+            }
+            if let Some(context) = arguments.get(2) {
+                string_literal_allow_empty(unwrap_conversion(context)).ok_or_else(|| {
+                    "UVM component registry context must be a string literal".to_string()
+                })?;
+            }
+            (
+                registry_create_class_name(right, &self.class_definitions).ok_or_else(|| {
+                    "UVM component registry create could not resolve its requested class"
+                        .to_string()
+                })?,
+                &arguments[0],
+                &arguments[1],
+            )
+        };
+        string_literal(unwrap_conversion(name_argument))
+            .ok_or_else(|| "UVM factory component name must be a string literal".to_string())?;
+
+        let mut selected_name = requested_name.clone();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(override_name) = self.uvm_factory_overrides.get(&selected_name).cloned() {
+            if !visited.insert(selected_name.clone()) {
+                return Err(format!(
+                    "UVM factory override cycle at '{selected_name}' while creating a component"
+                ));
+            }
+            selected_name = override_name;
+        }
+        let selected_key = self.class_type_key(&selected_name);
+        let Some(target_key) = self.class_object_key_for_value(left)? else {
+            return Err(with_source_span(
+                assignment,
+                "UVM factory component assignment target is not a prepared class object".into(),
+            ));
+        };
+        let target_class = self
+            .class_object_types
+            .get(&target_key)
+            .cloned()
+            .ok_or_else(|| format!("unknown UVM factory component target '{target_key}'"))?;
+        let selected_base = selected_key.split('@').next().unwrap_or(&selected_key);
+        let target_base = target_class.split('@').next().unwrap_or(&target_class);
+        if selected_key != target_class && selected_base != target_base {
+            return Err(with_source_span(
+                assignment,
+                format!(
+                    "UVM factory create selected '{selected_name}', which does not match prepared target type '{target_class}'"
+                ),
+            ));
+        }
+        let constructor = self
+            .class_chain(&selected_key)?
+            .iter()
+            .find_map(|(_, class)| {
+                let empty_members = Vec::new();
+                class
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_members)
+                    .iter()
+                    .find(|member| {
+                        string_field(member, "kind").as_deref() == Some("Subroutine")
+                            && string_field(member, "name").as_deref() == Some("new")
+                    })
+                    .cloned()
+            })
+            .ok_or_else(|| format!("UVM factory class '{selected_name}' has no constructor"))?;
+        let empty_formals = Vec::new();
+        let formals = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_formals);
+        if formals.len() != 2 {
+            return Err(format!(
+                "UVM factory component class '{selected_name}' must have two constructor arguments"
+            ));
+        }
+        let constructor_address =
+            constructor
+                .get("addr")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!("UVM factory class '{selected_name}' constructor has no address")
+                })?;
+        let construction = json!({
+            "kind": "Assignment",
+            "left": left,
+            "right": {
+                "kind": "NewClass",
+                "type": selected_key,
+                "isSuperClass": false,
+                "constructorCall": {
+                    "kind": "Call",
+                    "subroutine": format!("{constructor_address} new"),
+                    "arguments": [
+                        name_argument.clone(),
+                        parent_argument.clone(),
+                    ],
+                },
+            },
+            "isNonBlocking": bool_field(assignment, "isNonBlocking"),
+        });
+        self.lower_class_constructor(&construction)?
+            .map(Some)
+            .ok_or_else(|| format!("UVM factory failed to construct '{selected_name}'"))
+    }
     pub(super) fn lower_uvm_phase_objection_call(
         &self,
         call: &Value,
@@ -797,6 +935,93 @@ fn is_uvm_factory_override_call(value: &Value) -> bool {
         })
 }
 
+fn is_uvm_factory_create_component_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("create_component_by_type")
+        && value.get("thisClass").is_some_and(|receiver| {
+            string_field(receiver, "kind").as_deref() == Some("Call")
+                && string_field(receiver, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("get")
+                && string_field(receiver, "type")
+                    .map(|type_name| type_name.contains("uvm_factory"))
+                    .unwrap_or(false)
+        })
+}
+
+fn is_uvm_registry_create_call(value: &Value) -> bool {
+    string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("create")
+        && string_field(value, "type")
+            .map(|type_name| type_name.contains("uvm_component_registry::T"))
+            .unwrap_or(false)
+}
+
+fn registry_create_class_name(
+    call: &Value,
+    class_definitions: &BTreeMap<String, Value>,
+) -> Option<String> {
+    let address = string_field(call, "subroutine")?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    for class in class_definitions.values() {
+        let generic_class = string_field(class, "genericClass").unwrap_or_default();
+        if generic_class
+            .split_whitespace()
+            .next_back()
+            .is_none_or(|name| name != "uvm_component_registry")
+        {
+            continue;
+        }
+        let empty_members = Vec::new();
+        let members = class
+            .get("members")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_members);
+        let has_create = members.iter().any(|member| {
+            string_field(member, "kind").as_deref() == Some("Subroutine")
+                && string_field(member, "name").as_deref() == Some("create")
+                && member.get("addr").and_then(Value::as_u64) == Some(address)
+        });
+        if !has_create {
+            continue;
+        }
+        return members
+            .iter()
+            .find(|member| {
+                string_field(member, "kind").as_deref() == Some("TypeParameter")
+                    && string_field(member, "name").as_deref() == Some("T")
+            })
+            .and_then(|parameter| string_field(parameter, "type"))
+            .and_then(|type_name| type_name.split_whitespace().next_back().map(str::to_string));
+    }
+    None
+}
+
 fn uvm_factory_override_names(call: &Value) -> Result<(String, String), String> {
     let empty_arguments = Vec::new();
     let arguments = call
@@ -865,6 +1090,10 @@ fn wrapper_type_name(value: &Value) -> Option<String> {
 
 fn string_literal(value: &Value) -> Option<String> {
     string_field(value, "literal").filter(|literal| !literal.is_empty())
+}
+
+fn string_literal_allow_empty(value: &Value) -> Option<String> {
+    string_field(value, "literal")
 }
 
 fn source_location(value: &Value) -> Option<(String, u64, u64)> {
