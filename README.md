@@ -91,7 +91,7 @@ phases, `uvm_root::get().set_timeout(...)` configuration, and rejection of wrong
 objections, and name/type-based factory selection for `run_test` through
 official `uvm_factory::get().set_type_override_by_name` and
 `set_type_override_by_type(Class::get_type(), ...)` with replace semantics,
-exact/wildcard-path
+`set_type_alias(...)` name resolution, exact/wildcard-path
 `set_inst_override_by_type(...)`/`set_inst_override_by_name(...)`, and
 `Class::type_id::create(...)` component/object construction through prepared
 class properties, including compatible derived overrides with runtime virtual

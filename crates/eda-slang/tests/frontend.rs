@@ -12522,6 +12522,100 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_resolves_factory_type_aliases() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-type-alias-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class TypeAliasTrace;
+  static int stage = 0;
+endclass
+
+class direct_type_alias_base extends uvm_test;
+  `uvm_component_utils(direct_type_alias_base)
+
+  function new(string name = "direct_type_alias_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    TypeAliasTrace::stage = 1;
+  endtask
+endclass
+
+class direct_type_alias_derived extends direct_type_alias_base;
+  `uvm_component_utils(direct_type_alias_derived)
+
+  function new(string name = "direct_type_alias_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    TypeAliasTrace::stage = 2;
+  endtask
+endclass
+
+module official_uvm_type_alias_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_alias(
+      "direct_type_alias",
+      direct_type_alias_base::get_type()
+    );
+    uvm_factory::get().set_type_override_by_name(
+      "direct_type_alias",
+      "direct_type_alias_derived"
+    );
+    run_test("direct_type_alias_base");
+    stage = TypeAliasTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM type-alias wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_type_alias_probe"),
+            &options,
+        )
+        .expect("directly lower a UVM factory type alias");
+    let mut simulator = Simulator::new(&design).expect("create type-alias simulator");
+    simulator
+        .run_until(0)
+        .expect("run the alias-resolved factory override");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_component_registry_applies_instance_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
