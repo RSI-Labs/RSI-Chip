@@ -152,11 +152,11 @@ class dispatch, and supports literal callback_mode(0/1), callback_mode()
 queries, object/typewide delete(...), and null-root literal delete_by_name(...).
 Full dynamic pools, iterator APIs, derivation registries, and callback tracing
 remain fail-closed.
-A literal official-UVM `uvm_analysis_port#(T)` bootstrap can connect multiple
-prepared `uvm_subscriber#(T)` analysis exports in order and lower `write(...)`
-to each subscriber's virtual `write` method. Port/export hierarchy resolution,
-dynamic run-time connections, and the remaining TLM transport/FIFO APIs remain
-fail-closed.
+A literal official-UVM `uvm_analysis_port#(T)` bootstrap can connect prepared
+`uvm_analysis_export#(T)` chains and `uvm_subscriber#(T)` analysis exports in
+order, detect export cycles, and lower `write(...)` to each subscriber's
+virtual `write` method. Dynamic run-time connections and the remaining TLM
+transport/FIFO APIs remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

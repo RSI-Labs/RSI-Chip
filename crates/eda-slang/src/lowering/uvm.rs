@@ -2803,7 +2803,12 @@ impl SlangAstLowerer {
         if self
             .class_object_types
             .get(&port_key)
-            .is_none_or(|class_name| class_name != "uvm_analysis_port")
+            .is_none_or(|class_name| {
+                !matches!(
+                    class_name.as_str(),
+                    "uvm_analysis_port" | "uvm_analysis_export"
+                )
+            })
         {
             return Ok(None);
         }
@@ -2815,39 +2820,64 @@ impl SlangAstLowerer {
 
         if method_name == "connect" {
             if arguments.len() != 1 {
-                return Err("UVM analysis port connect requires one provider".into());
+                return Err("UVM analysis endpoint connect requires one provider".into());
             }
             let provider = unwrap_conversion(&arguments[0]);
-            if string_field(provider, "kind").as_deref() != Some("MemberAccess")
-                || string_field(provider, "member")
-                    .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
-                    .as_deref()
-                    != Some("analysis_export")
+            let (subscriber_key, subscriber_class) = if string_field(provider, "kind").as_deref()
+                == Some("NamedValue")
             {
-                return Err(
-                    "UVM analysis port connect requires a subscriber analysis_export".into(),
-                );
-            }
-            let subscriber_receiver = provider
-                .get("value")
-                .ok_or_else(|| "UVM analysis export has no subscriber receiver".to_string())?;
-            let subscriber_key = self
-                .class_object_key_for_value(subscriber_receiver)?
-                .ok_or_else(|| {
-                    "UVM analysis port connect requires an initialized subscriber".to_string()
+                let export_key = self.class_object_key_for_value(provider)?.ok_or_else(|| {
+                    "UVM analysis connect requires an initialized export".to_string()
                 })?;
-            let subscriber_class = self
-                .class_object_types
-                .get(&subscriber_key)
-                .cloned()
-                .ok_or_else(|| format!("class object '{subscriber_key}' has no type"))?;
-            let chain = self.class_chain(&subscriber_class)?;
-            let official_index = official_uvm_subscriber_index(&chain).ok_or_else(|| {
-                "UVM analysis port provider is not derived from uvm_subscriber".to_string()
-            })?;
-            user_uvm_class_method(&chain, official_index, "write").ok_or_else(|| {
-                "UVM analysis subscriber must define a literal write method".to_string()
-            })?;
+                let export_class = self
+                    .class_object_types
+                    .get(&export_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{export_key}' has no type"))?;
+                if export_class != "uvm_analysis_export" {
+                    return Err(
+                        "direct UVM analysis connect providers must be exports or subscribers"
+                            .into(),
+                    );
+                }
+                self.require_initialized_class_object(&export_key)?;
+                (export_key, export_class)
+            } else {
+                if string_field(provider, "kind").as_deref() != Some("MemberAccess")
+                    || string_field(provider, "member")
+                        .and_then(|member| {
+                            member.split_whitespace().next_back().map(str::to_string)
+                        })
+                        .as_deref()
+                        != Some("analysis_export")
+                {
+                    return Err(
+                        "UVM analysis connect requires an export or subscriber analysis_export"
+                            .into(),
+                    );
+                }
+                let subscriber_receiver = provider
+                    .get("value")
+                    .ok_or_else(|| "UVM analysis export has no subscriber receiver".to_string())?;
+                let subscriber_key = self
+                    .class_object_key_for_value(subscriber_receiver)?
+                    .ok_or_else(|| {
+                        "UVM analysis connect requires an initialized subscriber".to_string()
+                    })?;
+                let subscriber_class = self
+                    .class_object_types
+                    .get(&subscriber_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{subscriber_key}' has no type"))?;
+                let chain = self.class_chain(&subscriber_class)?;
+                let official_index = official_uvm_subscriber_index(&chain).ok_or_else(|| {
+                    "UVM analysis provider is not derived from uvm_subscriber".to_string()
+                })?;
+                user_uvm_class_method(&chain, official_index, "write").ok_or_else(|| {
+                    "UVM analysis subscriber must define a literal write method".to_string()
+                })?;
+                (subscriber_key, subscriber_class)
+            };
 
             let mut connections = self.uvm_analysis_connections.borrow_mut();
             if connections.iter().any(|existing| {
@@ -2866,18 +2896,42 @@ impl SlangAstLowerer {
         if arguments.len() != 1 {
             return Err("UVM analysis port write requires one transaction".into());
         }
+        let mut visited = std::collections::BTreeSet::new();
+        let statements = self.lower_uvm_analysis_writes(&port_key, arguments, &mut visited)?;
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    fn lower_uvm_analysis_writes(
+        &self,
+        endpoint_key: &str,
+        arguments: &[Value],
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Stmt>, String> {
+        if !visited.insert(endpoint_key.to_string()) {
+            return Err(format!("UVM analysis connection cycle at '{endpoint_key}'"));
+        }
         let connections = self
             .uvm_analysis_connections
             .borrow()
             .iter()
-            .filter(|connection| connection.port_key == port_key)
+            .filter(|connection| connection.port_key == endpoint_key)
             .cloned()
             .collect::<Vec<_>>();
         if connections.is_empty() {
-            return Err("UVM analysis port has no connected subscriber".into());
+            return Err(format!(
+                "UVM analysis endpoint '{endpoint_key}' has no connected subscriber"
+            ));
         }
         let mut statements = Vec::new();
         for connection in connections {
+            if connection.subscriber_class == "uvm_analysis_export" {
+                statements.extend(self.lower_uvm_analysis_writes(
+                    &connection.subscriber_key,
+                    arguments,
+                    visited,
+                )?);
+                continue;
+            }
             let chain = self.class_chain(&connection.subscriber_class)?;
             let official_index = official_uvm_subscriber_index(&chain)
                 .ok_or_else(|| "UVM analysis subscriber is no longer official".to_string())?;
@@ -2904,7 +2958,7 @@ impl SlangAstLowerer {
             };
             statements.push(statement);
         }
-        Ok(Some(Stmt::Block(statements)))
+        Ok(statements)
     }
 
     pub(super) fn lower_uvm_callback_mode_query(

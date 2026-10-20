@@ -13182,6 +13182,7 @@ class direct_analysis_probe extends uvm_test;
   direct_analysis_subscriber subscriber;
   direct_analysis_subscriber second_subscriber;
   uvm_analysis_port#(int) port;
+  uvm_analysis_export#(int) analysis_export;
 
   function new(string name = "direct_analysis_probe",
                uvm_component parent = null);
@@ -13192,11 +13193,13 @@ class direct_analysis_probe extends uvm_test;
     subscriber = new("subscriber", this);
     second_subscriber = new("second_subscriber", this);
     port = new("port", this);
+    analysis_export = new("analysis_export", this);
   endfunction
 
   virtual function void connect_phase(uvm_phase phase);
-    port.connect(subscriber.analysis_export);
-    port.connect(second_subscriber.analysis_export);
+    analysis_export.connect(subscriber.analysis_export);
+    analysis_export.connect(second_subscriber.analysis_export);
+    port.connect(analysis_export);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -13231,6 +13234,79 @@ endmodule
     simulator.run_until(1).expect("run UVM analysis port");
     assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(82));
     assert_eq!(simulator.read("writes").unwrap().to_u64(), Some(2));
+}
+
+#[test]
+fn slang_direct_official_uvm_analysis_export_cycles_fail_closed() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-analysis-cycle-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_analysis_cycle_probe extends uvm_test;
+  uvm_analysis_port#(int) port;
+  uvm_analysis_export#(int) first_export;
+  uvm_analysis_export#(int) second_export;
+
+  function new(string name = "direct_analysis_cycle_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    port = new("port", this);
+    first_export = new("first_export", this);
+    second_export = new("second_export", this);
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    port.connect(first_export);
+    first_export.connect(second_export);
+    second_export.connect(first_export);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    port.write(1);
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_analysis_cycle_probe;
+  initial run_test("direct_analysis_cycle_probe");
+endmodule
+"#,
+    )
+    .expect("write official-UVM analysis-cycle wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_analysis_cycle_probe"),
+            &options,
+        )
+        .expect_err("UVM analysis export cycles must fail closed");
+    assert!(error.contains("UVM analysis connection cycle"), "{error}");
 }
 
 #[test]

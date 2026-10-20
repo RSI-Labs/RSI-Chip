@@ -796,16 +796,21 @@ impl SlangAstLowerer {
         name: &str,
     ) -> Result<bool, String> {
         let type_name = string_field(member, "type").unwrap_or_default();
-        if type_name.contains("uvm_analysis_port") {
+        if type_name.contains("uvm_analysis_port") || type_name.contains("uvm_analysis_export") {
             let handle_address = member
                 .get("addr")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| format!("UVM analysis port '{name}' has no symbol address"))?;
             let object_key = format!("{handle_address} {name}");
+            let endpoint_class = if type_name.contains("uvm_analysis_export") {
+                "uvm_analysis_export"
+            } else {
+                "uvm_analysis_port"
+            };
             self.class_objects
                 .insert(object_key.clone(), BTreeMap::new());
             self.class_object_types
-                .insert(object_key, "uvm_analysis_port".to_string());
+                .insert(object_key, endpoint_class.to_string());
             return Ok(true);
         }
         let Some(class_name) = class_name(&type_name) else {
@@ -1239,7 +1244,12 @@ impl SlangAstLowerer {
         if self
             .class_object_types
             .get(&object_key)
-            .is_some_and(|class_name| class_name == "uvm_analysis_port")
+            .is_some_and(|class_name| {
+                matches!(
+                    class_name.as_str(),
+                    "uvm_analysis_port" | "uvm_analysis_export"
+                )
+            })
         {
             return Ok(Some(eda_core::ir::Stmt::Block(Vec::new())));
         }
