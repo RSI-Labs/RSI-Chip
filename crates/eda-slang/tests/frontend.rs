@@ -12323,6 +12323,98 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_report_hooks_can_suppress_messages() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-hooks-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ReportHookTrace;
+  static int stage = 0;
+endclass
+
+class direct_report_hook_probe extends uvm_test;
+  function new(string name = "direct_report_hook_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function bit report_hook(
+    string id,
+    string message,
+    int verbosity,
+    string filename,
+    int line
+  );
+    ReportHookTrace::stage = 1;
+    return 1;
+  endfunction
+
+  virtual function bit report_info_hook(
+    string id,
+    string message,
+    int verbosity,
+    string filename,
+    int line
+  );
+    ReportHookTrace::stage = ReportHookTrace::stage * 10 + 2;
+    return 0;
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info("HOOK", "hook suppressed message", UVM_LOW);
+    ReportHookTrace::stage = ReportHookTrace::stage * 10 + 3;
+  endtask
+endclass
+
+module official_uvm_report_hook_probe(output int stage);
+  initial begin
+    run_test("direct_report_hook_probe");
+    stage = ReportHookTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report hook wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_hook_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM report hooks");
+    let serialized = format!("{design:?}");
+    assert!(!serialized.contains("hook suppressed message"));
+    let mut simulator = Simulator::new(&design).expect("create UVM report hook simulator");
+    simulator.run_until(0).expect("run UVM report hooks");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(123));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_count_exits_at_max() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

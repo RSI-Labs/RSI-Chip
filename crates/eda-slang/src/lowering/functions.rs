@@ -225,7 +225,7 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_timeout_call(value)? {
             return Ok(Some(statement));
         }
-        if let Some(statement) = self.lower_uvm_report_call(value)? {
+        if let Some(statement) = self.lower_uvm_report_dispatch(value)? {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_uvm_factory_type_alias_call(value)? {

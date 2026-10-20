@@ -2281,7 +2281,176 @@ impl SlangAstLowerer {
         else {
             return Ok(None);
         };
-        self.lower_uvm_report_call(report_call)
+        self.lower_uvm_report_dispatch(report_call)
+    }
+
+    pub(super) fn lower_uvm_report_dispatch(&self, call: &Value) -> Result<Option<Stmt>, String> {
+        let Some(subroutine) = string_field(call, "subroutine") else {
+            return Ok(None);
+        };
+        let severity = match subroutine.split_whitespace().next_back() {
+            Some("uvm_report_info") => "INFO",
+            Some("uvm_report_warning") => "WARNING",
+            Some("uvm_report_error") => "ERROR",
+            Some("uvm_report_fatal") => "FATAL",
+            _ => return Ok(None),
+        };
+        let Some(active_object) = self.active_class_objects.borrow().last().cloned() else {
+            return self.lower_uvm_report_call(call);
+        };
+        let Some(active_class) = self.class_object_types.get(&active_object).cloned() else {
+            return self.lower_uvm_report_call(call);
+        };
+        let chain = self.class_chain(&active_class)?;
+        let Some(official_index) = official_uvm_test_index(&chain) else {
+            return self.lower_uvm_report_call(call);
+        };
+
+        let mut hook_statements = Vec::new();
+        let mut hooks_allow = true;
+        for method_name in [
+            "report_hook",
+            match severity {
+                "INFO" => "report_info_hook",
+                "WARNING" => "report_warning_hook",
+                "ERROR" => "report_error_hook",
+                _ => "report_fatal_hook",
+            },
+        ] {
+            let Some((owner, method)) = user_uvm_class_method(&chain, official_index, method_name)
+            else {
+                continue;
+            };
+            let hook_call =
+                self.uvm_report_hook_call(&active_object, &active_class, &method, call)?;
+            let body = self.specialized_method_body(&active_object, &owner, &method, &hook_call)?;
+            let statements = body
+                .get("list")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("UVM report hook '{method_name}' has no body"))?;
+            if statements.is_empty() {
+                return Err(format!("UVM report hook '{method_name}' has no return"));
+            }
+            self.active_class_objects
+                .borrow_mut()
+                .push(active_object.clone());
+            let lowered: Result<Vec<Stmt>, String> = (|| {
+                let mut lowered = Vec::new();
+                for statement in &statements[..statements.len() - 1] {
+                    lowered.push(self.lower_statement(statement)?);
+                }
+                Ok(lowered)
+            })();
+            self.active_class_objects.borrow_mut().pop();
+            hook_statements.extend(lowered?);
+
+            let return_statement = &statements[statements.len() - 1];
+            if string_field(return_statement, "kind").as_deref() != Some("Return") {
+                return Err(format!(
+                    "UVM report hook '{method_name}' must end in a literal return"
+                ));
+            }
+            let return_value = return_statement
+                .get("expr")
+                .ok_or_else(|| format!("UVM report hook '{method_name}' return has no value"))?;
+            let return_value = string_field(unwrap_conversion(return_value), "value")
+                .and_then(|value| match value.as_str() {
+                    "0" => Some(false),
+                    "1" => Some(true),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!("UVM report hook '{method_name}' must return literal 0 or 1")
+                })?;
+            hooks_allow &= return_value;
+        }
+        if !hooks_allow {
+            return Ok(Some(Stmt::Block(hook_statements)));
+        }
+        let Some(report_statement) = self.lower_uvm_report_call(call)? else {
+            return Ok(Some(Stmt::Block(hook_statements)));
+        };
+        hook_statements.push(report_statement);
+        Ok(Some(Stmt::Block(hook_statements)))
+    }
+
+    fn uvm_report_hook_call(
+        &self,
+        object_key: &str,
+        class_name: &str,
+        method: &Value,
+        report_call: &Value,
+    ) -> Result<Value, String> {
+        let address = method
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "UVM report hook has no address".to_string())?;
+        let empty_arguments = Vec::new();
+        let report_arguments = report_call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let default_verbosity = json!({
+            "kind": "Conversion",
+            "type": "int",
+            "operand": {
+                "kind": "IntegerLiteral",
+                "type": "int",
+                "value": "200",
+            },
+        });
+        let empty_filename = json!({
+            "kind": "Conversion",
+            "type": "string",
+            "operand": {
+                "kind": "StringLiteral",
+                "type": "bit[7:0]",
+                "literal": "",
+            },
+        });
+        let zero_line = json!({
+            "kind": "IntegerLiteral",
+            "type": "int",
+            "value": "0",
+        });
+        let id = report_arguments.first().cloned().unwrap_or_else(|| {
+            json!({
+                "kind": "Conversion",
+                "type": "string",
+                "operand": {
+                    "kind": "StringLiteral",
+                    "type": "bit[7:0]",
+                    "literal": "",
+                },
+            })
+        });
+        let message = report_arguments.get(1).cloned().unwrap_or_else(|| {
+            json!({
+                "kind": "Conversion",
+                "type": "string",
+                "operand": {
+                    "kind": "StringLiteral",
+                    "type": "bit[7:0]",
+                    "literal": "",
+                },
+            })
+        });
+        let verbosity = report_arguments
+            .get(2)
+            .cloned()
+            .unwrap_or(default_verbosity);
+        let filename = report_arguments.get(3).cloned().unwrap_or(empty_filename);
+        let line = report_arguments.get(4).cloned().unwrap_or(zero_line);
+        Ok(json!({
+            "kind": "Call",
+            "subroutine": format!("{address} {}", string_field(method, "name").unwrap_or_default()),
+            "thisClass": {
+                "kind": "NamedValue",
+                "type": class_name,
+                "symbol": object_key,
+            },
+            "arguments": [id, message, verbosity, filename, line],
+        }))
     }
 
     pub(super) fn lower_uvm_report_control_call(
@@ -3483,6 +3652,28 @@ fn user_phase_method<'chain>(
                 })
             })
     })
+}
+
+fn user_uvm_class_method(
+    chain: &[(String, Value)],
+    official_index: usize,
+    method_name: &str,
+) -> Option<(String, Value)> {
+    chain
+        .iter()
+        .take(official_index)
+        .find_map(|(owner, class)| {
+            let method = class
+                .get("members")
+                .and_then(Value::as_array)
+                .and_then(|members| {
+                    members.iter().find(|member| {
+                        string_field(member, "kind").as_deref() == Some("Subroutine")
+                            && string_field(member, "name").as_deref() == Some(method_name)
+                    })
+                })?;
+            Some((owner.clone(), method.clone()))
+        })
 }
 
 fn validate_bootstrap_phase_method(method: &Value, phase_name: &str) -> Result<(), String> {

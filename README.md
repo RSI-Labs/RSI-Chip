@@ -132,7 +132,9 @@ verbosity and actions, while literal `get_report_max_verbosity_level()`,
 the configured compile-time values. The current action subset is display,
 no-action, count, and fatal exit. Literal report-server counters track
 severity/id/quit counts, and a `UVM_COUNT` report terminates when the configured
-maximum quit count is reached.
+maximum quit count is reached. User-overridden literal
+`report_hook(...)`/severity hook functions execute before reporting, and a
+literal `0` return suppresses the message.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

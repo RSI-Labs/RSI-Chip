@@ -2895,7 +2895,7 @@ impl SlangAstLowerer {
         Ok(replacements)
     }
 
-    fn specialized_method_body(
+    pub(super) fn specialized_method_body(
         &self,
         object_key: &str,
         owner_class: &str,
