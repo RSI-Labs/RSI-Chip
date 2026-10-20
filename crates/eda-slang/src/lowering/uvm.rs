@@ -2601,7 +2601,7 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         let (target_type, callback_type) =
-            uvm_callback_specialization(call, &self.class_definitions).ok_or_else(|| {
+            uvm_callback_specialization(call, &self.class_definitions, "add").ok_or_else(|| {
                 "UVM callback registration has no specialized T/CB pair".to_string()
             })?;
 
@@ -2643,6 +2643,7 @@ impl SlangAstLowerer {
             callback_type,
             object_key,
             class_name,
+            enabled: true,
         };
         if prepend {
             callbacks.insert(0, callback);
@@ -2688,6 +2689,7 @@ impl SlangAstLowerer {
                     .as_ref()
                     .is_none_or(|context| *context == active_object)
                     && callback.callback_type == requested_type
+                    && callback.enabled
                     && active_chain.iter().any(|(owner, _)| {
                         owner.split('@').next() == Some(callback.target_type.as_str())
                     })
@@ -2722,6 +2724,138 @@ impl SlangAstLowerer {
             statements.push(statement);
         }
         Ok(Some(Stmt::Block(statements)))
+    }
+
+    pub(super) fn lower_uvm_callback_mode_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(receiver) = call.get("thisClass") else {
+            return Ok(None);
+        };
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "callback_mode" {
+            return Ok(None);
+        }
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(receiver))?
+            .ok_or_else(|| "UVM callback mode requires a callback handle".to_string())?;
+        if !self
+            .uvm_callbacks
+            .borrow()
+            .iter()
+            .any(|callback| callback.object_key == object_key)
+        {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 1 {
+            return Err("UVM callback mode requires one explicit argument".into());
+        }
+        let mode_argument = unwrap_conversion(&arguments[0]);
+        let mode = string_field(mode_argument, "value")
+            .or_else(|| string_field(mode_argument, "constant"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| "UVM callback mode must be -1, 0, or 1".to_string())?;
+        if !matches!(mode, -1..=1) {
+            return Err(format!("unsupported UVM callback mode '{mode}'"));
+        }
+        if mode != -1 {
+            for callback in self
+                .uvm_callbacks
+                .borrow_mut()
+                .iter_mut()
+                .filter(|callback| callback.object_key == object_key)
+            {
+                callback.enabled = mode == 1;
+            }
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_callback_delete_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "delete" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Ok(None);
+        }
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+            .ok_or_else(|| "UVM callback deletion requires a callback handle".to_string())?;
+        if !self
+            .uvm_callbacks
+            .borrow()
+            .iter()
+            .any(|callback| callback.object_key == object_key)
+        {
+            return Ok(None);
+        }
+        let Some((target_type, callback_type)) =
+            uvm_callback_specialization(call, &self.class_definitions, "delete")
+        else {
+            return Err("UVM callback deletion has no specialized T/CB pair".into());
+        };
+        let context_argument = unwrap_conversion(&arguments[0]);
+        let context_key = if string_field(context_argument, "kind").as_deref()
+            == Some("NullLiteral")
+        {
+            None
+        } else if is_this_reference(context_argument) {
+            Some(
+                self.active_class_objects
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| "UVM callback deletion has no active object".to_string())?,
+            )
+        } else {
+            Some(
+                self.class_object_key_for_value(context_argument)?
+                    .ok_or_else(|| {
+                        "UVM callback deletion requires an initialized object handle".to_string()
+                    })?,
+            )
+        };
+        let mut callbacks = self.uvm_callbacks.borrow_mut();
+        let before = callbacks.len();
+        callbacks.retain(|callback| {
+            !(callback.object_key == object_key
+                && callback.context_key == context_key
+                && callback.target_type == target_type
+                && callback.callback_type == callback_type)
+        });
+        if callbacks.len() == before {
+            return Err("UVM callback is not registered with the requested context".into());
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
     }
 
     pub(super) fn lower_uvm_report_catcher_mode_call(
@@ -4477,6 +4611,7 @@ fn official_uvm_callback_index(chain: &[(String, Value)]) -> Option<usize> {
 fn uvm_callback_specialization(
     call: &Value,
     class_definitions: &std::collections::BTreeMap<String, Value>,
+    method_name: &str,
 ) -> Option<(String, String)> {
     let address = string_field(call, "subroutine")?
         .split_whitespace()
@@ -4497,7 +4632,7 @@ fn uvm_callback_specialization(
         };
         if !members.iter().any(|member| {
             string_field(member, "kind").as_deref() == Some("Subroutine")
-                && string_field(member, "name").as_deref() == Some("add")
+                && string_field(member, "name").as_deref() == Some(method_name)
                 && member.get("addr").and_then(Value::as_u64) == Some(address)
         }) {
             continue;

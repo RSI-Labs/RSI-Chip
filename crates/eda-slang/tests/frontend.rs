@@ -12983,9 +12983,14 @@ class direct_object_callback_probe extends uvm_test;
       second,
       UVM_PREPEND
     );
+    second.callback_mode(0);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
+    `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
+    second.callback_mode(1);
+    `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
+    uvm_callbacks#(direct_object_callback_probe, direct_callback)::delete(this, second);
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
     phase.raise_objection(this);
     #1;
@@ -13011,7 +13016,7 @@ endmodule
         .expect("directly lower official UVM object callbacks");
     let mut simulator = Simulator::new(&design).expect("create UVM object-callback simulator");
     simulator.run_until(1).expect("run UVM object callbacks");
-    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(14));
 }
 
 #[test]

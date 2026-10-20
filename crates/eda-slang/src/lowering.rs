@@ -448,6 +448,7 @@ pub(super) struct AstUvmCallback {
     pub(super) callback_type: String,
     pub(super) object_key: String,
     pub(super) class_name: String,
+    pub(super) enabled: bool,
 }
 
 impl Default for AstUvmReportControls {

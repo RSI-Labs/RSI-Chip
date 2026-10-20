@@ -240,6 +240,12 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_callback_registration(value)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_callback_mode_call(value)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_callback_delete_call(value)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_report_dispatch(value)? {
             return Ok(Some(statement));
         }
