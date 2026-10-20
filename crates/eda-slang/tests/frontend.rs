@@ -13664,7 +13664,189 @@ endmodule
         )
         .expect_err("UVM TLM port/export mismatches must fail closed");
     assert!(
-        error.contains("UVM TLM port requires 'put_export', found 'get_peek_export'"),
+        error.contains("UVM TLM endpoint requires 'put_export', found 'get_peek_export'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn slang_direct_official_uvm_tlm_export_chains_route_to_fifos() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-tlm-export-chain-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class TlmExportTrace;
+  static int peeked = -1;
+  static int first_get = -1;
+  static int can_get_after_flush = -1;
+endclass
+
+class direct_tlm_export_chain_probe extends uvm_test;
+  uvm_tlm_fifo#(int) fifo;
+  uvm_put_port#(int) producer;
+  uvm_put_export#(int) put_link;
+  uvm_get_peek_port#(int) consumer;
+  uvm_get_peek_export#(int) get_link;
+
+  function new(string name = "direct_tlm_export_chain_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    fifo = new("fifo", this, 2);
+    producer = new("producer", this);
+    put_link = new("put_link", this);
+    consumer = new("consumer", this);
+    get_link = new("get_link", this);
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    put_link.connect(fifo.put_export);
+    producer.connect(put_link);
+    get_link.connect(fifo.get_peek_export);
+    consumer.connect(get_link);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    producer.try_put(10);
+    producer.try_put(20);
+    consumer.try_peek(TlmExportTrace::peeked);
+    consumer.try_get(TlmExportTrace::first_get);
+    fifo.flush();
+    TlmExportTrace::can_get_after_flush = consumer.can_get();
+    phase.raise_objection(this);
+    #1;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_tlm_export_chain_probe(
+  output int peeked,
+  output int first_get,
+  output int can_get_after_flush
+);
+  initial begin
+    run_test("direct_tlm_export_chain_probe");
+    peeked = TlmExportTrace::peeked;
+    first_get = TlmExportTrace::first_get;
+    can_get_after_flush = TlmExportTrace::can_get_after_flush;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM TLM export-chain wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_tlm_export_chain_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM TLM export chains");
+    let mut simulator = Simulator::new(&design).expect("create UVM TLM export-chain simulator");
+    simulator.run_until(1).expect("run UVM TLM export chains");
+    assert_eq!(simulator.read("peeked").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("first_get").unwrap().to_u64(), Some(10));
+    assert_eq!(
+        simulator.read("can_get_after_flush").unwrap().to_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn slang_direct_official_uvm_tlm_export_cycles_fail_closed() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-tlm-export-cycle-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_tlm_export_cycle_probe extends uvm_test;
+  uvm_put_port#(int) producer;
+  uvm_put_export#(int) first_link;
+  uvm_put_export#(int) second_link;
+
+  function new(string name = "direct_tlm_export_cycle_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    producer = new("producer", this);
+    first_link = new("first_link", this);
+    second_link = new("second_link", this);
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    first_link.connect(second_link);
+    second_link.connect(first_link);
+    producer.connect(first_link);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    producer.try_put(1);
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_tlm_export_cycle_probe;
+  initial run_test("direct_tlm_export_cycle_probe");
+endmodule
+"#,
+    )
+    .expect("write official-UVM TLM export-cycle wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_tlm_export_cycle_probe"),
+            &options,
+        )
+        .expect_err("UVM TLM export cycles must fail closed");
+    assert!(
+        error.contains("UVM TLM endpoint connection cycle"),
         "{error}"
     );
 }

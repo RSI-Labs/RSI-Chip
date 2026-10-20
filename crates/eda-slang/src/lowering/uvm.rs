@@ -90,17 +90,27 @@ impl SlangAstLowerer {
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("UVM TLM port '{name}' has no symbol address"))?;
         let object_key = format!("{handle_address} {name}");
-        let port_class = if string_field(member, "type")
-            .is_some_and(|type_name| type_name.contains("uvm_get_peek_port"))
+        let endpoint_class = if string_field(member, "type")
+            .is_some_and(|type_name| type_name.contains("uvm_get_peek"))
         {
-            "uvm_get_peek_port"
+            if string_field(member, "type")
+                .is_some_and(|type_name| type_name.contains("uvm_get_peek_export"))
+            {
+                "uvm_get_peek_export"
+            } else {
+                "uvm_get_peek_port"
+            }
+        } else if string_field(member, "type")
+            .is_some_and(|type_name| type_name.contains("uvm_put_export"))
+        {
+            "uvm_put_export"
         } else {
             "uvm_put_port"
         };
         self.class_objects
             .insert(object_key.clone(), BTreeMap::new());
         self.class_object_types
-            .insert(object_key, port_class.to_string());
+            .insert(object_key, endpoint_class.to_string());
         Ok(())
     }
 
@@ -3299,16 +3309,16 @@ impl SlangAstLowerer {
         ) {
             return Ok(None);
         }
-        let Some(port_key) = self.class_object_key_for_value(receiver)? else {
+        let Some(source_key) = self.class_object_key_for_value(receiver)? else {
             return Ok(None);
         };
-        let Some(port_class) = self.class_object_types.get(&port_key).cloned() else {
+        let Some(source_class) = self.class_object_types.get(&source_key).cloned() else {
             return Ok(None);
         };
-        if !matches!(port_class.as_str(), "uvm_put_port" | "uvm_get_peek_port") {
+        if !is_uvm_tlm_endpoint_class(&source_class) {
             return Ok(None);
         }
-        self.require_initialized_class_object(&port_key)?;
+        self.require_initialized_class_object(&source_key)?;
 
         if method_name == "connect" {
             let empty_arguments = Vec::new();
@@ -3317,59 +3327,87 @@ impl SlangAstLowerer {
                 .and_then(Value::as_array)
                 .unwrap_or(&empty_arguments);
             if arguments.len() != 1 {
-                return Err("UVM TLM port connect requires one provider".into());
+                return Err("UVM TLM endpoint connect requires one provider".into());
             }
             let provider = unwrap_conversion(&arguments[0]);
-            if string_field(provider, "kind").as_deref() != Some("MemberAccess") {
-                return Err("direct UVM TLM ports connect only to a bounded FIFO export".into());
-            }
-            let export_name = string_field(provider, "member")
-                .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
-                .ok_or_else(|| "UVM TLM export has no name".to_string())?;
-            let expected_export = if port_class == "uvm_put_port" {
+            let expected_export = if source_class.starts_with("uvm_put") {
                 "put_export"
             } else {
                 "get_peek_export"
             };
-            if export_name != expected_export {
-                return Err(format!(
-                    "UVM TLM port requires '{expected_export}', found '{export_name}'"
-                ));
-            }
-            let fifo_receiver = provider
-                .get("value")
-                .ok_or_else(|| "UVM TLM export has no FIFO receiver".to_string())?;
-            let fifo_key = self
-                .class_object_key_for_value(fifo_receiver)?
-                .ok_or_else(|| {
-                    "UVM TLM port connect requires an initialized bounded FIFO".to_string()
-                })?;
-            if self
-                .class_object_types
-                .get(&fifo_key)
-                .is_none_or(|class_name| class_name != "uvm_tlm_fifo")
+            let expected_export_class = if source_class.starts_with("uvm_put") {
+                "uvm_put_export"
+            } else {
+                "uvm_get_peek_export"
+            };
+            let (target_key, target_class) = if string_field(provider, "kind").as_deref()
+                == Some("NamedValue")
             {
-                return Err("UVM TLM port provider is not a bounded uvm_tlm_fifo".into());
-            }
-            self.require_initialized_class_object(&fifo_key)?;
-            let mut connections = self.uvm_tlm_port_connections.borrow_mut();
+                let target_key = self
+                    .class_object_key_for_value(provider)?
+                    .ok_or_else(|| "UVM TLM connect requires an initialized export".to_string())?;
+                let target_class = self
+                    .class_object_types
+                    .get(&target_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{target_key}' has no type"))?;
+                if target_class != expected_export_class {
+                    return Err(format!(
+                        "UVM TLM endpoint requires '{expected_export_class}', found '{target_class}'"
+                    ));
+                }
+                self.require_initialized_class_object(&target_key)?;
+                (target_key, target_class)
+            } else {
+                if string_field(provider, "kind").as_deref() != Some("MemberAccess") {
+                    return Err(format!(
+                        "direct UVM TLM endpoints connect only to '{expected_export}' or a matching export"
+                    ));
+                }
+                let export_name = string_field(provider, "member")
+                    .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+                    .ok_or_else(|| "UVM TLM export has no name".to_string())?;
+                if export_name != expected_export {
+                    return Err(format!(
+                        "UVM TLM endpoint requires '{expected_export}', found '{export_name}'"
+                    ));
+                }
+                let fifo_receiver = provider
+                    .get("value")
+                    .ok_or_else(|| "UVM TLM export has no FIFO receiver".to_string())?;
+                let target_key =
+                    self.class_object_key_for_value(fifo_receiver)?
+                        .ok_or_else(|| {
+                            "UVM TLM connect requires an initialized bounded FIFO".to_string()
+                        })?;
+                let target_class = self
+                    .class_object_types
+                    .get(&target_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{target_key}' has no type"))?;
+                if target_class != "uvm_tlm_fifo" {
+                    return Err("UVM TLM endpoint provider is not a bounded uvm_tlm_fifo".into());
+                }
+                self.require_initialized_class_object(&target_key)?;
+                (target_key, target_class)
+            };
+            let _ = target_class;
+            let mut connections = self.uvm_tlm_endpoint_connections.borrow_mut();
             if connections
                 .iter()
-                .any(|existing| existing.port_key == port_key)
+                .any(|existing| existing.source_key == source_key)
             {
-                return Err("UVM TLM port is already connected".into());
+                return Err("UVM TLM endpoint is already connected".into());
             }
-            connections.push(super::AstUvmTlmPortConnection { port_key, fifo_key });
+            connections.push(super::AstUvmTlmEndpointConnection {
+                source_key,
+                target_key,
+            });
             return Ok(Some(Stmt::Block(Vec::new())));
         }
 
-        let fifo_key = self
-            .uvm_tlm_port_connections
-            .borrow()
-            .iter()
-            .find(|connection| connection.port_key == port_key)
-            .map(|connection| connection.fifo_key.clone())
-            .ok_or_else(|| "UVM TLM port has no connected bounded FIFO".to_string())?;
+        let mut visited = std::collections::BTreeSet::new();
+        let fifo_key = self.resolve_uvm_tlm_fifo(&source_key, &mut visited)?;
         let fifo_receiver = json!({
             "kind": "NamedValue",
             "type": "uvm_tlm_fifo",
@@ -3378,6 +3416,40 @@ impl SlangAstLowerer {
         self.lower_uvm_tlm_fifo_call(call, &fifo_receiver)
     }
 
+    fn resolve_uvm_tlm_fifo(
+        &self,
+        endpoint_key: &str,
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Result<String, String> {
+        if !visited.insert(endpoint_key.to_string()) {
+            return Err(format!(
+                "UVM TLM endpoint connection cycle at '{endpoint_key}'"
+            ));
+        }
+        let endpoint_class = self
+            .class_object_types
+            .get(endpoint_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{endpoint_key}' has no type"))?;
+        if endpoint_class == "uvm_tlm_fifo" {
+            return Ok(endpoint_key.to_string());
+        }
+        if !is_uvm_tlm_endpoint_class(&endpoint_class) {
+            return Err(format!(
+                "UVM TLM endpoint '{endpoint_key}' has unsupported class '{endpoint_class}'"
+            ));
+        }
+        let target_key = self
+            .uvm_tlm_endpoint_connections
+            .borrow()
+            .iter()
+            .find(|connection| connection.source_key == endpoint_key)
+            .map(|connection| connection.target_key.clone())
+            .ok_or_else(|| {
+                format!("UVM TLM endpoint '{endpoint_key}' has no connected bounded FIFO")
+            })?;
+        self.resolve_uvm_tlm_fifo(&target_key, visited)
+    }
     pub(super) fn lower_uvm_tlm_port_query(
         &self,
         call: &Value,
@@ -3391,6 +3463,15 @@ impl SlangAstLowerer {
         }) else {
             return Ok(None);
         };
+        let Some(source_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        let Some(source_class) = self.class_object_types.get(&source_key).cloned() else {
+            return Ok(None);
+        };
+        if !is_uvm_tlm_endpoint_class(&source_class) {
+            return Ok(None);
+        }
         if matches!(method_name.as_str(), "try_put" | "try_get" | "try_peek") {
             return Err(format!(
                 "side-effecting UVM TLM port {method_name} is unsupported in an expression"
@@ -3402,25 +3483,8 @@ impl SlangAstLowerer {
         ) {
             return Ok(None);
         }
-        let Some(port_key) = self.class_object_key_for_value(receiver)? else {
-            return Ok(None);
-        };
-        if self
-            .class_object_types
-            .get(&port_key)
-            .is_none_or(|class_name| {
-                !matches!(class_name.as_str(), "uvm_put_port" | "uvm_get_peek_port")
-            })
-        {
-            return Ok(None);
-        }
-        let fifo_key = self
-            .uvm_tlm_port_connections
-            .borrow()
-            .iter()
-            .find(|connection| connection.port_key == port_key)
-            .map(|connection| connection.fifo_key.clone())
-            .ok_or_else(|| "UVM TLM port has no connected bounded FIFO".to_string())?;
+        let mut visited = std::collections::BTreeSet::new();
+        let fifo_key = self.resolve_uvm_tlm_fifo(&source_key, &mut visited)?;
         let fifo_receiver = json!({
             "kind": "NamedValue",
             "type": "uvm_tlm_fifo",
@@ -5124,6 +5188,13 @@ const UVM_LOG_ACTION: u64 = 2;
 const UVM_COUNT_ACTION: u64 = 4;
 const UVM_EXIT_ACTION: u64 = 8;
 const UVM_CALL_HOOK_ACTION: u64 = 16;
+
+fn is_uvm_tlm_endpoint_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "uvm_put_port" | "uvm_get_peek_port" | "uvm_put_export" | "uvm_get_peek_export"
+    )
+}
 
 fn fifo_count_equals(fifo: &super::AstUvmTlmFifo, value: usize) -> Expr {
     Expr::Bin {

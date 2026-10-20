@@ -800,7 +800,11 @@ impl SlangAstLowerer {
             self.declare_uvm_tlm_fifo(member, name)?;
             return Ok(true);
         }
-        if type_name.contains("uvm_put_port") || type_name.contains("uvm_get_peek_port") {
+        if type_name.contains("uvm_put_port")
+            || type_name.contains("uvm_get_peek_port")
+            || type_name.contains("uvm_put_export")
+            || type_name.contains("uvm_get_peek_export")
+        {
             self.declare_uvm_tlm_port(member, name)?;
             return Ok(true);
         }
@@ -1260,7 +1264,10 @@ impl SlangAstLowerer {
             .class_object_types
             .get(&object_key)
             .is_some_and(|class_name| {
-                matches!(class_name.as_str(), "uvm_put_port" | "uvm_get_peek_port")
+                matches!(
+                    class_name.as_str(),
+                    "uvm_put_port" | "uvm_get_peek_port" | "uvm_put_export" | "uvm_get_peek_export"
+                )
             })
         {
             return Ok(Some(eda_core::ir::Stmt::Block(Vec::new())));
@@ -1533,12 +1540,6 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        if let Some(statement) = self.lower_uvm_tlm_fifo_call(call, receiver)? {
-            return Ok(Some(statement));
-        }
-        if let Some(statement) = self.lower_uvm_tlm_port_call(call, receiver)? {
-            return Ok(Some(statement));
-        }
         if let Some(statement) = self.lower_uvm_analysis_port_call(call, receiver)? {
             return Ok(Some(statement));
         }
@@ -1574,6 +1575,12 @@ impl SlangAstLowerer {
                 });
             }
             return Ok(Some(Stmt::Block(statements)));
+        }
+        if let Some(statement) = self.lower_uvm_tlm_fifo_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_tlm_port_call(call, receiver)? {
+            return Ok(Some(statement));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
             self.synthetic_uvm_root_key(receiver).or_else(|| {
@@ -1884,12 +1891,6 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
-        if let Some(expression) = self.lower_uvm_tlm_fifo_query(call, receiver)? {
-            return Ok(Some(expression));
-        }
-        if let Some(expression) = self.lower_uvm_tlm_port_query(call, receiver)? {
-            return Ok(Some(expression));
-        }
         if let Some(expression) = self.lower_uvm_report_server_query_call(call, receiver)? {
             return Ok(Some(expression));
         }
@@ -1930,6 +1931,12 @@ impl SlangAstLowerer {
                 };
             }
             return Ok(Some(result));
+        }
+        if let Some(expression) = self.lower_uvm_tlm_fifo_query(call, receiver)? {
+            return Ok(Some(expression));
+        }
+        if let Some(expression) = self.lower_uvm_tlm_port_query(call, receiver)? {
+            return Ok(Some(expression));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
             self.synthetic_uvm_root_key(receiver).or_else(|| {

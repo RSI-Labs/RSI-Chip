@@ -466,9 +466,9 @@ pub(super) struct AstUvmTlmFifo {
 }
 
 #[derive(Clone)]
-pub(super) struct AstUvmTlmPortConnection {
-    pub(super) port_key: String,
-    pub(super) fifo_key: String,
+pub(super) struct AstUvmTlmEndpointConnection {
+    pub(super) source_key: String,
+    pub(super) target_key: String,
 }
 
 impl Default for AstUvmReportControls {
@@ -596,7 +596,7 @@ pub(super) struct SlangAstLowerer {
     uvm_callbacks: std::cell::RefCell<Vec<AstUvmCallback>>,
     uvm_analysis_connections: std::cell::RefCell<Vec<AstUvmAnalysisConnection>>,
     uvm_tlm_fifos: std::cell::RefCell<std::collections::BTreeMap<String, AstUvmTlmFifo>>,
-    uvm_tlm_port_connections: std::cell::RefCell<Vec<AstUvmTlmPortConnection>>,
+    uvm_tlm_endpoint_connections: std::cell::RefCell<Vec<AstUvmTlmEndpointConnection>>,
     active_uvm_phase: std::cell::RefCell<Option<String>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
@@ -757,7 +757,7 @@ impl SlangAstLowerer {
             uvm_callbacks: std::cell::RefCell::new(Vec::new()),
             uvm_analysis_connections: std::cell::RefCell::new(Vec::new()),
             uvm_tlm_fifos: std::cell::RefCell::new(std::collections::BTreeMap::new()),
-            uvm_tlm_port_connections: std::cell::RefCell::new(Vec::new()),
+            uvm_tlm_endpoint_connections: std::cell::RefCell::new(Vec::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

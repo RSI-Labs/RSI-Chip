@@ -452,7 +452,11 @@ impl SlangAstLowerer {
             self.declare_uvm_tlm_fifo(member, &name)?;
             return Ok(());
         }
-        if type_name.contains("uvm_put_port") || type_name.contains("uvm_get_peek_port") {
+        if type_name.contains("uvm_put_port")
+            || type_name.contains("uvm_get_peek_port")
+            || type_name.contains("uvm_put_export")
+            || type_name.contains("uvm_get_peek_export")
+        {
             self.declare_uvm_tlm_port(member, &name)?;
             return Ok(());
         }
