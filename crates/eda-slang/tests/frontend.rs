@@ -12151,17 +12151,19 @@ class direct_report_probe extends uvm_test;
 
   virtual task run_phase(uvm_phase phase);
     `uvm_info("DIRECT", "macro message", UVM_LOW)
+    `uvm_warning("DIRECT", "macro warning")
+    `uvm_error("DIRECT", "macro error")
     uvm_report_info("DIRECT", "informational message");
     uvm_report_warning("DIRECT", "warning message");
     uvm_report_error("DIRECT", "error message");
+    `uvm_fatal("DIRECT", "macro fatal")
   endtask
 endclass
 
 module official_uvm_report_probe(output int done);
   initial begin
-    run_test("direct_report_probe");
     done = 1;
-    uvm_report_fatal("DIRECT", "fatal message");
+    run_test("direct_report_probe");
   end
 endmodule
 "#,
@@ -12176,10 +12178,12 @@ endmodule
         .expect("directly lower official UVM report calls");
     let serialized = format!("{design:?}");
     assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_LOW] macro message"));
+    assert!(serialized.contains("[UVM_WARNING][DIRECT][UVM_NONE] macro warning"));
+    assert!(serialized.contains("[UVM_ERROR][DIRECT][UVM_NONE] macro error"));
+    assert!(serialized.contains("[UVM_FATAL][DIRECT][UVM_NONE] macro fatal"));
     assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_MEDIUM] informational message"));
     assert!(serialized.contains("[UVM_WARNING][DIRECT][UVM_NONE] warning message"));
     assert!(serialized.contains("[UVM_ERROR][DIRECT][UVM_NONE] error message"));
-    assert!(serialized.contains("[UVM_FATAL][DIRECT][UVM_NONE] fatal message"));
     let mut simulator = Simulator::new(&design).expect("create UVM report simulator");
     simulator.run_until(0).expect("run UVM report messages");
     assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
