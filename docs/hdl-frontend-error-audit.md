@@ -85,6 +85,12 @@ required remediation in P0-7.
 These results prove that the currently named regressions pass. They do **not**
 prove commercial SystemVerilog correctness or exhaustive LRM coverage.
 
+The official-UVM integration tests use an explicit source contract: when
+`UVM_HOME` is provided, `src/uvm.sv` and the Accellera UVM 2020.3.1 version
+marker must be present, and an invalid checkout fails the test rather than
+silently returning success. Omitting `UVM_HOME` still selects the optional
+lane; the required gate must set it explicitly.
+
 ## 3. Previously identified severe defects that are fixed
 
 These items are no longer current errors. They are listed to prevent stale

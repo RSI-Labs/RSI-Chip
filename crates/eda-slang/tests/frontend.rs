@@ -1,7 +1,7 @@
 use eda_core::logic::{LogicValue, LogicWord};
 use eda_sim::Simulator;
 use eda_slang::{PreprocessOptions, SlangFrontend};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn temporary_directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -14,6 +14,67 @@ fn temporary_directory(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&path).expect("create temporary test directory");
     path
+}
+
+fn validate_official_uvm_root(root: &Path) -> Result<PathBuf, String> {
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return Err(format!(
+            "UVM_HOME is set to {}, but the official UVM source is missing {}. Clone Accellera-official/uvm-core tag 2020.3.1 before running the required UVM gate",
+            root.display(),
+            source.display()
+        ));
+    }
+
+    let version_path = root.join("src").join("base").join("uvm_version.svh");
+    let version = std::fs::read_to_string(&version_path).map_err(|error| {
+        format!(
+            "cannot read official UVM version marker {}: {error}",
+            version_path.display()
+        )
+    })?;
+    if !version.contains("Accellera:1800.2:UVM:2020.3.1") {
+        return Err(format!(
+            "UVM_HOME {} does not contain the required official UVM 2020.3.1 source",
+            root.display()
+        ));
+    }
+
+    Ok(source)
+}
+
+fn official_uvm_sources() -> Option<(PathBuf, PathBuf)> {
+    let uvm_home = std::env::var_os("UVM_HOME")?;
+    let root = PathBuf::from(uvm_home);
+    let source = validate_official_uvm_root(&root).expect("valid official UVM 2020.3.1 source");
+    Some((root, source))
+}
+
+#[test]
+fn official_uvm_validation_fails_closed_on_missing_source() {
+    let root = temporary_directory("uvm-missing-source");
+    let error = validate_official_uvm_root(&root)
+        .expect_err("missing official UVM source must be an error, not a skip");
+    assert!(error.contains("official UVM source is missing"), "{error}");
+}
+
+#[test]
+fn official_uvm_validation_rejects_the_wrong_version() {
+    let root = temporary_directory("uvm-wrong-version");
+    let source_directory = root.join("src");
+    let base_directory = source_directory.join("base");
+    std::fs::create_dir_all(&base_directory).expect("create UVM source directories");
+    std::fs::write(source_directory.join("uvm.sv"), "module uvm;\nendmodule\n")
+        .expect("write UVM source stub");
+    std::fs::write(
+        base_directory.join("uvm_version.svh"),
+        r#"parameter string UVM_VERSION_STRING = "Accellera:1800.2:UVM:2020.2.0";"#,
+    )
+    .expect("write wrong UVM version marker");
+
+    let error = validate_official_uvm_root(&root)
+        .expect_err("wrong official UVM version must be an error, not a skip");
+    assert!(error.contains("required official UVM 2020.3.1"), "{error}");
 }
 
 #[test]
@@ -11825,14 +11886,9 @@ fn slang_directly_lowers_and_runs_a_minimal_class_derived_from_official_uvm() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -11895,14 +11951,9 @@ fn slang_direct_run_test_bootstraps_a_minimal_official_uvm_class() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12006,14 +12057,9 @@ fn slang_direct_run_test_executes_a_minimal_phase_schedule() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12115,14 +12161,9 @@ fn slang_direct_official_uvm_reports_literal_messages() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12209,14 +12250,9 @@ fn slang_direct_official_uvm_queries_report_controls() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12327,14 +12363,9 @@ fn slang_direct_official_uvm_report_hooks_can_suppress_messages() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12419,14 +12450,9 @@ fn slang_direct_official_uvm_report_catcher_can_catch_messages() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12515,14 +12541,9 @@ fn slang_direct_official_uvm_report_catcher_scopes_to_context_object() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12634,14 +12655,9 @@ fn slang_direct_official_uvm_report_catcher_delete_unregisters() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12725,14 +12741,9 @@ fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12815,14 +12826,9 @@ fn slang_direct_official_uvm_report_catcher_delete_by_name_unregisters() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12920,14 +12926,9 @@ fn slang_direct_official_uvm_report_count_exits_at_max() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -12989,14 +12990,9 @@ fn slang_direct_run_test_fails_closed_on_undrained_objections() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -13056,14 +13052,9 @@ fn slang_direct_run_test_waits_for_asynchronous_objection_drain() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -13130,14 +13121,9 @@ fn slang_direct_run_test_honors_configured_objection_timeout() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -13199,14 +13185,9 @@ fn slang_direct_config_db_sets_and_gets_literals() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -13328,14 +13309,9 @@ fn slang_direct_config_db_matches_wildcards_and_precedence() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -13554,14 +13530,9 @@ fn slang_direct_resource_db_sets_and_reads_literals() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14056,14 +14027,9 @@ fn slang_direct_config_db_exists_checks_scoped_resources() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14180,14 +14146,9 @@ fn slang_direct_config_db_wait_modified_wakes_on_matching_set() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14278,14 +14239,9 @@ fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14371,14 +14327,9 @@ fn slang_direct_config_db_fails_closed_on_unsupported_forms() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14762,14 +14713,9 @@ fn slang_direct_run_test_applies_a_name_based_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14844,14 +14790,9 @@ fn slang_direct_run_test_applies_a_type_based_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -14969,14 +14910,9 @@ fn slang_direct_run_test_resolves_factory_type_aliases() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15063,14 +14999,9 @@ fn slang_direct_factory_creates_components_by_name() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15187,14 +15118,9 @@ fn slang_direct_factory_creates_objects_by_name() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15306,14 +15232,9 @@ fn slang_direct_factory_creates_components_and_objects_by_type() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15474,14 +15395,9 @@ fn slang_direct_component_registry_applies_instance_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15645,14 +15561,9 @@ fn slang_direct_component_registry_creates_a_component() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15739,14 +15650,9 @@ fn slang_direct_component_registry_applies_factory_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -15849,14 +15755,9 @@ fn slang_direct_component_registry_preserves_component_names() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -16167,14 +16068,9 @@ fn slang_direct_component_registry_rejects_duplicate_child_names() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -16250,14 +16146,9 @@ fn slang_direct_object_registry_applies_factory_overrides() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -16356,14 +16247,9 @@ fn slang_direct_run_test_rejects_incompatible_factory_override() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -16431,14 +16317,9 @@ fn slang_direct_run_test_tracks_objections_by_owner() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
@@ -16507,14 +16388,9 @@ fn slang_direct_run_test_selects_objection_owners_by_runtime_identity() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
-    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+    let Some((root, source)) = official_uvm_sources() else {
         return;
     };
-    let root = PathBuf::from(uvm_home);
-    let source = root.join("src").join("uvm.sv");
-    if !source.is_file() {
-        return;
-    }
     let options = PreprocessOptions {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
