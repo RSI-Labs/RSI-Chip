@@ -964,6 +964,8 @@ impl SlangAstLowerer {
             scope: scope.pattern,
             field_name,
             precedence,
+            name_priority: true,
+            type_priority: false,
             value: config_value,
         });
         Ok(Some(Stmt::Block(triggers)))
@@ -973,7 +975,21 @@ impl SlangAstLowerer {
         &self,
         value: &Value,
     ) -> Result<Option<Stmt>, String> {
-        let Some(type_name) = self.uvm_resource_db_type_name(value, "set") else {
+        let method_name = string_field(value, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "UVM resource DB call has no subroutine name".to_string())?;
+        if !matches!(
+            method_name.as_str(),
+            "set" | "set_override" | "set_override_type" | "set_override_name"
+        ) {
+            return Ok(None);
+        }
+        let Some(type_name) = self.uvm_resource_db_type_name(value, &method_name) else {
             return Ok(None);
         };
         if !matches!(type_name.as_str(), "int" | "string") {
@@ -987,9 +1003,9 @@ impl SlangAstLowerer {
             .and_then(Value::as_array)
             .unwrap_or(&empty_arguments);
         if arguments.len() != 3 && arguments.len() != 4 {
-            return Err(
-                "UVM resource DB set requires three arguments plus optional accessor".into(),
-            );
+            return Err(format!(
+                "UVM resource DB {method_name} requires three arguments plus optional accessor"
+            ));
         }
         if arguments.len() == 4
             && string_field(unwrap_conversion(&arguments[3]), "kind").as_deref()
@@ -1012,16 +1028,28 @@ impl SlangAstLowerer {
             );
         }
         let mut entries = self.uvm_config_entries.borrow_mut();
-        entries.retain(|entry| {
-            !(entry.type_name == type_name
-                && entry.scope == scope
-                && entry.field_name == field_name)
-        });
+        if method_name == "set" {
+            entries.retain(|entry| {
+                !(entry.type_name == type_name
+                    && entry.scope == scope
+                    && entry.field_name == field_name
+                    && !entry.name_priority
+                    && !entry.type_priority)
+            });
+        }
+        let (name_priority, type_priority) = match method_name.as_str() {
+            "set" => (false, false),
+            "set_override" => (true, true),
+            "set_override_type" => (false, true),
+            _ => (true, false),
+        };
         entries.push(super::AstUvmConfigEntry {
             type_name,
             scope,
             field_name,
             precedence: UVM_CONFIG_DB_DEFAULT_PRECEDENCE,
+            name_priority,
+            type_priority,
             value: resource_value,
         });
         Ok(Some(Stmt::Block(Vec::new())))
@@ -1084,7 +1112,7 @@ impl SlangAstLowerer {
                 && Self::uvm_config_scope_match(&entry.scope, &scope.pattern)?
                 && selected_entry
                     .as_ref()
-                    .is_none_or(|selected| entry.precedence >= selected.precedence)
+                    .is_none_or(|selected| Self::uvm_name_priority_ge(entry, selected))
             {
                 selected_entry = Some(entry);
             }
@@ -1182,7 +1210,7 @@ impl SlangAstLowerer {
                 && Self::uvm_config_scope_match(&entry.scope, &scope)?
                 && selected_entry
                     .as_ref()
-                    .is_none_or(|selected| entry.precedence >= selected.precedence)
+                    .is_none_or(|selected| Self::uvm_name_priority_ge(entry, selected))
             {
                 selected_entry = Some(entry);
             }
@@ -1286,8 +1314,9 @@ impl SlangAstLowerer {
                 if entry.type_name == type_name
                     && entry.field_name == field_name
                     && Self::uvm_config_scope_match(&entry.scope, &scope)?
-                    && selected_index
-                        .is_none_or(|selected| entry.precedence >= entries[selected].precedence)
+                    && selected_index.is_none_or(|selected| {
+                        Self::uvm_name_priority_ge(entry, &entries[selected])
+                    })
                 {
                     selected_index = Some(index);
                 }
@@ -1360,7 +1389,7 @@ impl SlangAstLowerer {
                 && Self::uvm_config_scope_match(&entry.scope, &scope)?
                 && selected_entry
                     .as_ref()
-                    .is_none_or(|selected| entry.precedence >= selected.precedence)
+                    .is_none_or(|selected| Self::uvm_type_priority_ge(entry, selected))
             {
                 selected_entry = Some(entry);
             }
@@ -1444,8 +1473,9 @@ impl SlangAstLowerer {
             for (index, entry) in entries.iter().enumerate() {
                 if entry.type_name == type_name
                     && Self::uvm_config_scope_match(&entry.scope, &scope)?
-                    && selected_index
-                        .is_none_or(|selected| entry.precedence >= entries[selected].precedence)
+                    && selected_index.is_none_or(|selected| {
+                        Self::uvm_type_priority_ge(entry, &entries[selected])
+                    })
                 {
                     selected_index = Some(index);
                 }
@@ -1690,6 +1720,26 @@ impl SlangAstLowerer {
         Ok(regex.is_match(text))
     }
 
+    fn uvm_name_priority_ge(
+        candidate: &super::AstUvmConfigEntry,
+        selected: &super::AstUvmConfigEntry,
+    ) -> bool {
+        if candidate.name_priority != selected.name_priority {
+            return candidate.name_priority;
+        }
+        candidate.precedence >= selected.precedence
+    }
+
+    fn uvm_type_priority_ge(
+        candidate: &super::AstUvmConfigEntry,
+        selected: &super::AstUvmConfigEntry,
+    ) -> bool {
+        if candidate.type_priority != selected.type_priority {
+            return candidate.type_priority;
+        }
+        candidate.precedence >= selected.precedence
+    }
+
     fn levenshtein_distance(left: &str, right: &str) -> usize {
         let left = left.as_bytes();
         let right = right.as_bytes();
@@ -1762,7 +1812,7 @@ impl SlangAstLowerer {
         }
 
         let argument_index = match method_name {
-            "set" => Some(2),
+            "set" | "set_override" | "set_override_type" | "set_override_name" => Some(2),
             "read_by_name" => Some(2),
             "write_by_name" => Some(2),
             "read_by_type" => Some(1),

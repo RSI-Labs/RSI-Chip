@@ -113,12 +113,13 @@ missing-entry failure branches;
 prepared `wait_modified(...)` calls wake when a later matching `set(...)`
 executes, and literal spell-check mode emits a UVM information message with
 global cross-type Levenshtein alternatives. A minimal literal
-`uvm_resource_db#(T)::set/read_by_name/write_by_name/read_by_type/write_by_type`
-bootstrap now shares those typed resources, including cross-reads from
-`uvm_config_db` entries; conditional writes update an existing matching
-resource without creating a missing one. Unsupported non-literal values,
-non-literal spell-check arguments, accessors, direct value-returning resource
-forms, and unprepared waiters fail closed.
+`uvm_resource_db#(T)::set/set_override/set_override_type/set_override_name/
+read_by_name/write_by_name/read_by_type/write_by_type` bootstrap now shares
+those typed resources, including cross-reads from `uvm_config_db` entries;
+conditional writes update an existing matching resource without creating a
+missing one, and name/type overrides retain their official priority direction.
+Unsupported non-literal values, non-literal spell-check arguments, accessors,
+direct value-returning resource forms, and unprepared waiters fail closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

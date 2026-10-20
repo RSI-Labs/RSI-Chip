@@ -404,6 +404,8 @@ pub(super) struct AstUvmConfigEntry {
     pub(super) scope: String,
     pub(super) field_name: String,
     pub(super) precedence: u32,
+    pub(super) name_priority: bool,
+    pub(super) type_priority: bool,
     pub(super) value: serde_json::Value,
 }
 

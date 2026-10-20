@@ -12712,6 +12712,12 @@ class ResourceDbTrace;
   static int missing_write_executed = 0;
   static int typed_found = 0;
   static int typed_value = -1;
+  static int type_override_by_name = -1;
+  static int type_override_by_type = -1;
+  static int name_override_by_name = -1;
+  static int name_override_by_type = -1;
+  static int both_override_by_name = -1;
+  static int both_override_by_type = -1;
 endclass
 
 class direct_resource_db_probe extends uvm_test;
@@ -12720,6 +12726,12 @@ class direct_resource_db_probe extends uvm_test;
   int shared_value;
   int missing_value;
   int typed_value;
+  int type_override_by_name;
+  int type_override_by_type;
+  int name_override_by_name;
+  int name_override_by_type;
+  int both_override_by_name;
+  int both_override_by_type;
 
   function new(string name = "direct_resource_db_probe",
                uvm_component parent = null);
@@ -12729,6 +12741,12 @@ class direct_resource_db_probe extends uvm_test;
     shared_value = -1;
     missing_value = -1;
     typed_value = -1;
+    type_override_by_name = -1;
+    type_override_by_type = -1;
+    name_override_by_name = -1;
+    name_override_by_type = -1;
+    both_override_by_name = -1;
+    both_override_by_type = -1;
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
@@ -12752,6 +12770,36 @@ class direct_resource_db_probe extends uvm_test;
       "uvm_test_top.typed",
       "resource_name_is_ignored",
       88
+    );
+    uvm_resource_db#(int)::set_override_type(
+      "uvm_test_top.priority",
+      "value",
+      21
+    );
+    uvm_resource_db#(int)::set(
+      "uvm_test_top.priority",
+      "value",
+      20
+    );
+    uvm_resource_db#(int)::set_override_name(
+      "uvm_test_top.name_priority",
+      "value",
+      31
+    );
+    uvm_resource_db#(int)::set(
+      "uvm_test_top.name_priority",
+      "value",
+      30
+    );
+    uvm_resource_db#(int)::set_override(
+      "uvm_test_top.both_priority",
+      "value",
+      41
+    );
+    uvm_resource_db#(int)::set(
+      "uvm_test_top.both_priority",
+      "value",
+      40
     );
   endfunction
 
@@ -12782,6 +12830,63 @@ class direct_resource_db_probe extends uvm_test;
       ResourceDbTrace::typed_found = 0;
     end else begin
       ResourceDbTrace::typed_value = typed_value;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top.priority",
+      "value",
+      type_override_by_name
+    )) begin
+      ResourceDbTrace::type_override_by_name = -1;
+    end else begin
+      ResourceDbTrace::type_override_by_name = type_override_by_name;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.priority",
+      type_override_by_type
+    )) begin
+      ResourceDbTrace::type_override_by_type = -1;
+    end else begin
+      ResourceDbTrace::type_override_by_type = type_override_by_type;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top.name_priority",
+      "value",
+      name_override_by_name
+    )) begin
+      ResourceDbTrace::name_override_by_name = -1;
+    end else begin
+      ResourceDbTrace::name_override_by_name = name_override_by_name;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.name_priority",
+      name_override_by_type
+    )) begin
+      ResourceDbTrace::name_override_by_type = -1;
+    end else begin
+      ResourceDbTrace::name_override_by_type = name_override_by_type;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_name(
+      "uvm_test_top.both_priority",
+      "value",
+      both_override_by_name
+    )) begin
+      ResourceDbTrace::both_override_by_name = -1;
+    end else begin
+      ResourceDbTrace::both_override_by_name = both_override_by_name;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.both_priority",
+      both_override_by_type
+    )) begin
+      ResourceDbTrace::both_override_by_type = -1;
+    end else begin
+      ResourceDbTrace::both_override_by_type = both_override_by_type;
     end
 
     if (!uvm_resource_db#(int)::read_by_name(
@@ -12850,7 +12955,13 @@ module official_uvm_resource_db_probe(
   output int write_found,
   output int missing_write_executed,
   output int typed_found,
-  output int typed_value
+  output int typed_value,
+  output int type_override_by_name,
+  output int type_override_by_type,
+  output int name_override_by_name,
+  output int name_override_by_type,
+  output int both_override_by_name,
+  output int both_override_by_type
 );
   initial begin
     run_test("direct_resource_db_probe");
@@ -12865,6 +12976,12 @@ module official_uvm_resource_db_probe(
     missing_write_executed = ResourceDbTrace::missing_write_executed;
     typed_found = ResourceDbTrace::typed_found;
     typed_value = ResourceDbTrace::typed_value;
+    type_override_by_name = ResourceDbTrace::type_override_by_name;
+    type_override_by_type = ResourceDbTrace::type_override_by_type;
+    name_override_by_name = ResourceDbTrace::name_override_by_name;
+    name_override_by_type = ResourceDbTrace::name_override_by_type;
+    both_override_by_name = ResourceDbTrace::both_override_by_name;
+    both_override_by_type = ResourceDbTrace::both_override_by_type;
   end
 endmodule
 "#,
@@ -12884,6 +13001,30 @@ endmodule
     assert_eq!(simulator.read("write_found").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("typed_found").unwrap().to_u64(), Some(1));
     assert_eq!(simulator.read("typed_value").unwrap().to_u64(), Some(89));
+    assert_eq!(
+        simulator.read("type_override_by_name").unwrap().to_u64(),
+        Some(20)
+    );
+    assert_eq!(
+        simulator.read("type_override_by_type").unwrap().to_u64(),
+        Some(21)
+    );
+    assert_eq!(
+        simulator.read("name_override_by_name").unwrap().to_u64(),
+        Some(31)
+    );
+    assert_eq!(
+        simulator.read("name_override_by_type").unwrap().to_u64(),
+        Some(30)
+    );
+    assert_eq!(
+        simulator.read("both_override_by_name").unwrap().to_u64(),
+        Some(41)
+    );
+    assert_eq!(
+        simulator.read("both_override_by_type").unwrap().to_u64(),
+        Some(41)
+    );
     assert_eq!(simulator.read("string_found").unwrap().to_u64(), Some(1));
     assert_eq!(
         simulator
