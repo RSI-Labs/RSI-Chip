@@ -12239,6 +12239,10 @@ class ReportQueryTrace;
   static int maximum = -1;
   static int verbosity = -1;
   static int action = -1;
+  static int max_quit = -1;
+  static int quit = -1;
+  static int id_count = -1;
+  static int severity_count = -1;
 endclass
 
 class direct_report_query_probe extends uvm_test;
@@ -12250,6 +12254,8 @@ class direct_report_query_probe extends uvm_test;
   virtual function void build_phase(uvm_phase phase);
     this.set_report_verbosity_level(UVM_HIGH);
     this.set_report_id_action("SILENCE", UVM_NO_ACTION);
+    uvm_report_server::get_server().set_max_quit_count(2);
+    this.set_report_id_action("COUNTED", UVM_COUNT);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -12262,19 +12268,37 @@ class direct_report_query_probe extends uvm_test;
       UVM_INFO,
       "SILENCE"
     );
+    uvm_report_info("COUNTED", "count only message", UVM_LOW);
+    uvm_report_info("OTHER", "display message", UVM_LOW);
+    ReportQueryTrace::max_quit =
+      uvm_report_server::get_server().get_max_quit_count();
+    ReportQueryTrace::quit =
+      uvm_report_server::get_server().get_quit_count();
+    ReportQueryTrace::id_count =
+      uvm_report_server::get_server().get_id_count("COUNTED");
+    ReportQueryTrace::severity_count =
+      uvm_report_server::get_server().get_severity_count(UVM_INFO);
   endtask
 endclass
 
 module official_uvm_report_query_probe(
   output int maximum,
   output int verbosity,
-  output int action
+  output int action,
+  output int max_quit,
+  output int quit,
+  output int id_count,
+  output int severity_count
 );
   initial begin
     run_test("direct_report_query_probe");
     maximum = ReportQueryTrace::maximum;
     verbosity = ReportQueryTrace::verbosity;
     action = ReportQueryTrace::action;
+    max_quit = ReportQueryTrace::max_quit;
+    quit = ReportQueryTrace::quit;
+    id_count = ReportQueryTrace::id_count;
+    severity_count = ReportQueryTrace::severity_count;
   end
 endmodule
 "#,
@@ -12292,6 +12316,79 @@ endmodule
     assert_eq!(simulator.read("maximum").unwrap().to_u64(), Some(300));
     assert_eq!(simulator.read("verbosity").unwrap().to_u64(), Some(300));
     assert_eq!(simulator.read("action").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("max_quit").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("quit").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("id_count").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("severity_count").unwrap().to_u64(), Some(2));
+}
+
+#[test]
+fn slang_direct_official_uvm_report_count_exits_at_max() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-count-exit-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_report_count_exit_probe extends uvm_test;
+  function new(string name = "direct_report_count_exit_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_report_server::get_server().set_max_quit_count(1);
+    this.set_report_id_action("QUIT", UVM_COUNT);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info("QUIT", "count exit message", UVM_LOW);
+  endtask
+endclass
+
+module official_uvm_report_count_exit_probe(output int done);
+  initial begin
+    done = 1;
+    run_test("direct_report_count_exit_probe");
+    done = 2;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report count-exit wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_count_exit_probe"),
+            &options,
+        )
+        .expect("directly lower a UVM count-exit report");
+    let mut simulator = Simulator::new(&design).expect("create UVM count-exit simulator");
+    simulator.run_until(0).expect("run until the count exit");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
 }
 
 #[test]

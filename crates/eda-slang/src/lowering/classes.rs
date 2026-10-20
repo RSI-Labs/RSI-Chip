@@ -1480,6 +1480,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
+        if let Some(statement) = self.lower_uvm_report_server_control_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_report_control_call(call, receiver)? {
             return Ok(Some(statement));
         }
@@ -1819,6 +1822,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
+        if let Some(expression) = self.lower_uvm_report_server_query_call(call, receiver)? {
+            return Ok(Some(expression));
+        }
         if let Some(expression) = self.lower_uvm_report_query_call(call, receiver)? {
             return Ok(Some(expression));
         }

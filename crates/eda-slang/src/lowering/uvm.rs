@@ -2144,6 +2144,19 @@ impl SlangAstLowerer {
             return Ok(Some(Stmt::Block(Vec::new())));
         }
         let report_action = self.uvm_report_action(severity, &id);
+        let mut finish_after_report = false;
+        if report_action != 0 {
+            let mut controls = self.uvm_report_controls.borrow_mut();
+            *controls
+                .severity_counts
+                .entry(severity.to_string())
+                .or_insert(0) += 1;
+            *controls.id_counts.entry(id.clone()).or_insert(0) += 1;
+            if report_action & 4 != 0 && controls.max_quit_count != 0 {
+                controls.quit_count = controls.quit_count.saturating_add(1);
+                finish_after_report = controls.quit_count >= controls.max_quit_count;
+            }
+        }
         if report_action == 0 {
             return Ok(Some(Stmt::Block(Vec::new())));
         }
@@ -2158,21 +2171,26 @@ impl SlangAstLowerer {
                     monitor: false,
                 });
             }
-            if report_action & 8 != 0 {
+            if report_action & 8 != 0 || finish_after_report {
                 fatal_statements.push(Stmt::Finish);
             }
             return Ok(Some(Stmt::Block(fatal_statements)));
         }
-        if report_action & 1 == 0 {
-            return Ok(Some(Stmt::Block(Vec::new())));
+        let display = if report_action & 1 == 0 {
+            Stmt::Block(Vec::new())
+        } else {
+            Stmt::Display {
+                parts: vec![eda_core::ir::DispPart::Str(format!(
+                    "[UVM_{severity}][{id}][{verbosity}] {message}\n"
+                ))],
+                args: Vec::new(),
+                monitor: false,
+            }
+        };
+        if finish_after_report {
+            return Ok(Some(Stmt::Block(vec![display, Stmt::Finish])));
         }
-        Ok(Some(Stmt::Display {
-            parts: vec![eda_core::ir::DispPart::Str(format!(
-                "[UVM_{severity}][{id}][{verbosity}] {message}\n"
-            ))],
-            args: Vec::new(),
-            monitor: false,
-        }))
+        Ok(Some(display))
     }
 
     pub(super) fn lower_uvm_macro_report_list(
@@ -2439,6 +2457,167 @@ impl SlangAstLowerer {
                 let severity = uvm_report_severity(&arguments[0])?;
                 let id = uvm_report_string(&arguments[1])?;
                 self.uvm_report_action(&severity, &id)
+            }
+        };
+        Ok(Some(Expr::Const(LogicWord::from_u64(32, value))))
+    }
+
+    pub(super) fn lower_uvm_report_server_control_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        if !is_uvm_report_server_receiver(receiver) {
+            return Ok(None);
+        }
+        let method_name = string_field(call, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if !matches!(
+            method_name.as_str(),
+            "set_max_quit_count"
+                | "set_quit_count"
+                | "set_severity_count"
+                | "set_id_count"
+                | "reset_quit_count"
+                | "reset_severity_counts"
+        ) {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let mut controls = self.uvm_report_controls.borrow_mut();
+        match method_name.as_str() {
+            "set_max_quit_count" => {
+                if arguments.is_empty() || arguments.len() > 2 {
+                    return Err("UVM set_max_quit_count requires one or two arguments".into());
+                }
+                let count = uvm_report_count(&arguments[0])?;
+                let overridable = if let Some(argument) = arguments.get(1) {
+                    uvm_report_bool(argument)?
+                } else {
+                    true
+                };
+                if !controls.max_quit_overridable {
+                    return Err("non-overridable UVM max quit count is not yet supported".into());
+                }
+                controls.max_quit_count = count;
+                controls.max_quit_overridable = overridable;
+            }
+            "set_quit_count" => {
+                if arguments.len() != 1 {
+                    return Err("UVM set_quit_count requires one argument".into());
+                }
+                controls.quit_count = uvm_report_count(&arguments[0])?;
+            }
+            "set_severity_count" => {
+                if arguments.len() != 2 {
+                    return Err("UVM set_severity_count requires two arguments".into());
+                }
+                let severity = uvm_report_severity(&arguments[0])?;
+                let count = uvm_report_count(&arguments[1])?;
+                controls.severity_counts.insert(severity, count);
+            }
+            "set_id_count" => {
+                if arguments.len() != 2 {
+                    return Err("UVM set_id_count requires two arguments".into());
+                }
+                let id = uvm_report_string(&arguments[0])?;
+                let count = uvm_report_count(&arguments[1])?;
+                controls.id_counts.insert(id, count);
+            }
+            "reset_quit_count" => {
+                if !arguments.is_empty() {
+                    return Err("UVM reset_quit_count requires no arguments".into());
+                }
+                controls.quit_count = 0;
+            }
+            _ => {
+                if !arguments.is_empty() {
+                    return Err("UVM reset_severity_counts requires no arguments".into());
+                }
+                controls.severity_counts.clear();
+            }
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_report_server_query_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Expr>, String> {
+        if !is_uvm_report_server_receiver(receiver) {
+            return Ok(None);
+        }
+        let method_name = string_field(call, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if !matches!(
+            method_name.as_str(),
+            "get_max_quit_count"
+                | "get_quit_count"
+                | "is_quit_count_reached"
+                | "get_severity_count"
+                | "get_id_count"
+        ) {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let controls = self.uvm_report_controls.borrow();
+        let value = match method_name.as_str() {
+            "get_max_quit_count" => {
+                if !arguments.is_empty() {
+                    return Err("UVM get_max_quit_count requires no arguments".into());
+                }
+                controls.max_quit_count
+            }
+            "get_quit_count" => {
+                if !arguments.is_empty() {
+                    return Err("UVM get_quit_count requires no arguments".into());
+                }
+                controls.quit_count
+            }
+            "is_quit_count_reached" => {
+                if !arguments.is_empty() {
+                    return Err("UVM is_quit_count_reached requires no arguments".into());
+                }
+                u64::from(controls.quit_count >= controls.max_quit_count)
+            }
+            "get_severity_count" => {
+                if arguments.len() != 1 {
+                    return Err("UVM get_severity_count requires one argument".into());
+                }
+                let severity = uvm_report_severity(&arguments[0])?;
+                controls
+                    .severity_counts
+                    .get(&severity)
+                    .copied()
+                    .unwrap_or(0)
+            }
+            _ => {
+                if arguments.len() != 1 {
+                    return Err("UVM get_id_count requires one argument".into());
+                }
+                let id = uvm_report_string(&arguments[0])?;
+                controls.id_counts.get(&id).copied().unwrap_or(0)
             }
         };
         Ok(Some(Expr::Const(LogicWord::from_u64(32, value))))
@@ -3227,13 +3406,47 @@ fn uvm_report_string(value: &Value) -> Result<String, String> {
 
 fn uvm_report_action_value(value: &Value) -> Result<u64, String> {
     let action = uvm_report_integer(value)?;
-    if action & !(1 | 8) != 0 {
+    if action & !(1 | 4 | 8) != 0 {
         return Err(
-            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_EXIT, and their combinations are supported"
+            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_COUNT, UVM_EXIT, and their combinations are supported"
                 .into(),
         );
     }
     Ok(action)
+}
+
+fn uvm_report_count(value: &Value) -> Result<u64, String> {
+    let value = unwrap_conversion(value);
+    let count = string_field(value, "constant")
+        .or_else(|| string_field(value, "value"))
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| "UVM report count must be an integer literal".to_string())?;
+    Ok(count.max(0) as u64)
+}
+
+fn uvm_report_bool(value: &Value) -> Result<bool, String> {
+    let value = unwrap_conversion(value);
+    match string_field(value, "constant")
+        .or_else(|| string_field(value, "value"))
+        .as_deref()
+    {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err("UVM report boolean must be a literal 0 or 1".into()),
+    }
+}
+
+fn is_uvm_report_server_receiver(receiver: &Value) -> bool {
+    string_field(receiver, "kind").as_deref() == Some("Call")
+        && string_field(receiver, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("get_server")
 }
 
 fn is_this_reference(value: &Value) -> bool {

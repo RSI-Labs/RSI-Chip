@@ -130,8 +130,9 @@ default or literal-configured verbosity/action filtering. Literal
 verbosity and actions, while literal `get_report_max_verbosity_level()`,
 `get_report_verbosity_level(...)`, and `get_report_action(...)` queries return
 the configured compile-time values. The current action subset is display,
-no-action, and fatal exit, and fatal reporting terminates when its exit action
-is enabled.
+no-action, count, and fatal exit. Literal report-server counters track
+severity/id/quit counts, and a `UVM_COUNT` report terminates when the configured
+maximum quit count is reached.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

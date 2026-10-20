@@ -417,7 +417,6 @@ pub(super) struct AstUvmConfigWait {
     pub(super) net: usize,
 }
 
-#[derive(Default)]
 pub(super) struct AstUvmReportControls {
     pub(super) default_verbosity: Option<u64>,
     pub(super) id_verbosity: std::collections::BTreeMap<String, u64>,
@@ -426,6 +425,30 @@ pub(super) struct AstUvmReportControls {
     pub(super) id_actions: std::collections::BTreeMap<String, u64>,
     pub(super) severity_actions: std::collections::BTreeMap<String, u64>,
     pub(super) severity_id_actions: std::collections::BTreeMap<(String, String), u64>,
+    pub(super) max_quit_count: u64,
+    pub(super) max_quit_overridable: bool,
+    pub(super) quit_count: u64,
+    pub(super) severity_counts: std::collections::BTreeMap<String, u64>,
+    pub(super) id_counts: std::collections::BTreeMap<String, u64>,
+}
+
+impl Default for AstUvmReportControls {
+    fn default() -> Self {
+        Self {
+            default_verbosity: None,
+            id_verbosity: std::collections::BTreeMap::new(),
+            severity_verbosity: std::collections::BTreeMap::new(),
+            severity_id_verbosity: std::collections::BTreeMap::new(),
+            id_actions: std::collections::BTreeMap::new(),
+            severity_actions: std::collections::BTreeMap::new(),
+            severity_id_actions: std::collections::BTreeMap::new(),
+            max_quit_count: 0,
+            max_quit_overridable: true,
+            quit_count: 0,
+            severity_counts: std::collections::BTreeMap::new(),
+            id_counts: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 pub(super) struct AstEventArraySelection {
