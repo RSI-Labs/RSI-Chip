@@ -130,11 +130,12 @@ default or literal-configured verbosity/action filtering. Literal
 verbosity and actions, while literal `get_report_max_verbosity_level()`,
 `get_report_verbosity_level(...)`, and `get_report_action(...)` queries return
 the configured compile-time values. The current action subset is display,
-no-action, count, and fatal exit. Literal report-server counters track
+no-action, default-file `UVM_LOG` stdout suppression, count, fatal exit, and
+`UVM_CALL_HOOK`. Literal report-server counters track
 severity/id/quit counts, and a `UVM_COUNT` report terminates when the configured
 maximum quit count is reached. User-overridden literal
-`report_hook(...)`/severity hook functions execute before reporting, and a
-literal `0` return suppresses the message. Multiple null-context
+`report_hook(...)`/severity hook functions execute only when the selected action
+includes `UVM_CALL_HOOK`, and a literal `0` return suppresses the message. Multiple null-context
 `uvm_report_catcher` registrations support literal
 `UVM_APPEND`/`UVM_PREPEND` ordering and object-scoped registration, and stop
 at the first matching enabled `CAUGHT` result. Literal

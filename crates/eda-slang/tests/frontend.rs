@@ -12401,7 +12401,7 @@ class direct_report_hook_probe extends uvm_test;
     string filename,
     int line
   );
-    ReportHookTrace::stage = 1;
+    ReportHookTrace::stage = ReportHookTrace::stage * 10 + 1;
     return 1;
   endfunction
 
@@ -12416,9 +12416,20 @@ class direct_report_hook_probe extends uvm_test;
     return 0;
   endfunction
 
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_verbosity_level(UVM_NONE);
+    this.set_report_id_verbosity("HOOK", UVM_FULL);
+    this.set_report_id_action("HOOK", UVM_CALL_HOOK);
+    this.set_report_id_action("HOOK_SUPPRESSED", UVM_CALL_HOOK);
+  endfunction
+
   virtual task run_phase(uvm_phase phase);
+    uvm_report_info("NO_HOOK", "hook action disabled message", UVM_LOW);
+    ReportHookTrace::stage = ReportHookTrace::stage * 10 + 4;
     uvm_report_info("HOOK", "hook suppressed message", UVM_LOW);
     ReportHookTrace::stage = ReportHookTrace::stage * 10 + 3;
+    uvm_report_info("HOOK_SUPPRESSED", "verbosity suppressed message", UVM_LOW);
+    ReportHookTrace::stage = ReportHookTrace::stage * 10 + 5;
   endtask
 endclass
 
@@ -12442,7 +12453,81 @@ endmodule
     assert!(!serialized.contains("hook suppressed message"));
     let mut simulator = Simulator::new(&design).expect("create UVM report hook simulator");
     simulator.run_until(0).expect("run UVM report hooks");
-    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(123));
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(41235));
+}
+
+#[test]
+fn slang_direct_official_uvm_log_action_uses_default_stdout_suppression() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-log-action-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ReportLogTrace;
+  static int counts = 0;
+endclass
+
+class direct_report_log_probe extends uvm_test;
+  function new(string name = "direct_report_log_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_id_action("LOG_ONLY", UVM_LOG);
+    this.set_report_id_action("LOG_DISPLAY", UVM_LOG | UVM_DISPLAY);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info("LOG_ONLY", "log-only message", UVM_LOW);
+    uvm_report_info("LOG_DISPLAY", "logged display message", UVM_LOW);
+    ReportLogTrace::counts =
+      uvm_report_server::get_server().get_id_count("LOG_ONLY") * 10 +
+      uvm_report_server::get_server().get_id_count("LOG_DISPLAY");
+  endtask
+endclass
+
+module official_uvm_report_log_probe(output int counts);
+  initial begin
+    run_test("direct_report_log_probe");
+    counts = ReportLogTrace::counts;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM log-action wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_log_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM log actions");
+    let serialized = format!("{design:?}");
+    assert!(!serialized.contains("log-only message"));
+    assert!(serialized.contains("logged display message"));
+    let mut simulator = Simulator::new(&design).expect("create UVM log-action simulator");
+    simulator.run_until(0).expect("run UVM log actions");
+    assert_eq!(simulator.read("counts").unwrap().to_u64(), Some(11));
 }
 
 #[test]

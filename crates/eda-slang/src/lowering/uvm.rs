@@ -2306,63 +2306,74 @@ impl SlangAstLowerer {
             return self.lower_uvm_report_call(call);
         };
 
+        let id = uvm_report_call_id(call)?;
+        let verbosity = uvm_report_call_verbosity(call)?;
+        if verbosity > self.uvm_report_verbosity_threshold(severity, &id) {
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
+        let report_action = self.uvm_report_action(severity, &id);
+        let call_hooks = report_action & UVM_CALL_HOOK_ACTION != 0;
         let mut hook_statements = Vec::new();
         let mut hooks_allow = true;
-        for method_name in [
-            "report_hook",
-            match severity {
-                "INFO" => "report_info_hook",
-                "WARNING" => "report_warning_hook",
-                "ERROR" => "report_error_hook",
-                _ => "report_fatal_hook",
-            },
-        ] {
-            let Some((owner, method)) = user_uvm_class_method(&chain, official_index, method_name)
-            else {
-                continue;
-            };
-            let hook_call =
-                self.uvm_report_hook_call(&active_object, &active_class, &method, call)?;
-            let body = self.specialized_method_body(&active_object, &owner, &method, &hook_call)?;
-            let statements = body
-                .get("list")
-                .and_then(Value::as_array)
-                .ok_or_else(|| format!("UVM report hook '{method_name}' has no body"))?;
-            if statements.is_empty() {
-                return Err(format!("UVM report hook '{method_name}' has no return"));
-            }
-            self.active_class_objects
-                .borrow_mut()
-                .push(active_object.clone());
-            let lowered: Result<Vec<Stmt>, String> = (|| {
-                let mut lowered = Vec::new();
-                for statement in &statements[..statements.len() - 1] {
-                    lowered.push(self.lower_statement(statement)?);
+        if call_hooks {
+            for method_name in [
+                "report_hook",
+                match severity {
+                    "INFO" => "report_info_hook",
+                    "WARNING" => "report_warning_hook",
+                    "ERROR" => "report_error_hook",
+                    _ => "report_fatal_hook",
+                },
+            ] {
+                let Some((owner, method)) =
+                    user_uvm_class_method(&chain, official_index, method_name)
+                else {
+                    continue;
+                };
+                let hook_call =
+                    self.uvm_report_hook_call(&active_object, &active_class, &method, call)?;
+                let body =
+                    self.specialized_method_body(&active_object, &owner, &method, &hook_call)?;
+                let statements = body
+                    .get("list")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| format!("UVM report hook '{method_name}' has no body"))?;
+                if statements.is_empty() {
+                    return Err(format!("UVM report hook '{method_name}' has no return"));
                 }
-                Ok(lowered)
-            })();
-            self.active_class_objects.borrow_mut().pop();
-            hook_statements.extend(lowered?);
+                self.active_class_objects
+                    .borrow_mut()
+                    .push(active_object.clone());
+                let lowered: Result<Vec<Stmt>, String> = (|| {
+                    let mut lowered = Vec::new();
+                    for statement in &statements[..statements.len() - 1] {
+                        lowered.push(self.lower_statement(statement)?);
+                    }
+                    Ok(lowered)
+                })();
+                self.active_class_objects.borrow_mut().pop();
+                hook_statements.extend(lowered?);
 
-            let return_statement = &statements[statements.len() - 1];
-            if string_field(return_statement, "kind").as_deref() != Some("Return") {
-                return Err(format!(
-                    "UVM report hook '{method_name}' must end in a literal return"
-                ));
-            }
-            let return_value = return_statement
-                .get("expr")
-                .ok_or_else(|| format!("UVM report hook '{method_name}' return has no value"))?;
-            let return_value = string_field(unwrap_conversion(return_value), "value")
-                .and_then(|value| match value.as_str() {
-                    "0" => Some(false),
-                    "1" => Some(true),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    format!("UVM report hook '{method_name}' must return literal 0 or 1")
+                let return_statement = &statements[statements.len() - 1];
+                if string_field(return_statement, "kind").as_deref() != Some("Return") {
+                    return Err(format!(
+                        "UVM report hook '{method_name}' must end in a literal return"
+                    ));
+                }
+                let return_value = return_statement.get("expr").ok_or_else(|| {
+                    format!("UVM report hook '{method_name}' return has no value")
                 })?;
-            hooks_allow &= return_value;
+                let return_value = string_field(unwrap_conversion(return_value), "value")
+                    .and_then(|value| match value.as_str() {
+                        "0" => Some(false),
+                        "1" => Some(true),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!("UVM report hook '{method_name}' must return literal 0 or 1")
+                    })?;
+                hooks_allow &= return_value;
+            }
         }
         if !hooks_allow {
             return Ok(Some(Stmt::Block(hook_statements)));
@@ -3221,7 +3232,11 @@ impl SlangAstLowerer {
             .or_else(|| controls.id_actions.get(id))
             .or_else(|| controls.severity_actions.get(severity))
             .copied()
-            .unwrap_or(if severity == "FATAL" { 9 } else { 1 })
+            .unwrap_or(match severity {
+                "ERROR" => UVM_DISPLAY_ACTION | UVM_COUNT_ACTION,
+                "FATAL" => UVM_DISPLAY_ACTION | UVM_EXIT_ACTION,
+                _ => UVM_DISPLAY_ACTION,
+            })
     }
 
     fn uvm_report_verbosity_threshold(&self, severity: &str, id: &str) -> u64 {
@@ -3920,7 +3935,10 @@ fn contains_subroutine_call(value: &Value, subroutine_name: &str) -> bool {
 fn uvm_report_integer(value: &Value) -> Result<u64, String> {
     let value = unwrap_conversion(value);
     if string_field(value, "kind").as_deref() == Some("BinaryOp")
-        && string_field(value, "op").as_deref() == Some("BitwiseOr")
+        && matches!(
+            string_field(value, "op").as_deref(),
+            Some("BitwiseOr" | "BinaryOr")
+        )
     {
         let left = value
             .get("left")
@@ -3941,7 +3959,7 @@ fn uvm_report_integer(value: &Value) -> Result<u64, String> {
             "UVM_DEBUG" => Ok(500),
             "UVM_NO_ACTION" => Ok(0),
             "UVM_DISPLAY" => Ok(1),
-            "UVM_LOG" => Ok(2),
+            "UVM_LOG" => Ok(UVM_LOG_ACTION),
             "UVM_COUNT" => Ok(4),
             "UVM_EXIT" => Ok(8),
             "UVM_CALL_HOOK" => Ok(16),
@@ -3966,6 +3984,46 @@ fn uvm_report_verbosity_value(value: &str) -> Option<u64> {
         "UVM_DEBUG" => Some(500),
         numeric => numeric.parse::<u64>().ok(),
     }
+}
+
+const UVM_DISPLAY_ACTION: u64 = 1;
+const UVM_LOG_ACTION: u64 = 2;
+const UVM_COUNT_ACTION: u64 = 4;
+const UVM_EXIT_ACTION: u64 = 8;
+const UVM_CALL_HOOK_ACTION: u64 = 16;
+
+fn uvm_report_call_arguments(call: &Value) -> &[Value] {
+    call.get("arguments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn uvm_report_call_id(call: &Value) -> Result<String, String> {
+    uvm_report_call_arguments(call)
+        .first()
+        .map(uvm_report_string)
+        .transpose()
+        .map(|id| id.unwrap_or_default())
+}
+
+fn uvm_report_call_verbosity(call: &Value) -> Result<u64, String> {
+    let Some(argument) = uvm_report_call_arguments(call).get(2) else {
+        return Ok(200);
+    };
+    let argument = unwrap_conversion(argument);
+    if let Some(symbol) = string_field(argument, "symbol") {
+        let verbosity = symbol.split_whitespace().next_back().unwrap_or_default();
+        return uvm_report_verbosity_value(verbosity)
+            .ok_or_else(|| format!("unsupported UVM report verbosity '{verbosity}'"));
+    }
+    if string_field(argument, "kind").as_deref() == Some("IntegerLiteral") {
+        let verbosity = string_field(argument, "value")
+            .ok_or_else(|| "UVM report verbosity has no value".to_string())?;
+        return uvm_report_verbosity_value(&verbosity)
+            .ok_or_else(|| format!("unsupported UVM report verbosity '{verbosity}'"));
+    }
+    Err("UVM report verbosity must be a literal".into())
 }
 
 fn uvm_report_severity(value: &Value) -> Result<String, String> {
@@ -3996,9 +4054,14 @@ fn uvm_report_string(value: &Value) -> Result<String, String> {
 
 fn uvm_report_action_value(value: &Value) -> Result<u64, String> {
     let action = uvm_report_integer(value)?;
-    if action & !(1 | 4 | 8) != 0 {
+    let supported_actions = UVM_DISPLAY_ACTION
+        | UVM_LOG_ACTION
+        | UVM_COUNT_ACTION
+        | UVM_EXIT_ACTION
+        | UVM_CALL_HOOK_ACTION;
+    if action & !supported_actions != 0 {
         return Err(
-            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_COUNT, UVM_EXIT, and their combinations are supported"
+            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_LOG, UVM_COUNT, UVM_EXIT, UVM_CALL_HOOK, and their combinations are supported"
                 .into(),
         );
     }
