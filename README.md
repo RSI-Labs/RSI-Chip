@@ -124,7 +124,8 @@ non-literal values, non-literal spell-check arguments, accessors, direct
 value-returning resource forms, and unprepared waiters fail closed.
 Direct official-UVM reporting also accepts literal
 `uvm_report_info(...)`/`uvm_report_warning(...)`/`uvm_report_error(...)` calls,
-while `uvm_report_fatal(...)` displays its literal message and terminates the
+the literal `uvm_info` macro form with default verbosity filtering, and
+`uvm_report_fatal(...)`, which displays its literal message and terminates the
 simulation.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are

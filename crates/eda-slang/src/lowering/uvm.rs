@@ -2075,56 +2075,74 @@ impl SlangAstLowerer {
             .ok_or_else(|| "UVM report IDs must be string literals".to_string())?;
         let message = string_literal_allow_empty(unwrap_conversion(&arguments[1]))
             .ok_or_else(|| "UVM report messages must be string literals".to_string())?;
-        let expected_verbosity = if severity == "INFO" {
+        let default_verbosity = if severity == "INFO" {
             "UVM_MEDIUM"
         } else {
             "UVM_NONE"
         };
+        let mut verbosity = default_verbosity.to_string();
         if arguments.len() > 2 {
-            let verbosity = unwrap_conversion(&arguments[2]);
-            if !string_field(verbosity, "symbol")
-                .is_some_and(|symbol| symbol.ends_with(expected_verbosity))
+            let verbosity_argument = unwrap_conversion(&arguments[2]);
+            if let Some(symbol) = string_field(verbosity_argument, "symbol") {
+                let candidate = symbol.split_whitespace().next_back().unwrap_or_default();
+                if !matches!(
+                    candidate,
+                    "UVM_NONE" | "UVM_LOW" | "UVM_MEDIUM" | "UVM_HIGH" | "UVM_FULL"
+                ) {
+                    return Err(format!("unsupported UVM report verbosity '{candidate}'"));
+                }
+                verbosity = candidate.to_string();
+            } else if string_field(verbosity_argument, "kind").as_deref() == Some("IntegerLiteral")
             {
-                return Err("non-default UVM report verbosity is not yet supported".to_string());
+                let value = string_field(verbosity_argument, "value")
+                    .ok_or_else(|| "UVM report verbosity has no value".to_string())?;
+                let verbosity_value = match value.as_str() {
+                    "0" => "UVM_NONE",
+                    "100" => "UVM_LOW",
+                    "200" => "UVM_MEDIUM",
+                    "300" => "UVM_HIGH",
+                    "400" => "UVM_FULL",
+                    other => return Err(format!("unsupported UVM report verbosity '{other}'")),
+                };
+                verbosity = verbosity_value.to_string();
+            } else {
+                return Err("UVM report verbosity must be a literal".into());
             }
         }
         if arguments.len() > 3
-            && !matches!(
-                string_field(unwrap_conversion(&arguments[3]), "literal").as_deref(),
-                Some("")
-            )
+            && string_field(unwrap_conversion(&arguments[3]), "literal")
+                .as_deref()
+                .is_none()
         {
-            return Err("non-default UVM report filenames are not yet supported".into());
+            return Err("UVM report filenames must be string literals".into());
         }
         if arguments.len() > 4
-            && !matches!(
-                string_field(unwrap_conversion(&arguments[4]), "value").as_deref(),
-                Some("0")
-            )
+            && string_field(unwrap_conversion(&arguments[4]), "value")
+                .as_deref()
+                .is_none()
         {
-            return Err("non-default UVM report line numbers are not yet supported".into());
+            return Err("UVM report line numbers must be integer literals".into());
         }
         if arguments.len() > 5
-            && !matches!(
-                string_field(unwrap_conversion(&arguments[5]), "literal").as_deref(),
-                Some("")
-            )
+            && string_field(unwrap_conversion(&arguments[5]), "literal")
+                .as_deref()
+                .is_none()
         {
-            return Err("non-default UVM report contexts are not yet supported".into());
+            return Err("UVM report contexts must be string literals".into());
         }
         if arguments.len() > 6
             && !matches!(
                 string_field(unwrap_conversion(&arguments[6]), "value").as_deref(),
-                Some("0")
+                Some("0" | "1")
             )
         {
-            return Err("non-default UVM report actions are not yet supported".into());
+            return Err("UVM report action must be a literal 0 or 1".into());
         }
         if severity == "FATAL" {
             return Ok(Some(Stmt::Block(vec![
                 Stmt::Display {
                     parts: vec![eda_core::ir::DispPart::Str(format!(
-                        "[UVM_FATAL][{id}][UVM_NONE] {message}\n"
+                        "[UVM_FATAL][{id}][{verbosity}] {message}\n"
                     ))],
                     args: Vec::new(),
                     monitor: false,
@@ -2132,11 +2150,6 @@ impl SlangAstLowerer {
                 Stmt::Finish,
             ])));
         }
-        let verbosity = if severity == "INFO" {
-            "UVM_MEDIUM"
-        } else {
-            "UVM_NONE"
-        };
         Ok(Some(Stmt::Display {
             parts: vec![eda_core::ir::DispPart::Str(format!(
                 "[UVM_{severity}][{id}][{verbosity}] {message}\n"
@@ -2144,6 +2157,118 @@ impl SlangAstLowerer {
             args: Vec::new(),
             monitor: false,
         }))
+    }
+
+    pub(super) fn lower_uvm_macro_report_list(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let statement_kind = string_field(statement, "kind");
+        let container = if statement_kind.as_deref() == Some("Block") {
+            statement
+                .get("body")
+                .ok_or_else(|| "report block has no body".to_string())?
+        } else if statement_kind.as_deref() == Some("List") {
+            statement
+        } else {
+            return Ok(None);
+        };
+        let Some(items) = container.get("list").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        if items.len() != 3
+            || string_field(&items[0], "kind").as_deref() != Some("VariableDeclaration")
+            || !string_field(&items[0], "symbol")
+                .is_some_and(|symbol| symbol.ends_with("_local_report_object_"))
+        {
+            return Ok(None);
+        }
+        let Some(assignment) = items[1].as_object().and_then(|fields| {
+            fields
+                .get("expr")
+                .filter(|expr| string_field(expr, "kind").as_deref() == Some("Assignment"))
+        }) else {
+            return Ok(None);
+        };
+        let Some(report_object_call) = assignment
+            .get("right")
+            .filter(|call| string_field(call, "kind").as_deref() == Some("Call"))
+            .filter(|call| {
+                string_field(call, "subroutine")
+                    .and_then(|subroutine| {
+                        subroutine
+                            .split_whitespace()
+                            .next_back()
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("uvm_get_report_object")
+            })
+        else {
+            return Ok(None);
+        };
+        if report_object_call.get("thisClass").is_none() {
+            return Ok(None);
+        }
+        let Some(conditional) = items.get(2).filter(|conditional| {
+            string_field(conditional, "kind").as_deref() == Some("Conditional")
+        }) else {
+            return Ok(None);
+        };
+        let Some(condition) = conditional
+            .get("conditions")
+            .and_then(Value::as_array)
+            .and_then(|conditions| conditions.first())
+            .and_then(|condition| condition.get("expr"))
+        else {
+            return Ok(None);
+        };
+        if !contains_subroutine_call(condition, "get_report_verbosity_level")
+            || !contains_subroutine_call(condition, "get_report_action")
+        {
+            return Ok(None);
+        }
+        let report_body = conditional
+            .get("ifTrue")
+            .and_then(|block| block.get("body"))
+            .ok_or_else(|| "UVM macro report branch has no body".to_string())?;
+        let report_statement = if string_field(report_body, "kind").as_deref() == Some("List") {
+            report_body
+                .get("list")
+                .and_then(Value::as_array)
+                .and_then(|statements| statements.first())
+                .ok_or_else(|| "UVM macro report branch has no statement".to_string())?
+        } else {
+            report_body
+        };
+        let Some(report_call) = report_statement
+            .get("expr")
+            .filter(|call| string_field(call, "kind").as_deref() == Some("Call"))
+        else {
+            return Ok(None);
+        };
+        let severity = string_field(report_call, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if severity == "uvm_report_info" {
+            let verbosity = report_call
+                .get("arguments")
+                .and_then(Value::as_array)
+                .and_then(|arguments| arguments.get(2))
+                .map(unwrap_conversion)
+                .and_then(|verbosity| string_field(verbosity, "constant"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            if verbosity > 200 {
+                return Ok(Some(Stmt::Block(Vec::new())));
+            }
+        }
+        self.lower_uvm_report_call(report_call)
     }
 
     fn resolve_global_uvm_factory_class(&self, requested_name: &str) -> Result<String, String> {
@@ -2799,6 +2924,32 @@ fn uvm_conditional_call(statement: &Value) -> Result<Option<(&Value, bool)>, Str
         return Ok(Some((call, true)));
     }
     Ok(Some((condition, false)))
+}
+
+fn contains_subroutine_call(value: &Value, subroutine_name: &str) -> bool {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine")
+                .and_then(|subroutine| {
+                    subroutine
+                        .split_whitespace()
+                        .next_back()
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(subroutine_name)
+        {
+            return true;
+        }
+        return fields
+            .values()
+            .any(|nested| contains_subroutine_call(nested, subroutine_name));
+    }
+    value.as_array().is_some_and(|values| {
+        values
+            .iter()
+            .any(|nested| contains_subroutine_call(nested, subroutine_name))
+    })
 }
 
 fn is_this_reference(value: &Value) -> bool {

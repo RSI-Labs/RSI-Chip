@@ -516,6 +516,9 @@ impl SlangAstLowerer {
                         ));
                     }
                 }
+                if let Some(statement) = self.lower_uvm_macro_report_list(statement)? {
+                    return Ok(statement);
+                }
                 let named_id = string_field(statement, "block")
                     .filter(|symbol| !symbol.trim().is_empty());
                 if let Some(named_id) = &named_id {
@@ -598,6 +601,9 @@ impl SlangAstLowerer {
                 Ok(Stmt::Block(Vec::new()))
             }
             "List" => {
+                if let Some(statement) = self.lower_uvm_macro_report_list(statement)? {
+                    return Ok(statement);
+                }
                 let mut statements = Vec::new();
                 let active_ids = self.active_named_block_ids();
                 if let Some(items) = statement.get("list").and_then(Value::as_array) {

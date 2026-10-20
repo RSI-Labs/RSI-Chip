@@ -11849,6 +11849,8 @@ fn slang_directly_lowers_and_runs_a_minimal_class_derived_from_official_uvm() {
     std::fs::write(
         &wrapper,
         r#"
+`include "uvm_macros.svh"
+
 import uvm_pkg::*;
 
 class direct_uvm_test extends uvm_test;
@@ -11917,6 +11919,8 @@ fn slang_direct_run_test_bootstraps_a_minimal_official_uvm_class() {
     std::fs::write(
         &wrapper,
         r#"
+`include "uvm_macros.svh"
+
 import uvm_pkg::*;
 
 class direct_run_test_probe extends uvm_test;
@@ -12026,6 +12030,8 @@ fn slang_direct_run_test_executes_a_minimal_phase_schedule() {
     std::fs::write(
         &wrapper,
         r#"
+`include "uvm_macros.svh"
+
 import uvm_pkg::*;
 
 class PhaseTrace;
@@ -12133,6 +12139,8 @@ fn slang_direct_official_uvm_reports_literal_messages() {
     std::fs::write(
         &wrapper,
         r#"
+`include "uvm_macros.svh"
+
 import uvm_pkg::*;
 
 class direct_report_probe extends uvm_test;
@@ -12142,6 +12150,7 @@ class direct_report_probe extends uvm_test;
   endfunction
 
   virtual task run_phase(uvm_phase phase);
+    `uvm_info("DIRECT", "macro message", UVM_LOW)
     uvm_report_info("DIRECT", "informational message");
     uvm_report_warning("DIRECT", "warning message");
     uvm_report_error("DIRECT", "error message");
@@ -12166,6 +12175,7 @@ endmodule
         )
         .expect("directly lower official UVM report calls");
     let serialized = format!("{design:?}");
+    assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_LOW] macro message"));
     assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_MEDIUM] informational message"));
     assert!(serialized.contains("[UVM_WARNING][DIRECT][UVM_NONE] warning message"));
     assert!(serialized.contains("[UVM_ERROR][DIRECT][UVM_NONE] error message"));
