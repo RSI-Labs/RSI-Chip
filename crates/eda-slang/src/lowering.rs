@@ -437,6 +437,7 @@ pub(super) struct AstUvmReportCatcher {
     pub(super) context_key: Option<String>,
     pub(super) object_key: String,
     pub(super) class_name: String,
+    pub(super) enabled: bool,
     pub(super) method: serde_json::Value,
 }
 

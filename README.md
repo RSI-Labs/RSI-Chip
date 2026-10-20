@@ -137,7 +137,8 @@ maximum quit count is reached. User-overridden literal
 literal `0` return suppresses the message. Multiple null-context
 `uvm_report_catcher` registrations support literal
 `UVM_APPEND`/`UVM_PREPEND` ordering and object-scoped registration, and stop
-at the first matching `CAUGHT` result.
+at the first matching enabled `CAUGHT` result. Literal
+`callback_mode(0/1)` can disable or re-enable a registered catcher.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

@@ -2474,6 +2474,7 @@ impl SlangAstLowerer {
             object_key,
             class_name,
             method,
+            enabled: true,
         };
         let prepend = arguments
             .get(2)
@@ -2491,6 +2492,66 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_report_catcher_mode_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(receiver) = call.get("thisClass") else {
+            return Ok(None);
+        };
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "callback_mode" {
+            return Ok(None);
+        }
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(receiver))?
+            .ok_or_else(|| "UVM report catcher mode requires a catcher handle".to_string())?;
+        if !self
+            .uvm_report_catcher
+            .borrow()
+            .iter()
+            .any(|catcher| catcher.object_key == object_key)
+        {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() || arguments.len() > 2 {
+            return Err(
+                "UVM report catcher callback_mode requires at most one explicit argument".into(),
+            );
+        }
+        let mode_argument = unwrap_conversion(&arguments[0]);
+        let mode = string_field(mode_argument, "value")
+            .or_else(|| string_field(mode_argument, "constant"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| "UVM report catcher mode must be -1, 0, or 1".to_string())?;
+        if !matches!(mode, -1..=1) {
+            return Err(format!("unsupported UVM report catcher mode '{mode}'"));
+        }
+        if mode != -1 {
+            if let Some(catcher) = self
+                .uvm_report_catcher
+                .borrow_mut()
+                .iter_mut()
+                .find(|catcher| catcher.object_key == object_key)
+            {
+                catcher.enabled = mode == 1;
+            }
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
     fn lower_uvm_report_catcher(
         &self,
         active_object: Option<&str>,
@@ -2504,6 +2565,7 @@ impl SlangAstLowerer {
                     .context_key
                     .as_deref()
                     .is_none_or(|context_key| Some(context_key) == active_object)
+                    && catcher.enabled
             })
             .cloned()
             .collect::<Vec<_>>();
