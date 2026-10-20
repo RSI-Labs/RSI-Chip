@@ -12916,6 +12916,182 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_object_callbacks_execute_derived_methods() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-object-callback-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class CallbackTrace;
+  static int stage = 0;
+endclass
+
+class direct_callback extends uvm_callback;
+  function new(string name = "direct_callback");
+  endfunction
+
+  virtual function void observe(int value);
+    CallbackTrace::stage = CallbackTrace::stage + value;
+  endfunction
+endclass
+
+class direct_derived_callback extends direct_callback;
+  function new(string name = "direct_derived_callback");
+  endfunction
+
+  virtual function void observe(int value);
+    CallbackTrace::stage = CallbackTrace::stage * 10 + value + 1;
+  endfunction
+endclass
+
+class direct_object_callback_probe extends uvm_test;
+  direct_callback first;
+  direct_derived_callback second;
+
+  function new(string name = "direct_object_callback_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    first = new("first_callback");
+    second = new("second_callback");
+    uvm_callbacks#(direct_object_callback_probe, direct_callback)::add(this, first);
+    uvm_callbacks#(direct_object_callback_probe, direct_callback)::add(
+      this,
+      second,
+      UVM_PREPEND
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
+    phase.raise_objection(this);
+    #1;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_object_callback_probe(output int stage);
+  initial begin
+    run_test("direct_object_callback_probe");
+    stage = CallbackTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM object-callback wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_object_callback_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM object callbacks");
+    let mut simulator = Simulator::new(&design).expect("create UVM object-callback simulator");
+    simulator.run_until(1).expect("run UVM object callbacks");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(3));
+}
+
+#[test]
+fn slang_direct_official_uvm_typewide_callbacks_fail_closed() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-typewide-callback-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_typewide_callback extends uvm_callback;
+  function new(string name = "direct_typewide_callback");
+  endfunction
+
+  virtual function void observe(int value);
+  endfunction
+endclass
+
+class direct_typewide_callback_probe extends uvm_test;
+  direct_typewide_callback callback;
+
+  function new(string name = "direct_typewide_callback_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    callback = new("typewide_callback");
+    uvm_callbacks#(direct_typewide_callback_probe, direct_typewide_callback)::add(
+      null,
+      callback
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_typewide_callback_probe;
+  initial run_test("direct_typewide_callback_probe");
+endmodule
+"#,
+    )
+    .expect("write official-UVM typewide-callback wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_typewide_callback_probe"),
+            &options,
+        )
+        .expect_err("typewide UVM callbacks must fail closed");
+    assert!(
+        error.contains("typewide generic UVM callbacks are unsupported"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

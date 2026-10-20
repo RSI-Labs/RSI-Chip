@@ -2543,6 +2543,161 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_callback_registration(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "add" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Ok(None);
+        }
+
+        let context_argument = unwrap_conversion(&arguments[0]);
+        if string_field(context_argument, "kind").as_deref() == Some("NullLiteral") {
+            return Err(
+                "typewide generic UVM callbacks are unsupported; register with an object context"
+                    .into(),
+            );
+        }
+        let context_key = if is_this_reference(context_argument) {
+            self.active_class_objects
+                .borrow()
+                .last()
+                .cloned()
+                .ok_or_else(|| "UVM callback registration has no active object".to_string())?
+        } else {
+            self.class_object_key_for_value(context_argument)?
+                .ok_or_else(|| {
+                    "UVM callback registration requires an initialized object handle".to_string()
+                })?
+        };
+        self.require_initialized_class_object(&context_key)?;
+
+        let mut prepend = false;
+        if let Some(ordering) = arguments.get(2) {
+            let ordering_name = string_field(unwrap_conversion(ordering), "symbol")
+                .map(|symbol| {
+                    symbol
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .ok_or_else(|| "UVM callback ordering must be literal".to_string())?;
+            match ordering_name.as_str() {
+                "UVM_APPEND" => prepend = false,
+                "UVM_PREPEND" => prepend = true,
+                other => {
+                    return Err(format!("unsupported UVM callback ordering '{other}'"));
+                }
+            }
+        }
+
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+            .ok_or_else(|| "UVM callback registration requires a callback handle".to_string())?;
+        self.require_initialized_class_object(&object_key)?;
+        let class_name = self
+            .class_object_types
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no type"))?;
+        let chain = self.class_chain(&class_name)?;
+        if official_uvm_callback_index(&chain).is_none() {
+            return Ok(None);
+        }
+
+        let mut callbacks = self.uvm_callbacks.borrow_mut();
+        if callbacks.iter().any(|existing| {
+            existing.context_key == context_key && existing.object_key == object_key
+        }) {
+            return Err("duplicate direct-lowering UVM callback registration".into());
+        }
+        let callback = super::AstUvmCallback {
+            context_key,
+            object_key,
+            class_name,
+        };
+        if prepend {
+            callbacks.insert(0, callback);
+        } else {
+            callbacks.push(callback);
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_callback_macro(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_call) = uvm_callback_macro_method(statement) else {
+            return Ok(None);
+        };
+        let Some(receiver) = method_call.get("thisClass") else {
+            return Ok(None);
+        };
+        let requested_type = string_field(receiver, "type")
+            .and_then(|type_name| type_name.split_whitespace().next_back().map(str::to_string))
+            .ok_or_else(|| "UVM callback macro has no callback type".to_string())?;
+        let active_object = self
+            .active_class_objects
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or_else(|| "UVM callback macro has no active object".to_string())?;
+
+        let callbacks = self
+            .uvm_callbacks
+            .borrow()
+            .iter()
+            .filter(|callback| callback.context_key == active_object)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut statements = Vec::new();
+        for callback in callbacks {
+            let chain = self.class_chain(&callback.class_name)?;
+            if !chain
+                .iter()
+                .any(|(owner, _)| owner.split('@').next() == Some(requested_type.as_str()))
+            {
+                continue;
+            }
+            let mut specialized = method_call.clone();
+            if let Some(fields) = specialized.as_object_mut() {
+                fields.insert(
+                    "thisClass".into(),
+                    serde_json::json!({
+                        "kind": "NamedValue",
+                        "type": callback.class_name,
+                        "symbol": callback.object_key,
+                    }),
+                );
+            }
+            let Some(statement) = self.lower_class_task_call(&specialized)? else {
+                return Err(format!(
+                    "UVM callback class '{requested_type}' has no executable callback method"
+                ));
+            };
+            statements.push(statement);
+        }
+        Ok(Some(Stmt::Block(statements)))
+    }
+
     pub(super) fn lower_uvm_report_catcher_mode_call(
         &self,
         call: &Value,
@@ -4281,6 +4436,90 @@ fn official_uvm_report_catcher_index(chain: &[(String, Value)]) -> Option<usize>
                 .as_deref()
                 == Some("uvm_report_catcher.svh")
     })
+}
+
+fn official_uvm_callback_index(chain: &[(String, Value)]) -> Option<usize> {
+    chain.iter().position(|(owner, class)| {
+        owner.split('@').next() == Some("uvm_callback")
+            && string_field(class, "source_file")
+                .and_then(|file| file.split('/').next_back().map(str::to_string))
+                .as_deref()
+                == Some("uvm_callback.svh")
+    })
+}
+
+fn expression_call(expression: &Value) -> Option<&Value> {
+    (string_field(expression, "kind").as_deref() == Some("Call")).then_some(expression)
+}
+
+fn uvm_callback_macro_method(statement: &Value) -> Option<&Value> {
+    if string_field(statement, "kind").as_deref() != Some("Block") {
+        return None;
+    }
+    let body = statement.get("body")?;
+    if string_field(body, "kind").as_deref() != Some("List") {
+        return None;
+    }
+    let list = body.get("list")?.as_array()?;
+    if list.len() != 3
+        || list
+            .iter()
+            .take(2)
+            .any(|item| string_field(item, "kind").as_deref() != Some("VariableDeclaration"))
+        || string_field(&list[2], "kind").as_deref() != Some("WhileLoop")
+    {
+        return None;
+    }
+
+    let loop_statement = &list[2];
+    let condition = loop_statement.get("cond")?;
+    if string_field(condition, "kind").as_deref() != Some("BinaryOp")
+        || string_field(condition, "op").as_deref() != Some("Inequality")
+        || condition
+            .get("right")
+            .is_none_or(|right| string_field(right, "kind").as_deref() != Some("NullLiteral"))
+    {
+        return None;
+    }
+    let callback_symbol = string_field(condition.get("left")?, "symbol")?;
+
+    let loop_body = loop_statement.get("body")?;
+    if string_field(loop_body, "kind").as_deref() != Some("Block") {
+        return None;
+    }
+    let loop_body_body = loop_body.get("body")?;
+    if string_field(loop_body_body, "kind").as_deref() != Some("List") {
+        return None;
+    }
+    let loop_items = loop_body_body.get("list")?.as_array()?;
+    if loop_items.len() != 2 {
+        return None;
+    }
+    let method_expression = loop_items[0].get("expr")?;
+    let method_call = expression_call(method_expression)?;
+    method_call.get("thisClass")?;
+
+    let advance_expression = loop_items[1].get("expr")?;
+    let advance = advance_expression.get("right")?;
+    let advance_receiver = advance.get("thisClass")?;
+    if string_field(advance, "subroutine")
+        .and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        })
+        .as_deref()
+        != Some("next")
+        || !string_field(advance_receiver, "type")
+            .is_some_and(|type_name| type_name.contains("uvm_callback_iter#"))
+        || string_field(advance_expression.get("left")?, "symbol").as_deref()
+            != Some(callback_symbol.as_str())
+    {
+        return None;
+    }
+
+    Some(method_call)
 }
 
 fn validate_bootstrap_phase_method(method: &Value, phase_name: &str) -> Result<(), String> {

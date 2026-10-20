@@ -441,6 +441,13 @@ pub(super) struct AstUvmReportCatcher {
     pub(super) method: serde_json::Value,
 }
 
+#[derive(Clone)]
+pub(super) struct AstUvmCallback {
+    pub(super) context_key: String,
+    pub(super) object_key: String,
+    pub(super) class_name: String,
+}
+
 impl Default for AstUvmReportControls {
     fn default() -> Self {
         Self {
@@ -563,6 +570,7 @@ pub(super) struct SlangAstLowerer {
         std::cell::RefCell<std::collections::BTreeMap<(String, u64, u64), AstUvmConfigWait>>,
     uvm_report_controls: std::cell::RefCell<AstUvmReportControls>,
     uvm_report_catcher: std::cell::RefCell<Vec<AstUvmReportCatcher>>,
+    uvm_callbacks: std::cell::RefCell<Vec<AstUvmCallback>>,
     active_uvm_phase: std::cell::RefCell<Option<String>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
@@ -720,6 +728,7 @@ impl SlangAstLowerer {
             uvm_config_waits: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_report_controls: std::cell::RefCell::new(AstUvmReportControls::default()),
             uvm_report_catcher: std::cell::RefCell::new(Vec::new()),
+            uvm_callbacks: std::cell::RefCell::new(Vec::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

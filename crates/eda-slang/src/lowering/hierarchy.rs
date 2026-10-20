@@ -1073,6 +1073,7 @@ impl super::SlangAstLowerer {
             uvm_config_waits: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_report_controls: std::cell::RefCell::new(super::AstUvmReportControls::default()),
             uvm_report_catcher: std::cell::RefCell::new(Vec::new()),
+            uvm_callbacks: std::cell::RefCell::new(Vec::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

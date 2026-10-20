@@ -379,6 +379,9 @@ impl SlangAstLowerer {
         &self,
         statement: &serde_json::Value,
     ) -> Result<eda_core::ir::Stmt, String> {
+        if let Some(statement) = self.lower_uvm_callback_macro(statement)? {
+            return Ok(statement);
+        }
         self.lower_statement_inner(statement)
             .map_err(|error| with_source_span(statement, error))
     }

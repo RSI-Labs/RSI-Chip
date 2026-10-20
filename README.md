@@ -144,14 +144,19 @@ literal `uvm_report_cb::delete(...)` / `delete_by_name(...)` can remove a
 context-matching catcher, and straight-line literal catcher
 `set_severity(...)`, `set_message(...)`, and `set_action(...)` calls modify a
 subsequent THROW report.
+A literal object-scoped `uvm_callbacks#(T,CB)::add(...)` subset registers
+prepared callback objects by runtime context and lowers the
+`uvm_do_callbacks` macro to callback-method calls in append/prepend order,
+including derived-class virtual dispatch. Typewide callbacks, dynamic callback
+pools, iterator/delete/mode APIs, and callback tracing remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
 glob/regex/precedence/wait/spell model does not prove complete official POSIX
-dialect equivalence or all `uvm_resource_db` APIs, callbacks, waiter pools,
+dialect equivalence or all `uvm_resource_db` APIs and waiter pools,
 priority controls, resource-wide dictionaries, or dynamic resource-pool behavior,
-there is no parallel phase graph or callback-based objection scheduler, and
-TLM and sequences are not yet executed.
+there is no parallel phase graph, callback-based objection scheduler, full
+typewide callback pool, or TLM/sequence runtime.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit
