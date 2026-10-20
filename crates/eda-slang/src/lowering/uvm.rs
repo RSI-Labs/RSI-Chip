@@ -2362,6 +2362,88 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_report_query_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Expr>, String> {
+        if !is_this_reference(receiver) {
+            return Ok(None);
+        }
+        let method_name = string_field(call, "subroutine")
+            .and_then(|subroutine| {
+                subroutine
+                    .split_whitespace()
+                    .next_back()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if !matches!(
+            method_name.as_str(),
+            "get_report_verbosity_level" | "get_report_max_verbosity_level" | "get_report_action"
+        ) {
+            return Ok(None);
+        }
+        let active_object = self
+            .active_class_objects
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or_else(|| "UVM report query has no active object".to_string())?;
+        let active_class = self
+            .class_object_types
+            .get(&active_object)
+            .cloned()
+            .ok_or_else(|| format!("class object '{active_object}' has no type"))?;
+        let chain = self.class_chain(&active_class)?;
+        if official_uvm_test_index(&chain).is_none() {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let value = match method_name.as_str() {
+            "get_report_max_verbosity_level" => {
+                if !arguments.is_empty() {
+                    return Err("UVM get_report_max_verbosity_level requires no arguments".into());
+                }
+                self.uvm_report_controls
+                    .borrow()
+                    .default_verbosity
+                    .unwrap_or(200)
+            }
+            "get_report_verbosity_level" => {
+                if arguments.len() > 2 {
+                    return Err(
+                        "UVM get_report_verbosity_level requires at most two arguments".into(),
+                    );
+                }
+                let severity = if let Some(argument) = arguments.first() {
+                    uvm_report_severity(argument)?
+                } else {
+                    "INFO".to_string()
+                };
+                let id = if let Some(argument) = arguments.get(1) {
+                    uvm_report_string(argument)?
+                } else {
+                    String::new()
+                };
+                self.uvm_report_verbosity_threshold(&severity, &id)
+            }
+            _ => {
+                if arguments.len() != 2 {
+                    return Err("UVM get_report_action requires two arguments".into());
+                }
+                let severity = uvm_report_severity(&arguments[0])?;
+                let id = uvm_report_string(&arguments[1])?;
+                self.uvm_report_action(&severity, &id)
+            }
+        };
+        Ok(Some(Expr::Const(LogicWord::from_u64(32, value))))
+    }
+
     fn uvm_report_action(&self, severity: &str, id: &str) -> u64 {
         let controls = self.uvm_report_controls.borrow();
         controls

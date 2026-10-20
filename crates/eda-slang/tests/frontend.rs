@@ -12205,6 +12205,96 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_queries_report_controls() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-query-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ReportQueryTrace;
+  static int maximum = -1;
+  static int verbosity = -1;
+  static int action = -1;
+endclass
+
+class direct_report_query_probe extends uvm_test;
+  function new(string name = "direct_report_query_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_verbosity_level(UVM_HIGH);
+    this.set_report_id_action("SILENCE", UVM_NO_ACTION);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    ReportQueryTrace::maximum = this.get_report_max_verbosity_level();
+    ReportQueryTrace::verbosity = this.get_report_verbosity_level(
+      UVM_INFO,
+      "HIGH"
+    );
+    ReportQueryTrace::action = this.get_report_action(
+      UVM_INFO,
+      "SILENCE"
+    );
+  endtask
+endclass
+
+module official_uvm_report_query_probe(
+  output int maximum,
+  output int verbosity,
+  output int action
+);
+  initial begin
+    run_test("direct_report_query_probe");
+    maximum = ReportQueryTrace::maximum;
+    verbosity = ReportQueryTrace::verbosity;
+    action = ReportQueryTrace::action;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report query wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_query_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM report queries");
+    let mut simulator = Simulator::new(&design).expect("create UVM report query simulator");
+    simulator.run_until(0).expect("run UVM report queries");
+    assert_eq!(simulator.read("maximum").unwrap().to_u64(), Some(300));
+    assert_eq!(simulator.read("verbosity").unwrap().to_u64(), Some(300));
+    assert_eq!(simulator.read("action").unwrap().to_u64(), Some(0));
+}
+
+#[test]
 fn slang_direct_run_test_fails_closed_on_undrained_objections() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

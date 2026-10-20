@@ -127,8 +127,11 @@ Direct official-UVM reporting also accepts literal
 the literal `uvm_info`/`uvm_warning`/`uvm_error`/`uvm_fatal` macro forms with
 default or literal-configured verbosity/action filtering. Literal
 `set_report_*` controls support default/id/severity/id+severity precedence for
-verbosity and actions; the current action subset is display, no-action, and
-fatal exit, and fatal reporting terminates when its exit action is enabled.
+verbosity and actions, while literal `get_report_max_verbosity_level()`,
+`get_report_verbosity_level(...)`, and `get_report_action(...)` queries return
+the configured compile-time values. The current action subset is display,
+no-action, and fatal exit, and fatal reporting terminates when its exit action
+is enabled.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
