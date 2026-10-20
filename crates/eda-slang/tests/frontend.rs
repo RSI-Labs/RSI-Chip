@@ -12945,6 +12945,8 @@ import uvm_pkg::*;
 
 class CallbackTrace;
   static int stage = 0;
+  static int mode_before = -1;
+  static int mode_after = -1;
 endclass
 
 class direct_callback extends uvm_callback;
@@ -12988,7 +12990,9 @@ class direct_object_callback_probe extends uvm_test;
 
   virtual task run_phase(uvm_phase phase);
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
+    CallbackTrace::mode_before = second.callback_mode();
     second.callback_mode(1);
+    CallbackTrace::mode_after = second.callback_mode();
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
     uvm_callbacks#(direct_object_callback_probe, direct_callback)::delete(this, second);
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
@@ -12998,10 +13002,16 @@ class direct_object_callback_probe extends uvm_test;
   endtask
 endclass
 
-module official_uvm_object_callback_probe(output int stage);
+module official_uvm_object_callback_probe(
+  output int stage,
+  output int mode_before,
+  output int mode_after
+);
   initial begin
     run_test("direct_object_callback_probe");
     stage = CallbackTrace::stage;
+    mode_before = CallbackTrace::mode_before;
+    mode_after = CallbackTrace::mode_after;
   end
 endmodule
 "#,
@@ -13017,6 +13027,16 @@ endmodule
     let mut simulator = Simulator::new(&design).expect("create UVM object-callback simulator");
     simulator.run_until(1).expect("run UVM object callbacks");
     assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(14));
+    assert_eq!(
+        simulator.read("mode_before").unwrap().to_u64(),
+        Some(0),
+        "disabled callback mode should query as zero"
+    );
+    assert_eq!(
+        simulator.read("mode_after").unwrap().to_u64(),
+        Some(1),
+        "re-enabled callback mode should query as one"
+    );
 }
 
 #[test]

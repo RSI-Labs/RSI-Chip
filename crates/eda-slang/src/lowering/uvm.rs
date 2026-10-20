@@ -2764,10 +2764,7 @@ impl SlangAstLowerer {
             return Err("UVM callback mode requires one explicit argument".into());
         }
         let mode_argument = unwrap_conversion(&arguments[0]);
-        let mode = string_field(mode_argument, "value")
-            .or_else(|| string_field(mode_argument, "constant"))
-            .and_then(|value| value.parse::<i64>().ok())
-            .ok_or_else(|| "UVM callback mode must be -1, 0, or 1".to_string())?;
+        let mode = uvm_callback_mode_value(mode_argument)?;
         if !matches!(mode, -1..=1) {
             return Err(format!("unsupported UVM callback mode '{mode}'"));
         }
@@ -2782,6 +2779,56 @@ impl SlangAstLowerer {
             }
         }
         Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_callback_mode_query(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Expr>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "callback_mode" {
+            return Ok(None);
+        }
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(receiver))?
+            .ok_or_else(|| "UVM callback mode query requires a callback handle".to_string())?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() > 1 {
+            return Err("UVM callback mode query requires at most one argument".into());
+        }
+        if let Some(argument) = arguments.first() {
+            let mode_argument = unwrap_conversion(argument);
+            let mode = uvm_callback_mode_value(mode_argument)?;
+            if mode != -1 {
+                return Err(
+                    "callback_mode(0/1) as a value-returning expression is unsupported".into(),
+                );
+            }
+        }
+        let callbacks = self.uvm_callbacks.borrow();
+        let mut modes = callbacks
+            .iter()
+            .filter(|callback| callback.object_key == object_key)
+            .map(|callback| callback.enabled);
+        let Some(mode) = modes.next() else {
+            return Ok(None);
+        };
+        if modes.any(|other| other != mode) {
+            return Err("UVM callback object has inconsistent callback modes".into());
+        }
+        Ok(Some(Expr::Const(LogicWord::from_u64(1, u64::from(mode)))))
     }
 
     pub(super) fn lower_uvm_callback_delete_call(
@@ -4656,6 +4703,25 @@ fn uvm_callback_specialization(
         return Some((target_type, callback_type));
     }
     None
+}
+
+fn uvm_callback_mode_value(value: &Value) -> Result<i64, String> {
+    if string_field(value, "kind").as_deref() == Some("UnaryOp")
+        && string_field(value, "op").as_deref() == Some("Minus")
+    {
+        let operand = value
+            .get("operand")
+            .ok_or_else(|| "negative UVM callback mode has no operand".to_string())?;
+        let magnitude = string_field(operand, "value")
+            .or_else(|| string_field(operand, "constant"))
+            .and_then(|text| text.parse::<i64>().ok())
+            .ok_or_else(|| "UVM callback mode must be -1, 0, or 1".to_string())?;
+        return Ok(-magnitude);
+    }
+    string_field(value, "value")
+        .or_else(|| string_field(value, "constant"))
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| "UVM callback mode must be -1, 0, or 1".to_string())
 }
 
 fn expression_call(expression: &Value) -> Option<&Value> {

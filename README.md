@@ -148,8 +148,9 @@ A literal `uvm_callbacks#(T,CB)::add(...)` subset registers prepared callback
 objects by runtime context or a null typewide context, resolves the specialized
 T/CB pair, applies typewide callbacks to matching target derivatives, and lowers
 the `uvm_do_callbacks` macro to ordered callback-method calls with derived
-class dispatch, and supports literal callback_mode(0/1) plus object/typewide
-delete(...). Full dynamic pools, iterator APIs, delete_by_name, derivation
+class dispatch, and supports literal callback_mode(0/1), callback_mode()
+queries, and object/typewide delete(...). Full dynamic pools, iterator APIs,
+delete_by_name, derivation
 registries, and callback tracing remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are

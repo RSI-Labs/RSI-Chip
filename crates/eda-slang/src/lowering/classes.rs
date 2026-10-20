@@ -1828,6 +1828,9 @@ impl SlangAstLowerer {
         if let Some(expression) = self.lower_uvm_report_query_call(call, receiver)? {
             return Ok(Some(expression));
         }
+        if let Some(expression) = self.lower_uvm_callback_mode_query(call, receiver)? {
+            return Ok(Some(expression));
+        }
         if let Some(DynamicClassArraySelection {
             selector, elements, ..
         }) = self.dynamic_class_array_selection(receiver)?
