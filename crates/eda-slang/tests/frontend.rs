@@ -12511,6 +12511,125 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_report_catcher_scopes_to_context_object() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-scoped-report-catcher-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ScopedCatcherTrace;
+  static int stage = 0;
+endclass
+
+class direct_missed_report_catcher extends uvm_report_catcher;
+  function new(string name = "direct_missed_report_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    ScopedCatcherTrace::stage =
+      ScopedCatcherTrace::stage * 10 + 1;
+    return CAUGHT;
+  endfunction
+endclass
+
+class direct_applied_report_catcher extends uvm_report_catcher;
+  function new(string name = "direct_applied_report_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    ScopedCatcherTrace::stage =
+      ScopedCatcherTrace::stage * 10 + 2;
+    return CAUGHT;
+  endfunction
+endclass
+
+class direct_report_other_object extends uvm_test;
+  function new(string name = "direct_report_other_object",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+
+class direct_scoped_report_catcher_probe extends uvm_test;
+  direct_report_other_object other;
+  direct_missed_report_catcher missed;
+  direct_applied_report_catcher applied;
+
+  function new(string name = "direct_scoped_report_catcher_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    other = new("direct_report_other_object", null);
+    missed = new("direct_missed_report_catcher");
+    applied = new("direct_applied_report_catcher");
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_report_cb::add(other, missed);
+    uvm_report_cb::add(this, applied);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info(
+      "SCOPED",
+      "scoped catcher suppressed message",
+      UVM_LOW
+    );
+    ScopedCatcherTrace::stage =
+      ScopedCatcherTrace::stage * 10 + 3;
+  endtask
+endclass
+
+module official_uvm_scoped_report_catcher_probe(output int stage);
+  initial begin
+    run_test("direct_scoped_report_catcher_probe");
+    stage = ScopedCatcherTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM scoped report catcher wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_scoped_report_catcher_probe"),
+            &options,
+        )
+        .expect("directly lower object-scoped UVM report catchers");
+    let serialized = format!("{design:?}");
+    assert!(!serialized.contains("scoped catcher suppressed message"));
+    let mut simulator =
+        Simulator::new(&design).expect("create scoped UVM report catcher simulator");
+    simulator
+        .run_until(0)
+        .expect("run object-scoped UVM report catchers");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(23));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_count_exits_at_max() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

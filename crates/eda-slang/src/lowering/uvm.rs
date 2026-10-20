@@ -2367,7 +2367,7 @@ impl SlangAstLowerer {
         if !hooks_allow {
             return Ok(Some(Stmt::Block(hook_statements)));
         }
-        let (catcher_statements, caught) = self.lower_uvm_report_catcher()?;
+        let (catcher_statements, caught) = self.lower_uvm_report_catcher(Some(&active_object))?;
         hook_statements.extend(catcher_statements);
         if caught {
             return Ok(Some(Stmt::Block(hook_statements)));
@@ -2402,10 +2402,29 @@ impl SlangAstLowerer {
         if arguments.len() != 2 && arguments.len() != 3 {
             return Ok(None);
         }
-        if string_field(unwrap_conversion(&arguments[0]), "kind").as_deref() != Some("NullLiteral")
-        {
-            return Ok(None);
-        }
+        let context_argument = unwrap_conversion(&arguments[0]);
+        let context_key =
+            if string_field(context_argument, "kind").as_deref() == Some("NullLiteral") {
+                None
+            } else {
+                let context_key = if is_this_reference(context_argument) {
+                    self.active_class_objects
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .ok_or_else(|| {
+                            "UVM report catcher registration has no active object".to_string()
+                        })?
+                } else {
+                    self.class_object_key_for_value(context_argument)?
+                        .ok_or_else(|| {
+                            "UVM report catcher registration requires a report object handle"
+                                .to_string()
+                        })?
+                };
+                self.require_initialized_class_object(&context_key)?;
+                Some(context_key)
+            };
         if let Some(ordering) = arguments.get(2) {
             let ordering_name = string_field(unwrap_conversion(ordering), "symbol")
                 .map(|symbol| {
@@ -2451,6 +2470,7 @@ impl SlangAstLowerer {
             return Err("duplicate direct-lowering UVM report catcher registration".into());
         }
         let catcher = super::AstUvmReportCatcher {
+            context_key,
             object_key,
             class_name,
             method,
@@ -2471,8 +2491,22 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
-    fn lower_uvm_report_catcher(&self) -> Result<(Vec<Stmt>, bool), String> {
-        let catchers = self.uvm_report_catcher.borrow().clone();
+    fn lower_uvm_report_catcher(
+        &self,
+        active_object: Option<&str>,
+    ) -> Result<(Vec<Stmt>, bool), String> {
+        let catchers = self
+            .uvm_report_catcher
+            .borrow()
+            .iter()
+            .filter(|catcher| {
+                catcher
+                    .context_key
+                    .as_deref()
+                    .is_none_or(|context_key| Some(context_key) == active_object)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let mut statements = Vec::new();
         for catcher in catchers {
             let (catcher_statements, caught) = self.lower_one_uvm_report_catcher(catcher)?;

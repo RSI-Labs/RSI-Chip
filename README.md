@@ -136,7 +136,8 @@ maximum quit count is reached. User-overridden literal
 `report_hook(...)`/severity hook functions execute before reporting, and a
 literal `0` return suppresses the message. Multiple null-context
 `uvm_report_catcher` registrations support literal
-`UVM_APPEND`/`UVM_PREPEND` ordering and stop at the first `CAUGHT` result.
+`UVM_APPEND`/`UVM_PREPEND` ordering and object-scoped registration, and stop
+at the first matching `CAUGHT` result.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
