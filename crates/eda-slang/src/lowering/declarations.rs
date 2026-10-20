@@ -452,6 +452,10 @@ impl SlangAstLowerer {
             self.declare_uvm_tlm_fifo(member, &name)?;
             return Ok(());
         }
+        if type_name.contains("uvm_put_port") || type_name.contains("uvm_get_peek_port") {
+            self.declare_uvm_tlm_port(member, &name)?;
+            return Ok(());
+        }
         if type_name.contains("uvm_analysis_port") || type_name.contains("uvm_analysis_export") {
             let handle_address = member
                 .get("addr")

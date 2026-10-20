@@ -159,8 +159,11 @@ virtual `write` method. A bounded official-UVM `uvm_tlm_fifo#(int)` subset with
 an explicit size of 1..4 supports statement-form `try_put`, `try_get`,
 `try_peek`, `flush`, and the `size/used/is_empty/is_full/can_*` queries, while
 expression-form side-effecting `try_*` calls and blocking/transport APIs remain
-fail-closed. Dynamic run-time connections and the remaining TLM transport APIs
-remain fail-closed.
+fail-closed. Literal `uvm_put_port#(int)` and `uvm_get_peek_port#(int)` objects
+can connect to the matching bounded FIFO exports and route `try_*`/`can_*`
+operations to that FIFO; mismatched exports fail closed. Dynamic run-time
+connections, port hierarchies, and the remaining TLM transport APIs remain
+fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

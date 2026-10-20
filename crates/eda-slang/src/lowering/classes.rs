@@ -800,6 +800,10 @@ impl SlangAstLowerer {
             self.declare_uvm_tlm_fifo(member, name)?;
             return Ok(true);
         }
+        if type_name.contains("uvm_put_port") || type_name.contains("uvm_get_peek_port") {
+            self.declare_uvm_tlm_port(member, name)?;
+            return Ok(true);
+        }
         if type_name.contains("uvm_analysis_port") || type_name.contains("uvm_analysis_export") {
             let handle_address = member
                 .get("addr")
@@ -1256,6 +1260,15 @@ impl SlangAstLowerer {
             .class_object_types
             .get(&object_key)
             .is_some_and(|class_name| {
+                matches!(class_name.as_str(), "uvm_put_port" | "uvm_get_peek_port")
+            })
+        {
+            return Ok(Some(eda_core::ir::Stmt::Block(Vec::new())));
+        }
+        if self
+            .class_object_types
+            .get(&object_key)
+            .is_some_and(|class_name| {
                 matches!(
                     class_name.as_str(),
                     "uvm_analysis_port" | "uvm_analysis_export"
@@ -1521,6 +1534,9 @@ impl SlangAstLowerer {
             return Ok(None);
         };
         if let Some(statement) = self.lower_uvm_tlm_fifo_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_tlm_port_call(call, receiver)? {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_uvm_analysis_port_call(call, receiver)? {
@@ -1869,6 +1885,9 @@ impl SlangAstLowerer {
             return Ok(None);
         };
         if let Some(expression) = self.lower_uvm_tlm_fifo_query(call, receiver)? {
+            return Ok(Some(expression));
+        }
+        if let Some(expression) = self.lower_uvm_tlm_port_query(call, receiver)? {
             return Ok(Some(expression));
         }
         if let Some(expression) = self.lower_uvm_report_server_query_call(call, receiver)? {

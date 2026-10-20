@@ -1076,6 +1076,7 @@ impl super::SlangAstLowerer {
             uvm_callbacks: std::cell::RefCell::new(Vec::new()),
             uvm_analysis_connections: std::cell::RefCell::new(Vec::new()),
             uvm_tlm_fifos: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            uvm_tlm_port_connections: std::cell::RefCell::new(Vec::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

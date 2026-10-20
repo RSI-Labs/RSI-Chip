@@ -465,6 +465,12 @@ pub(super) struct AstUvmTlmFifo {
     pub(super) slots: Vec<AstLoweredSymbol>,
 }
 
+#[derive(Clone)]
+pub(super) struct AstUvmTlmPortConnection {
+    pub(super) port_key: String,
+    pub(super) fifo_key: String,
+}
+
 impl Default for AstUvmReportControls {
     fn default() -> Self {
         Self {
@@ -590,6 +596,7 @@ pub(super) struct SlangAstLowerer {
     uvm_callbacks: std::cell::RefCell<Vec<AstUvmCallback>>,
     uvm_analysis_connections: std::cell::RefCell<Vec<AstUvmAnalysisConnection>>,
     uvm_tlm_fifos: std::cell::RefCell<std::collections::BTreeMap<String, AstUvmTlmFifo>>,
+    uvm_tlm_port_connections: std::cell::RefCell<Vec<AstUvmTlmPortConnection>>,
     active_uvm_phase: std::cell::RefCell<Option<String>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
@@ -750,6 +757,7 @@ impl SlangAstLowerer {
             uvm_callbacks: std::cell::RefCell::new(Vec::new()),
             uvm_analysis_connections: std::cell::RefCell::new(Vec::new()),
             uvm_tlm_fifos: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            uvm_tlm_port_connections: std::cell::RefCell::new(Vec::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),
