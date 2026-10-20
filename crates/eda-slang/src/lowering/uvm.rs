@@ -29,6 +29,57 @@ struct AstUvmConfigScope {
 }
 
 impl SlangAstLowerer {
+    pub(super) fn declare_uvm_tlm_fifo(
+        &mut self,
+        member: &Value,
+        name: &str,
+    ) -> Result<(), String> {
+        let handle_address = member
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("UVM TLM FIFO '{name}' has no symbol address"))?;
+        let object_key = format!("{handle_address} {name}");
+        let sanitized_name = object_key
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let count =
+            self.declare_class_internal_net(&format!("__uvm_tlm_count_{sanitized_name}"), 32);
+        self.design.initials.push(Stmt::Bl {
+            lv: class_lvalue(&count),
+            e: Expr::Const(LogicWord::zero(count.width)),
+        });
+        let mut slots = Vec::new();
+        for slot in 0..4_usize {
+            let symbol = self
+                .declare_class_internal_net(&format!("__uvm_tlm_slot_{slot}_{sanitized_name}"), 32);
+            self.design.initials.push(Stmt::Bl {
+                lv: class_lvalue(&symbol),
+                e: Expr::Const(LogicWord::zero(symbol.width)),
+            });
+            slots.push(symbol);
+        }
+        self.class_objects
+            .insert(object_key.clone(), BTreeMap::new());
+        self.class_object_types
+            .insert(object_key.clone(), "uvm_tlm_fifo".to_string());
+        self.uvm_tlm_fifos.borrow_mut().insert(
+            object_key,
+            super::AstUvmTlmFifo {
+                capacity: 4,
+                count,
+                slots,
+            },
+        );
+        Ok(())
+    }
+
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
         let mut calls = Vec::new();
         collect_run_test_calls(body, &mut calls);
@@ -2961,6 +3012,250 @@ impl SlangAstLowerer {
         Ok(statements)
     }
 
+    pub(super) fn lower_uvm_tlm_fifo_constructor(
+        &self,
+        construction: &Value,
+        object_key: &str,
+    ) -> Result<Option<Stmt>, String> {
+        let constructor = construction
+            .get("constructorCall")
+            .ok_or_else(|| "UVM TLM FIFO construction has no constructor call".to_string())?;
+        let empty_arguments = Vec::new();
+        let arguments = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 3 {
+            return Err(
+                "direct UVM TLM FIFO construction requires an explicit bounded size".into(),
+            );
+        }
+        let size = string_field(unwrap_conversion(&arguments[2]), "value")
+            .or_else(|| string_field(unwrap_conversion(&arguments[2]), "constant"))
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| "UVM TLM FIFO size must be an integer literal".to_string())?;
+        if !matches!(size, 1..=4) {
+            return Err(format!(
+                "direct UVM TLM FIFO size must be between 1 and 4, found {size}"
+            ));
+        }
+        let fifo = self
+            .uvm_tlm_fifos
+            .borrow()
+            .get(object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no TLM FIFO state"))?;
+        let mut fifo = fifo;
+        fifo.capacity = size;
+        self.uvm_tlm_fifos
+            .borrow_mut()
+            .get_mut(object_key)
+            .ok_or_else(|| format!("class object '{object_key}' has no TLM FIFO state"))?
+            .capacity = size;
+        let mut statements = vec![Stmt::Bl {
+            lv: class_lvalue(&fifo.count),
+            e: Expr::Const(LogicWord::zero(fifo.count.width)),
+        }];
+        for slot in &fifo.slots {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(slot),
+                e: Expr::Const(LogicWord::zero(slot.width)),
+            });
+        }
+        Ok(Some(Stmt::Block(statements)))
+    }
+
+    pub(super) fn lower_uvm_tlm_fifo_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(
+            method_name.as_str(),
+            "try_put" | "try_get" | "try_peek" | "flush" | "put" | "get" | "peek"
+        ) {
+            return Ok(None);
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        if self
+            .class_object_types
+            .get(&object_key)
+            .is_none_or(|class_name| class_name != "uvm_tlm_fifo")
+        {
+            return Ok(None);
+        }
+        if matches!(method_name.as_str(), "put" | "get" | "peek") {
+            return Err(format!(
+                "blocking UVM TLM FIFO {method_name} is unsupported"
+            ));
+        }
+        let fifo = self
+            .uvm_tlm_fifos
+            .borrow()
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no TLM FIFO state"))?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+
+        if method_name == "flush" {
+            if !arguments.is_empty() {
+                return Err("UVM TLM FIFO flush requires no arguments".into());
+            }
+            let mut statements = vec![Stmt::Bl {
+                lv: class_lvalue(&fifo.count),
+                e: Expr::Const(LogicWord::zero(fifo.count.width)),
+            }];
+            for slot in &fifo.slots {
+                statements.push(Stmt::Bl {
+                    lv: class_lvalue(slot),
+                    e: Expr::Const(LogicWord::zero(slot.width)),
+                });
+            }
+            return Ok(Some(Stmt::Block(statements)));
+        }
+
+        if arguments.len() != 1 {
+            return Err(format!(
+                "UVM TLM FIFO {method_name} requires one transaction argument"
+            ));
+        }
+        match method_name.as_str() {
+            "try_put" => {
+                let value = self.lower_expression(&arguments[0])?;
+                let mut slot_assignments = Vec::new();
+                for (index, slot) in fifo.slots.iter().enumerate() {
+                    slot_assignments.push(Stmt::If {
+                        c: fifo_count_equals(&fifo, index),
+                        t: Box::new(Stmt::Bl {
+                            lv: class_lvalue(slot),
+                            e: value.clone(),
+                        }),
+                        f: None,
+                    });
+                }
+                Ok(Some(Stmt::If {
+                    c: fifo_count_less(&fifo, fifo.capacity),
+                    t: Box::new(Stmt::Block({
+                        slot_assignments.push(Stmt::Bl {
+                            lv: class_lvalue(&fifo.count),
+                            e: Expr::Bin {
+                                op: BinOp::Add,
+                                a: Box::new(class_expr(&fifo.count)),
+                                b: Box::new(Expr::Const(LogicWord::from_u64(fifo.count.width, 1))),
+                            },
+                        });
+                        slot_assignments
+                    })),
+                    f: None,
+                }))
+            }
+            "try_get" | "try_peek" => {
+                let output = arguments[0].get("left").ok_or_else(|| {
+                    format!("UVM TLM FIFO {method_name} requires an output argument")
+                })?;
+                let output = self.lower_lvalue(output)?;
+                let mut statements = vec![Stmt::Bl {
+                    lv: output,
+                    e: class_expr(&fifo.slots[0]),
+                }];
+                if method_name == "try_get" {
+                    for (index, (destination, source)) in
+                        fifo.slots.iter().zip(fifo.slots.iter().skip(1)).enumerate()
+                    {
+                        statements.push(Stmt::If {
+                            c: fifo_count_greater(&fifo, index + 1),
+                            t: Box::new(Stmt::Bl {
+                                lv: class_lvalue(destination),
+                                e: class_expr(source),
+                            }),
+                            f: None,
+                        });
+                    }
+                    statements.push(Stmt::Bl {
+                        lv: class_lvalue(&fifo.count),
+                        e: Expr::Bin {
+                            op: BinOp::Sub,
+                            a: Box::new(class_expr(&fifo.count)),
+                            b: Box::new(Expr::Const(LogicWord::from_u64(fifo.count.width, 1))),
+                        },
+                    });
+                }
+                Ok(Some(Stmt::If {
+                    c: fifo_count_greater(&fifo, 0),
+                    t: Box::new(Stmt::Block(statements)),
+                    f: None,
+                }))
+            }
+            _ => unreachable!("UVM TLM FIFO method was checked"),
+        }
+    }
+
+    pub(super) fn lower_uvm_tlm_fifo_query(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Expr>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if matches!(method_name.as_str(), "try_put" | "try_get" | "try_peek") {
+            return Err(format!(
+                "side-effecting UVM TLM FIFO {method_name} is unsupported in an expression"
+            ));
+        }
+        if !matches!(
+            method_name.as_str(),
+            "size" | "used" | "is_empty" | "is_full" | "can_put" | "can_get" | "can_peek"
+        ) {
+            return Ok(None);
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        if self
+            .class_object_types
+            .get(&object_key)
+            .is_none_or(|class_name| class_name != "uvm_tlm_fifo")
+        {
+            return Ok(None);
+        }
+        let fifo = self
+            .uvm_tlm_fifos
+            .borrow()
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no TLM FIFO state"))?;
+        let expression = match method_name.as_str() {
+            "size" => Expr::Const(LogicWord::from_u64(32, fifo.capacity as u64)),
+            "used" => class_expr(&fifo.count),
+            "is_empty" => fifo_count_equals(&fifo, 0),
+            "is_full" => fifo_count_equals(&fifo, fifo.capacity),
+            "can_put" => fifo_count_less(&fifo, fifo.capacity),
+            "can_get" | "can_peek" => fifo_count_greater(&fifo, 0),
+            _ => unreachable!("UVM TLM FIFO query was checked"),
+        };
+        Ok(Some(expression))
+    }
+
     pub(super) fn lower_uvm_callback_mode_query(
         &self,
         call: &Value,
@@ -4656,6 +4951,39 @@ const UVM_LOG_ACTION: u64 = 2;
 const UVM_COUNT_ACTION: u64 = 4;
 const UVM_EXIT_ACTION: u64 = 8;
 const UVM_CALL_HOOK_ACTION: u64 = 16;
+
+fn fifo_count_equals(fifo: &super::AstUvmTlmFifo, value: usize) -> Expr {
+    Expr::Bin {
+        op: BinOp::Eq,
+        a: Box::new(class_expr(&fifo.count)),
+        b: Box::new(Expr::Const(LogicWord::from_u64(
+            fifo.count.width,
+            value as u64,
+        ))),
+    }
+}
+
+fn fifo_count_less(fifo: &super::AstUvmTlmFifo, value: usize) -> Expr {
+    Expr::Bin {
+        op: BinOp::Lt,
+        a: Box::new(class_expr(&fifo.count)),
+        b: Box::new(Expr::Const(LogicWord::from_u64(
+            fifo.count.width,
+            value as u64,
+        ))),
+    }
+}
+
+fn fifo_count_greater(fifo: &super::AstUvmTlmFifo, value: usize) -> Expr {
+    Expr::Bin {
+        op: BinOp::Gt,
+        a: Box::new(class_expr(&fifo.count)),
+        b: Box::new(Expr::Const(LogicWord::from_u64(
+            fifo.count.width,
+            value as u64,
+        ))),
+    }
+}
 
 #[derive(Clone, Default)]
 struct UvmReportCatcherModification {

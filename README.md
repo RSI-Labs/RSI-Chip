@@ -155,8 +155,12 @@ remain fail-closed.
 A literal official-UVM `uvm_analysis_port#(T)` bootstrap can connect prepared
 `uvm_analysis_export#(T)` chains and `uvm_subscriber#(T)` analysis exports in
 order, detect export cycles, and lower `write(...)` to each subscriber's
-virtual `write` method. Dynamic run-time connections and the remaining TLM
-transport/FIFO APIs remain fail-closed.
+virtual `write` method. A bounded official-UVM `uvm_tlm_fifo#(int)` subset with
+an explicit size of 1..4 supports statement-form `try_put`, `try_get`,
+`try_peek`, `flush`, and the `size/used/is_empty/is_full/can_*` queries, while
+expression-form side-effecting `try_*` calls and blocking/transport APIs remain
+fail-closed. Dynamic run-time connections and the remaining TLM transport APIs
+remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

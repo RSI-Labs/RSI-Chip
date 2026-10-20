@@ -13310,6 +13310,190 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_tlm_fifo_try_operations_execute_in_order() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-tlm-fifo-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class TlmTrace;
+  static int capacity = -1;
+  static int full_before_flush = -1;
+  static int peeked = -1;
+  static int first_get = -1;
+  static int second_get = -1;
+  static int used_after_flush = -1;
+endclass
+
+class direct_tlm_fifo_probe extends uvm_test;
+  uvm_tlm_fifo#(int) fifo;
+
+  function new(string name = "direct_tlm_fifo_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    fifo = new("fifo", this, 2);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fifo.try_put(10);
+    fifo.try_put(20);
+    TlmTrace::capacity = fifo.size();
+    TlmTrace::full_before_flush = fifo.is_full();
+    fifo.try_put(99);
+    fifo.try_peek(TlmTrace::peeked);
+    fifo.try_get(TlmTrace::first_get);
+    fifo.try_put(30);
+    fifo.try_get(TlmTrace::second_get);
+    fifo.flush();
+    TlmTrace::used_after_flush = fifo.used();
+    phase.raise_objection(this);
+    #1;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_tlm_fifo_probe(
+  output int capacity,
+  output int full_before_flush,
+  output int peeked,
+  output int first_get,
+  output int second_get,
+  output int used_after_flush
+);
+  initial begin
+    run_test("direct_tlm_fifo_probe");
+    capacity = TlmTrace::capacity;
+    full_before_flush = TlmTrace::full_before_flush;
+    peeked = TlmTrace::peeked;
+    first_get = TlmTrace::first_get;
+    second_get = TlmTrace::second_get;
+    used_after_flush = TlmTrace::used_after_flush;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM TLM-FIFO wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_tlm_fifo_probe"),
+            &options,
+        )
+        .expect("directly lower an official UVM TLM FIFO");
+    let mut simulator = Simulator::new(&design).expect("create UVM TLM FIFO simulator");
+    simulator.run_until(1).expect("run UVM TLM FIFO");
+    assert_eq!(
+        simulator.read("capacity").unwrap().to_u64(),
+        Some(2),
+        "bounded FIFO capacity"
+    );
+    assert_eq!(
+        simulator.read("full_before_flush").unwrap().to_u64(),
+        Some(1),
+        "FIFO should be full after two puts"
+    );
+    assert_eq!(simulator.read("peeked").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("first_get").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("second_get").unwrap().to_u64(), Some(20));
+    assert_eq!(
+        simulator.read("used_after_flush").unwrap().to_u64(),
+        Some(0),
+        "flush should empty the bounded FIFO"
+    );
+}
+
+#[test]
+fn slang_direct_official_uvm_tlm_fifo_expression_side_effects_fail_closed() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-tlm-fifo-expression-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_tlm_expression_probe extends uvm_test;
+  uvm_tlm_fifo#(int) fifo;
+
+  function new(string name = "direct_tlm_expression_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    fifo = new("fifo", this, 1);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    if (fifo.try_put(1)) begin
+      phase.raise_objection(this);
+      phase.drop_objection(this);
+    end
+  endtask
+endclass
+
+module official_uvm_tlm_expression_probe;
+  initial run_test("direct_tlm_expression_probe");
+endmodule
+"#,
+    )
+    .expect("write official-UVM TLM expression wrapper");
+    let error = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_tlm_expression_probe"),
+            &options,
+        )
+        .expect_err("side-effecting TLM expressions must fail closed");
+    assert!(
+        error.contains("side-effecting UVM TLM FIFO try_put"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
