@@ -3128,11 +3128,6 @@ impl SlangAstLowerer {
         {
             return Ok(None);
         }
-        if matches!(method_name.as_str(), "put" | "get" | "peek") {
-            return Err(format!(
-                "blocking UVM TLM FIFO {method_name} is unsupported"
-            ));
-        }
         let fifo = self
             .uvm_tlm_fifos
             .borrow()
@@ -3168,7 +3163,7 @@ impl SlangAstLowerer {
             ));
         }
         match method_name.as_str() {
-            "try_put" => {
+            "try_put" | "put" => {
                 let value = self.lower_expression(&arguments[0])?;
                 let mut slot_assignments = Vec::new();
                 for (index, slot) in fifo.slots.iter().enumerate() {
@@ -3181,23 +3176,29 @@ impl SlangAstLowerer {
                         f: None,
                     });
                 }
-                Ok(Some(Stmt::If {
-                    c: fifo_count_less(&fifo, fifo.capacity),
-                    t: Box::new(Stmt::Block({
-                        slot_assignments.push(Stmt::Bl {
-                            lv: class_lvalue(&fifo.count),
-                            e: Expr::Bin {
-                                op: BinOp::Add,
-                                a: Box::new(class_expr(&fifo.count)),
-                                b: Box::new(Expr::Const(LogicWord::from_u64(fifo.count.width, 1))),
-                            },
-                        });
-                        slot_assignments
-                    })),
-                    f: None,
+                slot_assignments.push(Stmt::Bl {
+                    lv: class_lvalue(&fifo.count),
+                    e: Expr::Bin {
+                        op: BinOp::Add,
+                        a: Box::new(class_expr(&fifo.count)),
+                        b: Box::new(Expr::Const(LogicWord::from_u64(fifo.count.width, 1))),
+                    },
+                });
+                let body = Stmt::Block(slot_assignments);
+                Ok(Some(if method_name == "put" {
+                    Stmt::Wait {
+                        cond: fifo_count_less(&fifo, fifo.capacity),
+                        body: Box::new(body),
+                    }
+                } else {
+                    Stmt::If {
+                        c: fifo_count_less(&fifo, fifo.capacity),
+                        t: Box::new(body),
+                        f: None,
+                    }
                 }))
             }
-            "try_get" | "try_peek" => {
+            "try_get" | "get" | "try_peek" | "peek" => {
                 let output = arguments[0].get("left").ok_or_else(|| {
                     format!("UVM TLM FIFO {method_name} requires an output argument")
                 })?;
@@ -3206,7 +3207,7 @@ impl SlangAstLowerer {
                     lv: output,
                     e: class_expr(&fifo.slots[0]),
                 }];
-                if method_name == "try_get" {
+                if matches!(method_name.as_str(), "try_get" | "get") {
                     for (index, (destination, source)) in
                         fifo.slots.iter().zip(fifo.slots.iter().skip(1)).enumerate()
                     {
@@ -3228,10 +3229,18 @@ impl SlangAstLowerer {
                         },
                     });
                 }
-                Ok(Some(Stmt::If {
-                    c: fifo_count_greater(&fifo, 0),
-                    t: Box::new(Stmt::Block(statements)),
-                    f: None,
+                let body = Stmt::Block(statements);
+                Ok(Some(if matches!(method_name.as_str(), "get" | "peek") {
+                    Stmt::Wait {
+                        cond: fifo_count_greater(&fifo, 0),
+                        body: Box::new(body),
+                    }
+                } else {
+                    Stmt::If {
+                        c: fifo_count_greater(&fifo, 0),
+                        t: Box::new(body),
+                        f: None,
+                    }
                 }))
             }
             _ => unreachable!("UVM TLM FIFO method was checked"),

@@ -13852,6 +13852,124 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_tlm_blocking_ports_handshake_through_fifo() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-tlm-blocking-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class BlockingTlmTrace;
+  static int first = -1;
+  static int second = -1;
+  static int producer_done = 0;
+  static int consumer_done = 0;
+endclass
+
+class direct_blocking_tlm_probe extends uvm_test;
+  uvm_tlm_fifo#(int) fifo;
+  uvm_put_port#(int) producer;
+  uvm_get_peek_port#(int) consumer;
+
+  function new(string name = "direct_blocking_tlm_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    fifo = new("fifo", this, 1);
+    producer = new("producer", this);
+    consumer = new("consumer", this);
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    producer.connect(fifo.put_export);
+    consumer.connect(fifo.get_peek_export);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fork
+      begin
+        producer.put(10);
+        producer.put(20);
+        BlockingTlmTrace::producer_done = 1;
+      end
+      begin
+        #1;
+        consumer.get(BlockingTlmTrace::first);
+        #1;
+        consumer.get(BlockingTlmTrace::second);
+        BlockingTlmTrace::consumer_done = 1;
+      end
+    join
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_blocking_tlm_probe(
+  output int first,
+  output int second,
+  output int producer_done,
+  output int consumer_done
+);
+  initial begin
+    run_test("direct_blocking_tlm_probe");
+    first = BlockingTlmTrace::first;
+    second = BlockingTlmTrace::second;
+    producer_done = BlockingTlmTrace::producer_done;
+    consumer_done = BlockingTlmTrace::consumer_done;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM blocking-TLM wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_blocking_tlm_probe"),
+            &options,
+        )
+        .expect("directly lower blocking UVM TLM ports");
+    let mut simulator = Simulator::new(&design).expect("create blocking-UVM-TLM simulator");
+    simulator
+        .run_until(2)
+        .expect("run blocking UVM TLM handshake");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(10));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(20));
+    assert_eq!(
+        simulator.read("producer_done").unwrap().to_u64(),
+        Some(1),
+        "blocked producer should resume after consumer get"
+    );
+    assert_eq!(
+        simulator.read("consumer_done").unwrap().to_u64(),
+        Some(1),
+        "blocked consumer should resume after producer put"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

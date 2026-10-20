@@ -157,13 +157,13 @@ A literal official-UVM `uvm_analysis_port#(T)` bootstrap can connect prepared
 order, detect export cycles, and lower `write(...)` to each subscriber's
 virtual `write` method. A bounded official-UVM `uvm_tlm_fifo#(int)` subset with
 an explicit size of 1..4 supports statement-form `try_put`, `try_get`,
-`try_peek`, `flush`, and the `size/used/is_empty/is_full/can_*` queries, while
-expression-form side-effecting `try_*` calls and blocking/transport APIs remain
-fail-closed. Literal `uvm_put_port#(int)`, `uvm_put_export#(int)`,
+`try_peek`, `flush`, blocking `put/get/peek` by suspending on FIFO state, and
+the `size/used/is_empty/is_full/can_*` queries, while expression-form
+side-effecting `try_*` calls and transport APIs remain fail-closed. Literal `uvm_put_port#(int)`, `uvm_put_export#(int)`,
 `uvm_get_peek_port#(int)`, and `uvm_get_peek_export#(int)` objects can form
 matching endpoint chains that terminate at a bounded FIFO export, route
-`try_*`/`can_*` operations to that FIFO, reject direction mismatches, and
-detect endpoint cycles. Dynamic run-time connections, arbitrary port graphs,
+`try_*`, blocking `put/get/peek`, and `can_*` operations to that FIFO, reject
+direction mismatches, and detect endpoint cycles. Dynamic run-time connections, arbitrary port graphs,
 and the remaining TLM transport APIs remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
