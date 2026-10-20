@@ -12622,6 +12622,100 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_report_catcher_modifies_messages() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-mod-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class ReportModificationTrace;
+  static int counts = 0;
+endclass
+
+class direct_modifying_catcher extends uvm_report_catcher;
+  function new(string name = "direct_modifying_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    set_severity(UVM_WARNING);
+    set_message("modified catcher message");
+    set_action(UVM_DISPLAY | UVM_COUNT);
+    return THROW;
+  endfunction
+endclass
+
+class direct_report_modification_probe extends uvm_test;
+  function new(string name = "direct_report_modification_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_id_action("MOD", UVM_NO_ACTION);
+    uvm_report_server::get_server().set_max_quit_count(2);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_error("MOD", "original error message", UVM_NONE);
+    ReportModificationTrace::counts =
+      uvm_report_server::get_server().get_severity_count(UVM_WARNING) * 100 +
+      uvm_report_server::get_server().get_severity_count(UVM_ERROR) * 10 +
+      uvm_report_server::get_server().get_quit_count();
+  endtask
+endclass
+
+module official_uvm_report_modification_probe(
+  output int counts
+);
+  direct_modifying_catcher catcher;
+  initial begin
+    catcher = new("direct_modifying_catcher");
+    uvm_report_cb::add(null, catcher);
+    run_test("direct_report_modification_probe");
+    counts = ReportModificationTrace::counts;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report-modification wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_modification_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM report modifications");
+    let serialized = format!("{design:?}");
+    assert!(!serialized.contains("original error message"));
+    assert!(serialized.contains("modified catcher message"));
+    assert!(serialized.contains("[UVM_WARNING]"));
+    let mut simulator = Simulator::new(&design).expect("create UVM modification simulator");
+    simulator
+        .run_until(0)
+        .expect("run UVM report modifications");
+    assert_eq!(simulator.read("counts").unwrap().to_u64(), Some(101));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_scopes_to_context_object() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

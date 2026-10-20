@@ -141,7 +141,9 @@ includes `UVM_CALL_HOOK`, and a literal `0` return suppresses the message. Multi
 at the first matching enabled `CAUGHT` result. Literal
 `callback_mode(0/1)` can disable or re-enable a registered catcher, and
 literal `uvm_report_cb::delete(...)` / `delete_by_name(...)` can remove a
-context-matching catcher.
+context-matching catcher, and straight-line literal catcher
+`set_severity(...)`, `set_message(...)`, and `set_action(...)` calls modify a
+subsequent THROW report.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

@@ -2048,16 +2048,29 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn lower_uvm_report_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        self.lower_uvm_report_call_with(value, None, None, None, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_uvm_report_call_with(
+        &self,
+        value: &Value,
+        severity_override: Option<&str>,
+        message_override: Option<&str>,
+        action_override: Option<u64>,
+        apply_verbosity_filter: bool,
+    ) -> Result<Option<Stmt>, String> {
         let Some(subroutine) = string_field(value, "subroutine") else {
             return Ok(None);
         };
-        let severity = match subroutine.split_whitespace().next_back() {
+        let original_severity = match subroutine.split_whitespace().next_back() {
             Some("uvm_report_info") => "INFO",
             Some("uvm_report_warning") => "WARNING",
             Some("uvm_report_error") => "ERROR",
             Some("uvm_report_fatal") => "FATAL",
             _ => return Ok(None),
         };
+        let severity = severity_override.unwrap_or(original_severity);
         if value.get("thisClass").is_some() {
             return Ok(None);
         }
@@ -2073,9 +2086,13 @@ impl SlangAstLowerer {
         }
         let id = string_literal(unwrap_conversion(&arguments[0]))
             .ok_or_else(|| "UVM report IDs must be string literals".to_string())?;
-        let message = string_literal_allow_empty(unwrap_conversion(&arguments[1]))
-            .ok_or_else(|| "UVM report messages must be string literals".to_string())?;
-        let default_verbosity = if severity == "INFO" {
+        let message = if let Some(message) = message_override {
+            message.to_string()
+        } else {
+            string_literal_allow_empty(unwrap_conversion(&arguments[1]))
+                .ok_or_else(|| "UVM report messages must be string literals".to_string())?
+        };
+        let default_verbosity = if original_severity == "INFO" {
             "UVM_MEDIUM"
         } else {
             "UVM_NONE"
@@ -2140,10 +2157,13 @@ impl SlangAstLowerer {
         }
         let report_verbosity = uvm_report_verbosity_value(&verbosity)
             .ok_or_else(|| format!("unsupported UVM report verbosity '{verbosity}'"))?;
-        if report_verbosity > self.uvm_report_verbosity_threshold(severity, &id) {
+        if apply_verbosity_filter
+            && report_verbosity > self.uvm_report_verbosity_threshold(severity, &id)
+        {
             return Ok(Some(Stmt::Block(Vec::new())));
         }
-        let report_action = self.uvm_report_action(severity, &id);
+        let report_action =
+            action_override.unwrap_or_else(|| self.uvm_report_action(severity, &id));
         let mut finish_after_report = false;
         if report_action != 0 {
             let mut controls = self.uvm_report_controls.borrow_mut();
@@ -2378,12 +2398,32 @@ impl SlangAstLowerer {
         if !hooks_allow {
             return Ok(Some(Stmt::Block(hook_statements)));
         }
-        let (catcher_statements, caught) = self.lower_uvm_report_catcher(Some(&active_object))?;
+        let (catcher_statements, caught, modification) =
+            self.lower_uvm_report_catcher(Some(&active_object))?;
         hook_statements.extend(catcher_statements);
         if caught {
             return Ok(Some(Stmt::Block(hook_statements)));
         }
-        let Some(report_statement) = self.lower_uvm_report_call(call)? else {
+        let modified_severity = modification
+            .severity
+            .unwrap_or_else(|| severity.to_string());
+        let action_override = modification.action.or_else(|| {
+            if modified_severity != severity
+                && report_action == self.uvm_report_action(severity, &id)
+            {
+                Some(self.uvm_report_action(&modified_severity, &id))
+            } else {
+                None
+            }
+        });
+        let Some(report_statement) = self.lower_uvm_report_call_with(
+            call,
+            Some(&modified_severity),
+            modification.message.as_deref(),
+            action_override,
+            false,
+        )?
+        else {
             return Ok(Some(Stmt::Block(hook_statements)));
         };
         hook_statements.push(report_statement);
@@ -2703,7 +2743,7 @@ impl SlangAstLowerer {
     fn lower_uvm_report_catcher(
         &self,
         active_object: Option<&str>,
-    ) -> Result<(Vec<Stmt>, bool), String> {
+    ) -> Result<(Vec<Stmt>, bool, UvmReportCatcherModification), String> {
         let catchers = self
             .uvm_report_catcher
             .borrow()
@@ -2718,20 +2758,23 @@ impl SlangAstLowerer {
             .cloned()
             .collect::<Vec<_>>();
         let mut statements = Vec::new();
+        let mut modification = UvmReportCatcherModification::default();
         for catcher in catchers {
-            let (catcher_statements, caught) = self.lower_one_uvm_report_catcher(catcher)?;
+            let (catcher_statements, caught, catcher_modification) =
+                self.lower_one_uvm_report_catcher(catcher)?;
             statements.extend(catcher_statements);
+            modification.merge(catcher_modification);
             if caught {
-                return Ok((statements, true));
+                return Ok((statements, true, modification));
             }
         }
-        Ok((statements, false))
+        Ok((statements, false, modification))
     }
 
     fn lower_one_uvm_report_catcher(
         &self,
         catcher: super::AstUvmReportCatcher,
-    ) -> Result<(Vec<Stmt>, bool), String> {
+    ) -> Result<(Vec<Stmt>, bool, UvmReportCatcherModification), String> {
         let address = catcher
             .method
             .get("addr")
@@ -2766,13 +2809,18 @@ impl SlangAstLowerer {
         if statements.is_empty() {
             return Err("UVM report catcher catch method has no return".into());
         }
+        let mut modification = UvmReportCatcherModification::default();
         self.active_class_objects
             .borrow_mut()
             .push(catcher.object_key.clone());
         let lowered: Result<Vec<Stmt>, String> = (|| {
             let mut lowered = Vec::new();
             for statement in &statements[..statements.len() - 1] {
-                lowered.push(self.lower_statement(statement)?);
+                if let Some((setter, arguments)) = uvm_report_catcher_setter(statement) {
+                    modification.apply(setter, arguments)?;
+                } else {
+                    lowered.push(self.lower_statement(statement)?);
+                }
             }
             Ok(lowered)
         })();
@@ -2798,8 +2846,8 @@ impl SlangAstLowerer {
             .or_else(|| string_field(unwrap_conversion(return_value), "value"))
             .ok_or_else(|| "UVM report catcher return must be THROW or CAUGHT".to_string())?;
         match constant.as_str() {
-            "THROW" | "0" => Ok((catcher_statements, false)),
-            "CAUGHT" | "1" => Ok((catcher_statements, true)),
+            "THROW" | "0" => Ok((catcher_statements, false, modification)),
+            "CAUGHT" | "1" => Ok((catcher_statements, true, modification)),
             other => Err(format!(
                 "unsupported UVM report catcher return constant '{other}'"
             )),
@@ -3991,6 +4039,71 @@ const UVM_LOG_ACTION: u64 = 2;
 const UVM_COUNT_ACTION: u64 = 4;
 const UVM_EXIT_ACTION: u64 = 8;
 const UVM_CALL_HOOK_ACTION: u64 = 16;
+
+#[derive(Clone, Default)]
+struct UvmReportCatcherModification {
+    severity: Option<String>,
+    message: Option<String>,
+    action: Option<u64>,
+}
+
+impl UvmReportCatcherModification {
+    fn merge(&mut self, later: Self) {
+        if later.severity.is_some() {
+            self.severity = later.severity;
+        }
+        if later.message.is_some() {
+            self.message = later.message;
+        }
+        if later.action.is_some() {
+            self.action = later.action;
+        }
+    }
+
+    fn apply(&mut self, setter: &str, arguments: &[Value]) -> Result<(), String> {
+        if arguments.len() != 1 {
+            return Err(format!(
+                "UVM report catcher {setter} requires one literal argument"
+            ));
+        }
+        match setter {
+            "set_severity" => {
+                self.severity = Some(uvm_report_severity(&arguments[0])?);
+            }
+            "set_message" => {
+                self.message = Some(
+                    string_literal_allow_empty(unwrap_conversion(&arguments[0])).ok_or_else(
+                        || "UVM report catcher set_message requires a string literal".to_string(),
+                    )?,
+                );
+            }
+            _ => {
+                self.action = Some(uvm_report_action_value(&arguments[0])?);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn uvm_report_catcher_setter(statement: &Value) -> Option<(&'static str, &[Value])> {
+    let call = if string_field(statement, "kind").as_deref() == Some("ExpressionStatement") {
+        statement.get("expr")?
+    } else {
+        statement
+    };
+    if string_field(call, "kind").as_deref() != Some("Call") || call.get("thisClass").is_some() {
+        return None;
+    }
+    let subroutine = string_field(call, "subroutine")?;
+    let setter = match subroutine.split_whitespace().next_back() {
+        Some("set_severity") => "set_severity",
+        Some("set_message") => "set_message",
+        Some("set_action") => "set_action",
+        _ => return None,
+    };
+    let arguments = call.get("arguments")?.as_array()?;
+    Some((setter, arguments))
+}
 
 fn uvm_report_call_arguments(call: &Value) -> &[Value] {
     call.get("arguments")
