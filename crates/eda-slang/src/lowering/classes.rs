@@ -2467,7 +2467,7 @@ impl SlangAstLowerer {
         }
     }
 
-    fn require_initialized_class_object(&self, object_key: &str) -> Result<(), String> {
+    pub(super) fn require_initialized_class_object(&self, object_key: &str) -> Result<(), String> {
         if self.initialized_class_objects.contains(object_key)
             || !self.dynamic_sources_for(object_key).is_empty()
         {

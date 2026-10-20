@@ -2367,11 +2367,160 @@ impl SlangAstLowerer {
         if !hooks_allow {
             return Ok(Some(Stmt::Block(hook_statements)));
         }
+        let (catcher_statements, caught) = self.lower_uvm_report_catcher()?;
+        hook_statements.extend(catcher_statements);
+        if caught {
+            return Ok(Some(Stmt::Block(hook_statements)));
+        }
         let Some(report_statement) = self.lower_uvm_report_call(call)? else {
             return Ok(Some(Stmt::Block(hook_statements)));
         };
         hook_statements.push(report_statement);
         Ok(Some(Stmt::Block(hook_statements)))
+    }
+
+    pub(super) fn lower_uvm_report_catcher_registration(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "add" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Ok(None);
+        }
+        if string_field(unwrap_conversion(&arguments[0]), "kind").as_deref() != Some("NullLiteral")
+        {
+            return Ok(None);
+        }
+        if let Some(ordering) = arguments.get(2) {
+            if string_field(unwrap_conversion(ordering), "symbol")
+                .map(|symbol| symbol.ends_with("UVM_APPEND"))
+                != Some(true)
+            {
+                return Err("only UVM_APPEND report catcher ordering is supported".into());
+            }
+        }
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+            .ok_or_else(|| {
+                "UVM report catcher registration requires a catcher handle".to_string()
+            })?;
+        self.require_initialized_class_object(&object_key)?;
+        let class_name = self
+            .class_object_types
+            .get(&object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no type"))?;
+        let chain = self.class_chain(&class_name)?;
+        let Some(official_index) = official_uvm_report_catcher_index(&chain) else {
+            return Ok(None);
+        };
+        let Some((_, method)) = user_uvm_class_method(&chain, official_index, "catch") else {
+            return Err(format!(
+                "UVM report catcher class '{class_name}' has no catch method"
+            ));
+        };
+        if self.uvm_report_catcher.borrow().is_some() {
+            return Err("only one direct-lowering UVM report catcher is supported".into());
+        }
+        *self.uvm_report_catcher.borrow_mut() = Some(super::AstUvmReportCatcher {
+            object_key,
+            class_name,
+            method,
+        });
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    fn lower_uvm_report_catcher(&self) -> Result<(Vec<Stmt>, bool), String> {
+        let Some(catcher) = self.uvm_report_catcher.borrow().clone() else {
+            return Ok((Vec::new(), false));
+        };
+        let address = catcher
+            .method
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "UVM report catcher catch method has no address".to_string())?;
+        let catch_call = json!({
+            "kind": "Call",
+            "subroutine": format!("{address} catch"),
+            "thisClass": {
+                "kind": "NamedValue",
+                "type": catcher.class_name,
+                "symbol": catcher.object_key,
+            },
+            "arguments": [],
+        });
+        let chain = self.class_chain(&catcher.class_name)?;
+        let official_index = official_uvm_report_catcher_index(&chain)
+            .ok_or_else(|| "registered UVM report catcher is no longer official".to_string())?;
+        let owner = user_uvm_class_method(&chain, official_index, "catch")
+            .map(|(owner, _)| owner)
+            .ok_or_else(|| "registered UVM report catcher has no catch method".to_string())?;
+        let body = self.specialized_method_body(
+            &catcher.object_key,
+            &owner,
+            &catcher.method,
+            &catch_call,
+        )?;
+        let statements = body
+            .get("list")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "UVM report catcher catch method has no body".to_string())?;
+        if statements.is_empty() {
+            return Err("UVM report catcher catch method has no return".into());
+        }
+        self.active_class_objects
+            .borrow_mut()
+            .push(catcher.object_key.clone());
+        let lowered: Result<Vec<Stmt>, String> = (|| {
+            let mut lowered = Vec::new();
+            for statement in &statements[..statements.len() - 1] {
+                lowered.push(self.lower_statement(statement)?);
+            }
+            Ok(lowered)
+        })();
+        self.active_class_objects.borrow_mut().pop();
+        let catcher_statements = lowered?;
+
+        let return_statement = &statements[statements.len() - 1];
+        if string_field(return_statement, "kind").as_deref() != Some("Return") {
+            return Err("UVM report catcher catch method must end in a return".into());
+        }
+        let return_value = return_statement
+            .get("expr")
+            .ok_or_else(|| "UVM report catcher return has no value".to_string())?;
+        let symbol = string_field(unwrap_conversion(return_value), "symbol").map(|symbol| {
+            symbol
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .to_string()
+        });
+        let constant = symbol
+            .or_else(|| string_field(unwrap_conversion(return_value), "constant"))
+            .or_else(|| string_field(unwrap_conversion(return_value), "value"))
+            .ok_or_else(|| "UVM report catcher return must be THROW or CAUGHT".to_string())?;
+        match constant.as_str() {
+            "THROW" | "0" => Ok((catcher_statements, false)),
+            "CAUGHT" | "1" => Ok((catcher_statements, true)),
+            other => Err(format!(
+                "unsupported UVM report catcher return constant '{other}'"
+            )),
+        }
     }
 
     fn uvm_report_hook_call(
@@ -3674,6 +3823,16 @@ fn user_uvm_class_method(
                 })?;
             Some((owner.clone(), method.clone()))
         })
+}
+
+fn official_uvm_report_catcher_index(chain: &[(String, Value)]) -> Option<usize> {
+    chain.iter().position(|(owner, class)| {
+        owner.split('@').next() == Some("uvm_report_catcher")
+            && string_field(class, "source_file")
+                .and_then(|file| file.split('/').next_back().map(str::to_string))
+                .as_deref()
+                == Some("uvm_report_catcher.svh")
+    })
 }
 
 fn validate_bootstrap_phase_method(method: &Value, phase_name: &str) -> Result<(), String> {
