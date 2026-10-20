@@ -12149,7 +12149,18 @@ class direct_report_probe extends uvm_test;
     super.new(name, parent);
   endfunction
 
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_verbosity_level(UVM_HIGH);
+    this.set_report_id_action("SILENCE", UVM_NO_ACTION);
+    this.set_report_severity_id_action(UVM_INFO, "MUTE", UVM_DISPLAY);
+    this.set_report_severity_id_action(UVM_WARNING, "NO_WARN", UVM_NO_ACTION);
+  endfunction
+
   virtual task run_phase(uvm_phase phase);
+    `uvm_info("HIGH", "high message", UVM_HIGH)
+    `uvm_info("SILENCE", "silent message", UVM_LOW)
+    `uvm_info("MUTE", "pair action message", UVM_LOW)
+    `uvm_warning("NO_WARN", "silent warning")
     `uvm_info("DIRECT", "macro message", UVM_LOW)
     `uvm_warning("DIRECT", "macro warning")
     `uvm_error("DIRECT", "macro error")
@@ -12177,6 +12188,10 @@ endmodule
         )
         .expect("directly lower official UVM report calls");
     let serialized = format!("{design:?}");
+    assert!(serialized.contains("[UVM_INFO][HIGH][UVM_HIGH] high message"));
+    assert!(!serialized.contains("silent message"));
+    assert!(serialized.contains("[UVM_INFO][MUTE][UVM_LOW] pair action message"));
+    assert!(!serialized.contains("silent warning"));
     assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_LOW] macro message"));
     assert!(serialized.contains("[UVM_WARNING][DIRECT][UVM_NONE] macro warning"));
     assert!(serialized.contains("[UVM_ERROR][DIRECT][UVM_NONE] macro error"));

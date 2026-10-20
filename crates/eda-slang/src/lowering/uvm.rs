@@ -2138,17 +2138,33 @@ impl SlangAstLowerer {
         {
             return Err("UVM report action must be a literal 0 or 1".into());
         }
+        let report_verbosity = uvm_report_verbosity_value(&verbosity)
+            .ok_or_else(|| format!("unsupported UVM report verbosity '{verbosity}'"))?;
+        if report_verbosity > self.uvm_report_verbosity_threshold(severity, &id) {
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
+        let report_action = self.uvm_report_action(severity, &id);
+        if report_action == 0 {
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
         if severity == "FATAL" {
-            return Ok(Some(Stmt::Block(vec![
-                Stmt::Display {
+            let mut fatal_statements = Vec::new();
+            if report_action & 1 != 0 {
+                fatal_statements.push(Stmt::Display {
                     parts: vec![eda_core::ir::DispPart::Str(format!(
                         "[UVM_FATAL][{id}][{verbosity}] {message}\n"
                     ))],
                     args: Vec::new(),
                     monitor: false,
-                },
-                Stmt::Finish,
-            ])));
+                });
+            }
+            if report_action & 8 != 0 {
+                fatal_statements.push(Stmt::Finish);
+            }
+            return Ok(Some(Stmt::Block(fatal_statements)));
+        }
+        if report_action & 1 == 0 {
+            return Ok(Some(Stmt::Block(Vec::new())));
         }
         Ok(Some(Stmt::Display {
             parts: vec![eda_core::ir::DispPart::Str(format!(
@@ -2247,28 +2263,126 @@ impl SlangAstLowerer {
         else {
             return Ok(None);
         };
-        let severity = string_field(report_call, "subroutine")
-            .and_then(|subroutine| {
-                subroutine
-                    .split_whitespace()
-                    .next_back()
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        if severity == "uvm_report_info" {
-            let verbosity = report_call
-                .get("arguments")
-                .and_then(Value::as_array)
-                .and_then(|arguments| arguments.get(2))
-                .map(unwrap_conversion)
-                .and_then(|verbosity| string_field(verbosity, "constant"))
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(u64::MAX);
-            if verbosity > 200 {
-                return Ok(Some(Stmt::Block(Vec::new())));
+        self.lower_uvm_report_call(report_call)
+    }
+
+    pub(super) fn lower_uvm_report_control_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        if !is_this_reference(receiver) {
+            return Ok(None);
+        }
+        let active_object = self
+            .active_class_objects
+            .borrow()
+            .last()
+            .cloned()
+            .ok_or_else(|| "UVM report control has no active object".to_string())?;
+        let active_class = self
+            .class_object_types
+            .get(&active_object)
+            .cloned()
+            .ok_or_else(|| format!("class object '{active_object}' has no type"))?;
+        let chain = self.class_chain(&active_class)?;
+        if official_uvm_test_index(&chain).is_none() {
+            return Ok(None);
+        }
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(
+            method_name.as_str(),
+            "set_report_verbosity_level"
+                | "set_report_id_verbosity"
+                | "set_report_severity_id_verbosity"
+                | "set_report_severity_action"
+                | "set_report_id_action"
+                | "set_report_severity_id_action"
+        ) {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let expected_argument_count = match method_name.as_str() {
+            "set_report_verbosity_level" => 1,
+            "set_report_id_verbosity" | "set_report_severity_action" | "set_report_id_action" => 2,
+            _ => 3,
+        };
+        if arguments.len() != expected_argument_count {
+            return Err(format!(
+                "UVM report control {method_name} requires {expected_argument_count} arguments"
+            ));
+        }
+        let mut controls = self.uvm_report_controls.borrow_mut();
+        match method_name.as_str() {
+            "set_report_verbosity_level" => {
+                let verbosity = uvm_report_integer(&arguments[0])?;
+                controls.default_verbosity = Some(verbosity);
+            }
+            "set_report_id_verbosity" => {
+                let id = uvm_report_string(&arguments[0])?;
+                let verbosity = uvm_report_integer(&arguments[1])?;
+                controls.id_verbosity.insert(id, verbosity);
+            }
+            "set_report_severity_id_verbosity" => {
+                let severity = uvm_report_severity(&arguments[0])?;
+                let id = uvm_report_string(&arguments[1])?;
+                let verbosity = uvm_report_integer(&arguments[2])?;
+                controls
+                    .severity_id_verbosity
+                    .insert((severity, id), verbosity);
+            }
+            "set_report_severity_action" => {
+                let severity = uvm_report_severity(&arguments[0])?;
+                let action = uvm_report_action_value(&arguments[1])?;
+                controls.severity_actions.insert(severity, action);
+            }
+            "set_report_id_action" => {
+                let id = uvm_report_string(&arguments[0])?;
+                let action = uvm_report_action_value(&arguments[1])?;
+                controls.id_actions.insert(id, action);
+            }
+            _ => {
+                let severity = uvm_report_severity(&arguments[0])?;
+                let id = uvm_report_string(&arguments[1])?;
+                let action = uvm_report_action_value(&arguments[2])?;
+                controls.severity_id_actions.insert((severity, id), action);
             }
         }
-        self.lower_uvm_report_call(report_call)
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    fn uvm_report_action(&self, severity: &str, id: &str) -> u64 {
+        let controls = self.uvm_report_controls.borrow();
+        controls
+            .severity_id_actions
+            .get(&(severity.to_string(), id.to_string()))
+            .or_else(|| controls.id_actions.get(id))
+            .or_else(|| controls.severity_actions.get(severity))
+            .copied()
+            .unwrap_or(if severity == "FATAL" { 9 } else { 1 })
+    }
+
+    fn uvm_report_verbosity_threshold(&self, severity: &str, id: &str) -> u64 {
+        let controls = self.uvm_report_controls.borrow();
+        controls
+            .severity_id_verbosity
+            .get(&(severity.to_string(), id.to_string()))
+            .or_else(|| controls.id_verbosity.get(id))
+            .or_else(|| controls.severity_verbosity.get(severity))
+            .copied()
+            .or(controls.default_verbosity)
+            .unwrap_or(200)
     }
 
     fn resolve_global_uvm_factory_class(&self, requested_name: &str) -> Result<String, String> {
@@ -2950,6 +3064,94 @@ fn contains_subroutine_call(value: &Value, subroutine_name: &str) -> bool {
             .iter()
             .any(|nested| contains_subroutine_call(nested, subroutine_name))
     })
+}
+
+fn uvm_report_integer(value: &Value) -> Result<u64, String> {
+    let value = unwrap_conversion(value);
+    if string_field(value, "kind").as_deref() == Some("BinaryOp")
+        && string_field(value, "op").as_deref() == Some("BitwiseOr")
+    {
+        let left = value
+            .get("left")
+            .ok_or_else(|| "UVM report bitwise-or has no left operand".to_string())?;
+        let right = value
+            .get("right")
+            .ok_or_else(|| "UVM report bitwise-or has no right operand".to_string())?;
+        return Ok(uvm_report_integer(left)? | uvm_report_integer(right)?);
+    }
+    if let Some(symbol) = string_field(value, "symbol") {
+        let symbol = symbol.split_whitespace().next_back().unwrap_or_default();
+        return match symbol {
+            "UVM_NONE" => Ok(0),
+            "UVM_LOW" => Ok(100),
+            "UVM_MEDIUM" => Ok(200),
+            "UVM_HIGH" => Ok(300),
+            "UVM_FULL" => Ok(400),
+            "UVM_DEBUG" => Ok(500),
+            "UVM_NO_ACTION" => Ok(0),
+            "UVM_DISPLAY" => Ok(1),
+            "UVM_LOG" => Ok(2),
+            "UVM_COUNT" => Ok(4),
+            "UVM_EXIT" => Ok(8),
+            "UVM_CALL_HOOK" => Ok(16),
+            "UVM_STOP" => Ok(32),
+            "UVM_RM_RECORD" => Ok(64),
+            other => Err(format!("unsupported UVM report constant '{other}'")),
+        };
+    }
+    string_field(value, "constant")
+        .or_else(|| string_field(value, "value"))
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| "UVM report control value must be a literal".to_string())
+}
+
+fn uvm_report_verbosity_value(value: &str) -> Option<u64> {
+    match value {
+        "UVM_NONE" => Some(0),
+        "UVM_LOW" => Some(100),
+        "UVM_MEDIUM" => Some(200),
+        "UVM_HIGH" => Some(300),
+        "UVM_FULL" => Some(400),
+        "UVM_DEBUG" => Some(500),
+        numeric => numeric.parse::<u64>().ok(),
+    }
+}
+
+fn uvm_report_severity(value: &Value) -> Result<String, String> {
+    let value = unwrap_conversion(value);
+    let severity = string_field(value, "symbol")
+        .map(|symbol| {
+            symbol
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .or_else(|| string_field(value, "constant"))
+        .ok_or_else(|| "UVM report severity must be a literal".to_string())?;
+    match severity.as_str() {
+        "UVM_INFO" | "0" => Ok("INFO".to_string()),
+        "UVM_WARNING" | "1" => Ok("WARNING".to_string()),
+        "UVM_ERROR" | "2" => Ok("ERROR".to_string()),
+        "UVM_FATAL" | "3" => Ok("FATAL".to_string()),
+        other => Err(format!("unsupported UVM report severity '{other}'")),
+    }
+}
+
+fn uvm_report_string(value: &Value) -> Result<String, String> {
+    string_literal(unwrap_conversion(value))
+        .ok_or_else(|| "UVM report IDs must be string literals".to_string())
+}
+
+fn uvm_report_action_value(value: &Value) -> Result<u64, String> {
+    let action = uvm_report_integer(value)?;
+    if action & !(1 | 8) != 0 {
+        return Err(
+            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_EXIT, and their combinations are supported"
+                .into(),
+        );
+    }
+    Ok(action)
 }
 
 fn is_this_reference(value: &Value) -> bool {

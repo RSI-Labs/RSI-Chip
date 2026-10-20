@@ -125,7 +125,10 @@ value-returning resource forms, and unprepared waiters fail closed.
 Direct official-UVM reporting also accepts literal
 `uvm_report_info(...)`/`uvm_report_warning(...)`/`uvm_report_error(...)` calls,
 the literal `uvm_info`/`uvm_warning`/`uvm_error`/`uvm_fatal` macro forms with
-default verbosity/action filtering; fatal reporting terminates the simulation.
+default or literal-configured verbosity/action filtering. Literal
+`set_report_*` controls support default/id/severity/id+severity precedence for
+verbosity and actions; the current action subset is display, no-action, and
+fatal exit, and fatal reporting terminates when its exit action is enabled.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the

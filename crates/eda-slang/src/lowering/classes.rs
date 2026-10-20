@@ -1480,6 +1480,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
+        if let Some(statement) = self.lower_uvm_report_control_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_phase_objection_call(call)? {
             return Ok(Some(statement));
         }
