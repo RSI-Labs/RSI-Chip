@@ -443,7 +443,9 @@ pub(super) struct AstUvmReportCatcher {
 
 #[derive(Clone)]
 pub(super) struct AstUvmCallback {
-    pub(super) context_key: String,
+    pub(super) context_key: Option<String>,
+    pub(super) target_type: String,
+    pub(super) callback_type: String,
     pub(super) object_key: String,
     pub(super) class_name: String,
 }

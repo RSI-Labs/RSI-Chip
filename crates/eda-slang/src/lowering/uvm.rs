@@ -2567,27 +2567,6 @@ impl SlangAstLowerer {
             return Ok(None);
         }
 
-        let context_argument = unwrap_conversion(&arguments[0]);
-        if string_field(context_argument, "kind").as_deref() == Some("NullLiteral") {
-            return Err(
-                "typewide generic UVM callbacks are unsupported; register with an object context"
-                    .into(),
-            );
-        }
-        let context_key = if is_this_reference(context_argument) {
-            self.active_class_objects
-                .borrow()
-                .last()
-                .cloned()
-                .ok_or_else(|| "UVM callback registration has no active object".to_string())?
-        } else {
-            self.class_object_key_for_value(context_argument)?
-                .ok_or_else(|| {
-                    "UVM callback registration requires an initialized object handle".to_string()
-                })?
-        };
-        self.require_initialized_class_object(&context_key)?;
-
         let mut prepend = false;
         if let Some(ordering) = arguments.get(2) {
             let ordering_name = string_field(unwrap_conversion(ordering), "symbol")
@@ -2621,6 +2600,36 @@ impl SlangAstLowerer {
         if official_uvm_callback_index(&chain).is_none() {
             return Ok(None);
         }
+        let (target_type, callback_type) =
+            uvm_callback_specialization(call, &self.class_definitions).ok_or_else(|| {
+                "UVM callback registration has no specialized T/CB pair".to_string()
+            })?;
+
+        let context_argument = unwrap_conversion(&arguments[0]);
+        let context_key = if string_field(context_argument, "kind").as_deref()
+            == Some("NullLiteral")
+        {
+            None
+        } else if is_this_reference(context_argument) {
+            Some(
+                self.active_class_objects
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| "UVM callback registration has no active object".to_string())?,
+            )
+        } else {
+            Some(
+                self.class_object_key_for_value(context_argument)?
+                    .ok_or_else(|| {
+                        "UVM callback registration requires an initialized object handle"
+                            .to_string()
+                    })?,
+            )
+        };
+        if let Some(context_key) = &context_key {
+            self.require_initialized_class_object(context_key)?;
+        }
 
         let mut callbacks = self.uvm_callbacks.borrow_mut();
         if callbacks.iter().any(|existing| {
@@ -2630,6 +2639,8 @@ impl SlangAstLowerer {
         }
         let callback = super::AstUvmCallback {
             context_key,
+            target_type,
+            callback_type,
             object_key,
             class_name,
         };
@@ -2660,12 +2671,27 @@ impl SlangAstLowerer {
             .last()
             .cloned()
             .ok_or_else(|| "UVM callback macro has no active object".to_string())?;
+        let active_class = self
+            .class_object_types
+            .get(&active_object)
+            .cloned()
+            .ok_or_else(|| format!("class object '{active_object}' has no type"))?;
+        let active_chain = self.class_chain(&active_class)?;
 
         let callbacks = self
             .uvm_callbacks
             .borrow()
             .iter()
-            .filter(|callback| callback.context_key == active_object)
+            .filter(|callback| {
+                callback
+                    .context_key
+                    .as_ref()
+                    .is_none_or(|context| *context == active_object)
+                    && callback.callback_type == requested_type
+                    && active_chain.iter().any(|(owner, _)| {
+                        owner.split('@').next() == Some(callback.target_type.as_str())
+                    })
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut statements = Vec::new();
@@ -4446,6 +4472,55 @@ fn official_uvm_callback_index(chain: &[(String, Value)]) -> Option<usize> {
                 .as_deref()
                 == Some("uvm_callback.svh")
     })
+}
+
+fn uvm_callback_specialization(
+    call: &Value,
+    class_definitions: &std::collections::BTreeMap<String, Value>,
+) -> Option<(String, String)> {
+    let address = string_field(call, "subroutine")?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    for class in class_definitions.values() {
+        let is_callback_pool = string_field(class, "name").as_deref() == Some("uvm_callbacks")
+            || string_field(class, "genericClass")
+                .and_then(|generic| generic.split_whitespace().next_back().map(str::to_string))
+                .as_deref()
+                == Some("uvm_callbacks");
+        if !is_callback_pool {
+            continue;
+        }
+        let Some(members) = class.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        if !members.iter().any(|member| {
+            string_field(member, "kind").as_deref() == Some("Subroutine")
+                && string_field(member, "name").as_deref() == Some("add")
+                && member.get("addr").and_then(Value::as_u64) == Some(address)
+        }) {
+            continue;
+        }
+        let target_type = members
+            .iter()
+            .find(|member| {
+                string_field(member, "kind").as_deref() == Some("TypeParameter")
+                    && string_field(member, "name").as_deref() == Some("T")
+            })
+            .and_then(|member| string_field(member, "type"))
+            .and_then(|type_name| type_name.split_whitespace().next_back().map(str::to_string))?;
+        let callback_type = members
+            .iter()
+            .find(|member| {
+                string_field(member, "kind").as_deref() == Some("TypeParameter")
+                    && string_field(member, "name").as_deref() == Some("CB")
+            })
+            .and_then(|member| string_field(member, "type"))
+            .and_then(|type_name| type_name.split_whitespace().next_back().map(str::to_string))?;
+        return Some((target_type, callback_type));
+    }
+    None
 }
 
 fn expression_call(expression: &Value) -> Option<&Value> {

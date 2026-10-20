@@ -13015,7 +13015,7 @@ endmodule
 }
 
 #[test]
-fn slang_direct_official_uvm_typewide_callbacks_fail_closed() {
+fn slang_direct_official_uvm_typewide_callbacks_execute_for_matching_targets() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -13042,16 +13042,20 @@ fn slang_direct_official_uvm_typewide_callbacks_fail_closed() {
 
 import uvm_pkg::*;
 
+class CallbackTrace;
+  static int stage = 0;
+endclass
+
 class direct_typewide_callback extends uvm_callback;
   function new(string name = "direct_typewide_callback");
   endfunction
 
   virtual function void observe(int value);
+    CallbackTrace::stage = CallbackTrace::stage + value;
   endfunction
 endclass
 
 class direct_typewide_callback_probe extends uvm_test;
-  direct_typewide_callback callback;
 
   function new(string name = "direct_typewide_callback_probe",
                uvm_component parent = null);
@@ -13059,36 +13063,43 @@ class direct_typewide_callback_probe extends uvm_test;
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
-    callback = new("typewide_callback");
-    uvm_callbacks#(direct_typewide_callback_probe, direct_typewide_callback)::add(
-      null,
-      callback
-    );
   endfunction
 
   virtual task run_phase(uvm_phase phase);
+    `uvm_do_callbacks(direct_typewide_callback_probe, direct_typewide_callback, observe(7))
     phase.raise_objection(this);
     phase.drop_objection(this);
   endtask
 endclass
 
-module official_uvm_typewide_callback_probe;
-  initial run_test("direct_typewide_callback_probe");
+class direct_derived_typewide_callback_probe extends direct_typewide_callback_probe;
+endclass
+
+module official_uvm_typewide_callback_probe(output int stage);
+  direct_typewide_callback callback;
+  initial begin
+    callback = new("typewide_callback");
+    uvm_callbacks#(direct_typewide_callback_probe, direct_typewide_callback)::add(
+      null,
+      callback
+    );
+    run_test("direct_derived_typewide_callback_probe");
+    stage = CallbackTrace::stage;
+  end
 endmodule
 "#,
     )
     .expect("write official-UVM typewide-callback wrapper");
-    let error = slang
+    let design = slang
         .compile_files(
             &[source, wrapper],
             Some("official_uvm_typewide_callback_probe"),
             &options,
         )
-        .expect_err("typewide UVM callbacks must fail closed");
-    assert!(
-        error.contains("typewide generic UVM callbacks are unsupported"),
-        "{error}"
-    );
+        .expect("directly lower official UVM typewide callbacks");
+    let mut simulator = Simulator::new(&design).expect("create UVM typewide-callback simulator");
+    simulator.run_until(0).expect("run UVM typewide callbacks");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(7));
 }
 
 #[test]
