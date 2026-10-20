@@ -985,7 +985,12 @@ impl SlangAstLowerer {
             .ok_or_else(|| "UVM resource DB call has no subroutine name".to_string())?;
         if !matches!(
             method_name.as_str(),
-            "set" | "set_override" | "set_override_type" | "set_override_name"
+            "set"
+                | "set_default"
+                | "set_anonymous"
+                | "set_override"
+                | "set_override_type"
+                | "set_override_name"
         ) {
             return Ok(None);
         }
@@ -1002,6 +1007,66 @@ impl SlangAstLowerer {
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_arguments);
+        if method_name == "set_default" {
+            if arguments.len() != 2 {
+                return Err("UVM resource DB set_default requires two arguments".into());
+            }
+            let scope = string_literal_allow_empty(unwrap_conversion(&arguments[0]))
+                .ok_or_else(|| "UVM resource DB scopes must be string literals".to_string())?;
+            Self::uvm_config_scope_match(&scope, "")?;
+            let field_name = string_literal(unwrap_conversion(&arguments[1]))
+                .ok_or_else(|| "UVM resource DB names must be string literals".to_string())?;
+            self.uvm_config_entries
+                .borrow_mut()
+                .push(super::AstUvmConfigEntry {
+                    type_name: type_name.clone(),
+                    scope,
+                    field_name,
+                    precedence: UVM_CONFIG_DB_DEFAULT_PRECEDENCE,
+                    name_priority: false,
+                    type_priority: false,
+                    value: Self::uvm_resource_default(&type_name),
+                });
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
+        if method_name == "set_anonymous" {
+            if arguments.len() != 2 && arguments.len() != 3 {
+                return Err(
+                    "UVM resource DB set_anonymous requires two arguments plus optional accessor"
+                        .into(),
+                );
+            }
+            if arguments.len() == 3
+                && string_field(unwrap_conversion(&arguments[2]), "kind").as_deref()
+                    != Some("NullLiteral")
+            {
+                return Err("UVM resource DB accessors are not yet supported".into());
+            }
+            let scope = string_literal_allow_empty(unwrap_conversion(&arguments[0]))
+                .ok_or_else(|| "UVM resource DB scopes must be string literals".to_string())?;
+            Self::uvm_config_scope_match(&scope, "")?;
+            let resource_value = unwrap_conversion(&arguments[1]).clone();
+            if !matches!(
+                string_field(&resource_value, "kind").as_deref(),
+                Some("IntegerLiteral" | "StringLiteral")
+            ) {
+                return Err(
+                    "UVM resource DB bootstrap values must be integer or string literals".into(),
+                );
+            }
+            self.uvm_config_entries
+                .borrow_mut()
+                .push(super::AstUvmConfigEntry {
+                    type_name,
+                    scope,
+                    field_name: String::new(),
+                    precedence: UVM_CONFIG_DB_DEFAULT_PRECEDENCE,
+                    name_priority: false,
+                    type_priority: false,
+                    value: resource_value,
+                });
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
         if arguments.len() != 3 && arguments.len() != 4 {
             return Err(format!(
                 "UVM resource DB {method_name} requires three arguments plus optional accessor"
@@ -1740,6 +1805,22 @@ impl SlangAstLowerer {
         candidate.precedence >= selected.precedence
     }
 
+    fn uvm_resource_default(type_name: &str) -> Value {
+        if type_name == "string" {
+            json!({
+                "kind": "StringLiteral",
+                "type": "string",
+                "literal": "",
+            })
+        } else {
+            json!({
+                "kind": "IntegerLiteral",
+                "type": "int",
+                "value": "0",
+            })
+        }
+    }
+
     fn levenshtein_distance(left: &str, right: &str) -> usize {
         let left = left.as_bytes();
         let right = right.as_bytes();
@@ -1813,6 +1894,7 @@ impl SlangAstLowerer {
 
         let argument_index = match method_name {
             "set" | "set_override" | "set_override_type" | "set_override_name" => Some(2),
+            "set_anonymous" => Some(1),
             "read_by_name" => Some(2),
             "write_by_name" => Some(2),
             "read_by_type" => Some(1),
@@ -1834,7 +1916,41 @@ impl SlangAstLowerer {
                 return Some(type_name);
             }
         }
+        if method_name == "set_default" {
+            if let Some(type_name) = self.uvm_resource_return_type(call) {
+                return Some(type_name);
+            }
+        }
         Some(type_name)
+    }
+
+    fn uvm_resource_return_type(&self, call: &Value) -> Option<String> {
+        let return_type_address = string_field(call, "type")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        for class in self.class_definitions.values() {
+            let empty_members = Vec::new();
+            let members = class
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            let Some(alias) = members.iter().find(|member| {
+                string_field(member, "kind").as_deref() == Some("TypeAlias")
+                    && member.get("addr").and_then(Value::as_u64) == Some(return_type_address)
+            }) else {
+                continue;
+            };
+            let target = string_field(alias, "target")?;
+            if target.contains("uvm_resource#(int)") {
+                return Some("int".to_string());
+            }
+            if target.contains("uvm_resource#(string)") {
+                return Some("string".to_string());
+            }
+        }
+        None
     }
 
     fn uvm_db_type_name(

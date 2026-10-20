@@ -12718,6 +12718,14 @@ class ResourceDbTrace;
   static int name_override_by_type = -1;
   static int both_override_by_name = -1;
   static int both_override_by_type = -1;
+  static int default_int_found = 0;
+  static int default_int_value = -1;
+  static int default_string_found = 0;
+  static string default_string_value = "";
+  static int anonymous_int_found = 0;
+  static int anonymous_int_value = -1;
+  static int anonymous_string_found = 0;
+  static string anonymous_string_value = "";
 endclass
 
 class direct_resource_db_probe extends uvm_test;
@@ -12732,6 +12740,10 @@ class direct_resource_db_probe extends uvm_test;
   int name_override_by_type;
   int both_override_by_name;
   int both_override_by_type;
+  int default_int_value;
+  string default_string_value;
+  int anonymous_int_value;
+  string anonymous_string_value;
 
   function new(string name = "direct_resource_db_probe",
                uvm_component parent = null);
@@ -12747,6 +12759,10 @@ class direct_resource_db_probe extends uvm_test;
     name_override_by_type = -1;
     both_override_by_name = -1;
     both_override_by_type = -1;
+    default_int_value = -1;
+    default_string_value = "";
+    anonymous_int_value = -1;
+    anonymous_string_value = "";
   endfunction
 
   virtual function void build_phase(uvm_phase phase);
@@ -12800,6 +12816,22 @@ class direct_resource_db_probe extends uvm_test;
       "uvm_test_top.both_priority",
       "value",
       40
+    );
+    uvm_resource_db#(int)::set_default(
+      "uvm_test_top.default_int",
+      "value"
+    );
+    uvm_resource_db#(string)::set_default(
+      "uvm_test_top.default_string",
+      "text"
+    );
+    uvm_resource_db#(int)::set_anonymous(
+      "uvm_test_top.anonymous_int",
+      57
+    );
+    uvm_resource_db#(string)::set_anonymous(
+      "uvm_test_top.anonymous_string",
+      "anonymous"
     );
   endfunction
 
@@ -12889,6 +12921,46 @@ class direct_resource_db_probe extends uvm_test;
       ResourceDbTrace::both_override_by_type = both_override_by_type;
     end
 
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.default_int",
+      default_int_value
+    )) begin
+      ResourceDbTrace::default_int_found = 0;
+    end else begin
+      ResourceDbTrace::default_int_found = 1;
+      ResourceDbTrace::default_int_value = default_int_value;
+    end
+
+    if (!uvm_resource_db#(string)::read_by_type(
+      "uvm_test_top.default_string",
+      default_string_value
+    )) begin
+      ResourceDbTrace::default_string_found = 0;
+    end else begin
+      ResourceDbTrace::default_string_found = 1;
+      ResourceDbTrace::default_string_value = default_string_value;
+    end
+
+    if (!uvm_resource_db#(int)::read_by_type(
+      "uvm_test_top.anonymous_int",
+      anonymous_int_value
+    )) begin
+      ResourceDbTrace::anonymous_int_found = 0;
+    end else begin
+      ResourceDbTrace::anonymous_int_found = 1;
+      ResourceDbTrace::anonymous_int_value = anonymous_int_value;
+    end
+
+    if (!uvm_resource_db#(string)::read_by_type(
+      "uvm_test_top.anonymous_string",
+      anonymous_string_value
+    )) begin
+      ResourceDbTrace::anonymous_string_found = 0;
+    end else begin
+      ResourceDbTrace::anonymous_string_found = 1;
+      ResourceDbTrace::anonymous_string_value = anonymous_string_value;
+    end
+
     if (!uvm_resource_db#(int)::read_by_name(
       "uvm_test_top",
       "integer_value",
@@ -12961,7 +13033,15 @@ module official_uvm_resource_db_probe(
   output int name_override_by_name,
   output int name_override_by_type,
   output int both_override_by_name,
-  output int both_override_by_type
+  output int both_override_by_type,
+  output int default_int_found,
+  output int default_int_value,
+  output int default_string_found,
+  output string default_string_value,
+  output int anonymous_int_found,
+  output int anonymous_int_value,
+  output int anonymous_string_found,
+  output string anonymous_string_value
 );
   initial begin
     run_test("direct_resource_db_probe");
@@ -12982,6 +13062,14 @@ module official_uvm_resource_db_probe(
     name_override_by_type = ResourceDbTrace::name_override_by_type;
     both_override_by_name = ResourceDbTrace::both_override_by_name;
     both_override_by_type = ResourceDbTrace::both_override_by_type;
+    default_int_found = ResourceDbTrace::default_int_found;
+    default_int_value = ResourceDbTrace::default_int_value;
+    default_string_found = ResourceDbTrace::default_string_found;
+    default_string_value = ResourceDbTrace::default_string_value;
+    anonymous_int_found = ResourceDbTrace::anonymous_int_found;
+    anonymous_int_value = ResourceDbTrace::anonymous_int_value;
+    anonymous_string_found = ResourceDbTrace::anonymous_string_found;
+    anonymous_string_value = ResourceDbTrace::anonymous_string_value;
   end
 endmodule
 "#,
@@ -13024,6 +13112,44 @@ endmodule
     assert_eq!(
         simulator.read("both_override_by_type").unwrap().to_u64(),
         Some(41)
+    );
+    assert_eq!(
+        simulator.read("default_int_found").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator.read("default_int_value").unwrap().to_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        simulator.read("default_string_found").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator
+            .read("default_string_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        ""
+    );
+    assert_eq!(
+        simulator.read("anonymous_int_found").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator.read("anonymous_int_value").unwrap().to_u64(),
+        Some(57)
+    );
+    assert_eq!(
+        simulator.read("anonymous_string_found").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator
+            .read("anonymous_string_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "anonymous"
     );
     assert_eq!(simulator.read("string_found").unwrap().to_u64(), Some(1));
     assert_eq!(
