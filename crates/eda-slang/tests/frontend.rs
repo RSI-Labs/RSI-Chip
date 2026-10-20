@@ -12630,6 +12630,97 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_report_catcher_delete_unregisters() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-catcher-delete-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class CatcherDeleteTrace;
+  static int stage = 0;
+endclass
+
+class direct_deleted_report_catcher extends uvm_report_catcher;
+  function new(string name = "direct_deleted_report_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    CatcherDeleteTrace::stage = 1;
+    return CAUGHT;
+  endfunction
+endclass
+
+class direct_report_catcher_delete_probe extends uvm_test;
+  function new(string name = "direct_report_catcher_delete_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info(
+      "DELETED",
+      "deleted catcher message",
+      UVM_LOW
+    );
+    CatcherDeleteTrace::stage = CatcherDeleteTrace::stage * 10 + 2;
+  endtask
+endclass
+
+module official_uvm_report_catcher_delete_probe(output int stage);
+  direct_deleted_report_catcher catcher;
+  initial begin
+    catcher = new("direct_deleted_report_catcher");
+    uvm_report_cb::add(null, catcher);
+    uvm_report_cb::delete(null, catcher);
+    run_test("direct_report_catcher_delete_probe");
+    stage = CatcherDeleteTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report catcher deletion wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_catcher_delete_probe"),
+            &options,
+        )
+        .expect("directly lower UVM report catcher deletion");
+    let serialized = format!("{design:?}");
+    assert!(serialized.contains("deleted catcher message"));
+    let mut simulator =
+        Simulator::new(&design).expect("create UVM report catcher deletion simulator");
+    simulator
+        .run_until(0)
+        .expect("run after deleting the UVM report catcher");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -228,6 +228,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_report_catcher_registration(value)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_report_catcher_delete_call(value)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_report_catcher_mode_call(value)? {
             return Ok(Some(statement));
         }

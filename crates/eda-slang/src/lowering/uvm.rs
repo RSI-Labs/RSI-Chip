@@ -2552,6 +2552,65 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_report_catcher_delete_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "delete" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Ok(None);
+        }
+        let context_argument = unwrap_conversion(&arguments[0]);
+        let context_key = if string_field(context_argument, "kind").as_deref()
+            == Some("NullLiteral")
+        {
+            None
+        } else if is_this_reference(context_argument) {
+            Some(
+                self.active_class_objects
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "UVM report catcher deletion has no active object".to_string()
+                    })?,
+            )
+        } else {
+            Some(
+                self.class_object_key_for_value(context_argument)?
+                    .ok_or_else(|| {
+                        "UVM report catcher deletion requires a report object handle".to_string()
+                    })?,
+            )
+        };
+        let catcher_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+            .ok_or_else(|| "UVM report catcher deletion requires a catcher handle".to_string())?;
+        let mut catchers = self.uvm_report_catcher.borrow_mut();
+        let Some(index) = catchers.iter().position(|catcher| {
+            catcher.object_key == catcher_key && catcher.context_key == context_key
+        }) else {
+            return Err("UVM report catcher is not registered with the requested context".into());
+        };
+        catchers.remove(index);
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
     fn lower_uvm_report_catcher(
         &self,
         active_object: Option<&str>,
