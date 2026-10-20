@@ -12995,6 +12995,12 @@ class direct_object_callback_probe extends uvm_test;
     CallbackTrace::mode_after = second.callback_mode();
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
     uvm_callbacks#(direct_object_callback_probe, direct_callback)::delete(this, second);
+    uvm_callbacks#(direct_object_callback_probe, direct_callback)::add(this, second);
+    uvm_callbacks#(direct_object_callback_probe, direct_callback)::delete_by_name(
+      "uvm_test_top",
+      second,
+      null
+    );
     `uvm_do_callbacks(direct_object_callback_probe, direct_callback, observe(1))
     phase.raise_objection(this);
     #1;

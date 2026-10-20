@@ -2905,6 +2905,81 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_callback_delete_by_name_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "delete_by_name" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 3 {
+            return Ok(None);
+        }
+        if string_field(unwrap_conversion(&arguments[2]), "kind").as_deref() != Some("NullLiteral")
+        {
+            return Err("non-null UVM callback delete_by_name roots are unsupported".into());
+        }
+        let component_name = string_literal(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM callback names must be string literals".to_string())?;
+        let object_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+            .ok_or_else(|| "UVM callback delete_by_name requires a callback handle".to_string())?;
+        if !self
+            .uvm_callbacks
+            .borrow()
+            .iter()
+            .any(|callback| callback.object_key == object_key)
+        {
+            return Ok(None);
+        }
+        let Some((target_type, callback_type)) =
+            uvm_callback_specialization(call, &self.class_definitions, "delete_by_name")
+        else {
+            return Err("UVM callback delete_by_name has no specialized T/CB pair".into());
+        };
+        let matching_contexts = self
+            .class_object_declared_full_names
+            .borrow()
+            .iter()
+            .filter(|(_, full_name)| wildcard_matches(&component_name, full_name))
+            .map(|(context_key, _)| context_key.clone())
+            .collect::<Vec<_>>();
+        if matching_contexts.is_empty() {
+            return Err(format!(
+                "UVM callback name '{component_name}' matches no component"
+            ));
+        }
+
+        let mut callbacks = self.uvm_callbacks.borrow_mut();
+        let before = callbacks.len();
+        callbacks.retain(|callback| {
+            !(callback.object_key == object_key
+                && callback.target_type == target_type
+                && callback.callback_type == callback_type
+                && callback
+                    .context_key
+                    .as_ref()
+                    .is_some_and(|context| matching_contexts.contains(context)))
+        });
+        if callbacks.len() == before {
+            return Err("UVM callback is not registered with a matching component".into());
+        }
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
     pub(super) fn lower_uvm_report_catcher_mode_call(
         &self,
         call: &Value,
