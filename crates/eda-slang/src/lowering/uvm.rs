@@ -2047,6 +2047,105 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_report_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        let severity = match subroutine.split_whitespace().next_back() {
+            Some("uvm_report_info") => "INFO",
+            Some("uvm_report_warning") => "WARNING",
+            Some("uvm_report_error") => "ERROR",
+            Some("uvm_report_fatal") => "FATAL",
+            _ => return Ok(None),
+        };
+        if value.get("thisClass").is_some() {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() < 2 || arguments.len() > 7 {
+            return Err(format!(
+                "UVM {severity} report requires two arguments plus optional elaborated defaults"
+            ));
+        }
+        let id = string_literal(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM report IDs must be string literals".to_string())?;
+        let message = string_literal_allow_empty(unwrap_conversion(&arguments[1]))
+            .ok_or_else(|| "UVM report messages must be string literals".to_string())?;
+        let expected_verbosity = if severity == "INFO" {
+            "UVM_MEDIUM"
+        } else {
+            "UVM_NONE"
+        };
+        if arguments.len() > 2 {
+            let verbosity = unwrap_conversion(&arguments[2]);
+            if !string_field(verbosity, "symbol")
+                .is_some_and(|symbol| symbol.ends_with(expected_verbosity))
+            {
+                return Err("non-default UVM report verbosity is not yet supported".to_string());
+            }
+        }
+        if arguments.len() > 3
+            && !matches!(
+                string_field(unwrap_conversion(&arguments[3]), "literal").as_deref(),
+                Some("")
+            )
+        {
+            return Err("non-default UVM report filenames are not yet supported".into());
+        }
+        if arguments.len() > 4
+            && !matches!(
+                string_field(unwrap_conversion(&arguments[4]), "value").as_deref(),
+                Some("0")
+            )
+        {
+            return Err("non-default UVM report line numbers are not yet supported".into());
+        }
+        if arguments.len() > 5
+            && !matches!(
+                string_field(unwrap_conversion(&arguments[5]), "literal").as_deref(),
+                Some("")
+            )
+        {
+            return Err("non-default UVM report contexts are not yet supported".into());
+        }
+        if arguments.len() > 6
+            && !matches!(
+                string_field(unwrap_conversion(&arguments[6]), "value").as_deref(),
+                Some("0")
+            )
+        {
+            return Err("non-default UVM report actions are not yet supported".into());
+        }
+        if severity == "FATAL" {
+            return Ok(Some(Stmt::Block(vec![
+                Stmt::Display {
+                    parts: vec![eda_core::ir::DispPart::Str(format!(
+                        "[UVM_FATAL][{id}][UVM_NONE] {message}\n"
+                    ))],
+                    args: Vec::new(),
+                    monitor: false,
+                },
+                Stmt::Finish,
+            ])));
+        }
+        let verbosity = if severity == "INFO" {
+            "UVM_MEDIUM"
+        } else {
+            "UVM_NONE"
+        };
+        Ok(Some(Stmt::Display {
+            parts: vec![eda_core::ir::DispPart::Str(format!(
+                "[UVM_{severity}][{id}][{verbosity}] {message}\n"
+            ))],
+            args: Vec::new(),
+            monitor: false,
+        }))
+    }
+
     fn resolve_global_uvm_factory_class(&self, requested_name: &str) -> Result<String, String> {
         let mut selected_name = requested_name.to_string();
         let mut visited = std::collections::BTreeSet::new();

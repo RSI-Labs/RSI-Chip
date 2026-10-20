@@ -12105,6 +12105,77 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_reports_literal_messages() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_report_probe extends uvm_test;
+  function new(string name = "direct_report_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info("DIRECT", "informational message");
+    uvm_report_warning("DIRECT", "warning message");
+    uvm_report_error("DIRECT", "error message");
+  endtask
+endclass
+
+module official_uvm_report_probe(output int done);
+  initial begin
+    run_test("direct_report_probe");
+    done = 1;
+    uvm_report_fatal("DIRECT", "fatal message");
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM report calls");
+    let serialized = format!("{design:?}");
+    assert!(serialized.contains("[UVM_INFO][DIRECT][UVM_MEDIUM] informational message"));
+    assert!(serialized.contains("[UVM_WARNING][DIRECT][UVM_NONE] warning message"));
+    assert!(serialized.contains("[UVM_ERROR][DIRECT][UVM_NONE] error message"));
+    assert!(serialized.contains("[UVM_FATAL][DIRECT][UVM_NONE] fatal message"));
+    let mut simulator = Simulator::new(&design).expect("create UVM report simulator");
+    simulator.run_until(0).expect("run UVM report messages");
+    assert_eq!(simulator.read("done").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_direct_run_test_fails_closed_on_undrained_objections() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
