@@ -448,6 +448,18 @@ impl SlangAstLowerer {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
         let type_name = string_field(member, "type").unwrap_or_default();
+        if type_name.contains("uvm_analysis_port") {
+            let handle_address = member
+                .get("addr")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("UVM analysis port '{name}' has no symbol address"))?;
+            let object_key = format!("{handle_address} {name}");
+            self.class_objects
+                .insert(object_key.clone(), std::collections::BTreeMap::new());
+            self.class_object_types
+                .insert(object_key, "uvm_analysis_port".to_string());
+            return Ok(());
+        }
         if self.declare_class_object(member, &name)? {
             return Ok(());
         }

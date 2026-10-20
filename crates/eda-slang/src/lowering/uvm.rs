@@ -2781,6 +2781,132 @@ impl SlangAstLowerer {
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
+    pub(super) fn lower_uvm_analysis_port_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(method_name.as_str(), "connect" | "write") {
+            return Ok(None);
+        }
+        let Some(port_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        if self
+            .class_object_types
+            .get(&port_key)
+            .is_none_or(|class_name| class_name != "uvm_analysis_port")
+        {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+
+        if method_name == "connect" {
+            if arguments.len() != 1 {
+                return Err("UVM analysis port connect requires one provider".into());
+            }
+            let provider = unwrap_conversion(&arguments[0]);
+            if string_field(provider, "kind").as_deref() != Some("MemberAccess")
+                || string_field(provider, "member")
+                    .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+                    .as_deref()
+                    != Some("analysis_export")
+            {
+                return Err(
+                    "UVM analysis port connect requires a subscriber analysis_export".into(),
+                );
+            }
+            let subscriber_receiver = provider
+                .get("value")
+                .ok_or_else(|| "UVM analysis export has no subscriber receiver".to_string())?;
+            let subscriber_key = self
+                .class_object_key_for_value(subscriber_receiver)?
+                .ok_or_else(|| {
+                    "UVM analysis port connect requires an initialized subscriber".to_string()
+                })?;
+            let subscriber_class = self
+                .class_object_types
+                .get(&subscriber_key)
+                .cloned()
+                .ok_or_else(|| format!("class object '{subscriber_key}' has no type"))?;
+            let chain = self.class_chain(&subscriber_class)?;
+            let official_index = official_uvm_subscriber_index(&chain).ok_or_else(|| {
+                "UVM analysis port provider is not derived from uvm_subscriber".to_string()
+            })?;
+            user_uvm_class_method(&chain, official_index, "write").ok_or_else(|| {
+                "UVM analysis subscriber must define a literal write method".to_string()
+            })?;
+
+            let mut connections = self.uvm_analysis_connections.borrow_mut();
+            if connections.iter().any(|existing| {
+                existing.port_key == port_key && existing.subscriber_key == subscriber_key
+            }) {
+                return Err("duplicate direct-lowering UVM analysis connection".into());
+            }
+            connections.push(super::AstUvmAnalysisConnection {
+                port_key,
+                subscriber_key,
+                subscriber_class,
+            });
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
+
+        if arguments.len() != 1 {
+            return Err("UVM analysis port write requires one transaction".into());
+        }
+        let connections = self
+            .uvm_analysis_connections
+            .borrow()
+            .iter()
+            .filter(|connection| connection.port_key == port_key)
+            .cloned()
+            .collect::<Vec<_>>();
+        if connections.is_empty() {
+            return Err("UVM analysis port has no connected subscriber".into());
+        }
+        let mut statements = Vec::new();
+        for connection in connections {
+            let chain = self.class_chain(&connection.subscriber_class)?;
+            let official_index = official_uvm_subscriber_index(&chain)
+                .ok_or_else(|| "UVM analysis subscriber is no longer official".to_string())?;
+            let Some((_, method)) = user_uvm_class_method(&chain, official_index, "write") else {
+                return Err("UVM analysis subscriber has no executable write method".to_string());
+            };
+            let address = method
+                .get("addr")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "UVM analysis write method has no address".to_string())?;
+            let subscriber_call = json!({
+                "kind": "Call",
+                "type": "void",
+                "subroutine": format!("{address} write"),
+                "thisClass": {
+                    "kind": "NamedValue",
+                    "type": connection.subscriber_class,
+                    "symbol": connection.subscriber_key,
+                },
+                "arguments": arguments,
+            });
+            let Some(statement) = self.lower_class_task_call(&subscriber_call)? else {
+                return Err("UVM analysis subscriber write method could not be lowered".to_string());
+            };
+            statements.push(statement);
+        }
+        Ok(Some(Stmt::Block(statements)))
+    }
+
     pub(super) fn lower_uvm_callback_mode_query(
         &self,
         call: &Value,
@@ -4727,6 +4853,16 @@ fn official_uvm_callback_index(chain: &[(String, Value)]) -> Option<usize> {
                 .and_then(|file| file.split('/').next_back().map(str::to_string))
                 .as_deref()
                 == Some("uvm_callback.svh")
+    })
+}
+
+fn official_uvm_subscriber_index(chain: &[(String, Value)]) -> Option<usize> {
+    chain.iter().position(|(owner, class)| {
+        owner.split('@').next() == Some("uvm_subscriber")
+            && string_field(class, "source_file")
+                .and_then(|file| file.split('/').next_back().map(str::to_string))
+                .as_deref()
+                == Some("uvm_subscriber.svh")
     })
 }
 

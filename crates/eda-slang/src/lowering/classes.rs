@@ -796,6 +796,18 @@ impl SlangAstLowerer {
         name: &str,
     ) -> Result<bool, String> {
         let type_name = string_field(member, "type").unwrap_or_default();
+        if type_name.contains("uvm_analysis_port") {
+            let handle_address = member
+                .get("addr")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("UVM analysis port '{name}' has no symbol address"))?;
+            let object_key = format!("{handle_address} {name}");
+            self.class_objects
+                .insert(object_key.clone(), BTreeMap::new());
+            self.class_object_types
+                .insert(object_key, "uvm_analysis_port".to_string());
+            return Ok(true);
+        }
         let Some(class_name) = class_name(&type_name) else {
             return Ok(false);
         };
@@ -825,9 +837,9 @@ impl SlangAstLowerer {
             ));
         }
         let chain = self.class_chain(&class_key)?;
-        let official_uvm_derivation = chain
-            .iter()
-            .any(|(owner, _)| owner.split('@').next() == Some("uvm_test"));
+        let official_uvm_derivation = chain.iter().any(|(owner, _)| {
+            matches!(owner.split('@').next(), Some("uvm_test" | "uvm_subscriber"))
+        });
         let empty_members = Vec::new();
         let mut declared_properties = BTreeMap::new();
         for (owner_name, class) in &chain {
@@ -1224,6 +1236,13 @@ impl SlangAstLowerer {
         let Some(object_key) = self.class_object_key_for_value(left)? else {
             return Ok(None);
         };
+        if self
+            .class_object_types
+            .get(&object_key)
+            .is_some_and(|class_name| class_name == "uvm_analysis_port")
+        {
+            return Ok(Some(eda_core::ir::Stmt::Block(Vec::new())));
+        }
         let constructor = right
             .get("constructorCall")
             .ok_or_else(|| "class construction has no constructor call".to_string())?;
@@ -1480,6 +1499,9 @@ impl SlangAstLowerer {
         let Some(receiver) = call.get("thisClass") else {
             return Ok(None);
         };
+        if let Some(statement) = self.lower_uvm_analysis_port_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_report_server_control_call(call, receiver)? {
             return Ok(Some(statement));
         }
@@ -2794,7 +2816,9 @@ impl SlangAstLowerer {
                 return Err(format!("class inheritance cycle at '{current}'"));
             }
             let Some(class) = self.class_definitions.get(&current).cloned() else {
-                return Err(format!("unknown class '{current}'"));
+                return Err(format!(
+                    "unknown class '{current}' while resolving class '{start}'"
+                ));
             };
             let base_reference = class
                 .get("baseClass")
@@ -2994,7 +3018,10 @@ impl SlangAstLowerer {
                             .and_then(class_name)
                     })
                     .ok_or_else(|| format!("class '{owner_class}' has no base constructor"))?;
-                if class_name(&base).as_deref() == Some("uvm_test") {
+                if matches!(
+                    class_name(&base).as_deref(),
+                    Some("uvm_test" | "uvm_subscriber")
+                ) {
                     return Ok(json!({"kind": "Empty"}));
                 }
                 let empty_members = Vec::new();

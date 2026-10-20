@@ -13134,6 +13134,106 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_analysis_port_broadcasts_to_subscribers() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-analysis-port-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class AnalysisTrace;
+  static int observed = 0;
+  static int writes = 0;
+endclass
+
+class direct_analysis_subscriber extends uvm_subscriber#(int);
+  function new(string name = "direct_analysis_subscriber",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void write(int t);
+    AnalysisTrace::observed = AnalysisTrace::observed + t;
+    AnalysisTrace::writes = AnalysisTrace::writes + 1;
+  endfunction
+endclass
+
+class direct_analysis_probe extends uvm_test;
+  direct_analysis_subscriber subscriber;
+  direct_analysis_subscriber second_subscriber;
+  uvm_analysis_port#(int) port;
+
+  function new(string name = "direct_analysis_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    subscriber = new("subscriber", this);
+    second_subscriber = new("second_subscriber", this);
+    port = new("port", this);
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    port.connect(subscriber.analysis_export);
+    port.connect(second_subscriber.analysis_export);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    port.write(41);
+    phase.raise_objection(this);
+    #1;
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_analysis_port_probe(
+  output int observed,
+  output int writes
+);
+  initial begin
+    run_test("direct_analysis_probe");
+    observed = AnalysisTrace::observed;
+    writes = AnalysisTrace::writes;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM analysis-port wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_analysis_port_probe"),
+            &options,
+        )
+        .expect("directly lower an official UVM analysis port");
+    let mut simulator = Simulator::new(&design).expect("create UVM analysis simulator");
+    simulator.run_until(1).expect("run UVM analysis port");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(82));
+    assert_eq!(simulator.read("writes").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

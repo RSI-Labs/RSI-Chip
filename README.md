@@ -152,6 +152,11 @@ class dispatch, and supports literal callback_mode(0/1), callback_mode()
 queries, object/typewide delete(...), and null-root literal delete_by_name(...).
 Full dynamic pools, iterator APIs, derivation registries, and callback tracing
 remain fail-closed.
+A literal official-UVM `uvm_analysis_port#(T)` bootstrap can connect multiple
+prepared `uvm_subscriber#(T)` analysis exports in order and lower `write(...)`
+to each subscriber's virtual `write` method. Port/export hierarchy resolution,
+dynamic run-time connections, and the remaining TLM transport/FIFO APIs remain
+fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
@@ -159,7 +164,7 @@ glob/regex/precedence/wait/spell model does not prove complete official POSIX
 dialect equivalence or all `uvm_resource_db` APIs and waiter pools,
 priority controls, resource-wide dictionaries, or dynamic resource-pool behavior,
 there is no parallel phase graph, callback-based objection scheduler, full
-dynamic callback pool, or TLM/sequence runtime.
+dynamic callback pool, full TLM runtime, or sequence runtime.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit
