@@ -12454,8 +12454,18 @@ class direct_report_catcher extends uvm_report_catcher;
   endfunction
 
   virtual function action_e catch();
-    CatcherTrace::stage = 1;
+    CatcherTrace::stage = CatcherTrace::stage * 10 + 1;
     return CAUGHT;
+  endfunction
+endclass
+
+class direct_second_report_catcher extends uvm_report_catcher;
+  function new(string name = "direct_second_report_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    CatcherTrace::stage = 2;
+    return THROW;
   endfunction
 endclass
 
@@ -12473,9 +12483,12 @@ endclass
 
 module official_uvm_report_catcher_probe(output int stage);
   direct_report_catcher catcher;
+  direct_second_report_catcher second;
   initial begin
     catcher = new("direct_report_catcher");
+    second = new("direct_second_report_catcher");
     uvm_report_cb::add(null, catcher);
+    uvm_report_cb::add(null, second, UVM_PREPEND);
     run_test("direct_report_catcher_probe");
     stage = CatcherTrace::stage;
   end
@@ -12494,7 +12507,7 @@ endmodule
     assert!(!serialized.contains("catcher suppressed message"));
     let mut simulator = Simulator::new(&design).expect("create UVM report catcher simulator");
     simulator.run_until(0).expect("run UVM report catcher");
-    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(12));
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(212));
 }
 
 #[test]

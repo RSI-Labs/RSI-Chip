@@ -2407,11 +2407,19 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         if let Some(ordering) = arguments.get(2) {
-            if string_field(unwrap_conversion(ordering), "symbol")
-                .map(|symbol| symbol.ends_with("UVM_APPEND"))
-                != Some(true)
-            {
-                return Err("only UVM_APPEND report catcher ordering is supported".into());
+            let ordering_name = string_field(unwrap_conversion(ordering), "symbol")
+                .map(|symbol| {
+                    symbol
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .ok_or_else(|| "UVM report catcher ordering must be literal".to_string())?;
+            if !matches!(ordering_name.as_str(), "UVM_APPEND" | "UVM_PREPEND") {
+                return Err(format!(
+                    "unsupported UVM report catcher ordering '{ordering_name}'"
+                ));
             }
         }
         let object_key = self
@@ -2434,21 +2442,52 @@ impl SlangAstLowerer {
                 "UVM report catcher class '{class_name}' has no catch method"
             ));
         };
-        if self.uvm_report_catcher.borrow().is_some() {
-            return Err("only one direct-lowering UVM report catcher is supported".into());
+        if self
+            .uvm_report_catcher
+            .borrow()
+            .iter()
+            .any(|existing| existing.object_key == object_key)
+        {
+            return Err("duplicate direct-lowering UVM report catcher registration".into());
         }
-        *self.uvm_report_catcher.borrow_mut() = Some(super::AstUvmReportCatcher {
+        let catcher = super::AstUvmReportCatcher {
             object_key,
             class_name,
             method,
-        });
+        };
+        let prepend = arguments
+            .get(2)
+            .map(|ordering| {
+                string_field(unwrap_conversion(ordering), "symbol")
+                    .map(|symbol| symbol.ends_with("UVM_PREPEND"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if prepend {
+            self.uvm_report_catcher.borrow_mut().insert(0, catcher);
+        } else {
+            self.uvm_report_catcher.borrow_mut().push(catcher);
+        }
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
     fn lower_uvm_report_catcher(&self) -> Result<(Vec<Stmt>, bool), String> {
-        let Some(catcher) = self.uvm_report_catcher.borrow().clone() else {
-            return Ok((Vec::new(), false));
-        };
+        let catchers = self.uvm_report_catcher.borrow().clone();
+        let mut statements = Vec::new();
+        for catcher in catchers {
+            let (catcher_statements, caught) = self.lower_one_uvm_report_catcher(catcher)?;
+            statements.extend(catcher_statements);
+            if caught {
+                return Ok((statements, true));
+            }
+        }
+        Ok((statements, false))
+    }
+
+    fn lower_one_uvm_report_catcher(
+        &self,
+        catcher: super::AstUvmReportCatcher,
+    ) -> Result<(Vec<Stmt>, bool), String> {
         let address = catcher
             .method
             .get("addr")

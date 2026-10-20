@@ -134,8 +134,9 @@ no-action, count, and fatal exit. Literal report-server counters track
 severity/id/quit counts, and a `UVM_COUNT` report terminates when the configured
 maximum quit count is reached. User-overridden literal
 `report_hook(...)`/severity hook functions execute before reporting, and a
-literal `0` return suppresses the message. A single null-context
-`uvm_report_catcher` can be registered and return literal `THROW` or `CAUGHT`.
+literal `0` return suppresses the message. Multiple null-context
+`uvm_report_catcher` registrations support literal
+`UVM_APPEND`/`UVM_PREPEND` ordering and stop at the first `CAUGHT` result.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
