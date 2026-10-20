@@ -12811,6 +12811,111 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_report_catcher_delete_by_name_unregisters() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        return;
+    };
+    let root = PathBuf::from(uvm_home);
+    let source = root.join("src").join("uvm.sv");
+    if !source.is_file() {
+        return;
+    }
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-report-catcher-delete-by-name-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+import uvm_pkg::*;
+
+class DeleteByNameTrace;
+  static int stage = 0;
+endclass
+
+class direct_delete_by_name_catcher extends uvm_report_catcher;
+  function new(string name = "direct_delete_by_name_catcher");
+  endfunction
+
+  virtual function action_e catch();
+    DeleteByNameTrace::stage = 1;
+    return CAUGHT;
+  endfunction
+endclass
+
+class direct_delete_by_name_object extends uvm_test;
+  function new(string name = "direct_delete_by_name_object",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+endclass
+
+class direct_report_delete_by_name_probe extends uvm_test;
+  direct_delete_by_name_object other;
+  direct_delete_by_name_catcher catcher;
+
+  function new(string name = "direct_report_delete_by_name_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+    other = new("other", this);
+    catcher = new("direct_delete_by_name_catcher");
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    uvm_report_cb::add(other, catcher);
+    uvm_report_cb::delete_by_name(
+      "uvm_test_top.other",
+      catcher,
+      null
+    );
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info(
+      "BY_NAME",
+      "delete-by-name catcher message",
+      UVM_LOW
+    );
+    DeleteByNameTrace::stage = DeleteByNameTrace::stage * 10 + 2;
+  endtask
+endclass
+
+module official_uvm_report_delete_by_name_probe(output int stage);
+  initial begin
+    run_test("direct_report_delete_by_name_probe");
+    stage = DeleteByNameTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM report delete-by-name wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_report_delete_by_name_probe"),
+            &options,
+        )
+        .expect("directly lower UVM report catcher delete_by_name");
+    let serialized = format!("{design:?}");
+    assert!(serialized.contains("delete-by-name catcher message"));
+    let mut simulator = Simulator::new(&design).expect("create UVM delete-by-name simulator");
+    simulator.run_until(0).expect("run after delete_by_name");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_official_uvm_report_count_exits_at_max() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

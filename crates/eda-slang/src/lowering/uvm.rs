@@ -2598,16 +2598,94 @@ impl SlangAstLowerer {
                     })?,
             )
         };
-        let catcher_key = self
-            .class_object_key_for_value(unwrap_conversion(&arguments[1]))?
-            .ok_or_else(|| "UVM report catcher deletion requires a catcher handle".to_string())?;
+        let Some(catcher_key) =
+            self.class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+        else {
+            return Ok(None);
+        };
         let mut catchers = self.uvm_report_catcher.borrow_mut();
+        if !catchers
+            .iter()
+            .any(|catcher| catcher.object_key == catcher_key)
+        {
+            return Ok(None);
+        }
         let Some(index) = catchers.iter().position(|catcher| {
             catcher.object_key == catcher_key && catcher.context_key == context_key
         }) else {
             return Err("UVM report catcher is not registered with the requested context".into());
         };
         catchers.remove(index);
+        Ok(Some(Stmt::Block(Vec::new())))
+    }
+
+    pub(super) fn lower_uvm_report_catcher_delete_by_name_call(
+        &self,
+        call: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "delete_by_name" {
+            return Ok(None);
+        }
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 && arguments.len() != 3 {
+            return Ok(None);
+        }
+        if let Some(root) = arguments.get(2) {
+            if string_field(unwrap_conversion(root), "kind").as_deref() != Some("NullLiteral") {
+                return Err(
+                    "non-null UVM report catcher delete_by_name roots are unsupported".into(),
+                );
+            }
+        }
+        let component_name = string_literal(unwrap_conversion(&arguments[0]))
+            .ok_or_else(|| "UVM report catcher names must be string literals".to_string())?;
+        let Some(catcher_key) =
+            self.class_object_key_for_value(unwrap_conversion(&arguments[1]))?
+        else {
+            return Ok(None);
+        };
+        let matching_contexts = self
+            .class_object_declared_full_names
+            .borrow()
+            .iter()
+            .filter(|(_, full_name)| wildcard_matches(&component_name, full_name))
+            .map(|(object_key, _)| object_key.clone())
+            .collect::<Vec<_>>();
+        if matching_contexts.is_empty() {
+            return Err(format!(
+                "UVM report catcher name '{component_name}' matches no component"
+            ));
+        }
+        let mut catchers = self.uvm_report_catcher.borrow_mut();
+        if !catchers
+            .iter()
+            .any(|catcher| catcher.object_key == catcher_key)
+        {
+            return Ok(None);
+        }
+        let before = catchers.len();
+        catchers.retain(|catcher| {
+            !(catcher.object_key == catcher_key
+                && catcher
+                    .context_key
+                    .as_ref()
+                    .is_some_and(|context| matching_contexts.contains(context)))
+        });
+        if catchers.len() == before {
+            return Err("UVM report catcher is not registered with the requested component".into());
+        }
         Ok(Some(Stmt::Block(Vec::new())))
     }
 
