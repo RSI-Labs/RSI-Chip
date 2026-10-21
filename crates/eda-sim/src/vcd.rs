@@ -1,7 +1,8 @@
 //! VCD (Value Change Dump) waveform writer.
 
+use super::MemoryElementStorage;
 use eda_core::ir::Design;
-use eda_core::logic::{LogicValue, LogicWord};
+use eda_core::logic::LogicValue;
 use std::collections::{HashMap, HashSet};
 
 pub struct VcdWriter {
@@ -104,12 +105,12 @@ impl VcdWriter {
 
     /// Record changes at time `t`. `changed` holds declaration indices whose
     /// bits changed since the previous flush.
-    pub fn advance(
+    pub(crate) fn advance(
         &mut self,
         t: u64,
         vals: &[LogicValue],
         changed: &HashSet<usize>,
-        memory_elements: &[HashMap<u64, LogicWord>],
+        memory_elements: &[MemoryElementStorage],
         memory_changes: &HashSet<(usize, u64)>,
     ) {
         self.ensure_memory_words(memory_elements, memory_changes);
@@ -163,15 +164,20 @@ impl VcdWriter {
         }
     }
 
-    pub fn render(
+    pub(crate) fn render(
         &mut self,
         vals: &[LogicValue],
-        memory_elements: &[HashMap<u64, LogicWord>],
+        memory_elements: &[MemoryElementStorage],
     ) -> String {
         let all_memory_changes = memory_elements
             .iter()
             .enumerate()
-            .flat_map(|(memory, elements)| elements.keys().map(move |address| (memory, *address)))
+            .flat_map(|(memory, elements)| {
+                elements
+                    .touched_addresses()
+                    .into_iter()
+                    .map(move |address| (memory, address))
+            })
             .collect::<HashSet<_>>();
         self.ensure_memory_words(memory_elements, &all_memory_changes);
         let mut out = self.header();
@@ -200,7 +206,7 @@ impl VcdWriter {
 
     fn ensure_memory_words(
         &mut self,
-        memory_elements: &[HashMap<u64, LogicWord>],
+        memory_elements: &[MemoryElementStorage],
         changes: &HashSet<(usize, u64)>,
     ) {
         for &(memory, address) in changes {
@@ -210,7 +216,7 @@ impl VcdWriter {
             let Some(elements) = memory_elements.get(memory) else {
                 continue;
             };
-            let Some(value) = elements.get(&address) else {
+            let Some(value) = elements.get(address) else {
                 continue;
             };
             let Some(declaration) = self.memory_meta.get(memory) else {
@@ -274,14 +280,14 @@ fn dump_value(bits: &[LogicValue], id: &str) -> String {
 }
 
 fn read_memory(
-    memory_elements: &[HashMap<u64, LogicWord>],
+    memory_elements: &[MemoryElementStorage],
     memory: usize,
     address: u64,
     width: usize,
 ) -> Vec<LogicValue> {
     memory_elements
         .get(memory)
-        .and_then(|elements| elements.get(&address))
+        .and_then(|elements| elements.get(address))
         .map(|word| (0..width).map(|bit| word.bit(bit)).collect())
         .unwrap_or_else(|| vec![LogicValue::X; width])
 }

@@ -1,6 +1,7 @@
 use super::*;
 use eda_core::ir::{
-    Assign, Expr, LValue, MemoryDecl, MemoryDimension, NetDecl, PortDecl, Range, Stmt,
+    Assign, Expr, LValue, MemoryDecl, MemoryDimension, MemoryStorage, NetDecl, PortDecl, Range,
+    Stmt,
 };
 
 fn sparse_memory_design(nonblocking: bool) -> Design {
@@ -71,6 +72,74 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
         }],
         processes: Vec::new(),
         initials: vec![Stmt::Block(vec![memory_write])],
+        final_blocks: Vec::new(),
+        clocking_blocks: Vec::new(),
+        hierarchy: Vec::new(),
+    }
+}
+
+fn ordinary_array_design() -> Design {
+    let memory_write = |index: u8, value: u8| Stmt::MemoryBl {
+        memory: 0,
+        indexes: vec![Expr::Const(LogicWord::from_u64(8, index.into()))],
+        e: Expr::Const(LogicWord::from_u64(8, value.into())),
+    };
+    Design {
+        name: "ordinary_array".into(),
+        time_scale: Default::default(),
+        memory_ports: Vec::new(),
+        net_decls: vec![NetDecl {
+            name: "q".into(),
+            width: 8,
+            is_reg: false,
+            is_signed: false,
+            base: 0,
+        }],
+        memories: vec![MemoryDecl {
+            name: "values".into(),
+            element_width: 8,
+            element_msb: 7,
+            element_lsb: 0,
+            dimensions: vec![MemoryDimension {
+                base: 0,
+                step: 1,
+                length: 4,
+            }],
+            flat_length: 4,
+            storage: MemoryStorage::Ordinary,
+            kind: Default::default(),
+            template: Default::default(),
+            write_mask: None,
+            byte_enable: None,
+            banking: Default::default(),
+        }],
+        memory_connections: Vec::new(),
+        n_nets: 8,
+        ports: vec![PortDecl {
+            name: "q".into(),
+            dir: eda_core::ir::Dir::Out,
+            base: 0,
+            width: 8,
+        }],
+        assigns: vec![Assign {
+            lv: LValue {
+                net: 0,
+                decl_width: 8,
+                range: Range::Span { msb: 7, lsb: 0 },
+            },
+            e: Expr::MemoryRead {
+                memory: 0,
+                indexes: vec![Expr::Const(LogicWord::from_u64(8, 1))],
+                width: 8,
+                signed: false,
+            },
+            delay: 0,
+        }],
+        processes: Vec::new(),
+        initials: vec![Stmt::Block(vec![
+            memory_write(1, 0x3c),
+            memory_write(3, 0xa5),
+        ])],
         final_blocks: Vec::new(),
         clocking_blocks: Vec::new(),
         hierarchy: Vec::new(),
@@ -203,4 +272,21 @@ endmodule
     assert!(runtime_vcd.contains("b10100101"));
     assert!(runtime_vcd.contains("b00111100"));
     assert!(!runtime_vcd.contains(" memory[999999] $end"));
+}
+
+#[test]
+fn ordinary_array_vcd_dumps_touched_dense_elements() {
+    let design = ordinary_array_design();
+    assert_eq!(design.memories[0].storage, MemoryStorage::Ordinary);
+    let design: &'static Design = Box::leak(Box::new(design));
+    let mut sim = Simulator::new(design).unwrap();
+    sim.enable_vcd();
+    sim.run_until(1).unwrap();
+    assert_eq!(sim.read("q").unwrap().to_u64(), Some(0x3c));
+
+    let vcd = sim.vcd().unwrap();
+    assert!(vcd.contains(" values[1] "));
+    assert!(vcd.contains(" values[3] "));
+    assert!(!vcd.contains(" values[0] "));
+    assert!(!vcd.contains(" values[2] "));
 }

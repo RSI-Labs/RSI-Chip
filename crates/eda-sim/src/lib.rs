@@ -88,6 +88,64 @@ struct Monitor<'d> {
 const MAX_STEPS_PER_TIME: u64 = 200_000;
 const MAX_EVENTS: u64 = 20_000_000;
 
+pub(crate) struct OrdinaryArrayElements {
+    words: Vec<LogicWord>,
+    touched: Vec<bool>,
+}
+
+pub(crate) enum MemoryElementStorage {
+    Ordinary(OrdinaryArrayElements),
+    Sparse(HashMap<u64, LogicWord>),
+}
+
+impl MemoryElementStorage {
+    fn get(&self, index: u64) -> Option<&LogicWord> {
+        match self {
+            Self::Ordinary(elements) => elements.words.get(usize::try_from(index).ok()?),
+            Self::Sparse(elements) => elements.get(&index),
+        }
+    }
+
+    fn touched_addresses(&self) -> Vec<u64> {
+        match self {
+            Self::Ordinary(elements) => elements
+                .touched
+                .iter()
+                .enumerate()
+                .filter(|(_, touched)| **touched)
+                .map(|(index, _)| u64::try_from(index).unwrap_or(u64::MAX))
+                .collect(),
+            Self::Sparse(elements) => elements.keys().copied().collect(),
+        }
+    }
+
+    fn set(&mut self, index: u64, value: LogicWord) -> bool {
+        match self {
+            Self::Ordinary(elements) => {
+                let Some(index) = usize::try_from(index).ok() else {
+                    return false;
+                };
+                let Some(element) = elements.words.get_mut(index) else {
+                    return false;
+                };
+                if *element == value {
+                    return false;
+                }
+                *element = value;
+                elements.touched[index] = true;
+                true
+            }
+            Self::Sparse(elements) => {
+                if elements.get(&index) == Some(&value) {
+                    return false;
+                }
+                elements.insert(index, value);
+                true
+            }
+        }
+    }
+}
+
 pub struct Simulator<'d> {
     pub design: &'d Design,
     vals: Vec<LogicValue>,
@@ -105,7 +163,7 @@ pub struct Simulator<'d> {
     forced_values: HashMap<usize, LogicValue>,
     forced_saved_values: HashMap<usize, LogicValue>,
     net_change_times: HashMap<usize, u64>,
-    memory_elements: Vec<HashMap<u64, LogicWord>>,
+    memory_elements: Vec<MemoryElementStorage>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
     memory_readers: Vec<Vec<usize>>,
@@ -148,7 +206,24 @@ impl<'d> Simulator<'d> {
             if memory.flat_length == 0 {
                 return Err(format!("memory '{}' is empty", memory.name));
             }
-            memory_elements.push(HashMap::new());
+            let total_bits =
+                u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
+            if memory.storage == eda_core::ir::MemoryStorage::Ordinary {
+                if total_bits > 4096 {
+                    return Err(format!(
+                        "ordinary array '{}' exceeds the 4096-bit dense-storage limit",
+                        memory.name
+                    ));
+                }
+                let length = usize::try_from(memory.flat_length)
+                    .map_err(|_| format!("ordinary array '{}' is too large", memory.name))?;
+                memory_elements.push(MemoryElementStorage::Ordinary(OrdinaryArrayElements {
+                    words: vec![LogicWord::xes(memory.element_width); length],
+                    touched: vec![false; length],
+                }));
+            } else {
+                memory_elements.push(MemoryElementStorage::Sparse(HashMap::new()));
+            }
         }
         let mut memory_aliases = vec![0_usize; design.memories.len()];
         for (index, alias) in memory_aliases.iter_mut().enumerate() {
@@ -516,7 +591,7 @@ impl<'d> Simulator<'d> {
         Ok(self
             .memory_elements
             .get(memory)
-            .and_then(|elements| elements.get(&physical))
+            .and_then(|elements| elements.get(physical))
             .cloned()
             .unwrap_or_else(|| LogicWord::xes(declaration.element_width)))
     }
@@ -560,7 +635,7 @@ impl<'d> Simulator<'d> {
             .map(|physical| {
                 self.memory_elements
                     .get(memory)
-                    .and_then(|elements| elements.get(&physical))
+                    .and_then(|elements| elements.get(physical))
                     .cloned()
                     .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
             })
@@ -599,7 +674,7 @@ impl<'d> Simulator<'d> {
             .map(|physical| {
                 self.memory_elements
                     .get(memory)
-                    .and_then(|elements| elements.get(&physical))
+                    .and_then(|elements| elements.get(physical))
                     .cloned()
                     .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
             })
@@ -1053,10 +1128,9 @@ impl<'d> Simulator<'d> {
         };
         let element_width = self.design.memories[memory].element_width;
         let value = value.sized(element_width);
-        if storage.get(&index) == Some(&value) {
+        if !storage.set(index, value) {
             return Ok(());
         }
-        storage.insert(index, value);
         self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
         if self.event_count > MAX_EVENTS {
@@ -1083,7 +1157,7 @@ impl<'d> Simulator<'d> {
             return Ok(());
         }
         let old = storage
-            .get(&index)
+            .get(index)
             .cloned()
             .unwrap_or_else(|| LogicWord::xes(element_width));
         let value = value.sized(width);
@@ -1104,7 +1178,9 @@ impl<'d> Simulator<'d> {
         if updated == old {
             return Ok(());
         }
-        storage.insert(index, updated);
+        if !storage.set(index, updated) {
+            return Ok(());
+        }
         self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
         if self.event_count > MAX_EVENTS {
@@ -1308,7 +1384,7 @@ impl<'d> Simulator<'d> {
         let mut output = String::new();
         for address in start..=finish {
             let value = storage
-                .get(&address)
+                .get(address)
                 .cloned()
                 .unwrap_or_else(|| LogicWord::xes(declaration.element_width));
             let text = if radix == 16 {
@@ -2368,7 +2444,7 @@ impl<'d> Simulator<'d> {
                 Some(index) => self
                     .memory_elements
                     .get(self.canonical_memory(*memory))
-                    .and_then(|elements| elements.get(&index))
+                    .and_then(|elements| elements.get(index))
                     .cloned()
                     .unwrap_or_else(|| LogicWord::xes(*width)),
                 None => LogicWord::xes(*width),
@@ -2384,7 +2460,7 @@ impl<'d> Simulator<'d> {
                     let element = self
                         .memory_elements
                         .get(self.canonical_memory(*memory))
-                        .and_then(|elements| elements.get(&index))
+                        .and_then(|elements| elements.get(index))
                         .cloned()
                         .unwrap_or_else(|| {
                             LogicWord::xes(self.design.memories[*memory].element_width)
