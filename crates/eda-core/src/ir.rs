@@ -68,6 +68,18 @@ pub enum MemoryKind {
     Rom,
 }
 
+/// Execution and mapping contract for an unpacked-array object.
+///
+/// Ordinary arrays carry aggregate/value semantics and do not participate in
+/// sparse RAM/ROM macro planning. Sparse objects use first-class memory
+/// storage and memory-port inference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryStorage {
+    #[default]
+    Ordinary,
+    Sparse,
+}
+
 /// Technology-independent macro candidate inferred from memory port timing.
 ///
 /// This does not select a vendor cell. A physical mapping layer can use these
@@ -214,6 +226,7 @@ pub struct MemoryDecl {
     pub dimensions: Vec<MemoryDimension>,
     /// Product of all dimension lengths.
     pub flat_length: u64,
+    pub storage: MemoryStorage,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
     /// Inferred technology-independent macro candidate.
@@ -954,12 +967,32 @@ impl Design {
             collect_memory_accesses(final_block, false, &memory_widths, &mut accesses);
         }
         for assignment in &self.assigns {
-            collect_memory_expr_reads(&assignment.e, false, &mut accesses);
+            collect_memory_expr_reads(&assignment.e, false, true, &mut accesses);
         }
         let aliases = self.memory_alias_roots();
         let accesses = accesses.canonicalize(&aliases);
         for (index, memory) in self.memories.iter_mut().enumerate() {
             let root = aliases.get(index).copied().unwrap_or(index);
+            let total_bits =
+                u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
+            let sparse = total_bits > 4096
+                || accesses.sync_writes.contains(&root)
+                || accesses.async_writes.contains(&root)
+                || accesses.sync_reads.contains(&root)
+                || accesses.async_reads.contains(&root);
+            memory.storage = if sparse {
+                MemoryStorage::Sparse
+            } else {
+                MemoryStorage::Ordinary
+            };
+            if !sparse {
+                memory.kind = MemoryKind::Ram;
+                memory.template = MemoryTemplate::Unmapped;
+                memory.write_mask = None;
+                memory.byte_enable = None;
+                memory.banking = MemoryBanking::default();
+                continue;
+            }
             memory.kind =
                 if accesses.sync_writes.contains(&root) || accesses.async_writes.contains(&root) {
                     MemoryKind::Ram
@@ -1013,6 +1046,7 @@ impl Design {
 struct MemoryAccesses {
     sync_reads: std::collections::HashSet<usize>,
     async_reads: std::collections::HashSet<usize>,
+    continuous_reads: std::collections::HashSet<usize>,
     sync_writes: std::collections::HashSet<usize>,
     async_writes: std::collections::HashSet<usize>,
     write_observations: std::collections::HashMap<usize, Vec<MemoryWriteObservation>>,
@@ -1041,6 +1075,7 @@ impl MemoryAccesses {
             sync_reads: canonicalize_set(self.sync_reads, aliases),
             async_reads: canonicalize_set(self.async_reads, aliases),
             sync_writes: canonicalize_set(self.sync_writes, aliases),
+            continuous_reads: canonicalize_set(self.continuous_reads, aliases),
             async_writes: canonicalize_set(self.async_writes, aliases),
             write_observations: self
                 .write_observations
@@ -1064,7 +1099,8 @@ impl MemoryAccesses {
         }
 
         let sync_read = self.sync_reads.contains(&memory);
-        let async_read = self.async_reads.contains(&memory);
+        let async_read =
+            self.async_reads.contains(&memory) || self.continuous_reads.contains(&memory);
         match (sync_read, async_read) {
             (true, true) => MemoryTemplate::MixedRom,
             (true, false) => MemoryTemplate::SyncRom,
@@ -1127,7 +1163,7 @@ fn collect_memory_accesses(
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
         Stmt::Wait { cond, body } => {
-            collect_memory_expr_reads(cond, synchronous, accesses);
+            collect_memory_expr_reads(cond, synchronous, false, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
         Stmt::EventWait { body, .. } => {
@@ -1147,7 +1183,7 @@ fn collect_memory_accesses(
             collect_memory_accesses(branch, synchronous, memory_widths, accesses)
         }),
         Stmt::While { cond, body, steps } => {
-            collect_memory_expr_reads(cond, synchronous, accesses);
+            collect_memory_expr_reads(cond, synchronous, false, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses);
             for step in steps {
                 collect_memory_accesses(step, synchronous, memory_widths, accesses);
@@ -1155,16 +1191,16 @@ fn collect_memory_accesses(
         }
         Stmt::Break | Stmt::Continue => {}
         Stmt::Repeat { count, body } => {
-            collect_memory_expr_reads(count, synchronous, accesses);
+            collect_memory_expr_reads(count, synchronous, false, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses)
         }
-        Stmt::Force { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
+        Stmt::Force { e, .. } => collect_memory_expr_reads(e, synchronous, false, accesses),
         Stmt::Release { .. } => {}
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
-                collect_memory_expr_reads(index, synchronous, accesses);
+                collect_memory_expr_reads(index, synchronous, false, accesses);
             }
-            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, false, accesses);
             if synchronous {
                 accesses.sync_writes.insert(*memory);
             } else {
@@ -1197,10 +1233,10 @@ fn collect_memory_accesses(
             e,
         } => {
             for index in indexes {
-                collect_memory_expr_reads(index, synchronous, accesses);
+                collect_memory_expr_reads(index, synchronous, false, accesses);
             }
-            collect_memory_expr_reads(start, synchronous, accesses);
-            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(start, synchronous, false, accesses);
+            collect_memory_expr_reads(e, synchronous, false, accesses);
             if synchronous {
                 accesses.sync_writes.insert(*memory);
             } else {
@@ -1231,37 +1267,44 @@ fn collect_memory_accesses(
             }
         }
         Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => {
-            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, false, accesses);
         }
         Stmt::BlIndexed { start, e, .. } | Stmt::NBlIndexed { start, e, .. } => {
-            collect_memory_expr_reads(start, synchronous, accesses);
-            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(start, synchronous, false, accesses);
+            collect_memory_expr_reads(e, synchronous, false, accesses);
         }
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
-            collect_memory_expr_reads(cond, synchronous, accesses)
+            collect_memory_expr_reads(cond, synchronous, false, accesses)
         }
         Stmt::Display { args, .. } => {
             for argument in args {
-                collect_memory_expr_reads(argument, synchronous, accesses);
+                collect_memory_expr_reads(argument, synchronous, false, accesses);
             }
         }
         Stmt::TimeFormat { .. } | Stmt::WriteMem { .. } | Stmt::Finish => {}
     }
 }
 
-fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mut MemoryAccesses) {
+fn collect_memory_expr_reads(
+    expression: &Expr,
+    synchronous: bool,
+    continuous: bool,
+    accesses: &mut MemoryAccesses,
+) {
     match expression {
         Expr::Const(_) | Expr::Ref { .. } | Expr::SimulationTime { .. } => {}
         Expr::MemoryRead {
             memory, indexes, ..
         } => {
-            if synchronous {
+            if continuous {
+                accesses.continuous_reads.insert(*memory);
+            } else if synchronous {
                 accesses.sync_reads.insert(*memory);
             } else {
                 accesses.async_reads.insert(*memory);
             }
             for index in indexes {
-                collect_memory_expr_reads(index, synchronous, accesses);
+                collect_memory_expr_reads(index, synchronous, continuous, accesses);
             }
         }
         Expr::MemoryReadPart {
@@ -1270,62 +1313,66 @@ fn collect_memory_expr_reads(expression: &Expr, synchronous: bool, accesses: &mu
             start,
             ..
         } => {
-            if synchronous {
+            if continuous {
+                accesses.continuous_reads.insert(*memory);
+            } else if synchronous {
                 accesses.sync_reads.insert(*memory);
             } else {
                 accesses.async_reads.insert(*memory);
             }
             for index in indexes {
-                collect_memory_expr_reads(index, synchronous, accesses);
+                collect_memory_expr_reads(index, synchronous, continuous, accesses);
             }
-            collect_memory_expr_reads(start, synchronous, accesses);
+            collect_memory_expr_reads(start, synchronous, continuous, accesses);
         }
-        Expr::Un { a, .. } => collect_memory_expr_reads(a, synchronous, accesses),
+        Expr::Un { a, .. } => collect_memory_expr_reads(a, synchronous, continuous, accesses),
         Expr::Bin { a, b, .. } => {
-            collect_memory_expr_reads(a, synchronous, accesses);
-            collect_memory_expr_reads(b, synchronous, accesses);
+            collect_memory_expr_reads(a, synchronous, continuous, accesses);
+            collect_memory_expr_reads(b, synchronous, continuous, accesses);
         }
         Expr::Cond { c, t, f } => {
-            collect_memory_expr_reads(c, synchronous, accesses);
-            collect_memory_expr_reads(t, synchronous, accesses);
-            collect_memory_expr_reads(f, synchronous, accesses);
+            collect_memory_expr_reads(c, synchronous, continuous, accesses);
+            collect_memory_expr_reads(t, synchronous, continuous, accesses);
+            collect_memory_expr_reads(f, synchronous, continuous, accesses);
         }
         Expr::Concat(parts) => parts
             .iter()
-            .for_each(|part| collect_memory_expr_reads(part, synchronous, accesses)),
+            .for_each(|part| collect_memory_expr_reads(part, synchronous, continuous, accesses)),
         Expr::Repeat { e, .. } | Expr::Signed { e, .. } | Expr::Index { e, .. } => {
-            collect_memory_expr_reads(e, synchronous, accesses)
+            collect_memory_expr_reads(e, synchronous, continuous, accesses)
         }
-        Expr::StringLength { e } => collect_memory_expr_reads(e, synchronous, accesses),
+        Expr::StringLength { e } => collect_memory_expr_reads(e, synchronous, continuous, accesses),
         Expr::StringConcat { left, right } => {
-            collect_memory_expr_reads(left, synchronous, accesses);
-            collect_memory_expr_reads(right, synchronous, accesses);
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
         }
         Expr::StringGetByte { e, index } => {
-            collect_memory_expr_reads(e, synchronous, accesses);
-            collect_memory_expr_reads(index, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, continuous, accesses);
+            collect_memory_expr_reads(index, synchronous, continuous, accesses);
         }
-        Expr::StringCase { e, .. } => collect_memory_expr_reads(e, synchronous, accesses),
+        Expr::StringCase { e, .. } => {
+            collect_memory_expr_reads(e, synchronous, continuous, accesses)
+        }
         Expr::StringCompare { left, right, .. } => {
-            collect_memory_expr_reads(left, synchronous, accesses);
-            collect_memory_expr_reads(right, synchronous, accesses);
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
         }
         Expr::EventTriggered { .. } => {}
         Expr::StringPutc { e, index, value } => {
-            collect_memory_expr_reads(e, synchronous, accesses);
-            collect_memory_expr_reads(index, synchronous, accesses);
-            collect_memory_expr_reads(value, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, continuous, accesses);
+            collect_memory_expr_reads(index, synchronous, continuous, accesses);
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
         }
         Expr::StringSubstr { e, left, right } => {
-            collect_memory_expr_reads(e, synchronous, accesses);
-            collect_memory_expr_reads(left, synchronous, accesses);
-            collect_memory_expr_reads(right, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, continuous, accesses);
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
         }
         Expr::StringToRadix { e, .. } => {
-            collect_memory_expr_reads(e, synchronous, accesses);
+            collect_memory_expr_reads(e, synchronous, continuous, accesses);
         }
         Expr::StringFromRadix { value, .. } => {
-            collect_memory_expr_reads(value, synchronous, accesses);
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
         }
     }
 }
@@ -1411,6 +1458,7 @@ mod tests {
                 },
             ],
             flat_length: 8,
+            storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
             write_mask: None,
@@ -1446,6 +1494,7 @@ mod tests {
                 length: 513,
             }],
             flat_length: 513,
+            storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
             write_mask: None,

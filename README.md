@@ -201,9 +201,11 @@ The bounded internal frontend also provides `HdlSource`, `SourceManager`, and
 `compile_sources` for deterministic named multi-unit compilation with parser
 errors mapped back to their originating file and line.
 Module unpacked arrays now support whole-element reads and writes, including
-fixed multidimensional selections. Large memories lower to first-class sparse
-`MemoryDecl` objects with explicit read, blocking-write, and NBA-write
-operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
+fixed multidimensional selections. The IR separates `MemoryStorage::Ordinary`
+value arrays from `MemoryStorage::Sparse` memories: ordinary aggregate arrays do
+not receive RAM/ROM timing templates or macro plans, while process-accessed or
+>4,096-bit storage lowers to first-class sparse `MemoryDecl` objects with
+explicit read, blocking-write, and NBA-write operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and

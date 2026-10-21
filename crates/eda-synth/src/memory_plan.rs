@@ -1,6 +1,8 @@
 //! Sparse-memory macro planning and technology-independent candidate choice.
 
-use eda_core::ir::{Design, MemoryByteEnable, MemoryKind, MemoryTemplate, MemoryWriteMask};
+use eda_core::ir::{
+    Design, MemoryByteEnable, MemoryKind, MemoryStorage, MemoryTemplate, MemoryWriteMask,
+};
 
 /// Technology-independent macro candidate.
 ///
@@ -39,6 +41,7 @@ pub fn plan_memories(design: &Design) -> Vec<MemoryMacroPlan> {
         .memories
         .iter()
         .enumerate()
+        .filter(|(_, memory)| memory.storage == MemoryStorage::Sparse)
         .map(|(memory_index, memory)| {
             let total_bits =
                 u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);

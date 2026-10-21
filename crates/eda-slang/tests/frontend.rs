@@ -3080,6 +3080,10 @@ endmodule
         )
         .expect("lower sparse memory through the preprocessed path");
     assert_eq!(design.memories.len(), 1);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Sparse
+    );
     assert_eq!(design.memories[0].name, "mem");
     assert_eq!(design.memories[0].element_width, 8);
     assert_eq!(design.memories[0].flat_length, 4);
@@ -3937,7 +3941,7 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_initializes_multidimensional_sparse_memory() {
+fn slang_ast_direct_lowering_initializes_multidimensional_ordinary_array() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -3971,18 +3975,22 @@ endmodule
         )
         .expect("directly lower sparse-memory initializer");
     assert_eq!(design.memories.len(), 1);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
     assert_eq!(design.memories[0].dimensions.len(), 2);
     assert_eq!(design.memories[0].flat_length, 6);
-    assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
+    assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Ram);
     assert_eq!(
         design.memories[0].template,
-        eda_core::ir::MemoryTemplate::AsyncRom
+        eda_core::ir::MemoryTemplate::Unmapped
     );
     assert_eq!(design.memories[0].write_mask, None);
     assert_eq!(design.memories[0].byte_enable, None);
     assert_eq!(
         design.memories[0].banking,
-        eda_core::ir::MemoryBanking { count: 2, depth: 3 }
+        eda_core::ir::MemoryBanking::default()
     );
     assert_eq!(design.initials.len(), 1);
 
@@ -4341,6 +4349,14 @@ endmodule
         )
         .expect("lower memory files through the bounded path");
     assert_eq!(design.memories.len(), 2);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Sparse
+    );
+    assert_eq!(
+        design.memories[1].storage,
+        eda_core::ir::MemoryStorage::Sparse
+    );
     assert_eq!(design.memories[0].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(design.memories[1].kind, eda_core::ir::MemoryKind::Rom);
     assert_eq!(

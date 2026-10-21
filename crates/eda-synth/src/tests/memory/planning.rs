@@ -1,6 +1,7 @@
 //! Memory macro contract and timing planning tests.
 
 use super::super::super::*;
+use eda_core::ir::{MemoryDecl, MemoryStorage};
 use eda_hdl::compile;
 
 #[test]
@@ -57,4 +58,24 @@ endmodule
         .as_ref()
         .expect("full byte-enable mask")
         .is_full());
+}
+
+#[test]
+fn ordinary_arrays_do_not_become_sparse_memory_macro_plans() {
+    let mut ordinary = Design::default();
+    ordinary.memories.push(MemoryDecl {
+        name: "values".into(),
+        element_width: 8,
+        element_msb: 7,
+        element_lsb: 0,
+        dimensions: Vec::new(),
+        flat_length: 4,
+        storage: MemoryStorage::Ordinary,
+        kind: Default::default(),
+        template: Default::default(),
+        write_mask: None,
+        byte_enable: None,
+        banking: Default::default(),
+    });
+    assert_eq!(plan_memories(&ordinary), Vec::new());
 }

@@ -40,6 +40,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
                 length: 4,
             }],
             flat_length: 4,
+            storage: eda_core::ir::MemoryStorage::Sparse,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,
             write_mask: None,
