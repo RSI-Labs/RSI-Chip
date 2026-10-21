@@ -7767,7 +7767,9 @@ fn slang_ast_summary_rejects_wrong_memory_member_lvalue_shapes() {
 module memory_member_summary(
   input logic [1:0] address,
   input logic [3:0] value,
-  output logic [7:0] observed
+  input logic [1:0] nested_value,
+  output logic [7:0] observed,
+  output logic [7:0] nested_observed
 );
   typedef struct packed {
     logic [3:0] high;
@@ -7775,10 +7777,25 @@ module memory_member_summary(
   } pair_t;
 
   pair_t pairs [0:3];
+  typedef struct packed {
+    logic [1:0] a;
+    logic [1:0] b;
+  } inner_t;
+
+  typedef struct packed {
+    inner_t left;
+    logic [3:0] right;
+  } nested_t;
+
+  nested_t rows [0:3];
   always_comb begin
     pairs[address].high = value;
+    rows[address].right = 4'b0;
+    rows[address].left.b = 2'b0;
+    rows[address].left.a = nested_value;
   end
   assign observed = pairs[address];
+  assign nested_observed = rows[address];
 endmodule
 "#,
     )
@@ -7836,12 +7853,12 @@ endmodule
         .as_mut()
         .expect("sparse-memory member lvalue")
         .indexes[0]
-        .literal = Some("32:00000000000000000000000000000000".into());
+        .literal = None;
     assignment
         .memory_member_lvalue
         .as_mut()
         .expect("sparse-memory member lvalue")
-        .member = "low".into();
+        .members = vec!["low".into()];
     let error = summary
         .validate_against_design(&design)
         .expect_err("wrong sparse-memory member field must fail");
@@ -7859,7 +7876,54 @@ endmodule
         .memory_member_lvalue
         .as_mut()
         .expect("sparse-memory member lvalue")
-        .member = "high".into();
+        .members = vec!["high".into()];
+
+    if let Some(nested_assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .memory_member_lvalue
+                .as_ref()
+                .is_some_and(|member| member.members.last().is_some_and(|name| name == "a"))
+        })
+    }) {
+        nested_assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("nested sparse-memory member lvalue")
+            .members[1] = "b".into();
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong nested sparse-memory member field must fail");
+    assert!(
+        error.contains("Range:5:0") && error.contains("Range:7:6") && error.contains("Range:3:0"),
+        "unexpected structural error: {error}"
+    );
+    if let Some(nested_assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .memory_member_lvalue
+                .as_ref()
+                .is_some_and(|member| member.members.last().is_some_and(|name| name == "b"))
+        })
+    }) {
+        nested_assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("nested sparse-memory member lvalue")
+            .members[1] = "a".into();
+    }
+
+    let assignment = summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+        .expect("sparse-memory member assignment");
+    assignment
+        .memory_member_lvalue
+        .as_mut()
+        .expect("sparse-memory member lvalue")
+        .members = vec!["high".into()];
     assignment.rhs.symbol = Some("wrong_value".into());
     let error = summary
         .validate_against_design(&design)
@@ -7867,6 +7931,23 @@ endmodule
     assert!(
         error.contains("Ref:4:u[wrong_value]"),
         "unexpected structural error: {error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create sparse-memory member simulator");
+    simulator
+        .set_input("address", &LogicWord::from_u64(2, 1))
+        .unwrap();
+    simulator
+        .set_input("value", &LogicWord::from_u64(4, 0))
+        .unwrap();
+    simulator
+        .set_input("nested_value", &LogicWord::from_u64(2, 3))
+        .unwrap();
+    simulator.run_until(0).unwrap();
+    assert_eq!(
+        simulator.read("nested_observed").unwrap().to_u64(),
+        Some(0b1100_0000),
+        "nested memory member write should update the physically offset field"
     );
 }
 

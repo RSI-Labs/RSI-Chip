@@ -169,9 +169,19 @@ fn memory_member_lvalue_summary(value: &Value) -> Option<SlangMemoryMemberLvalue
     if string_field(value, "kind").as_deref() != Some("MemberAccess") {
         return None;
     }
-    let selected = value.get("value")?;
+    let mut members = Vec::new();
+    let mut member_access = value;
+    while string_field(member_access, "kind").as_deref() == Some("MemberAccess") {
+        members.push(
+            string_field(member_access, "member")?
+                .split_whitespace()
+                .next_back()?
+                .to_string(),
+        );
+        member_access = member_access.get("value")?;
+    }
     let mut selectors = Vec::new();
-    let mut base = selected;
+    let mut base = member_access;
     while string_field(base, "kind").as_deref() == Some("ElementSelect") {
         selectors.push(
             base.get("selector")
@@ -184,13 +194,10 @@ fn memory_member_lvalue_summary(value: &Value) -> Option<SlangMemoryMemberLvalue
         return None;
     }
     selectors.reverse();
-    let member = string_field(value, "member")?
-        .split_whitespace()
-        .next_back()?
-        .to_string();
+    members.reverse();
     Some(SlangMemoryMemberLvalueSummary {
         indexes: selectors,
-        member,
+        members,
     })
 }
 

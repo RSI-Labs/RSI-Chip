@@ -1898,28 +1898,38 @@ impl SlangAstLowerer {
         if string_field(left, "kind").as_deref() != Some("MemberAccess") {
             return Ok(None);
         }
-        let selected = left
-            .get("value")
-            .ok_or_else(|| "struct member access has no selected value".to_string())?;
-        let Some((memory, indexes)) = self.memory_element_select(selected)? else {
+        let Some(selection) = self.memory_member_selection(left)? else {
             return Ok(None);
         };
-        let member = string_field(left, "member")
-            .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
-            .ok_or_else(|| "struct member access has no member".to_string())?;
-        let field = self.struct_field_for_type(selected, &member)?;
+        let mut offset = 0_usize;
+        let mut field_width = None;
+        for (selected, member) in &selection.members {
+            let field = self.struct_field_for_type(selected, member)?;
+            offset += field.offset;
+            field_width = Some(field.width);
+        }
+        let Some(field_width) = field_width else {
+            return Ok(None);
+        };
+        let memory = selection.memory;
+        let indexes = selection.indexes;
+        let member = selection
+            .members
+            .last()
+            .map(|(_, member)| member.clone())
+            .unwrap_or_default();
         let element_width = self.design.memories[memory].element_width;
-        if field.offset + field.width > element_width {
+        if offset + field_width > element_width {
             return Err(format!(
                 "struct member '{member}' exceeds memory element width {element_width}"
             ));
         }
 
         let value = self.lower_expression(right)?;
-        if value.width() != field.width {
+        if value.width() != field_width {
             return Err(format!(
                 "memory struct member '{member}' width {} does not match assignment width {}",
-                field.width,
+                field_width,
                 value.width()
             ));
         }
@@ -1930,18 +1940,18 @@ impl SlangAstLowerer {
             signed: false,
         };
         let mut parts = Vec::new();
-        if field.offset + field.width < element_width {
+        if offset + field_width < element_width {
             parts.push(Expr::Index {
                 e: Box::new(old.clone()),
                 msb: element_width - 1,
-                lsb: field.offset + field.width,
+                lsb: offset + field_width,
             });
         }
         parts.push(value);
-        if field.offset > 0 {
+        if offset > 0 {
             parts.push(Expr::Index {
                 e: Box::new(old),
-                msb: field.offset - 1,
+                msb: offset - 1,
                 lsb: 0,
             });
         }
@@ -2042,6 +2052,44 @@ impl SlangAstLowerer {
             delay: 0,
         });
     }
+
+    fn memory_member_selection(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<MemoryMemberSelection>, String> {
+        match string_field(value, "kind").as_deref() {
+            Some("ElementSelect") => {
+                let Some((memory, indexes)) = self.memory_element_select(value)? else {
+                    return Ok(None);
+                };
+                Ok(Some(MemoryMemberSelection {
+                    memory,
+                    indexes,
+                    members: Vec::new(),
+                }))
+            }
+            Some("MemberAccess") => {
+                let selected = value
+                    .get("value")
+                    .ok_or_else(|| "struct member access has no selected value".to_string())?;
+                let Some(mut selection) = self.memory_member_selection(selected)? else {
+                    return Ok(None);
+                };
+                let member = string_field(value, "member")
+                    .and_then(|member| member.split_whitespace().next_back().map(str::to_string))
+                    .ok_or_else(|| "struct member access has no member".to_string())?;
+                selection.members.push((selected.clone(), member));
+                Ok(Some(selection))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+struct MemoryMemberSelection {
+    memory: usize,
+    indexes: Vec<eda_core::ir::Expr>,
+    members: Vec<(serde_json::Value, String)>,
 }
 
 fn sensitivity_net(signal: &eda_core::ir::LValue) -> Result<usize, String> {

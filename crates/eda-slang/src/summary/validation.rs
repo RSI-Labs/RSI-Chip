@@ -511,13 +511,31 @@ fn memory_member_lvalue_fingerprint(
         .rsplit(['.', ':'])
         .next()?
         .trim();
-    let layout = type_layouts.get(alias)?;
-    let field = layout
-        .fields
-        .iter()
-        .find(|field| field.name == member.member)?;
-    let element_width = layout.element_width;
-    if field.offset + field.width > element_width {
+    let mut current_alias = alias.to_string();
+    let mut offset = 0_usize;
+    let mut field_width = None;
+    for member_name in &member.members {
+        let layout = type_layouts.get(&current_alias)?;
+        let field = layout
+            .fields
+            .iter()
+            .find(|field| field.name == *member_name)?;
+        offset += field.offset;
+        field_width = Some(field.width);
+        current_alias = field
+            .type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+    }
+    let field_width = field_width?;
+    let root_layout = type_layouts.get(alias)?;
+    let element_width = root_layout.element_width;
+    if offset + field_width > element_width {
         return None;
     }
 
@@ -532,8 +550,8 @@ fn memory_member_lvalue_fingerprint(
     );
     let value = slang_expression_fingerprint_with_parameters(value, parameters)?;
     let mut parts = Vec::new();
-    if field.offset + field.width < element_width {
-        let lsb = field.offset + field.width;
+    if offset + field_width < element_width {
+        let lsb = offset + field_width;
         let msb = element_width - 1;
         parts.push(format!(
             "PackedSelect:{}:u[{old},Range:{msb}:{lsb}]",
@@ -541,8 +559,8 @@ fn memory_member_lvalue_fingerprint(
         ));
     }
     parts.push(value);
-    if field.offset > 0 {
-        let msb = field.offset - 1;
+    if offset > 0 {
+        let msb = offset - 1;
         parts.push(format!("PackedSelect:{}:u[{old},Range:{msb}:0]", msb + 1));
     }
     Some(format!("Concat:{element_width}:u[{}]", parts.join(",")))

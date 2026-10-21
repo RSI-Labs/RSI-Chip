@@ -181,7 +181,10 @@ fn collect_instance_array_summary(
     Ok(())
 }
 
-fn type_layout_summary(member: &Value) -> Result<Option<(String, SlangTypeLayoutSummary)>, String> {
+fn type_layout_summary(
+    member: &Value,
+    existing: &std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
+) -> Result<Option<(String, SlangTypeLayoutSummary)>, String> {
     if string_field(member, "kind").as_deref() != Some("TypeAlias") {
         return Ok(None);
     }
@@ -213,13 +216,23 @@ fn type_layout_summary(member: &Value) -> Result<Option<(String, SlangTypeLayout
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no bit offset"))?;
         let type_name = string_field(field, "type").unwrap_or_default();
-        let Some(width) = crate::types::simple_type_width(&type_name) else {
+        let alias = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#'])
+            .next()
+            .unwrap_or_default();
+        let Some(width) = crate::types::simple_type_width(&type_name)
+            .or_else(|| existing.get(alias).map(|layout| layout.element_width))
+        else {
             return Ok(None);
         };
         fields.push(SlangFieldLayoutSummary {
             name: field_name,
             offset,
             width,
+            type_name,
         });
     }
     let Some(element_width) = fields.iter().map(|field| field.offset + field.width).max() else {
@@ -286,12 +299,13 @@ pub struct SlangFieldLayoutSummary {
     pub name: String,
     pub offset: usize,
     pub width: usize,
+    pub type_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangMemoryMemberLvalueSummary {
     pub indexes: Vec<SlangExpressionSummary>,
-    pub member: String,
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -489,7 +503,7 @@ impl SlangAstSummary {
                     }
                 }
                 "TypeAlias" => {
-                    if let Some((name, layout)) = type_layout_summary(member)? {
+                    if let Some((name, layout)) = type_layout_summary(member, &type_layouts)? {
                         type_layouts.insert(name, layout);
                     }
                 }
