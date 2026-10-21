@@ -83,8 +83,8 @@ authoritative AST, including exact whole-element and indexed-part sparse-memory
 read memory/index/start fingerprints plus constant packed element/range/indexed
 select physical-range fingerprints. Dynamic packed element reads plus module- and procedure-local dynamic packed
 lvalue updates retain exact selector/per-bit conditional-tree fingerprints;
-simple and nested packed sparse-memory member writes retain exact
-memory/index/member-path/RHS whole-element concatenation fingerprints; and
+simple, nested, and forward-declared packed sparse-memory member writes
+retain exact memory/index/member-path/RHS whole-element concatenation fingerprints; and
 direct class-static property reads retain exact class/property fingerprints. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.

@@ -862,10 +862,16 @@ impl SlangAstLowerer {
     }
 
     fn lower_members(&mut self, members: &[serde_json::Value]) -> Result<(), String> {
-        for member in members {
-            if string_field(member, "kind").as_deref() == Some("TypeAlias") {
-                self.collect_type_alias(member)
-                    .map_err(|error| with_source_span(member, error))?;
+        loop {
+            let type_alias_count = self.type_aliases.len();
+            for member in members {
+                if string_field(member, "kind").as_deref() == Some("TypeAlias") {
+                    self.collect_type_alias(member)
+                        .map_err(|error| with_source_span(member, error))?;
+                }
+            }
+            if self.type_aliases.len() == type_alias_count {
+                break;
             }
         }
         for member in members {
@@ -909,6 +915,7 @@ impl SlangAstLowerer {
                     .map_err(|error| with_source_span(member, error))?,
                 "Subroutine" => {}
                 "TypeAlias" => {}
+                "ForwardingTypedef" => {}
                 "EnumType" => {}
                 "StatementBlock" => {}
                 "Modport" => {}

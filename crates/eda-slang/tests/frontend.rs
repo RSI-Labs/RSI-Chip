@@ -7984,6 +7984,98 @@ endmodule
         Some(0b1100_0000),
         "nested memory member write should update the physically offset field"
     );
+
+    let forward_path = root.join("forward_memory_member.sv");
+    std::fs::write(
+        &forward_path,
+        r#"
+module forward_memory_member(
+  input logic [1:0] address,
+  input logic [1:0] value,
+  output logic [7:0] observed
+);
+  typedef inner_t;
+  typedef struct packed {
+    inner_t left;
+    logic [3:0] right;
+  } outer_t;
+  typedef struct packed {
+    logic [1:0] a;
+    logic [1:0] b;
+  } inner_t;
+
+  outer_t rows [0:3];
+  always_comb begin
+    rows[address].right = 4'b0;
+    rows[address].left.b = 2'b0;
+    rows[address].left.a = value;
+  end
+  assign observed = rows[address];
+endmodule
+"#,
+    )
+    .expect("write forward nested sparse-memory member source");
+    let forward_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&forward_path),
+            Some("forward_memory_member"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower forward nested sparse-memory member");
+    let forward_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&forward_path),
+            Some("forward_memory_member"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize forward nested sparse-memory AST");
+    let mut forward_summary = slang
+        .summarize_ast_json(&forward_json)
+        .expect("summarize forward nested sparse-memory AST");
+    forward_summary
+        .validate_against_design(&forward_design)
+        .expect("forward nested packed layouts should resolve exactly");
+    if let Some(assignment) = forward_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .memory_member_lvalue
+                    .as_ref()
+                    .is_some_and(|member| member.members.last().is_some_and(|name| name == "a"))
+            })
+        })
+    {
+        assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("forward nested sparse-memory member lvalue")
+            .members[1] = "b".into();
+    }
+    let error = forward_summary
+        .validate_against_design(&forward_design)
+        .expect_err("wrong forward nested sparse-memory field must fail");
+    assert!(
+        error.contains("Range:5:0") && error.contains("Range:7:6") && error.contains("Range:3:0"),
+        "unexpected structural error: {error}"
+    );
+
+    let mut forward_simulator =
+        Simulator::new(&forward_design).expect("create forward sparse-memory simulator");
+    forward_simulator
+        .set_input("address", &LogicWord::from_u64(2, 2))
+        .unwrap();
+    forward_simulator
+        .set_input("value", &LogicWord::from_u64(2, 3))
+        .unwrap();
+    forward_simulator.run_until(0).unwrap();
+    assert_eq!(
+        forward_simulator.read("observed").unwrap().to_u64(),
+        Some(0b1100_0000),
+        "forward nested packed layout should preserve physical field offset"
+    );
 }
 
 #[test]

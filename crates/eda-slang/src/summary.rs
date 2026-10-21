@@ -509,6 +509,25 @@ impl SlangAstSummary {
         let mut procedural_blocks = Vec::new();
         let mut instances = Vec::new();
         let mut type_layouts = std::collections::BTreeMap::new();
+        let type_alias_members = members
+            .iter()
+            .filter(|member| string_field(member, "kind").as_deref() == Some("TypeAlias"))
+            .cloned()
+            .collect::<Vec<_>>();
+        loop {
+            let mut changed = false;
+            for member in &type_alias_members {
+                let Some((name, layout)) = type_layout_summary(member, &type_layouts)? else {
+                    continue;
+                };
+                if type_layouts.insert(name, layout).is_none() {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         for member in &members {
             let Some(kind) = string_field(member, "kind") else {
                 continue;
@@ -569,11 +588,6 @@ impl SlangAstSummary {
                     parameters.push(parameter_summary(member)?);
                     if let Some(span) = source_span(member) {
                         source_spans.insert(format!("parameter:{name}"), span);
-                    }
-                }
-                "TypeAlias" => {
-                    if let Some((name, layout)) = type_layout_summary(member, &type_layouts)? {
-                        type_layouts.insert(name, layout);
                     }
                 }
                 "ContinuousAssign" => {
