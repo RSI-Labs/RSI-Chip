@@ -56,6 +56,12 @@ impl SlangAstLowerer {
         if function_name == "$size" {
             return self.lower_fixed_array_size(value);
         }
+        if matches!(
+            function_name,
+            "$left" | "$right" | "$low" | "$high" | "$increment"
+        ) {
+            return self.lower_fixed_array_bound(value, function_name);
+        }
         match subroutine.as_str() {
             "next" | "prev" => {
                 return self.lower_enum_next_prev(value, subroutine == "next");
@@ -888,35 +894,45 @@ impl SlangAstLowerer {
     }
 
     fn lower_fixed_array_size(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
-        let arguments = value
-            .get("arguments")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "$size requires a fixed unpacked-array receiver".to_string())?;
+        let arguments = fixed_array_arguments(value, "$size")?;
         if arguments.is_empty() || arguments.len() > 2 {
             return Err("$size expects one array argument and at most one dimension".into());
         }
-        let receiver = arguments
-            .first()
-            .ok_or_else(|| "$size has no array receiver".to_string())?;
-        let receiver_type = string_field(receiver, "type").unwrap_or_default();
-        let array = memory_type(&receiver_type).ok_or_else(|| {
-            format!("$size receiver is not a fixed unpacked array: '{receiver_type}'")
-        })?;
-        let mut dimension = 1_i64;
-        if let Some(argument) = arguments.get(1) {
-            dimension = constant_ast_i64(argument)
-                .map_err(|_| "$size dimension must be an integer constant")?;
-        }
-        if dimension < 1 || dimension as usize > array.dimensions.len() {
-            return Err(format!(
-                "$size dimension {dimension} is outside 1..={}",
-                array.dimensions.len()
-            ));
-        }
-        let length = array.dimensions[dimension as usize - 1].length as u64;
+        let (dimensions, dimension) = fixed_array_dimension(arguments, "$size")?;
+        let length = dimensions[dimension as usize - 1].length as u64;
         Ok(eda_core::ir::Expr::Signed {
             e: Box::new(eda_core::ir::Expr::Const(
                 eda_core::logic::LogicWord::from_u64(32, length),
+            )),
+            signed: true,
+        })
+    }
+
+    fn lower_fixed_array_bound(
+        &self,
+        value: &Value,
+        function_name: &str,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let arguments = fixed_array_arguments(value, function_name)?;
+        if arguments.is_empty() || arguments.len() > 2 {
+            return Err(format!(
+                "{function_name} expects one array argument and at most one dimension"
+            ));
+        }
+        let (dimensions, dimension) = fixed_array_dimension(arguments, function_name)?;
+        let dimension = dimensions[dimension as usize - 1];
+        let last = dimension.base + dimension.step * (dimension.length as i64 - 1);
+        let result = match function_name {
+            "$left" => dimension.base,
+            "$right" => last,
+            "$low" => dimension.base.min(last),
+            "$high" => dimension.base.max(last),
+            "$increment" => dimension.step,
+            _ => unreachable!("fixed-array bound function dispatch"),
+        };
+        Ok(eda_core::ir::Expr::Signed {
+            e: Box::new(eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_u64(32, result as u64),
             )),
             signed: true,
         })
@@ -1789,6 +1805,39 @@ fn format_time_precision(exponent: i8) -> String {
         .checked_pow(u32::try_from(remainder).unwrap_or(u32::MAX))
         .unwrap_or(1);
     format_time_component(magnitude, i8::try_from(base).unwrap_or(-9))
+}
+
+fn fixed_array_arguments<'a>(value: &'a Value, function_name: &str) -> Result<&'a [Value], String> {
+    value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{function_name} requires a fixed unpacked-array receiver"))
+}
+
+fn fixed_array_dimension(
+    arguments: &[Value],
+    function_name: &str,
+) -> Result<(Vec<eda_core::ir::MemoryDimension>, i64), String> {
+    let receiver = arguments
+        .first()
+        .ok_or_else(|| format!("{function_name} has no array receiver"))?;
+    let receiver_type = string_field(receiver, "type").unwrap_or_default();
+    let array = memory_type(&receiver_type).ok_or_else(|| {
+        format!("{function_name} receiver is not a fixed unpacked array: '{receiver_type}'")
+    })?;
+    let mut dimension = 1_i64;
+    if let Some(argument) = arguments.get(1) {
+        dimension = constant_ast_i64(argument)
+            .map_err(|_| format!("{function_name} dimension must be an integer constant"))?;
+    }
+    if dimension < 1 || dimension as usize > array.dimensions.len() {
+        return Err(format!(
+            "{function_name} dimension {dimension} is outside 1..={}",
+            array.dimensions.len()
+        ));
+    }
+    Ok((array.dimensions, dimension))
 }
 
 fn constant_ast_i64(value: &Value) -> Result<i64, String> {

@@ -4594,6 +4594,110 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_fixed_array_bounds() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-fixed-array-bounds");
+    let source_path = root.join("fixed_array_bounds.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module fixed_array_bounds(
+  output int first_left,
+  output int first_right,
+  output int first_low,
+  output int first_high,
+  output int first_increment,
+  output int second_left,
+  output int second_right,
+  output int second_low,
+  output int second_high,
+  output int second_increment
+);
+  logic [7:0] values [2:0][1:4];
+
+  initial begin
+    first_left = $left(values);
+    first_right = $right(values);
+    first_low = $low(values);
+    first_high = $high(values);
+    first_increment = $increment(values);
+
+    second_left = $left(values, 2);
+    second_right = $right(values, 2);
+    second_low = $low(values, 2);
+    second_high = $high(values, 2);
+    second_increment = $increment(values, 2);
+  end
+endmodule
+"#,
+    )
+    .expect("write fixed-array bounds source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("fixed_array_bounds"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fixed-array bounds");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].dimensions.len(), 2);
+
+    let mut simulator = Simulator::new(&design).expect("create fixed-array-bounds simulator");
+    simulator.run_until(0).expect("settle fixed-array bounds");
+    let expected = [
+        ("first_left", 2),
+        ("first_right", 0),
+        ("first_low", 0),
+        ("first_high", 2),
+        ("first_increment", u32::MAX as u64),
+        ("second_left", 1),
+        ("second_right", 4),
+        ("second_low", 1),
+        ("second_high", 4),
+        ("second_increment", 1),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong value for {name}"
+        );
+    }
+
+    let invalid_path = root.join("invalid_array_dimension.sv");
+    std::fs::write(
+        &invalid_path,
+        r#"
+module invalid_array_dimension;
+  logic [7:0] values [0:3];
+  initial begin
+    values[0] = 8'h00;
+    values[1] = 8'h00;
+    values[2] = 8'h00;
+    values[3] = 8'h00;
+    values[$left(values, 2)] = 8'hff;
+  end
+endmodule
+"#,
+    )
+    .expect("write invalid fixed-array dimension source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_path),
+            Some("invalid_array_dimension"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("invalid fixed-array dimensions must fail closed");
+    assert!(
+        error.contains("cannot refer to element"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
