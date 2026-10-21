@@ -5,6 +5,7 @@ use super::expressions::{
     slang_expression_fingerprint_with_parameters,
 };
 use super::*;
+use crate::types::simple_type_shape;
 
 impl SlangAstSummary {
     pub fn validate_against_design(&self, design: &Design) -> Result<(), String> {
@@ -241,9 +242,10 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
-                        let shape = if !strict_generated_hierarchy
-                            && legacy_array_targets.contains(target)
-                            || assignment.dynamic_packed_lvalue
+                        let legacy_array_shape =
+                            !strict_generated_hierarchy && legacy_array_targets.contains(target);
+                        let shape = if legacy_array_shape
+                            || assignment.memory_member_lvalue
                             || assignment.uses_class_static
                         {
                             // Small arrays still use the legacy bounded
@@ -252,6 +254,30 @@ impl SlangAstSummary {
                             // slang source. Preserve assignment-count checking
                             // without guessing an equivalence.
                             "?".to_string()
+                        } else if let Some(selector) =
+                            assignment.dynamic_packed_lvalue_selector.as_ref()
+                        {
+                            if !strict_generated_hierarchy
+                                || !expression_references_declared_symbols(
+                                    selector,
+                                    &declaration_names,
+                                )
+                            {
+                                "?".to_string()
+                            } else {
+                                dynamic_packed_lvalue_fingerprint(
+                                    target,
+                                    selector,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.parameters,
+                                )
+                                .ok_or_else(|| {
+                                    format!(
+                                        "direct lowering could not fingerprint dynamic packed lvalue '{target}'"
+                                    )
+                                })?
+                            }
                         } else {
                             match slang_expression_fingerprint_with_parameters(
                                 &assignment.rhs,
@@ -431,4 +457,81 @@ fn memory_fingerprint_target_exists(
     fingerprint
         .get(start + 1..end)
         .is_some_and(|memory| memory_names.contains(memory))
+}
+
+fn expression_references_declared_symbols(
+    expression: &super::SlangExpressionSummary,
+    declaration_names: &std::collections::BTreeSet<String>,
+) -> bool {
+    let visible = expression
+        .symbol
+        .as_deref()
+        .map(|symbol| {
+            let name = symbol
+                .rsplit_once(' ')
+                .map(|(_, name)| name)
+                .unwrap_or(symbol);
+            declaration_names.contains(name)
+        })
+        .unwrap_or(true);
+    visible
+        && expression
+            .operands
+            .iter()
+            .all(|operand| expression_references_declared_symbols(operand, declaration_names))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dynamic_packed_lvalue_fingerprint(
+    target_name: &str,
+    selector: &super::SlangExpressionSummary,
+    value: &super::SlangExpressionSummary,
+    declarations: &[super::SlangDeclarationSummary],
+    parameters: &[super::SlangParameterSummary],
+) -> Option<String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let shape = simple_type_shape(&declaration.type_name)?;
+    let dimension = shape.dimensions.first()?;
+    let base_width = shape.width;
+    let group_width = dimension.element_width;
+    let selector_width = selector.type_width?.max(1);
+    let selector_fingerprint = slang_expression_fingerprint_with_parameters(selector, parameters)?;
+    let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters)?;
+    let old_fingerprint = format!("Ref:{base_width}:u[{target_name}]");
+    let mut physical_bits = vec![None; base_width];
+
+    for coordinate in 0..dimension.length {
+        let logical_index = if dimension.msb >= dimension.lsb {
+            dimension.lsb + coordinate as i64
+        } else {
+            dimension.lsb - coordinate as i64
+        };
+        let logical_bits = logical_index as u64;
+        let mut constant_bits = String::new();
+        for bit in (0..selector_width).rev() {
+            constant_bits.push(if (logical_bits >> bit) & 1 == 0 {
+                '0'
+            } else {
+                '1'
+            });
+        }
+        let condition = format!(
+            "Eq:1:u[{selector_fingerprint},Const:{selector_width}:u[{selector_width}:{constant_bits}]]"
+        );
+        for bit in 0..group_width {
+            let physical_bit = coordinate * group_width + bit;
+            let updated = format!("PackedSelect:1:u[{value_fingerprint},Range:{bit}:{bit}]");
+            let old =
+                format!("PackedSelect:1:u[{old_fingerprint},Range:{physical_bit}:{physical_bit}]");
+            physical_bits[physical_bit] = Some(format!("Cond:1:u[{condition},{updated},{old}]"));
+        }
+    }
+
+    let operands = physical_bits
+        .into_iter()
+        .rev()
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("Concat:{base_width}:u[{}]", operands.join(",")))
 }

@@ -261,9 +261,13 @@ pub struct SlangAssignmentSummary {
     pub target_names: Vec<String>,
     pub rhs: SlangExpressionSummary,
     pub nonblocking: bool,
-    /// Dynamic packed selects are canonicalized into whole-vector update
-    /// expressions by direct lowering, so exact RHS equivalence is deferred.
+    /// Selector of a dynamic packed lvalue. Direct lowering canonicalizes the
+    /// update into a whole-vector concatenation of per-bit conditionals.
     pub dynamic_packed_lvalue: bool,
+    pub dynamic_packed_lvalue_selector: Option<SlangExpressionSummary>,
+    /// Member writes through a sparse-memory element are canonicalized into a
+    /// whole-memory-element concat; exact structural equivalence is deferred.
+    pub memory_member_lvalue: bool,
     /// Class static storage uses an internal IR name, so exact RHS symbol
     /// equivalence is deferred while assignment inventory remains checked.
     pub uses_class_static: bool,

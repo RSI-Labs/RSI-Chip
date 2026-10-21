@@ -3197,7 +3197,7 @@ endmodule
 }
 
 #[test]
-fn slang_ast_summary_rejects_wrong_constant_packed_select_shapes() {
+fn slang_ast_summary_rejects_wrong_packed_select_shapes() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
@@ -3209,17 +3209,30 @@ fn slang_ast_summary_rejects_wrong_constant_packed_select_shapes() {
 module packed_summary(
   input logic [7:0] data,
   input logic [0:7] ascending,
+  input logic [2:0] selector,
+  input logic [3:0][7:0] groups,
+  input logic [0:3][0:7] ascending_groups,
+  input logic signed [2:0] signed_selector,
+  input logic [-4:3] negative_range,
   output logic bit_one,
   output logic [3:0] high,
   output logic [3:0] up,
   output logic [3:0] down,
-  output logic [3:0] ascending_up
+  output logic [3:0] ascending_up,
+  output logic dynamic_bit,
+  output logic [7:0] dynamic_group,
+  output logic [7:0] ascending_dynamic_group,
+  output logic negative_dynamic
 );
   assign bit_one = data[1];
   assign high = data[7:4];
   assign up = data[3 +: 4];
   assign down = data[6 -: 4];
   assign ascending_up = ascending[0 +: 4];
+  assign dynamic_bit = data[selector];
+  assign dynamic_group = groups[selector];
+  assign ascending_dynamic_group = ascending_groups[selector];
+  assign negative_dynamic = negative_range[signed_selector];
 endmodule
 "#,
     )
@@ -3310,6 +3323,29 @@ endmodule
         .expect_err("wrong constant descending packed select start must fail");
     assert!(
         error.contains("PackedSelect:") && error.contains("Range:5:2"),
+        "unexpected structural error: {error}"
+    );
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "down")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000110".into());
+    }
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "dynamic_bit")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_selector".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic packed selector must fail structural validation");
+    assert!(
+        error.contains("Eq:1:u[Ref:3:u[wrong_selector],"),
         "unexpected structural error: {error}"
     );
 }
@@ -10320,6 +10356,67 @@ endmodule
         .expect("lower dynamic packed lvalue");
     assert_eq!(design.initials.len(), 0);
     assert_eq!(design.processes.len(), 1);
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_lvalue"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize authoritative dynamic-lvalue AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize authoritative dynamic-lvalue AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact dynamic packed-lvalue fingerprint should match");
+    {
+        let assignment = summary
+            .procedural_blocks
+            .iter_mut()
+            .find_map(|block| block.assignments.first_mut())
+            .expect("dynamic packed-lvalue assignment");
+        assignment
+            .dynamic_packed_lvalue_selector
+            .as_mut()
+            .expect("dynamic packed-lvalue selector")
+            .symbol = Some("clk".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic packed-lvalue selector must fail");
+    assert!(
+        error.contains("Eq:1:u[Ref:3:u[clk],"),
+        "unexpected structural error: {error}"
+    );
+    {
+        let assignment = summary
+            .procedural_blocks
+            .iter_mut()
+            .find_map(|block| block.assignments.first_mut())
+            .expect("dynamic packed-lvalue assignment");
+        assignment
+            .dynamic_packed_lvalue_selector
+            .as_mut()
+            .expect("dynamic packed-lvalue selector")
+            .symbol = Some("selector".into());
+        assignment.rhs.symbol = Some("wrong_value".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic packed-lvalue RHS must fail");
+    assert!(
+        error.contains("PackedSelect:1:u[Ref:1:u[wrong_value],"),
+        "unexpected structural error: {error}"
+    );
+    {
+        let assignment = summary
+            .procedural_blocks
+            .iter_mut()
+            .find_map(|block| block.assignments.first_mut())
+            .expect("dynamic packed-lvalue assignment");
+        assignment.rhs.symbol = Some("value".into());
+    }
 
     let mut simulator = Simulator::new(&design).expect("create dynamic lvalue simulator");
     let mut expected = 0_u64;

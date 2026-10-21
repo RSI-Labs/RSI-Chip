@@ -146,18 +146,39 @@ fn repeat_count(value: &Value) -> Option<usize> {
 
 fn is_dynamic_packed_lvalue(value: &Value) -> bool {
     match string_field(value, "kind").as_deref() {
-        Some("ElementSelect") => value.get("selector").is_some_and(|selector| {
-            integer_literal_word(selector).is_none() && string_field(selector, "constant").is_none()
-        }),
+        Some("ElementSelect") => {
+            let selected_is_memory = value
+                .get("value")
+                .and_then(|selected| string_field(selected, "type"))
+                .is_some_and(|type_name| type_name.contains('$'));
+            !selected_is_memory
+                && value.get("selector").is_some_and(|selector| {
+                    integer_literal_word(selector).is_none()
+                        && string_field(selector, "constant").is_none()
+                })
+        }
         Some("MemberAccess") => value
             .get("value")
-            .map(|selected| {
-                string_field(selected, "kind").as_deref() == Some("ElementSelect")
-                    || is_dynamic_packed_lvalue(selected)
-            })
+            .map(is_dynamic_packed_lvalue)
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn is_memory_member_lvalue(value: &Value) -> bool {
+    if string_field(value, "kind").as_deref() != Some("MemberAccess") {
+        return false;
+    }
+    value
+        .get("value")
+        .map(|selected| {
+            if let Some(base) = selected.get("value") {
+                string_field(base, "type").is_some_and(|type_name| type_name.contains('$'))
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn procedural_assignments(
@@ -182,11 +203,17 @@ pub(crate) fn procedural_assignments(
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
             if !is_class_handle_target(left, class_handles) {
                 let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
+                let dynamic_packed_lvalue_selector = dynamic_packed_lvalue
+                    .then(|| left.get("selector").map(expression_summary))
+                    .flatten();
+                let memory_member_lvalue = is_memory_member_lvalue(left);
                 assignments.push(SlangAssignmentSummary {
                     target_names: expression_target_names(left),
                     rhs: expression_summary(right),
                     nonblocking: bool_field(value, "isNonBlocking"),
                     dynamic_packed_lvalue,
+                    dynamic_packed_lvalue_selector,
+                    memory_member_lvalue,
                     uses_class_static: expression_uses_class_symbol(right, class_handles),
                 });
             }
@@ -444,6 +471,63 @@ fn constant_packed_select_fingerprint(
     ))
 }
 
+fn dynamic_packed_element_select_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+) -> Option<String> {
+    if expression.kind != "ElementSelect" {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    if selected.type_name.contains('$') {
+        return None;
+    }
+    let selector = expression.operands.get(1)?;
+    if selector.literal.is_some() {
+        return None;
+    }
+    let shape = simple_type_shape(&selected.type_name)?;
+    let dimension = shape.dimensions.first()?;
+    let width = dimension.element_width;
+    if expression.type_width? != width {
+        return None;
+    }
+
+    let selector_width = selector.type_width?.max(1);
+    let selector_fingerprint = slang_expression_fingerprint_with_parameters(selector, parameters)?;
+    let base = slang_expression_fingerprint_with_parameters(selected, parameters)?;
+    let lower = dimension.msb.min(dimension.lsb);
+    let upper = dimension.msb.max(dimension.lsb);
+    let mut selected_fingerprint = format!("Const:{width}:u[{width}:{}]", "x".repeat(width));
+
+    for logical_index in lower..=upper {
+        let coordinate = if dimension.msb >= dimension.lsb {
+            logical_index - dimension.lsb
+        } else {
+            dimension.lsb - logical_index
+        };
+        let physical_lsb = usize::try_from(coordinate).ok()?.checked_mul(width)?;
+        let physical_msb = physical_lsb + width - 1;
+        let logical_bits = logical_index as u64;
+        let mut constant_bits = String::new();
+        for bit in (0..selector_width).rev() {
+            constant_bits.push(if (logical_bits >> bit) & 1 == 0 {
+                '0'
+            } else {
+                '1'
+            });
+        }
+        let constant_fingerprint =
+            format!("Const:{selector_width}:u[{selector_width}:{constant_bits}]");
+        let condition = format!("Eq:1:u[{selector_fingerprint},{constant_fingerprint}]");
+        let candidate =
+            format!("PackedSelect:{width}:u[{base},Range:{physical_msb}:{physical_lsb}]");
+        selected_fingerprint =
+            format!("Cond:{width}:u[{condition},{candidate},{selected_fingerprint}]");
+    }
+    Some(selected_fingerprint)
+}
+
 fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> Option<String> {
     let (_, bits) = literal.split_once(':')?;
     let signed_label = if signed && bits.starts_with('1') {
@@ -517,6 +601,10 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     }
     if matches!(expression.kind.as_str(), "ElementSelect" | "RangeSelect") {
         if let Some(fingerprint) = constant_packed_select_fingerprint(expression, parameters) {
+            return Some(fingerprint);
+        }
+        if let Some(fingerprint) = dynamic_packed_element_select_fingerprint(expression, parameters)
+        {
             return Some(fingerprint);
         }
     }
