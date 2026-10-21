@@ -247,6 +247,14 @@ pub struct MemoryConnection {
     pub parent: usize,
 }
 
+/// Aliases a child instance's ordinary unpacked-array object to the parent
+/// aggregate supplied on an array port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayConnection {
+    pub child: usize,
+    pub parent: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryPortDirection {
     In,
@@ -883,6 +891,8 @@ pub struct Design {
     pub net_decls: Vec<NetDecl>,
     pub memories: Vec<MemoryDecl>,
     pub memory_connections: Vec<MemoryConnection>,
+    /// First-class aliases for child ordinary-array ports.
+    pub array_connections: Vec<ArrayConnection>,
     pub n_nets: usize,
     pub ports: Vec<PortDecl>,
     pub assigns: Vec<Assign>,
@@ -1060,20 +1070,54 @@ impl Design {
                 });
             }
         }
+
+        let connections = std::mem::take(&mut self.memory_connections)
+            .into_iter()
+            .map(|connection| (connection.child, connection.parent))
+            .chain(
+                std::mem::take(&mut self.array_connections)
+                    .into_iter()
+                    .map(|connection| (connection.child, connection.parent)),
+            )
+            .collect::<Vec<_>>();
+        for (child, parent) in connections {
+            let storage = self
+                .memories
+                .get(child)
+                .or_else(|| self.memories.get(parent))
+                .map(|memory| memory.storage)
+                .unwrap_or(MemoryStorage::Sparse);
+            if storage == MemoryStorage::Ordinary {
+                self.array_connections
+                    .push(ArrayConnection { child, parent });
+            } else {
+                self.memory_connections
+                    .push(MemoryConnection { child, parent });
+            }
+        }
     }
 
     fn memory_alias_roots(&self) -> Vec<usize> {
         let mut aliases = (0..self.memories.len()).collect::<Vec<_>>();
         for _ in 0..self.memories.len() {
             for connection in &self.memory_connections {
-                if let Some(parent) = aliases.get(connection.parent).copied() {
-                    if let Some(alias) = aliases.get_mut(connection.child) {
-                        *alias = parent;
-                    }
-                }
+                let (child, parent) = (connection.child, connection.parent);
+                Self::alias_memory(&mut aliases, child, parent);
+            }
+            for connection in &self.array_connections {
+                let (child, parent) = (connection.child, connection.parent);
+                Self::alias_memory(&mut aliases, child, parent);
             }
         }
         aliases
+    }
+
+    fn alias_memory(aliases: &mut [usize], child: usize, parent: usize) {
+        if let Some(parent) = aliases.get(parent).copied() {
+            if let Some(alias) = aliases.get_mut(child) {
+                *alias = parent;
+            }
+        }
     }
 
     /// Human-readable elaborated hierarchy summary.
@@ -1520,6 +1564,10 @@ mod tests {
             direction: MemoryPortDirection::InOut,
             memory: 0,
         });
+        design.memory_connections.push(MemoryConnection {
+            child: 0,
+            parent: 0,
+        });
         design.processes.push(Process {
             sens: Sens::Comb,
             body: Stmt::MemoryBl {
@@ -1533,11 +1581,21 @@ mod tests {
         assert_eq!(design.memories[0].storage, MemoryStorage::Sparse);
         assert_eq!(design.memory_ports.len(), 1);
         assert_eq!(design.array_ports.len(), 0);
+        assert_eq!(design.memory_connections.len(), 1);
+        assert_eq!(design.array_connections.len(), 0);
 
         design.processes.clear();
         design.infer_memory_kinds();
         assert_eq!(design.memories[0].storage, MemoryStorage::Ordinary);
         assert_eq!(design.memory_ports.len(), 0);
+        assert_eq!(design.memory_connections.len(), 0);
+        assert_eq!(
+            design.array_connections,
+            vec![ArrayConnection {
+                child: 0,
+                parent: 0,
+            }]
+        );
         assert_eq!(
             design.array_ports,
             vec![ArrayPortDecl {
@@ -1550,6 +1608,8 @@ mod tests {
         design.infer_memory_kinds();
         assert_eq!(design.memory_ports.len(), 0);
         assert_eq!(design.array_ports.len(), 1);
+        assert_eq!(design.memory_connections.len(), 0);
+        assert_eq!(design.array_connections.len(), 1);
     }
 
     #[test]

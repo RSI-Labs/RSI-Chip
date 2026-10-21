@@ -1200,6 +1200,7 @@ mod tests {
             net_decls,
             memories: Vec::new(),
             memory_connections: Vec::new(),
+            array_connections: Vec::new(),
             n_nets: 3,
             ports: vec![
                 PortDecl {

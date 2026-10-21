@@ -237,6 +237,13 @@ impl<'d> Simulator<'d> {
             }
             memory_aliases[connection.child] = connection.parent;
         }
+        for connection in &design.array_connections {
+            if connection.child >= memory_aliases.len() || connection.parent >= memory_aliases.len()
+            {
+                return Err("array connection refers to a missing array object".into());
+            }
+            memory_aliases[connection.child] = connection.parent;
+        }
         // Parent memories are elaborated before child instances, but resolve
         // chains explicitly so nested aliases remain well-formed.
         for index in 0..memory_aliases.len() {

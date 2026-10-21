@@ -50,6 +50,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
             banking: eda_core::ir::MemoryBanking::default(),
         }],
         memory_connections: Vec::new(),
+        array_connections: Vec::new(),
         n_nets: 8,
         ports: vec![PortDecl {
             name: "q".into(),
@@ -116,6 +117,7 @@ fn ordinary_array_design() -> Design {
             banking: Default::default(),
         }],
         memory_connections: Vec::new(),
+        array_connections: Vec::new(),
         n_nets: 8,
         ports: vec![PortDecl {
             name: "q".into(),

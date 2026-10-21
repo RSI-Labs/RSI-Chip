@@ -1305,6 +1305,11 @@ impl super::SlangAstLowerer {
             connection.parent += memory_offset;
             self.design.memory_connections.push(connection);
         }
+        for mut connection in child.design.array_connections {
+            connection.child += memory_offset;
+            connection.parent += memory_offset;
+            self.design.array_connections.push(connection);
+        }
         for (parent, child) in interface_memory_connections {
             self.design
                 .memory_connections

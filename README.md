@@ -210,7 +210,8 @@ macro plans, and emit VCD words only when touched, while process-accessed or
 touched-element maps with explicit read, blocking-write, and NBA-write
 operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Ordinary top-level
-ports use a separate `ArrayPortDecl` IR contract; dedicated
+ports use a separate `ArrayPortDecl` contract and child aliases use
+`ArrayConnection`; dedicated
 `set_ordinary_array_input*` and `read_ordinary_array_output*` APIs enforce the
 Ordinary storage contract and reject sparse-memory ports, while sparse-memory
 APIs reject Ordinary arrays. Sparse memories

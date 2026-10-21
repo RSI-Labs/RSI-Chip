@@ -3887,6 +3887,7 @@ endmodule
         .expect("lower shared sparse-memory port through bounded path");
     assert_eq!(direct.memories.len(), 2);
     assert_eq!(direct.memory_connections.len(), 1);
+    assert_eq!(direct.array_connections.len(), 0);
     assert_eq!(direct.memory_connections[0].child, 1);
     assert_eq!(direct.memory_connections[0].parent, 0);
     assert_eq!(reference.memories.len(), 2);
@@ -3937,6 +3938,148 @@ endmodule
     assert_eq!(
         reference_simulator.read("parent_q").unwrap().to_u64(),
         Some(0xa7)
+    );
+}
+
+#[test]
+fn slang_ast_direct_and_bounded_paths_share_nested_ordinary_array_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nested-ordinary-array-ports");
+    let source_path = root.join("nested_ordinary_array_ports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module leaf(
+  input wire logic [7:0] source [0:3],
+  output logic [7:0] destination [0:3],
+  output logic [7:0] source_observed
+);
+  initial begin
+    destination[2] = 8'h5a;
+  end
+  assign source_observed = source[2];
+endmodule
+
+module middle(
+  input wire logic [7:0] pass_source [0:3],
+  output logic [7:0] pass_destination [0:3],
+  output logic [7:0] middle_observed
+);
+  leaf u (
+    .source(pass_source),
+    .destination(pass_destination),
+    .source_observed(middle_observed)
+  );
+endmodule
+
+module top(
+  output logic [7:0] source_observed,
+  output logic [7:0] destination_observed
+);
+  logic [7:0] source [0:3];
+  logic [7:0] destination [0:3];
+
+  initial begin
+    source[2] = 8'h3c;
+  end
+
+  middle u (
+    .pass_source(source),
+    .pass_destination(destination),
+    .middle_observed(source_observed)
+  );
+  assign destination_observed = destination[2];
+endmodule
+"#,
+    )
+    .expect("write nested ordinary-array port source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nested ordinary-array ports");
+    let reference = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower nested ordinary-array ports through bounded path");
+
+    assert_eq!(direct.memories.len(), 6);
+    assert_eq!(direct.memory_connections.len(), 0);
+    assert_eq!(direct.array_connections.len(), 4);
+    assert!(direct
+        .array_connections
+        .contains(&eda_core::ir::ArrayConnection {
+            child: 4,
+            parent: 2
+        }));
+    assert!(direct
+        .array_connections
+        .contains(&eda_core::ir::ArrayConnection {
+            child: 5,
+            parent: 3
+        }));
+    assert!(direct
+        .array_connections
+        .contains(&eda_core::ir::ArrayConnection {
+            child: 2,
+            parent: 0
+        }));
+    assert!(direct
+        .array_connections
+        .contains(&eda_core::ir::ArrayConnection {
+            child: 3,
+            parent: 1
+        }));
+    assert!(direct
+        .memories
+        .iter()
+        .all(|memory| memory.storage == eda_core::ir::MemoryStorage::Ordinary));
+
+    let mut direct_simulator =
+        Simulator::new(&direct).expect("create direct nested ordinary-array simulator");
+    direct_simulator
+        .run_until(0)
+        .expect("settle direct nested ordinary arrays");
+    assert_eq!(
+        direct_simulator.read("source_observed").unwrap().to_u64(),
+        Some(0x3c),
+        "parent initial value must flow through two child input aliases"
+    );
+    assert_eq!(
+        direct_simulator
+            .read("destination_observed")
+            .unwrap()
+            .to_u64(),
+        Some(0x5a),
+        "leaf initial value must flow through two child output aliases"
+    );
+
+    let mut reference_simulator =
+        Simulator::new(&reference).expect("create bounded nested ordinary-array simulator");
+    reference_simulator
+        .run_until(0)
+        .expect("settle bounded nested ordinary arrays");
+    assert_eq!(
+        reference_simulator
+            .read("source_observed")
+            .unwrap()
+            .to_u64(),
+        Some(0x3c)
+    );
+    assert_eq!(
+        reference_simulator
+            .read("destination_observed")
+            .unwrap()
+            .to_u64(),
+        Some(0x5a)
     );
 }
 
