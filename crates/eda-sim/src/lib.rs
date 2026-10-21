@@ -1301,6 +1301,43 @@ impl<'d> Simulator<'d> {
         self.notify_memory_write(memory)
     }
 
+    fn sample_memory_copy(
+        &self,
+        source: usize,
+        destination: usize,
+    ) -> Result<Vec<(u64, LogicWord)>, String> {
+        let source = self.canonical_memory(source);
+        let destination = self.canonical_memory(destination);
+        let source_declaration = self
+            .design
+            .memories
+            .get(source)
+            .ok_or_else(|| "memory copy source is missing".to_string())?;
+        let destination_declaration = self
+            .design
+            .memories
+            .get(destination)
+            .ok_or_else(|| "memory copy destination is missing".to_string())?;
+        if source_declaration.flat_length != destination_declaration.flat_length
+            || source_declaration.element_width != destination_declaration.element_width
+            || source_declaration.dimensions != destination_declaration.dimensions
+        {
+            return Err("memory copy source and destination shapes do not match".into());
+        }
+        let element_width = destination_declaration.element_width;
+        let mut values = Vec::new();
+        for index in 0..destination_declaration.flat_length {
+            let value = self
+                .memory_elements
+                .get(source)
+                .and_then(|elements| elements.get(index))
+                .cloned()
+                .unwrap_or_else(|| LogicWord::xes(element_width));
+            values.push((index, value.sized(element_width)));
+        }
+        Ok(values)
+    }
+
     fn apply_memory_part_update(
         &mut self,
         memory: usize,
@@ -1824,6 +1861,28 @@ impl<'d> Simulator<'d> {
                         index,
                         value,
                     });
+                }
+                Stmt::MemoryCopy {
+                    source,
+                    destination,
+                    nonblocking,
+                } => {
+                    let destination = self.canonical_memory(*destination);
+                    let values = self.sample_memory_copy(*source, destination)?;
+                    if *nonblocking {
+                        self.memory_nba.reserve(values.len());
+                        for (index, value) in values {
+                            self.memory_nba.push(MemoryNbaUpdate::Whole {
+                                memory: destination,
+                                index,
+                                value,
+                            });
+                        }
+                    } else {
+                        for (index, value) in values {
+                            self.apply_memory_update(destination, index, value)?;
+                        }
+                    }
                 }
                 Stmt::MemoryBlPart {
                     memory,
@@ -3318,6 +3377,14 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             indexes.iter().for_each(|x| walk_expr_memories(x, out));
             walk_expr_memories(e, out);
         }
+        Stmt::MemoryCopy {
+            source,
+            destination,
+            ..
+        } => {
+            out.push(*source);
+            out.push(*destination);
+        }
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -3424,6 +3491,7 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(indexes.iter().flat_map(expr_nets));
             reads.extend(expr_nets(e));
         }
+        Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -3542,6 +3610,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             indexes.iter().for_each(|x| walk_expr(x, out));
             walk_expr(e, out);
         }
+        Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }

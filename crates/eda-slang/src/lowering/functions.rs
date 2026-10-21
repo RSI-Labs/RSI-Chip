@@ -3,6 +3,7 @@
 use super::statements::event_array_condition;
 use super::{declaration_name, SlangAstLowerer};
 use crate::ast_util::{bool_field, expression_symbol, string_field};
+use crate::types::memory_type;
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -51,6 +52,9 @@ impl SlangAstLowerer {
                     unit_exponent: self.time_scale.normalized_unit_exponent(),
                 }
             });
+        }
+        if function_name == "$size" {
+            return self.lower_fixed_array_size(value);
         }
         match subroutine.as_str() {
             "next" | "prev" => {
@@ -881,6 +885,41 @@ impl SlangAstLowerer {
             };
         }
         Ok(result)
+    }
+
+    fn lower_fixed_array_size(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "$size requires a fixed unpacked-array receiver".to_string())?;
+        if arguments.is_empty() || arguments.len() > 2 {
+            return Err("$size expects one array argument and at most one dimension".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "$size has no array receiver".to_string())?;
+        let receiver_type = string_field(receiver, "type").unwrap_or_default();
+        let array = memory_type(&receiver_type).ok_or_else(|| {
+            format!("$size receiver is not a fixed unpacked array: '{receiver_type}'")
+        })?;
+        let mut dimension = 1_i64;
+        if let Some(argument) = arguments.get(1) {
+            dimension = constant_ast_i64(argument)
+                .map_err(|_| "$size dimension must be an integer constant")?;
+        }
+        if dimension < 1 || dimension as usize > array.dimensions.len() {
+            return Err(format!(
+                "$size dimension {dimension} is outside 1..={}",
+                array.dimensions.len()
+            ));
+        }
+        let length = array.dimensions[dimension as usize - 1].length as u64;
+        Ok(eda_core::ir::Expr::Signed {
+            e: Box::new(eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_u64(32, length),
+            )),
+            signed: true,
+        })
     }
 
     fn lower_enum_first_last(

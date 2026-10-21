@@ -80,6 +80,7 @@ fn feedback(s: &Stmt) -> bool {
                 indexes.iter().for_each(|e| expr_nets(e, reads));
                 expr_nets(e, reads);
             }
+            Stmt::MemoryCopy { .. } => {}
             Stmt::MemoryBlPart {
                 indexes, start, e, ..
             }

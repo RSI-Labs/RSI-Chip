@@ -7,7 +7,7 @@ use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
     slang_constant_u64, string_field, usize_field, with_source_span,
 };
-use crate::types::AstPackedDimension;
+use crate::types::{memory_type, AstPackedDimension};
 use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
@@ -1803,6 +1803,11 @@ impl SlangAstLowerer {
         if let Some(statement) = self.memory_struct_member_assignment(assignment, left, right)? {
             return Ok(statement);
         }
+        if let Some(statement) =
+            self.whole_memory_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
+        {
+            return Ok(statement);
+        }
         if let Some(statement) = self.dynamic_packed_element_assignment(assignment, left, right)? {
             return Ok(statement);
         }
@@ -1851,6 +1856,61 @@ impl SlangAstLowerer {
         } else {
             Ok(Stmt::Bl { lv, e: expression })
         }
+    }
+
+    fn whole_memory_assignment(
+        &self,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        nonblocking: bool,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        if !matches!(
+            (
+                string_field(left, "kind").as_deref(),
+                string_field(right, "kind").as_deref(),
+            ),
+            (
+                Some("NamedValue" | "HierarchicalValue"),
+                Some("NamedValue" | "HierarchicalValue"),
+            )
+        ) {
+            return Ok(None);
+        }
+        if memory_type(&string_field(left, "type").unwrap_or_default()).is_none()
+            || memory_type(&string_field(right, "type").unwrap_or_default()).is_none()
+        {
+            return Ok(None);
+        }
+        let left_symbol = self.named_symbol(left)?;
+        let right_symbol = self.named_symbol(right)?;
+        let Some(destination) = left_symbol.memory else {
+            return Ok(None);
+        };
+        let Some(source) = right_symbol.memory else {
+            return Ok(None);
+        };
+        let source_memory = &self.design.memories[source];
+        let destination_memory = &self.design.memories[destination];
+        let shapes_match = source_memory.element_width == destination_memory.element_width
+            && source_memory.element_msb == destination_memory.element_msb
+            && source_memory.element_lsb == destination_memory.element_lsb
+            && source_memory.dimensions == destination_memory.dimensions
+            && source_memory.flat_length == destination_memory.flat_length;
+        if !shapes_match {
+            return Err(
+                "whole unpacked-array assignment source and destination shapes do not match".into(),
+            );
+        }
+        if source_memory.flat_length > 4096 {
+            return Err(
+                "whole unpacked-array assignment exceeds the 4096-element support limit".into(),
+            );
+        }
+        Ok(Some(eda_core::ir::Stmt::MemoryCopy {
+            source,
+            destination,
+            nonblocking,
+        }))
     }
 
     fn dynamic_packed_element_assignment(

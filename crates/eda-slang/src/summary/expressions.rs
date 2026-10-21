@@ -1189,6 +1189,20 @@ pub(crate) fn design_stmt_assignments(
                     .map(|memory| (memory.name.clone(), design_expr_fingerprint(design, e))),
             );
         }
+        Stmt::MemoryCopy {
+            source,
+            destination,
+            ..
+        } => {
+            assignments.extend(design.memories.get(*destination).map(|destination| {
+                let source = design
+                    .memories
+                    .get(*source)
+                    .map(|source| source.name.as_str())
+                    .unwrap_or("<unknown>");
+                (destination.name.clone(), format!("MemoryCopy:{source}"))
+            }));
+        }
         Stmt::BlIndexed { net, e, .. } | Stmt::NBlIndexed { net, e, .. } => {
             assignments.extend(design.net_decls.iter().find_map(|declaration| {
                 (*net >= declaration.base && *net < declaration.base + declaration.width)

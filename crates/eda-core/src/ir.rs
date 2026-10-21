@@ -641,6 +641,13 @@ pub enum Stmt {
         indexes: Vec<Expr>,
         e: Expr,
     },
+    /// Whole fixed-array copy. Source elements are sampled before blocking
+    /// destination updates; nonblocking copies commit in the NBA region.
+    MemoryCopy {
+        source: usize,
+        destination: usize,
+        nonblocking: bool,
+    },
     /// Blocking indexed part-select write to a sparse-memory element.
     MemoryBlPart {
         memory: usize,
@@ -1310,6 +1317,28 @@ fn collect_memory_accesses(
                 .push(MemoryWriteObservation {
                     start: Some(0),
                     width: memory_widths.get(*memory).copied().unwrap_or(0),
+                    ascending: true,
+                });
+        }
+        Stmt::MemoryCopy {
+            source,
+            destination,
+            ..
+        } => {
+            if synchronous {
+                accesses.sync_reads.insert(*source);
+                accesses.sync_writes.insert(*destination);
+            } else {
+                accesses.async_reads.insert(*source);
+                accesses.async_writes.insert(*destination);
+            }
+            accesses
+                .write_observations
+                .entry(*destination)
+                .or_default()
+                .push(MemoryWriteObservation {
+                    start: Some(0),
+                    width: memory_widths.get(*destination).copied().unwrap_or(0),
                     ascending: true,
                 });
         }

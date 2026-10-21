@@ -4433,6 +4433,167 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_fixed_array_copies_and_size() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-fixed-array-copy-size");
+    let source_path = root.join("fixed_array_copy_size.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module fixed_array_copy_size(
+  output int first_dimension,
+  output int second_dimension,
+  output int nonblocking_size,
+  output logic [7:0] copied_first,
+  output logic [7:0] copied_last,
+  output logic [7:0] nonblocking_first,
+  output logic [7:0] nonblocking_last
+);
+  logic [7:0] source [0:1][0:2];
+  logic [7:0] destination [0:1][0:2];
+  logic [7:0] nonblocking_source [0:1][0:2];
+  logic [7:0] nonblocking_destination [0:1][0:2];
+
+  initial begin
+    source[0][0] = 8'h11;
+    source[1][2] = 8'h66;
+    destination = source;
+
+    nonblocking_source[0][0] = 8'h7c;
+    nonblocking_source[1][2] = 8'ha5;
+    nonblocking_destination <= nonblocking_source;
+
+    first_dimension = $size(source);
+    second_dimension = $size(source, 2);
+    nonblocking_size = $size(nonblocking_destination);
+  end
+
+  assign copied_first = destination[0][0];
+  assign copied_last = destination[1][2];
+  assign nonblocking_first = nonblocking_destination[0][0];
+  assign nonblocking_last = nonblocking_destination[1][2];
+endmodule
+"#,
+    )
+    .expect("write fixed-array copy and size source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("fixed_array_copy_size"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fixed-array copies and size");
+    assert_eq!(design.memories.len(), 4);
+    assert!(design
+        .memories
+        .iter()
+        .all(|memory| memory.storage == eda_core::ir::MemoryStorage::Ordinary));
+
+    let mut simulator = Simulator::new(&design).expect("create fixed-array simulator");
+    simulator.run_until(0).expect("settle fixed-array copies");
+    assert_eq!(simulator.read("first_dimension").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("second_dimension").unwrap().to_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        simulator.read("nonblocking_size").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(simulator.read("copied_first").unwrap().to_u64(), Some(0x11));
+    assert_eq!(simulator.read("copied_last").unwrap().to_u64(), Some(0x66));
+    assert_eq!(
+        simulator.read("nonblocking_first").unwrap().to_u64(),
+        Some(0x7c)
+    );
+    assert_eq!(
+        simulator.read("nonblocking_last").unwrap().to_u64(),
+        Some(0xa5)
+    );
+
+    let mismatch_path = root.join("array_copy_mismatch.sv");
+    std::fs::write(
+        &mismatch_path,
+        r#"
+module array_copy_mismatch;
+  logic [7:0] source [0:3];
+  logic [7:0] destination [0:4];
+  initial destination = source;
+endmodule
+"#,
+    )
+    .expect("write array-copy shape mismatch source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&mismatch_path),
+            Some("array_copy_mismatch"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("whole-array shape mismatches must fail closed");
+    assert!(
+        error.contains("cannot be assigned"),
+        "unexpected error: {error}"
+    );
+
+    let differential_path = root.join("array_copy_differential.sv");
+    std::fs::write(
+        &differential_path,
+        r#"
+module array_copy_differential(
+  output logic [7:0] first,
+  output logic [7:0] second
+);
+  logic [7:0] source [0:3];
+  logic [7:0] destination [0:3];
+  initial begin
+    source[0] = 8'h34;
+    source[1] = 8'h12;
+    destination = source;
+  end
+  assign first = destination[0];
+  assign second = destination[1];
+endmodule
+"#,
+    )
+    .expect("write array-copy differential source");
+    let direct_copy = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&differential_path),
+            Some("array_copy_differential"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower array-copy differential");
+    let reference_copy = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&differential_path),
+            Some("array_copy_differential"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower array-copy differential through bounded path");
+    let mut direct_copy_simulator =
+        Simulator::new(&direct_copy).expect("create direct array-copy simulator");
+    direct_copy_simulator
+        .run_until(0)
+        .expect("settle direct array copy");
+    let mut reference_copy_simulator =
+        Simulator::new(&reference_copy).expect("create bounded array-copy simulator");
+    reference_copy_simulator
+        .run_until(0)
+        .expect("settle bounded array copy");
+    assert_eq!(
+        direct_copy_simulator.read("first").unwrap().to_u64(),
+        reference_copy_simulator.read("first").unwrap().to_u64()
+    );
+    assert_eq!(
+        direct_copy_simulator.read("second").unwrap().to_u64(),
+        reference_copy_simulator.read("second").unwrap().to_u64()
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

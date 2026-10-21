@@ -378,6 +378,7 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
                 .for_each(|index| remap_expression(index, offset));
             remap_expression(e, offset);
         }
+        Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -584,6 +585,7 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
                 .for_each(|index| rewrite_expression_nets(index, rewrites));
             rewrite_expression_nets(e, rewrites);
         }
+        Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -813,6 +815,14 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
         Stmt::BlIndexed { start, e, .. } | Stmt::NBlIndexed { start, e, .. } => {
             remap_expression_memory_ids(start, offset);
             remap_expression_memory_ids(e, offset);
+        }
+        Stmt::MemoryCopy {
+            source,
+            destination,
+            ..
+        } => {
+            *source += offset;
+            *destination += offset;
         }
         Stmt::If { c, t, f } => {
             remap_expression_memory_ids(c, offset);
