@@ -60,7 +60,8 @@ direct `$display`/`$write`/`$monitor` formatting tasks for
 `$printtimescale`, blocking/non-blocking assignments, blocks, if plus normal,
 wildcard, inside, and qualified priority/unique case control flow, bounded
 strings and their checked methods, scalar and edge-qualified event lists,
-delays, waits, runtime loops, jumps, force/release, fork join modes, recursive
+delays, waits, runtime loops, jumps, task return boundaries that resume callers,
+force/release, fork join modes, recursive
 hierarchy, parameterized interfaces, interface arrays and ports, packed and
 unpacked aggregates, simple non-virtual class objects with constructors,
 properties, methods, single-inheritance field flattening, constructor chaining,

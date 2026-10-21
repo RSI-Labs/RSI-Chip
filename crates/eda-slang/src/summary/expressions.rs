@@ -1169,7 +1169,10 @@ pub(crate) fn design_stmt_assignments(
             assignments.extend(design_stmt_assignments(design, body));
         }
         Stmt::Force { .. } | Stmt::Release { .. } => {}
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => {
+            assignments.extend(design_stmt_assignments(design, body));
+        }
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {
                 assignments.push((name, design_expr_fingerprint(design, e)));

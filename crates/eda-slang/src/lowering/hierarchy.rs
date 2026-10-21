@@ -443,7 +443,8 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
                 .iter_mut()
                 .for_each(|step| remap_statement(step, offset));
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => remap_statement(body, offset),
         Stmt::Repeat { count, body } => {
             remap_expression(count, offset);
             remap_statement(body, offset);
@@ -652,7 +653,8 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
                 .iter_mut()
                 .for_each(|step| rewrite_statement_nets(step, rewrites));
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => rewrite_statement_nets(body, rewrites),
         Stmt::Repeat { count, body } => {
             rewrite_expression_nets(count, rewrites);
             rewrite_statement_nets(body, rewrites);
@@ -854,7 +856,8 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
                 .iter_mut()
                 .for_each(|step| remap_statement_memory_ids(step, offset));
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => remap_statement_memory_ids(body, offset),
         Stmt::Repeat { count, body } => {
             remap_expression_memory_ids(count, offset);
             remap_statement_memory_ids(body, offset);

@@ -909,6 +909,17 @@ impl SlangAstLowerer {
             }
             "Break" => Ok(Stmt::Break),
             "Continue" => Ok(Stmt::Continue),
+            "Return" => {
+                if statement
+                    .get("expr")
+                    .is_some_and(|expression| !expression.is_null())
+                {
+                    return Err(
+                        "direct slang-AST statement lowering supports only void task return".into(),
+                    );
+                }
+                Ok(Stmt::Return)
+            }
             "Empty" => Ok(Stmt::Block(Vec::new())),
             "EventTrigger" => self.lower_event_trigger(statement),
             "Wait" => {

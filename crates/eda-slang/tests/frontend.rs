@@ -11686,6 +11686,73 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_task_returns() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-task-return");
+    let source_path = root.join("task_return.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module task_return(
+  output int true_state,
+  output int true_skipped,
+  output int false_state,
+  output int false_skipped,
+  output int task_after
+);
+  task automatic stop_early(
+    input logic stop,
+    output int state,
+    output int skipped
+  );
+    state = 1;
+    if (stop) return;
+    skipped = 1;
+  endtask
+
+  initial begin
+    stop_early(1'b1, true_state, true_skipped);
+    stop_early(1'b0, false_state, false_skipped);
+    task_after = 2;
+  end
+endmodule
+"#,
+    )
+    .expect("write task-return source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("task_return"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower task returns");
+    assert_eq!(design.initials.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create return simulator");
+    simulator.run_until(0).expect("run return initializers");
+    assert_eq!(simulator.read("true_state").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("true_skipped").unwrap().to_u64(),
+        None,
+        "task return must skip only the remainder of the task body"
+    );
+    assert_eq!(simulator.read("false_state").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("false_skipped").unwrap().to_u64(),
+        Some(1),
+        "a non-taken return must preserve normal task execution"
+    );
+    assert_eq!(
+        simulator.read("task_after").unwrap().to_u64(),
+        Some(2),
+        "task return must resume the caller"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_task_local_variables() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

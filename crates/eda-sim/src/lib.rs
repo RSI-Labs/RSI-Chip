@@ -87,6 +87,7 @@ struct Monitor<'d> {
 
 const MAX_STEPS_PER_TIME: u64 = 200_000;
 const MAX_EVENTS: u64 = 20_000_000;
+static RETURN_BARRIER: Stmt = Stmt::ReturnBarrier;
 
 pub(crate) struct OrdinaryArrayElements {
     words: Vec<LogicWord>,
@@ -1517,6 +1518,11 @@ impl<'d> Simulator<'d> {
                     work.push(s);
                     work.push(inner);
                 }
+                Stmt::Scope(inner) => {
+                    work.push(&RETURN_BARRIER);
+                    work.push(inner);
+                }
+                Stmt::ReturnBarrier => {}
                 Stmt::While { cond, body, steps } => {
                     const MAX_WHILE_ITERATIONS: u64 = 65_536;
                     let condition = self.eval(cond);
@@ -1666,6 +1672,16 @@ impl<'d> Simulator<'d> {
                             }
                         }
                         _ => unreachable!("loop position must point to a runtime loop"),
+                    }
+                }
+                Stmt::Return => {
+                    if let Some(scope_position) = work
+                        .iter()
+                        .rposition(|statement| matches!(statement, Stmt::ReturnBarrier))
+                    {
+                        work.truncate(scope_position);
+                    } else {
+                        work.clear();
                     }
                 }
                 Stmt::Bl { lv, e } => {
@@ -3288,7 +3304,8 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
         }
         Stmt::Force { e, .. } => walk_expr_memories(e, out),
         Stmt::Release { .. } => {}
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => walk_stmt_memories(body, out),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
@@ -3412,7 +3429,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         }
         Stmt::Force { e, .. } => reads.extend(expr_nets(e)),
         Stmt::Release { .. } => {}
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => collect_stmt_access(body, reads, writes),
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
@@ -3510,7 +3528,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         }
         Stmt::Force { e, .. } => walk_expr(e, out),
         Stmt::Release { .. } => {}
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => walk_stmt(body, out),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),

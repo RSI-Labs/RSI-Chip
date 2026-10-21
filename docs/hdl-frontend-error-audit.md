@@ -1,8 +1,8 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-21 (local time)
-Repository state audited: `fix-digital` at `33c8971` plus the dedicated ordinary-array
-port API changes in this change set.
+Repository state audited: `fix-digital` at `7af7d72` plus the task-return boundary
+changes in this change set.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -55,12 +55,12 @@ complete design.
 
 ### 1.2 Finding inventory
 
-The open inventory below contains 20 rolled-up frontend findings (`F-*`), 66
+The open inventory below contains 20 rolled-up frontend findings (`F-*`), 65
 direct-AST coverage gaps (`D-*`), 12 bounded-path limitations (`B-*`), and 17
 additional confirmed bounded-path defects/blind spots (`O-*`). It also records
 19 explicit resource limits (`L-*`). These categories overlap intentionally:
 `F-*` rows are architectural rollups, while `D-*`, `B-*`, and `O-*` expose their
-specific known consequences. The ten `R-*` rows are former defects retained only
+specific known consequences. The 13 `R-*` rows are former defects retained only
 to document their fixes; they are not current errors.
 
 ## 2. Validation performed for this audit
@@ -72,11 +72,11 @@ All commands were run against the current worktree:
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 89 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 219 passed, 500.11 s |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 220 passed, 442.01 s |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 28 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 85 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 190.78 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 142.27 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -111,6 +111,7 @@ information from re-entering the roadmap.
 | R-10 | ASCII string ordering was expected incorrectly | Fixed in `b4a2b34`. `"a"` is greater than `"-"`, so `mixed < right` is false/zero for the tested operands. |
 | R-11 | Unsigned relational expressions were cast from `u64` to `i64` | Fixed. Comparisons now order full-width packed bit vectors; direct-versus-bounded regressions cover values above `I64::MAX` and signed/unsigned 65-bit ordering. |
 | R-12 | A 65-bit decimal literal could panic while shifting beyond `u64::BITS` | Fixed. Decimal literal decoding checks the bit index before shifting, and a 65-bit zero regression covers the former panic boundary. |
+| R-13 | Task `return` had no runtime subroutine boundary | Fixed. Inlined task bodies lower into `Stmt::Scope`; `Stmt::ReturnBarrier` bounds `Stmt::Return`, so a return skips only the task body and resumes its caller. `slang_ast_direct_lowering_supports_task_returns` covers taken/non-taken returns and caller continuation. |
 
 ## 4. Current P0 and P1 findings
 
@@ -132,7 +133,7 @@ broader tool-flow percentage.
 | F-11 | Complete width/signedness/type propagation | Implement IEEE 1800 self-determined and context-determined expression rules, literal sizing, mixed-sign rules, casts, port coercion, and X/Z propagation. | Many basic tests pass and summary checks simple width/sign. Full-width relational ordering now handles 64-bit and 65-bit signed/unsigned boundaries, and a direct-versus-bounded differential covers 64-bit wrap plus values above `I64::MAX`. Propagation is still not a complete LRM implementation, mixed-sign/cast/X-Z corpora remain incomplete, and bounded constant evaluation is historically `i64`-oriented. | P0 | 48% | Differential expression corpus against an independent evaluator, including mixed signs, shifts, casts, context widths, X/Z propagation, and arbitrary >64-bit constants. |
 | F-12 | Net types, strength, and resolution | Preserve net kinds, implicit nets, strengths, tri-state resolution, multi-driver behavior, supply nets, and charge decay. | Basic `wire`/tri-state values work in tested cases. Direct lowering does not preserve a complete strength/net-resolution model; strength qualifiers are not a first-class IR property. | P1 correctness risk | 25% | Systematic multi-driver strength/tri-state truth tables and implicit-net diagnostics. |
 | F-13 | Complete string model | Support dynamic SystemVerilog strings, Unicode/locale behavior where required by methods, mutation, substrings, conversions, formatting, and concatenation overflow. | Current model is a fixed 512-bit, 64-byte NUL-padded ASCII representation. Direct path supports literals, concatenation, length, byte reads/index writes, case conversion, comparison, `putc()`, `substr()`, and decimal/hex/binary radix conversions. Dynamic growth beyond 64 bytes, Unicode behavior, and synthesis remain incomplete/fail closed. | P1 | 55% of bounded string subset; 0% for unbounded strings | String method conformance tests and explicit overflow/unknown/NUL behavior tests. |
-| F-14 | Complete function/task execution model | Support recursive/nonrecursive routines, all argument directions/default values, static/automatic lifetimes, void functions, virtual dispatch, out-of-line calls, loops, jumps, and runtime control flow. | Direct inlining supports many straight-line/control-flow functions/tasks, output/inout/ref arguments, locals, conditionals, and bounded loops. Recursion is rejected; loop unrolling is capped at 256; simple class constructors/methods inline with receiver-field substitution; inherited fields, constructor chaining, receiver-resolved virtual calls, direct base/derived handle reassignment, object-identity propagation, runtime virtual dispatch, hierarchy-global static class functions/tasks, package-qualified class methods, value-parameterized class methods with parameter-symbol substitution, and class-array method/property reads plus sampled dynamic construction/property writes, dynamic handle assignment, nested composed-receiver methods including class-valued array properties, and instance property initializers execute. Full dynamic object semantics, complete static/automatic routine lifetimes, and general procedure jumps remain absent. | P0 | 53% | Separate compile-time inlining tests from a real runtime subroutine/process model. |
+| F-14 | Complete function/task execution model | Support recursive/nonrecursive routines, all argument directions/default values, static/automatic lifetimes, void functions, virtual dispatch, out-of-line calls, loops, jumps, and runtime control flow. | Direct inlining supports many straight-line/control-flow functions/tasks, output/inout/ref arguments, locals, conditionals, bounded loops, and task return boundaries that skip only the inlined task body before resuming the caller. Recursion is rejected; loop unrolling is capped at 256; simple class constructors/methods inline with receiver-field substitution; inherited fields, constructor chaining, receiver-resolved virtual calls, direct base/derived handle reassignment, object-identity propagation, runtime virtual dispatch, hierarchy-global static class functions/tasks, package-qualified class methods, value-parameterized class methods with parameter-symbol substitution, and class-array method/property reads plus sampled dynamic construction/property writes, dynamic handle assignment, nested composed-receiver methods including class-valued array properties, and instance property initializers execute. Full dynamic object semantics, complete static/automatic routine lifetimes, and general out-of-line subroutine/process control remain absent. | P0 | 54% | Separate compile-time inlining tests from a real runtime subroutine/process model. |
 | F-15 | Package and namespace elaboration | Support packages, imports, exports, scoped references, nested packages, compilation-unit scopes, typedef visibility, and configuration. | Bounded path handles selected package constants/functions and wildcard imports. Direct path imports compilation-unit package constants, functions, typedefs, and enums through wildcard and explicit imports, supports scoped constants/functions in imported packages, executes enum/struct-typed package constants and package enum `first`/`last`/`num`/`next`/`prev`/`name` methods, and rejects imported symbol collisions. Simple integral/string aliases and string parameters execute, package-qualified classes including duplicate unqualified names resolve through slang type identity, and the official Accellera UVM package source loads through the direct path with a trivial wrapper. Unsupported package-only class/queue aliases are deferred and fail closed when referenced. Exports, nested packages, and full shadowing remain incomplete. | P1 | 62% | Multi-package name-collision/shadowing/order tests. |
 | F-16 | Parameterization and elaboration diagnostics | Support integer/string/type parameters, localparams, complex override graphs, default values, parameter ports, defparam, and cycle/dependency diagnostics. | Direct path handles simple elaborated constants, generated parameter values, and value-parameterized interface specializations with aggregate layouts. Type parameters and defparam are unsupported; bounded constant evaluation and diagnostics remain incomplete. | P0 | 42% | Parameter dependency/cycle/override matrix and preserve-overrides metadata in IR. |
 | F-17 | Source diagnostics engine | Every parser/elaboration/lowering error needs file, line, column, range, severity, diagnostic code, notes, related locations, suppression, and multi-error recovery. | Direct errors often include slang spans. Bounded parser diagnostics are mostly line-only; many bounded elaboration errors are plain strings. There is no complete structured diagnostic object or suppression system. | P1 | 30% | Snapshot diagnostics for malformed and unsupported corpora; no raw `Result<_, String>` at public boundaries. |
@@ -210,7 +211,6 @@ versus bounded probe.
 | D-50 | Remaining general loop forms | Runtime `repeat`, `while`/`do...while`, loop jumps, module-scope `for`, and initialized automatic procedure-local `for` with assignment/increment steps are supported. Arbitrary for-step forms and locals without entry initializers remain unsupported. |
 | D-51 | Loop jumps across process/fork boundaries | `break`/`continue` work in a runtime loop continuation, but cancellation and jump propagation through fork children or named processes remain unsupported. |
 | D-52 | `disable fork`/named process termination | Unsupported and fails closed; sequential lexical block `disable` is supported. |
-| D-53 | Procedure-level `return` | Unsupported as a general statement (function inlining has selected return handling). |
 | D-54 | Procedural `deassign` | Scalar static-lvalue `force` and `release` are supported; procedural variable `deassign` and aggregate/dynamic force targets remain unsupported. |
 | D-55 | Qualified wildcard/inside checks | Normal `priority`/`unique`/`unique0` if/case checks execute, including runtime no-match and overlap diagnostics. Qualified wildcard and case-inside forms still fail closed. |
 | D-56 | Full wildcard/inside case grammar | Direct statements support `casez`, `casex`, and simple `case ... inside` value/range arms. Remaining exotic range/pattern forms still fail closed. |

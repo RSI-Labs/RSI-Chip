@@ -160,7 +160,8 @@ fn feedback(s: &Stmt) -> bool {
             }
             Stmt::Force { e, .. } => expr_nets(e, reads),
             Stmt::Release { .. } => {}
-            Stmt::Break | Stmt::Continue => {}
+            Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+            Stmt::Scope(body) => walk(body, reads, writes),
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
                 expr_nets(cond, reads)
             }

@@ -735,6 +735,13 @@ pub enum Stmt {
     Break,
     /// Start the next iteration of the nearest runtime loop.
     Continue,
+    /// An inlined subroutine invocation with its own return boundary.
+    Scope(Box<Stmt>),
+    /// Marks the outer edge of a subroutine return boundary.
+    ReturnBarrier,
+    /// Return from the current subroutine or, outside a subroutine scope,
+    /// from the current procedural activation.
+    Return,
     Display {
         parts: Vec<DispPart>,
         args: Vec<Expr>,
@@ -1189,7 +1196,8 @@ fn collect_memory_accesses(
                 collect_memory_accesses(step, synchronous, memory_widths, accesses);
             }
         }
-        Stmt::Break | Stmt::Continue => {}
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Scope(body) => collect_memory_accesses(body, synchronous, memory_widths, accesses),
         Stmt::Repeat { count, body } => {
             collect_memory_expr_reads(count, synchronous, false, accesses);
             collect_memory_accesses(body, synchronous, memory_widths, accesses)

@@ -2493,14 +2493,15 @@ impl SlangAstLowerer {
         statement: &Value,
     ) -> Result<Option<Stmt>, String> {
         let statement_kind = string_field(statement, "kind");
-        let container = if statement_kind.as_deref() == Some("Block") {
-            statement
-                .get("body")
-                .ok_or_else(|| "report block has no body".to_string())?
-        } else if statement_kind.as_deref() == Some("List") {
-            statement
-        } else {
-            return Ok(None);
+        let container = match statement_kind.as_deref() {
+            Some("Block") => {
+                let Some(body) = statement.get("body") else {
+                    return Ok(None);
+                };
+                body
+            }
+            Some("List") => statement,
+            _ => return Ok(None),
         };
         let Some(items) = container.get("list").and_then(Value::as_array) else {
             return Ok(None);

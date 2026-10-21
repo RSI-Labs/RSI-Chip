@@ -444,7 +444,7 @@ impl SlangAstLowerer {
         }
         let result = self.lower_statement(&body);
         self.inline_stack.borrow_mut().pop();
-        result.map(Some)
+        result.map(|statement| Some(eda_core::ir::Stmt::Scope(Box::new(statement))))
     }
 
     fn lower_display_call(

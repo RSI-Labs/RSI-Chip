@@ -60,6 +60,10 @@ impl<'a> Synth<'a> {
             Stmt::TimeFormat { .. } => Err("time formatting is not synthesizable".into()),
             Stmt::Release { .. } => Err("release statements are not synthesizable".into()),
             Stmt::Break | Stmt::Continue => Err("loop jumps are not synthesizable".into()),
+            Stmt::ReturnBarrier | Stmt::Return => {
+                Err("procedure return is not synthesizable".into())
+            }
+            Stmt::Scope(body) => self.exec_stmt(body),
             Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
                 let w = lv.range.width();
                 let v = self.blast(e, w)?;
@@ -416,6 +420,7 @@ impl<'a> Synth<'a> {
 fn strip_block(s: &Stmt) -> &Stmt {
     match s {
         Stmt::Block(v) if v.len() == 1 => strip_block(&v[0]),
+        Stmt::Scope(body) => strip_block(body),
         other => other,
     }
 }
