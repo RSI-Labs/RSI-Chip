@@ -330,6 +330,7 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
                 .for_each(|index| remap_expression(index, offset));
             remap_expression(start, offset);
         }
+        Expr::MemorySize { .. } => {}
         Expr::Index { e, .. } => remap_expression(e, offset),
         Expr::StringLength { e } => remap_expression(e, offset),
         Expr::StringConcat { left, right } => {
@@ -379,6 +380,8 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             remap_expression(e, offset);
         }
         Stmt::MemoryCopy { .. } => {}
+        Stmt::MemoryNew { size, .. } => remap_expression(size, offset),
+        Stmt::MemoryDelete { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -537,6 +540,7 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
                 .for_each(|index| rewrite_expression_nets(index, rewrites));
             rewrite_expression_nets(start, rewrites);
         }
+        Expr::MemorySize { .. } => {}
         Expr::Index { e, .. } => rewrite_expression_nets(e, rewrites),
         Expr::StringLength { e } => rewrite_expression_nets(e, rewrites),
         Expr::StringConcat { left, right } => {
@@ -586,6 +590,8 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
             rewrite_expression_nets(e, rewrites);
         }
         Stmt::MemoryCopy { .. } => {}
+        Stmt::MemoryNew { size, .. } => rewrite_expression_nets(size, rewrites),
+        Stmt::MemoryDelete { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -740,6 +746,7 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
                 .for_each(|index| remap_expression_memory_ids(index, offset));
             remap_expression_memory_ids(start, offset);
         }
+        Expr::MemorySize { memory, .. } => *memory += offset,
         Expr::Index { e, .. } => remap_expression_memory_ids(e, offset),
         Expr::StringLength { e } => remap_expression_memory_ids(e, offset),
         Expr::StringConcat { left, right } => {
@@ -824,6 +831,11 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             *source += offset;
             *destination += offset;
         }
+        Stmt::MemoryNew { memory, size, .. } => {
+            *memory += offset;
+            remap_expression_memory_ids(size, offset);
+        }
+        Stmt::MemoryDelete { memory } => *memory += offset,
         Stmt::If { c, t, f } => {
             remap_expression_memory_ids(c, offset);
             remap_statement_memory_ids(t, offset);

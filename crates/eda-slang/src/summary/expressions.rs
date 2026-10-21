@@ -895,6 +895,7 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringFromRadix { .. } => "StringFromRadix",
         Expr::EventTriggered { .. } => "EventTriggered",
         Expr::SimulationTime { .. } => "SimulationTime",
+        Expr::MemorySize { .. } => "MemorySize",
     }
 }
 
@@ -994,11 +995,26 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
     if let Expr::Repeat { times, e } = expression {
         return format!("Repeat:{times}:u[{}]", design_expr_fingerprint(design, e));
     }
+    if let Expr::MemorySize {
+        memory,
+        width,
+        signed,
+    } = expression
+    {
+        let memory_name = design
+            .memories
+            .get(*memory)
+            .map(|memory| memory.name.as_str())
+            .unwrap_or("<unknown>");
+        let signed_label = if *signed { "s" } else { "u" };
+        return format!("MemorySize:{width}:{signed_label}[{memory_name}]");
+    }
     let operands: Vec<String> = match expression {
         Expr::Const(_)
         | Expr::Ref { .. }
         | Expr::MemoryRead { .. }
-        | Expr::SimulationTime { .. } => Vec::new(),
+        | Expr::SimulationTime { .. }
+        | Expr::MemorySize { .. } => Vec::new(),
         Expr::MemoryReadPart { indexes, start, .. } => indexes
             .iter()
             .chain(std::iter::once(start.as_ref()))
@@ -1202,6 +1218,22 @@ pub(crate) fn design_stmt_assignments(
                     .unwrap_or("<unknown>");
                 (destination.name.clone(), format!("MemoryCopy:{source}"))
             }));
+        }
+        Stmt::MemoryNew { memory, size, .. } => {
+            assignments.extend(design.memories.get(*memory).map(|memory| {
+                (
+                    memory.name.clone(),
+                    format!("MemoryNew:{}", design_expr_fingerprint(design, size)),
+                )
+            }));
+        }
+        Stmt::MemoryDelete { memory } => {
+            assignments.extend(
+                design
+                    .memories
+                    .get(*memory)
+                    .map(|memory| (memory.name.clone(), "MemoryDelete".to_string())),
+            );
         }
         Stmt::BlIndexed { net, e, .. } | Stmt::NBlIndexed { net, e, .. } => {
             assignments.extend(design.net_decls.iter().find_map(|declaration| {

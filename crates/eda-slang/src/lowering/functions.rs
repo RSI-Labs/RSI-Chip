@@ -68,6 +68,11 @@ impl SlangAstLowerer {
         if function_name == "$bits" {
             return self.lower_bits(value);
         }
+        if subroutine == "size" {
+            if let Some(expression) = self.lower_dynamic_array_size(value)? {
+                return Ok(expression);
+            }
+        }
         match subroutine.as_str() {
             "next" | "prev" => {
                 return self.lower_enum_next_prev(value, subroutine == "next");
@@ -232,6 +237,11 @@ impl SlangAstLowerer {
             .next_back()
             .unwrap_or_default()
             .to_string();
+        if task_name == "delete" {
+            if let Some(statement) = self.lower_dynamic_array_delete(value)? {
+                return Ok(Some(statement));
+            }
+        }
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
@@ -904,6 +914,25 @@ impl SlangAstLowerer {
         if arguments.is_empty() || arguments.len() > 2 {
             return Err("$size expects one array argument and at most one dimension".into());
         }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "$size has no array receiver".to_string())?;
+        if let Some(name) = expression_symbol(receiver) {
+            if let Some(symbol) = self.symbols.get(&name) {
+                if let Some(memory) = symbol.memory {
+                    if self.design.memories[memory].dynamic {
+                        if arguments.len() != 1 {
+                            return Err("$size does not take a dimension for dynamic arrays".into());
+                        }
+                        return Ok(eda_core::ir::Expr::MemorySize {
+                            memory,
+                            width: 32,
+                            signed: true,
+                        });
+                    }
+                }
+            }
+        }
         let (dimensions, dimension) = self.fixed_array_dimension(arguments, "$size")?;
         let length = dimensions[dimension as usize - 1].length as u64;
         Ok(eda_core::ir::Expr::Signed {
@@ -912,6 +941,68 @@ impl SlangAstLowerer {
             )),
             signed: true,
         })
+    }
+
+    fn lower_dynamic_array_size(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 1 {
+            return Ok(None);
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "dynamic-array size has no receiver".to_string())?;
+        let name = expression_symbol(receiver)
+            .ok_or_else(|| "dynamic-array size receiver has no symbol".to_string())?;
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if !self.design.memories[memory].dynamic {
+            return Ok(None);
+        }
+        Ok(Some(eda_core::ir::Expr::MemorySize {
+            memory,
+            width: 32,
+            signed: true,
+        }))
+    }
+
+    fn lower_dynamic_array_delete(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 1 {
+            return Ok(None);
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "dynamic-array delete has no receiver".to_string())?;
+        let name = expression_symbol(receiver)
+            .ok_or_else(|| "dynamic-array delete receiver has no symbol".to_string())?;
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if !self.design.memories[memory].dynamic {
+            return Ok(None);
+        }
+        Ok(Some(eda_core::ir::Stmt::MemoryDelete { memory }))
     }
 
     fn lower_fixed_array_bound(
@@ -994,6 +1085,37 @@ impl SlangAstLowerer {
             .first()
             .ok_or_else(|| "$bits has no receiver".to_string())?;
         let receiver_type = string_field(receiver, "type").unwrap_or_default();
+        if let Some(array) = self.declared_memory_type(&receiver_type) {
+            if array.dynamic {
+                let name = expression_symbol(receiver)
+                    .ok_or_else(|| "$bits receiver has no symbol".to_string())?;
+                let symbol = self
+                    .symbols
+                    .get(&name)
+                    .ok_or_else(|| format!("unknown $bits receiver '{name}'"))?;
+                let memory = symbol
+                    .memory
+                    .ok_or_else(|| format!("$bits receiver '{name}' is not a dynamic array"))?;
+                let element_width = u32::try_from(array.element_width).map_err(|_| {
+                    format!("$bits element width is too large: {}", array.element_width)
+                })?;
+                let size = eda_core::ir::Expr::MemorySize {
+                    memory,
+                    width: 32,
+                    signed: true,
+                };
+                return Ok(eda_core::ir::Expr::Bin {
+                    op: eda_core::ir::BinOp::Mul,
+                    a: Box::new(size),
+                    b: Box::new(eda_core::ir::Expr::Signed {
+                        e: Box::new(eda_core::ir::Expr::Const(
+                            eda_core::logic::LogicWord::from_u64(32, u64::from(element_width)),
+                        )),
+                        signed: true,
+                    }),
+                });
+            }
+        }
         let bits = if let Some(array) = self.declared_memory_type(&receiver_type) {
             u128::from(array.flat_length) * array.element_width as u128
         } else {
@@ -1020,6 +1142,11 @@ impl SlangAstLowerer {
         let array = self.declared_memory_type(&receiver_type).ok_or_else(|| {
             format!("{function_name} receiver is not a fixed unpacked array: '{receiver_type}'")
         })?;
+        if array.dynamic {
+            return Err(format!(
+                "{function_name} requires a fixed unpacked array, found a dynamic array"
+            ));
+        }
         let mut dimension = 1_i64;
         if let Some(argument) = arguments.get(1) {
             dimension = constant_ast_i64(argument)

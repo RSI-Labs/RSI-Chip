@@ -1642,6 +1642,7 @@ impl<'a> Elaborator<'a> {
                 })
                 .collect(),
             flat_length: array.length as u64,
+            dynamic: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

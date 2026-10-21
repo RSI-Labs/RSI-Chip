@@ -145,6 +145,21 @@ impl MemoryElementStorage {
             }
         }
     }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Ordinary(elements) => {
+                let width = elements
+                    .words
+                    .first()
+                    .map(LogicWord::width)
+                    .unwrap_or_default();
+                elements.words.fill(LogicWord::xes(width));
+                elements.touched.fill(false);
+            }
+            Self::Sparse(elements) => elements.clear(),
+        }
+    }
 }
 
 pub struct Simulator<'d> {
@@ -167,6 +182,8 @@ pub struct Simulator<'d> {
     memory_elements: Vec<MemoryElementStorage>,
     memory_aliases: Vec<usize>,
     memory_nba: Vec<MemoryNbaUpdate>,
+    dynamic_lengths: Vec<u64>,
+    dynamic_nba: Vec<(usize, u64)>,
     memory_readers: Vec<Vec<usize>>,
     memory_assign_fanin: Vec<Vec<usize>>,
     assign_fanin: Vec<Vec<usize>>,
@@ -313,6 +330,8 @@ impl<'d> Simulator<'d> {
             memory_elements,
             memory_aliases,
             memory_nba: Vec::new(),
+            dynamic_lengths: vec![0; design.memories.len()],
+            dynamic_nba: Vec::new(),
             memory_readers,
             memory_assign_fanin,
             assign_fanin,
@@ -1047,7 +1066,11 @@ impl<'d> Simulator<'d> {
             if self.finished {
                 break;
             }
-            if !did && (!self.nba.is_empty() || !self.memory_nba.is_empty()) {
+            if !did
+                && (!self.nba.is_empty()
+                    || !self.memory_nba.is_empty()
+                    || !self.dynamic_nba.is_empty())
+            {
                 let updates = std::mem::take(&mut self.nba);
                 for (net, val) in updates {
                     if self.cancellation.is_cancelled() {
@@ -1060,6 +1083,13 @@ impl<'d> Simulator<'d> {
                     });
                 }
                 let memory_updates = std::mem::take(&mut self.memory_nba);
+                let dynamic_updates = std::mem::take(&mut self.dynamic_nba);
+                for (memory, size) in dynamic_updates {
+                    if self.cancellation.is_cancelled() {
+                        return Err("simulation cancelled".into());
+                    }
+                    self.allocate_dynamic_memory(memory, size)?;
+                }
                 for update in memory_updates {
                     if self.cancellation.is_cancelled() {
                         return Err("simulation cancelled".into());
@@ -1277,6 +1307,32 @@ impl<'d> Simulator<'d> {
             }
         }
         Ok(())
+    }
+
+    fn allocate_dynamic_memory(&mut self, memory: usize, size: u64) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| "dynamic-array allocation target is missing".to_string())?;
+        if !declaration.dynamic {
+            return Err(format!(
+                "dynamic-array allocation target '{}' is not dynamic",
+                declaration.name
+            ));
+        }
+        if size > declaration.flat_length {
+            return Err(format!(
+                "dynamic-array '{}' allocation size {size} exceeds capacity {}",
+                declaration.name, declaration.flat_length
+            ));
+        }
+        if let Some(storage) = self.memory_elements.get_mut(memory) {
+            storage.clear();
+        }
+        self.dynamic_lengths[memory] = size;
+        self.notify_memory_write(memory)
     }
 
     fn apply_memory_update(
@@ -1884,6 +1940,29 @@ impl<'d> Simulator<'d> {
                         }
                     }
                 }
+                Stmt::MemoryNew {
+                    memory,
+                    size,
+                    nonblocking,
+                } => {
+                    let value = self.eval(size);
+                    if value.width() > u64::BITS as usize {
+                        return Err("dynamic-array allocation size exceeds 64 bits".into());
+                    }
+                    let Some(size) = value.to_u64() else {
+                        return Err("dynamic-array allocation size must be known".into());
+                    };
+                    let memory = self.canonical_memory(*memory);
+                    if *nonblocking {
+                        self.dynamic_nba.push((memory, size));
+                    } else {
+                        self.allocate_dynamic_memory(memory, size)?;
+                    }
+                }
+                Stmt::MemoryDelete { memory } => {
+                    let memory = self.canonical_memory(*memory);
+                    self.allocate_dynamic_memory(memory, 0)?;
+                }
                 Stmt::MemoryBlPart {
                     memory,
                     indexes,
@@ -2366,7 +2445,11 @@ impl<'d> Simulator<'d> {
         for expression in indexes {
             logical.push(self.eval(expression).to_u64()? as i64);
         }
-        declaration.physical_index(&logical)
+        let physical = declaration.physical_index(&logical)?;
+        if declaration.dynamic && physical >= self.dynamic_lengths[self.canonical_memory(memory)] {
+            return None;
+        }
+        Some(physical)
     }
 
     fn memory_part_location(
@@ -2714,6 +2797,11 @@ impl<'d> Simulator<'d> {
                 }
                 None => LogicWord::xes(*width),
             },
+            Expr::MemorySize { memory, width, .. } => {
+                let memory = self.canonical_memory(*memory);
+                let size = self.dynamic_lengths.get(memory).copied().unwrap_or(0);
+                LogicWord::from_u64(*width, size)
+            }
         }
     }
 
@@ -3201,6 +3289,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             indexes.iter().for_each(|x| walk_expr(x, out));
             walk_expr(start, out);
         }
+        Expr::MemorySize { .. } => {}
     }
 }
 
@@ -3352,6 +3441,7 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             indexes.iter().for_each(|x| walk_expr_memories(x, out));
             walk_expr_memories(start, out);
         }
+        Expr::MemorySize { memory, .. } => out.push(*memory),
     }
 }
 
@@ -3385,6 +3475,11 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             out.push(*source);
             out.push(*destination);
         }
+        Stmt::MemoryNew { memory, size, .. } => {
+            out.push(*memory);
+            walk_expr_memories(size, out);
+        }
+        Stmt::MemoryDelete { memory } => out.push(*memory),
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -3492,6 +3587,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(expr_nets(e));
         }
         Stmt::MemoryCopy { .. } => {}
+        Stmt::MemoryNew { size, .. } => reads.extend(expr_nets(size)),
+        Stmt::MemoryDelete { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -3611,6 +3708,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr(e, out);
         }
         Stmt::MemoryCopy { .. } => {}
+        Stmt::MemoryNew { size, .. } => walk_expr(size, out),
+        Stmt::MemoryDelete { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }

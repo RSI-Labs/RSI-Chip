@@ -70,6 +70,7 @@ fn ordinary_arrays_do_not_become_sparse_memory_macro_plans() {
         element_lsb: 0,
         dimensions: Vec::new(),
         flat_length: 4,
+        dynamic: false,
         storage: MemoryStorage::Ordinary,
         kind: Default::default(),
         template: Default::default(),

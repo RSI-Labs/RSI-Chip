@@ -226,6 +226,9 @@ pub struct MemoryDecl {
     pub dimensions: Vec<MemoryDimension>,
     /// Product of all dimension lengths.
     pub flat_length: u64,
+    /// Dynamic arrays use runtime allocation semantics over a fixed maximum
+    /// elaboration capacity; fixed arrays and sparse memories do not.
+    pub dynamic: bool,
     pub storage: MemoryStorage,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
@@ -439,6 +442,12 @@ pub enum Expr {
         width: usize,
         ascending: bool,
     },
+    /// Current runtime length of a dynamic array.
+    MemorySize {
+        memory: usize,
+        width: usize,
+        signed: bool,
+    },
     /// Part-select of an arbitrary sub-expression: `[msb:lsb]`.
     Index {
         e: Box<Expr>,
@@ -541,6 +550,7 @@ impl Expr {
             Expr::Signed { e, .. } => e.width(),
             Expr::MemoryRead { width, .. } => *width,
             Expr::MemoryReadPart { width, .. } => *width,
+            Expr::MemorySize { width, .. } => *width,
             Expr::Index { msb, lsb, .. } => msb - lsb + 1,
             Expr::StringLength { .. } => 32,
             Expr::StringConcat { left, .. } => left.width(),
@@ -585,6 +595,7 @@ impl Expr {
             Expr::MemoryRead { signed, .. } => *signed,
             // A part-select is unsigned even when its base declaration is signed.
             Expr::MemoryReadPart { .. } => false,
+            Expr::MemorySize { signed, .. } => *signed,
             Expr::Index { .. } => false,
             Expr::StringLength { .. } => true,
             Expr::StringConcat { .. } => false,
@@ -647,6 +658,17 @@ pub enum Stmt {
         source: usize,
         destination: usize,
         nonblocking: bool,
+    },
+    /// Allocate a dynamic array. Blocking allocation replaces all elements with
+    /// X; nonblocking allocation samples size and commits in the NBA region.
+    MemoryNew {
+        memory: usize,
+        size: Expr,
+        nonblocking: bool,
+    },
+    /// Delete a dynamic array and set its runtime size to zero.
+    MemoryDelete {
+        memory: usize,
     },
     /// Blocking indexed part-select write to a sparse-memory element.
     MemoryBlPart {
@@ -1010,6 +1032,15 @@ impl Design {
         let aliases = self.memory_alias_roots();
         let accesses = accesses.canonicalize(&aliases);
         for (index, memory) in self.memories.iter_mut().enumerate() {
+            if memory.dynamic {
+                memory.storage = MemoryStorage::Ordinary;
+                memory.kind = MemoryKind::Ram;
+                memory.template = MemoryTemplate::Unmapped;
+                memory.write_mask = None;
+                memory.byte_enable = None;
+                memory.banking = MemoryBanking::default();
+                continue;
+            }
             let root = aliases.get(index).copied().unwrap_or(index);
             let total_bits =
                 u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
@@ -1342,6 +1373,10 @@ fn collect_memory_accesses(
                     ascending: true,
                 });
         }
+        Stmt::MemoryNew { size, .. } => {
+            collect_memory_expr_reads(size, synchronous, false, accesses)
+        }
+        Stmt::MemoryDelete { .. } => {}
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -1418,7 +1453,10 @@ fn collect_memory_expr_reads(
     accesses: &mut MemoryAccesses,
 ) {
     match expression {
-        Expr::Const(_) | Expr::Ref { .. } | Expr::SimulationTime { .. } => {}
+        Expr::Const(_)
+        | Expr::Ref { .. }
+        | Expr::SimulationTime { .. }
+        | Expr::MemorySize { .. } => {}
         Expr::MemoryRead {
             memory, indexes, ..
         } => {
@@ -1581,6 +1619,7 @@ mod tests {
                 length: 4,
             }],
             flat_length: 4,
+            dynamic: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1661,6 +1700,7 @@ mod tests {
                 },
             ],
             flat_length: 8,
+            dynamic: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1697,6 +1737,7 @@ mod tests {
                 length: 513,
             }],
             flat_length: 513,
+            dynamic: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

@@ -7,9 +7,9 @@ use crate::ast_util::{
     bool_field, literal_word, memory_initializer_statements, string_field, usize_field,
 };
 use crate::types::{
-    memory_type, memory_type_with_element, simple_type_shape, simple_type_signed,
-    simple_type_width, string_literal_word, AstMemoryType, AstPackedDimension, AstTypeShape,
-    STRING_WIDTH,
+    dynamic_memory_type, memory_type, memory_type_with_element, simple_type_shape,
+    simple_type_signed, simple_type_width, string_literal_word, AstMemoryType, AstPackedDimension,
+    AstTypeShape, STRING_WIDTH,
 };
 
 impl SlangAstLowerer {
@@ -357,6 +357,9 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn declared_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
+        if let Some(memory) = dynamic_memory_type(type_name) {
+            return Some(memory);
+        }
         if let Some(memory) = memory_type(type_name) {
             return Some(memory);
         }
@@ -408,6 +411,14 @@ impl SlangAstLowerer {
         member: &serde_json::Value,
         name: &str,
     ) -> Result<(), String> {
+        if self
+            .declared_memory_type(&string_field(member, "type").unwrap_or_default())
+            .is_some_and(|memory| memory.dynamic)
+        {
+            return Err(format!(
+                "dynamic-array ports are not supported for '{name}'"
+            ));
+        }
         let memory_direction = match string_field(member, "direction").as_deref() {
             Some("In") => eda_core::ir::MemoryPortDirection::In,
             Some("Out") => eda_core::ir::MemoryPortDirection::Out,
@@ -550,6 +561,7 @@ impl SlangAstLowerer {
             element_lsb: memory.element_lsb,
             dimensions: memory.dimensions,
             flat_length: memory.flat_length,
+            dynamic: memory.dynamic,
             storage: eda_core::ir::MemoryStorage::Ordinary,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,

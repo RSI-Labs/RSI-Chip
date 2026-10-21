@@ -33,7 +33,10 @@ pub(super) struct AstMemoryType {
     pub dimensions: Vec<MemoryDimension>,
     pub flat_length: u64,
     pub signed: bool,
+    pub dynamic: bool,
 }
+
+pub(super) const DYNAMIC_ARRAY_CAPACITY: usize = 256;
 
 pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
     simple_type_width(type_name).map(|_| {
@@ -120,7 +123,30 @@ pub(super) fn memory_type_with_element(
         dimensions,
         flat_length,
         signed,
+        dynamic: false,
     })
+}
+
+pub(super) fn dynamic_memory_type(type_name: &str) -> Option<AstMemoryType> {
+    let type_name = type_name.trim();
+    if !type_name.ends_with("$[]") {
+        return None;
+    }
+    let separator = type_name.find('$')?;
+    let element_type = type_name[..separator].trim();
+    let shape = simple_type_shape(element_type)?;
+    let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
+    let bounds = shape.bounds.unwrap_or((element_msb, 0));
+    let capacity_msb = i64::try_from(DYNAMIC_ARRAY_CAPACITY.saturating_sub(1)).ok()?;
+    let fixed_type_name = type_name.replace("$[]", &format!("$[0:{capacity_msb}]"));
+    let mut memory = memory_type_with_element(
+        &fixed_type_name,
+        shape.width,
+        bounds,
+        simple_type_signed(element_type)?,
+    )?;
+    memory.dynamic = true;
+    Some(memory)
 }
 
 pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {

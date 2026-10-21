@@ -1804,6 +1804,11 @@ impl SlangAstLowerer {
             return Ok(statement);
         }
         if let Some(statement) =
+            self.dynamic_array_allocation(left, right, bool_field(assignment, "isNonBlocking"))?
+        {
+            return Ok(statement);
+        }
+        if let Some(statement) =
             self.memory_pattern_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
         {
             return Ok(statement);
@@ -1918,6 +1923,42 @@ impl SlangAstLowerer {
         }))
     }
 
+    fn dynamic_array_allocation(
+        &self,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        nonblocking: bool,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        if string_field(right, "kind").as_deref() != Some("NewArray") {
+            return Ok(None);
+        }
+        if !matches!(
+            string_field(left, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) {
+            return Err("dynamic-array allocation requires a named array target".into());
+        }
+        let destination = self.named_symbol(left)?;
+        let Some(memory) = destination.memory else {
+            return Err("dynamic-array allocation target is not a dynamic array".into());
+        };
+        if !self.design.memories[memory].dynamic {
+            return Err("new[] target is not a dynamic array".into());
+        }
+        let size = right
+            .get("sizeExpr")
+            .ok_or_else(|| "dynamic-array allocation has no size".to_string())?;
+        let size = self.lower_expression(size)?;
+        if size.width() > u64::BITS as usize {
+            return Err("dynamic-array allocation size exceeds 64 bits".into());
+        }
+        Ok(Some(eda_core::ir::Stmt::MemoryNew {
+            memory,
+            size,
+            nonblocking,
+        }))
+    }
+
     fn memory_pattern_assignment(
         &self,
         left: &serde_json::Value,
@@ -1938,6 +1979,9 @@ impl SlangAstLowerer {
         let Some(memory) = destination.memory else {
             return Ok(None);
         };
+        if self.design.memories[memory].dynamic {
+            return Err("unpacked assignment patterns are not supported for dynamic arrays".into());
+        }
         let dimensions = self.design.memories[memory].dimensions.clone();
         let flat_length = self.design.memories[memory].flat_length;
         if flat_length > 4096 {
@@ -2551,6 +2595,7 @@ fn collect_expression_references(
                 .for_each(|index| collect_expression_references(index, references));
             collect_expression_references(start, references);
         }
+        Expr::MemorySize { .. } => {}
         Expr::Index { e, .. } => collect_expression_references(e, references),
         Expr::StringConcat { left, right } | Expr::StringCompare { left, right, .. } => {
             collect_expression_references(left, references);

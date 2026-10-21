@@ -4882,6 +4882,96 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_dynamic_array_lifecycle() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-array-lifecycle");
+    let source_path = root.join("dynamic_array_lifecycle.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_array_lifecycle(
+  input int requested_size,
+  input logic [7:0] data,
+  output int blocking_size,
+  output int system_size,
+  output int array_bits,
+  output int nonblocking_size,
+  output int deleted_size,
+  output logic [7:0] first,
+  output logic [7:0] last,
+  output logic [7:0] out_of_bounds
+);
+  logic [7:0] blocking_values[];
+  logic [7:0] nonblocking_values[];
+
+  initial begin
+    #1;
+    blocking_values = new[requested_size];
+    blocking_size = blocking_values.size();
+    system_size = $size(blocking_values);
+    array_bits = $bits(blocking_values);
+    blocking_values[0] = data + 8'd1;
+    blocking_values[requested_size - 1] = data + 8'd2;
+    first = blocking_values[0];
+    last = blocking_values[requested_size - 1];
+    out_of_bounds = blocking_values[requested_size];
+
+    nonblocking_values <= new[3];
+    #1;
+    nonblocking_size = nonblocking_values.size();
+
+    blocking_values.delete();
+    deleted_size = blocking_values.size();
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic-array lifecycle source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_array_lifecycle"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic-array lifecycle");
+    assert_eq!(design.memories.len(), 2);
+    assert!(design.memories.iter().all(|memory| memory.dynamic));
+    assert_eq!(design.memories[0].flat_length, 256);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::Unmapped
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic-array simulator");
+    simulator
+        .set_input("requested_size", &LogicWord::from_u64(32, 4))
+        .expect("set dynamic-array size");
+    simulator
+        .set_input("data", &LogicWord::from_u64(8, 0x20))
+        .expect("set dynamic-array data");
+    simulator.run_until(2).expect("run dynamic-array lifecycle");
+
+    assert_eq!(simulator.read("blocking_size").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("system_size").unwrap().to_u64(), Some(4));
+    assert_eq!(simulator.read("array_bits").unwrap().to_u64(), Some(32));
+    assert_eq!(
+        simulator.read("nonblocking_size").unwrap().to_u64(),
+        Some(3)
+    );
+    assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(0x21));
+    assert_eq!(simulator.read("last").unwrap().to_u64(), Some(0x22));
+    assert_eq!(simulator.read("out_of_bounds").unwrap().to_u64(), None);
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

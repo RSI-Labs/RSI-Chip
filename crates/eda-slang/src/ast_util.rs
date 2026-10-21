@@ -81,6 +81,15 @@ fn canonical_detailed_type(value: &Value) -> Option<String> {
                 Some(format!("{element}${range}"))
             }
         }
+        "DynamicArrayType" => {
+            let element = value.get("elementType")?;
+            let element = if let Some(element_name) = element.as_str() {
+                element_name.to_string()
+            } else {
+                canonical_detailed_type(element)?
+            };
+            Some(format!("{element}$[]"))
+        }
         _ => None,
     }
 }

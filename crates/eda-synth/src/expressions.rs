@@ -127,6 +127,9 @@ impl<'a> Synth<'a> {
                     "first-class sparse-memory part-select reads are not synthesizable yet".into(),
                 )
             }
+            Expr::MemorySize { .. } => {
+                return Err("dynamic-array size queries are not synthesizable yet".into())
+            }
             Expr::StringLength { .. } => {
                 return Err("bounded string methods are not synthesizable yet".into())
             }

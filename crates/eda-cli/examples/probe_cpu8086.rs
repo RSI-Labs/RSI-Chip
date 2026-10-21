@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
     match e {
-        Expr::Const(_) | Expr::SimulationTime { .. } => {}
+        Expr::Const(_) | Expr::SimulationTime { .. } | Expr::MemorySize { .. } => {}
         Expr::Ref { net, .. } => {
             out.insert(*net);
         }
@@ -81,6 +81,8 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(e, reads);
             }
             Stmt::MemoryCopy { .. } => {}
+            Stmt::MemoryNew { size, .. } => expr_nets(size, reads),
+            Stmt::MemoryDelete { .. } => {}
             Stmt::MemoryBlPart {
                 indexes, start, e, ..
             }

@@ -270,6 +270,9 @@ impl<'a> Synth<'a> {
             Stmt::MemoryCopy { .. } => {
                 Err("first-class memory copies are not synthesizable yet".into())
             }
+            Stmt::MemoryNew { .. } | Stmt::MemoryDelete { .. } => {
+                Err("dynamic-array allocation is not synthesizable yet".into())
+            }
             Stmt::MemoryBlPart { .. } | Stmt::MemoryNBlPart { .. } => {
                 Err("first-class sparse-memory part-select writes are not synthesizable yet".into())
             }

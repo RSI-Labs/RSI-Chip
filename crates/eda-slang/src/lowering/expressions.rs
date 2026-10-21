@@ -181,6 +181,16 @@ impl super::SlangAstLowerer {
         }
         match string_field(value, "kind").as_deref() {
             Some("NamedValue" | "HierarchicalValue") => {
+                if let Some(name) = expression_symbol(value) {
+                    if let Some(symbol) = self.symbols.get(&name) {
+                        if symbol
+                            .memory
+                            .is_some_and(|memory| self.design.memories[memory].dynamic)
+                        {
+                            return Err("dynamic arrays cannot be assigned as whole objects".into());
+                        }
+                    }
+                }
                 let symbol = self.named_symbol(value)?;
                 Ok(eda_core::ir::LValue {
                     net: symbol.base,
@@ -308,6 +318,15 @@ impl super::SlangAstLowerer {
                 }
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.symbols.get(&symbol_id) {
+                        if symbol
+                            .memory
+                            .is_some_and(|memory| self.design.memories[memory].dynamic)
+                        {
+                            return Err(
+                                "dynamic-array values require element selection or size query"
+                                    .into(),
+                            );
+                        }
                         return Ok(Expr::Ref {
                             net: symbol.base,
                             decl_width: symbol.width,
@@ -323,6 +342,14 @@ impl super::SlangAstLowerer {
                     return Ok(Expr::Const(word));
                 }
                 if let Some(symbol) = self.symbols.get(&name) {
+                    if symbol
+                        .memory
+                        .is_some_and(|memory| self.design.memories[memory].dynamic)
+                    {
+                        return Err(
+                            "dynamic-array values require element selection or size query".into(),
+                        );
+                    }
                     Ok(Expr::Ref {
                         net: symbol.base,
                         decl_width: symbol.width,
