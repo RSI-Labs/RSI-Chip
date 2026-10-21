@@ -4,7 +4,9 @@ use crate::ast_util::{
     bool_field, expression_symbol, expression_target_names, instance_parameters,
     integer_literal_word, literal_word, named_constant_word, slang_constant_u64, string_field,
 };
-use crate::types::{simple_type_signed, simple_type_width, string_literal_word, STRING_WIDTH};
+use crate::types::{
+    simple_type_shape, simple_type_signed, simple_type_width, string_literal_word, STRING_WIDTH,
+};
 use eda_core::ir::Design;
 use serde_json::Value;
 
@@ -345,6 +347,103 @@ pub(crate) fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) 
     ))
 }
 
+fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option<i64> {
+    let (_, bits) = expression.literal.as_deref()?.split_once(':')?;
+    let mut value = 0_i64;
+    for bit in bits.chars() {
+        value = value.checked_mul(2)?;
+        if bit == '1' {
+            value = value.checked_add(1)?;
+        } else if bit != '0' {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+fn constant_packed_select_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+) -> Option<String> {
+    let selected = expression.operands.first()?;
+    if selected.type_name.contains('$') {
+        return None;
+    }
+    let shape = simple_type_shape(&selected.type_name)?;
+    let dimension = shape.dimensions.first()?;
+    let width = expression.type_width?;
+    if width == 0 || width > shape.width {
+        return None;
+    }
+
+    let physical_bit = |logical: i64| -> Option<i64> {
+        let lower = dimension.msb.min(dimension.lsb);
+        let upper = dimension.msb.max(dimension.lsb);
+        if logical < lower || logical > upper {
+            return None;
+        }
+        let coordinate = if dimension.msb >= dimension.lsb {
+            logical - dimension.lsb
+        } else {
+            dimension.lsb - logical
+        };
+        coordinate.checked_mul(dimension.element_width as i64)
+    };
+
+    let (logical_msb, logical_lsb) = match expression.kind.as_str() {
+        "ElementSelect" => {
+            let logical = summary_literal_i64(expression.operands.get(1)?)?;
+            (logical, logical)
+        }
+        "RangeSelect" => match expression.selection_kind.as_str() {
+            "Simple" => {
+                let left = summary_literal_i64(expression.operands.get(1)?)?;
+                let right = summary_literal_i64(expression.operands.get(2)?)?;
+                (left.max(right), left.min(right))
+            }
+            "IndexedUp" => {
+                let start = summary_literal_i64(expression.operands.get(1)?)?;
+                let width = summary_literal_i64(expression.operands.get(2)?)?;
+                if width <= 0 {
+                    return None;
+                }
+                let width = usize::try_from(width).ok()?;
+                let end = start.checked_add(width as i64 - 1)?;
+                (end, start)
+            }
+            "IndexedDown" => {
+                let start = summary_literal_i64(expression.operands.get(1)?)?;
+                let width = summary_literal_i64(expression.operands.get(2)?)?;
+                if width <= 0 {
+                    return None;
+                }
+                let width = usize::try_from(width).ok()?;
+                let end = start.checked_sub(width as i64 - 1)?;
+                (start, end)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let physical_msb_bit = physical_bit(logical_msb)?;
+    let physical_lsb_bit = physical_bit(logical_lsb)?;
+    let (physical_msb, physical_lsb, width) = if expression.kind == "ElementSelect" {
+        let physical_lsb = physical_msb_bit.min(physical_lsb_bit);
+        let physical_msb = physical_lsb + width as i64 - 1;
+        (physical_msb, physical_lsb, width)
+    } else {
+        let physical_msb = physical_msb_bit.max(physical_lsb_bit);
+        let physical_lsb = physical_msb_bit.min(physical_lsb_bit);
+        let width = usize::try_from(physical_msb - physical_lsb + 1).ok()?;
+        (physical_msb, physical_lsb, width)
+    };
+    let base = slang_expression_fingerprint_with_parameters(selected, parameters)?;
+    Some(format!(
+        "PackedSelect:{width}:u[{base},Range:{physical_msb}:{physical_lsb}]"
+    ))
+}
+
 fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> Option<String> {
     let (_, bits) = literal.split_once(':')?;
     let signed_label = if signed && bits.starts_with('1') {
@@ -415,6 +514,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             "MemoryReadPart:{width}:u[{memory},{},{start},{direction}]",
             indexes.join(",")
         ));
+    }
+    if matches!(expression.kind.as_str(), "ElementSelect" | "RangeSelect") {
+        if let Some(fingerprint) = constant_packed_select_fingerprint(expression, parameters) {
+            return Some(fingerprint);
+        }
     }
     if expression.kind == "UnaryOp" && expression.operator == "LogicalNot" {
         let operand = expression.operands.first()?;
@@ -736,6 +840,13 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         return format!(
             "MemoryReadPart:{width}:u[{memory_name},{},{direction}]",
             index_fingerprints.join(",")
+        );
+    }
+    if let Expr::Index { e, msb, lsb } = expression {
+        let base = design_expr_fingerprint(design, e);
+        return format!(
+            "PackedSelect:{}:u[{base},Range:{msb}:{lsb}]",
+            expression.width()
         );
     }
     let root = design_expr_shape(expression);

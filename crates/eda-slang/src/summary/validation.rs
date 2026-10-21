@@ -141,7 +141,8 @@ impl SlangAstSummary {
                             let fingerprint =
                                 canonicalize_memory_fingerprint(&fingerprint, &memory_names);
                             if strict_generated_hierarchy
-                                || !fingerprint.starts_with("MemoryRead")
+                                || (!fingerprint.starts_with("MemoryRead")
+                                    && !fingerprint.contains("PackedSelect:"))
                                 || memory_fingerprint_target_exists(&fingerprint, &memory_names)
                             {
                                 fingerprint
@@ -262,7 +263,8 @@ impl SlangAstSummary {
                                         &memory_names,
                                     );
                                     if strict_generated_hierarchy
-                                        || !fingerprint.starts_with("MemoryRead")
+                                        || (!fingerprint.starts_with("MemoryRead")
+                                            && !fingerprint.contains("PackedSelect:"))
                                         || memory_fingerprint_target_exists(
                                             &fingerprint,
                                             &memory_names,

@@ -80,7 +80,8 @@ width, with direct-versus-bounded coverage for 64-bit wrap, unsigned values
 above `I64::MAX`, signed minima, and signed/unsigned 65-bit ordering. It
 records slang source spans and validates lowered structure against the
 authoritative AST, including exact whole-element and indexed-part sparse-memory
-read memory/index/start fingerprints. Unsupported
+read memory/index/start fingerprints plus constant packed element/range/indexed
+select physical-range fingerprints. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
 

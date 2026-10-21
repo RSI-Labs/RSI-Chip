@@ -3197,6 +3197,124 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_rejects_wrong_constant_packed_select_shapes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-packed-summary");
+    let source_path = root.join("packed_summary.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module packed_summary(
+  input logic [7:0] data,
+  input logic [0:7] ascending,
+  output logic bit_one,
+  output logic [3:0] high,
+  output logic [3:0] up,
+  output logic [3:0] down,
+  output logic [3:0] ascending_up
+);
+  assign bit_one = data[1];
+  assign high = data[7:4];
+  assign up = data[3 +: 4];
+  assign down = data[6 -: 4];
+  assign ascending_up = ascending[0 +: 4];
+endmodule
+"#,
+    )
+    .expect("write packed-select summary source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("packed_summary"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower packed-select summary source");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("packed_summary"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize authoritative packed-select AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize authoritative packed-select AST");
+    summary
+        .validate_against_design(&design)
+        .expect("constant packed-select fingerprints should match");
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "bit_one")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000010".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong constant packed bit index must fail structural validation");
+    assert!(
+        error.contains("PackedSelect:") && error.contains("Range:2:2"),
+        "unexpected structural error: {error}"
+    );
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "bit_one")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000001".into());
+    }
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "high")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000111".into());
+    }
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "up")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000010".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong constant indexed packed select start must fail");
+    assert!(
+        error.contains("PackedSelect:") && error.contains("Range:5:2"),
+        "unexpected structural error: {error}"
+    );
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "up")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000011".into());
+    }
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "down")
+    {
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000101".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong constant descending packed select start must fail");
+    assert!(
+        error.contains("PackedSelect:") && error.contains("Range:5:2"),
+        "unexpected structural error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_uses_sparse_memory_part_selects() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -4701,13 +4819,13 @@ endmodule
     assert!(summary.kinds.contains("InstanceBody"));
     assert!(summary.kinds.contains("ContinuousAssign"));
     summary
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .expect("slang and bounded design inventories agree");
 
     let mut dropped_port = summary.clone();
     dropped_port.ports.pop();
     assert!(dropped_port
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("do not match slang"));
 
@@ -4721,7 +4839,7 @@ endmodule
             width: Some(1),
         });
     assert!(dropped_declaration
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("dropped slang declaration 'missing'"));
 
@@ -4733,7 +4851,7 @@ endmodule
         .expect("wide declaration summary")
         .width = Some(7);
     assert!(changed_width
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("width 8 does not match slang width 7"));
 
@@ -4757,7 +4875,7 @@ endmodule
             },
         });
     assert!(dropped_continuous
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'wide' does not match slang"));
 
@@ -4775,7 +4893,7 @@ endmodule
     sum_rhs.operator = "Add".into();
     sum_rhs.symbol = None;
     assert!(changed_operand_shape
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'sum' does not match slang"));
 
@@ -4791,7 +4909,7 @@ endmodule
         .expect("sum binary operand");
     operand.symbol = Some("wrong".into());
     assert!(changed_operand_symbol
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'sum' does not match slang"));
 
@@ -4807,7 +4925,7 @@ endmodule
         .expect("sum binary operand");
     operand.type_width = Some(3);
     assert!(changed_operand_width
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'sum' does not match slang"));
 
@@ -4824,7 +4942,7 @@ endmodule
     operand.type_width = Some(4);
     operand.type_signed = Some(true);
     assert!(changed_operand_signedness
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'sum' does not match slang"));
 
@@ -4837,7 +4955,7 @@ endmodule
             assignments: Vec::new(),
         });
     assert!(dropped_procedural
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("dropped initial blocks"));
 
@@ -4853,7 +4971,7 @@ endmodule
     assignment.rhs.kind = "BinaryOp".into();
     assignment.rhs.operator = "Add".into();
     assert!(changed_procedural_rhs
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("procedural assignment shape for 'held' does not match slang"));
 
@@ -4872,14 +4990,14 @@ endmodule
         .expect("slang literal fingerprint");
     *literal_rhs = "8:10100100".into();
     assert!(changed_literal
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("continuous assignment shape for 'lit' does not match slang"));
 
     let mut dropped_instance = summary;
     dropped_instance.instances.pop();
     assert!(dropped_instance
-        .validate_against_design(&design)
+        .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("direct instances"));
 }
