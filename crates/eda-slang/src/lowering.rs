@@ -482,6 +482,7 @@ pub(super) struct AstUvmSequencer {
 
 #[derive(Clone)]
 pub(super) struct AstUvmSequencerResponseEntry {
+    pub(super) transaction_id: AstLoweredSymbol,
     pub(super) tag: AstLoweredSymbol,
     pub(super) id: AstLoweredSymbol,
     pub(super) name: AstLoweredSymbol,
@@ -620,6 +621,8 @@ pub(super) struct SlangAstLowerer {
     uvm_sequence_contexts: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     uvm_sequence_items: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     uvm_sequence_response_types: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    uvm_sequence_transaction_ids:
+        std::cell::RefCell<std::collections::BTreeMap<String, AstLoweredSymbol>>,
     active_uvm_phase: std::cell::RefCell<Option<String>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
@@ -785,6 +788,7 @@ impl SlangAstLowerer {
             uvm_sequence_contexts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_response_types: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            uvm_sequence_transaction_ids: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

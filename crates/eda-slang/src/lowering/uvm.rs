@@ -160,6 +160,10 @@ impl SlangAstLowerer {
         ]);
         let mut response_entries = Vec::new();
         for entry_index in 0..8_usize {
+            let transaction_id = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_transaction_id_{entry_index}_{sanitized_name}"),
+                32,
+            );
             let tag = self.declare_class_internal_net(
                 &format!("__uvm_sequence_response_tag_{entry_index}_{sanitized_name}"),
                 32,
@@ -194,13 +198,14 @@ impl SlangAstLowerer {
                 });
                 slots.push(slot);
             }
-            for symbol in [&tag, &id, &name, &full_name, &parent_id] {
+            for symbol in [&transaction_id, &tag, &id, &name, &full_name, &parent_id] {
                 self.design.initials.push(Stmt::Bl {
                     lv: class_lvalue(symbol),
                     e: Expr::Const(LogicWord::zero(symbol.width)),
                 });
             }
             response_entries.push(super::AstUvmSequencerResponseEntry {
+                transaction_id,
                 tag,
                 id,
                 name,
@@ -266,6 +271,37 @@ impl SlangAstLowerer {
             },
         );
         Ok(())
+    }
+
+    pub(super) fn declare_uvm_sequence_transaction_id(&mut self, object_key: &str) {
+        if self
+            .uvm_sequence_transaction_ids
+            .borrow()
+            .contains_key(object_key)
+        {
+            return;
+        }
+        let sanitized_name = object_key
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let symbol = self.declare_class_internal_net(
+            &format!("__uvm_sequence_transaction_id_{sanitized_name}"),
+            32,
+        );
+        self.design.initials.push(Stmt::Bl {
+            lv: class_lvalue(&symbol),
+            e: Expr::Const(LogicWord::from_u64(32, u32::MAX as u64)),
+        });
+        self.uvm_sequence_transaction_ids
+            .borrow_mut()
+            .insert(object_key.to_string(), symbol);
     }
 
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
@@ -4002,7 +4038,23 @@ impl SlangAstLowerer {
             .ok_or_else(|| {
                 "UVM sequencer get_next_item was lowered before a sequence start_item".to_string()
             })?;
-        let copies = self.class_object_copy_statements(&output_key, &item_key)?;
+        let mut copies = self.class_object_copy_statements(&output_key, &item_key)?;
+        let transaction_ids = self.uvm_sequence_transaction_ids.borrow();
+        match (
+            transaction_ids.get(&output_key),
+            transaction_ids.get(&item_key),
+        ) {
+            (Some(target), Some(source)) => copies.push(Stmt::Bl {
+                lv: class_lvalue(target),
+                e: class_expr(source),
+            }),
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "UVM sequencer get_next_item has inconsistent transaction-id metadata".into(),
+                );
+            }
+        }
         Ok(Some(Stmt::Wait {
             cond: Expr::Bin {
                 op: BinOp::Eq,
@@ -4058,29 +4110,29 @@ impl SlangAstLowerer {
                 "UVM sequence get_response requires an output and optional transaction id".into(),
             );
         }
-        if let Some(transaction_id) = arguments.get(1) {
-            let transaction_id = unwrap_conversion(transaction_id);
-            let literal = match string_field(transaction_id, "kind").as_deref() {
-                Some("UnaryOp")
-                    if string_field(transaction_id, "op").as_deref() == Some("Minus") =>
-                {
-                    transaction_id
-                        .get("operand")
-                        .and_then(|operand| string_field(operand, "value"))
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .map(|value| -value)
+        let transaction_selector = match arguments.get(1) {
+            None => None,
+            Some(argument) => {
+                let argument = unwrap_conversion(argument);
+                let literal = match string_field(argument, "kind").as_deref() {
+                    Some("UnaryOp") if string_field(argument, "op").as_deref() == Some("Minus") => {
+                        argument
+                            .get("operand")
+                            .and_then(|operand| string_field(operand, "value"))
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .map(|value| -value)
+                    }
+                    _ => string_field(argument, "value")
+                        .or_else(|| string_field(argument, "constant"))
+                        .and_then(|value| value.parse::<i64>().ok()),
+                };
+                if literal == Some(-1) {
+                    None
+                } else {
+                    Some(self.lower_expression(argument)?)
                 }
-                _ => string_field(transaction_id, "value")
-                    .or_else(|| string_field(transaction_id, "constant"))
-                    .and_then(|value| value.parse::<i64>().ok()),
-            };
-            if literal != Some(-1) {
-                return Err(
-                    "direct UVM sequence get_response supports only the default transaction id"
-                        .into(),
-                );
             }
-        }
+        };
         let output = arguments[0]
             .get("left")
             .ok_or_else(|| "UVM sequence get_response requires an output argument".to_string())?;
@@ -4096,15 +4148,97 @@ impl SlangAstLowerer {
         self.uvm_sequence_response_types
             .borrow_mut()
             .insert(sequencer_key.clone(), output_class);
-        let body = self.response_restore_statements(&sequencer, &output_key)?;
+        let (condition, body) = self.response_restore_statements(
+            &sequencer,
+            &output_key,
+            transaction_selector.as_ref(),
+        )?;
         Ok(Some(Stmt::Wait {
-            cond: Expr::Bin {
-                op: BinOp::Gt,
-                a: Box::new(class_expr(&sequencer.response_count)),
-                b: Box::new(Expr::Const(LogicWord::zero(sequencer.response_count.width))),
-            },
+            cond: condition,
             body: Box::new(Stmt::Block(body)),
         }))
+    }
+
+    pub(super) fn lower_uvm_sequence_transaction_id_task(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "set_transaction_id" {
+            return Ok(None);
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        let transaction_id = self
+            .uvm_sequence_transaction_ids
+            .borrow()
+            .get(&object_key)
+            .cloned();
+        let Some(transaction_id) = transaction_id else {
+            return Ok(None);
+        };
+        self.require_initialized_class_object(&object_key)?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 1 {
+            return Err("UVM set_transaction_id requires one transaction id".into());
+        }
+        let value = self.lower_expression(&arguments[0])?;
+        Ok(Some(Stmt::Bl {
+            lv: class_lvalue(&transaction_id),
+            e: value,
+        }))
+    }
+
+    pub(super) fn lower_uvm_sequence_transaction_id_query(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Expr>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "get_transaction_id" {
+            return Ok(None);
+        }
+        let Some(object_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        let transaction_id = self
+            .uvm_sequence_transaction_ids
+            .borrow()
+            .get(&object_key)
+            .cloned();
+        let Some(transaction_id) = transaction_id else {
+            return Ok(None);
+        };
+        self.require_initialized_class_object(&object_key)?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if !arguments.is_empty() {
+            return Err("UVM get_transaction_id requires no arguments".into());
+        }
+        Ok(Some(class_expr(&transaction_id)))
     }
 
     fn response_capture_statements(
@@ -4140,6 +4274,20 @@ impl SlangAstLowerer {
                 ],
                 true,
             );
+            if let Some(transaction_id) = self
+                .uvm_sequence_transaction_ids
+                .borrow()
+                .get(source_key)
+                .cloned()
+            {
+                captures.insert(
+                    0,
+                    Stmt::Bl {
+                        lv: class_lvalue(&entry.transaction_id),
+                        e: class_expr(&transaction_id),
+                    },
+                );
+            }
             for ((_, source), slot) in fields.iter().zip(&entry.slots) {
                 captures.push(Stmt::Bl {
                     lv: class_lvalue(slot),
@@ -4191,66 +4339,231 @@ impl SlangAstLowerer {
         &self,
         sequencer: &super::AstUvmSequencer,
         target_key: &str,
-    ) -> Result<Vec<Stmt>, String> {
+        transaction_selector: Option<&Expr>,
+    ) -> Result<(Expr, Vec<Stmt>), String> {
         let fields = self.ordered_response_fields(target_key)?;
-        let mut statements = Vec::new();
-        for (entry_index, entry) in sequencer.response_entries.iter().enumerate() {
-            let mut restores = self.response_metadata_statements(
-                target_key,
-                [
-                    &entry.tag,
-                    &entry.id,
-                    &entry.name,
-                    &entry.full_name,
-                    &entry.parent_id,
-                ],
-                false,
-            );
-            for ((_, target), slot) in fields.iter().zip(&entry.slots) {
-                restores.push(Stmt::Bl {
-                    lv: class_lvalue(target),
-                    e: class_expr(slot),
-                });
+        let head_width = sequencer.response_head.width;
+        let head = class_expr(&sequencer.response_head);
+        let count = class_expr(&sequencer.response_count);
+        let ring = |offset: usize| {
+            if offset == 0 {
+                head.clone()
+            } else {
+                Expr::Bin {
+                    op: BinOp::Mod,
+                    a: Box::new(Expr::Bin {
+                        op: BinOp::Add,
+                        a: Box::new(head.clone()),
+                        b: Box::new(Expr::Const(LogicWord::from_u64(head_width, offset as u64))),
+                    }),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(head_width, 8))),
+                }
             }
-            statements.push(Stmt::If {
-                c: Expr::Bin {
-                    op: BinOp::Eq,
-                    a: Box::new(class_expr(&sequencer.response_head)),
-                    b: Box::new(Expr::Const(LogicWord::from_u64(
-                        sequencer.response_head.width,
-                        entry_index as u64,
-                    ))),
-                },
-                t: Box::new(Stmt::Block(restores)),
-                f: None,
-            });
+        };
+        let at = |offset: usize, entry_index: usize| Expr::Bin {
+            op: BinOp::Eq,
+            a: Box::new(ring(offset)),
+            b: Box::new(Expr::Const(LogicWord::from_u64(
+                head_width,
+                entry_index as u64,
+            ))),
+        };
+        let entry_transaction_id = |offset: usize| {
+            let mut selected =
+                class_expr(&sequencer.response_entries.last().unwrap().transaction_id);
+            for (entry_index, entry) in sequencer.response_entries.iter().enumerate().rev() {
+                if entry_index + 1 == sequencer.response_entries.len() {
+                    continue;
+                }
+                selected = Expr::Cond {
+                    c: Box::new(at(offset, entry_index)),
+                    t: Box::new(class_expr(&entry.transaction_id)),
+                    f: Box::new(selected),
+                };
+            }
+            selected
+        };
+
+        let mut statements = Vec::new();
+        let mut selective_availability = None;
+        match transaction_selector {
+            None => {
+                for (entry_index, entry) in sequencer.response_entries.iter().enumerate() {
+                    let mut restores = self.response_metadata_statements(
+                        target_key,
+                        [
+                            &entry.tag,
+                            &entry.id,
+                            &entry.name,
+                            &entry.full_name,
+                            &entry.parent_id,
+                        ],
+                        false,
+                    );
+                    if let Some(transaction_id) = self
+                        .uvm_sequence_transaction_ids
+                        .borrow()
+                        .get(target_key)
+                        .cloned()
+                    {
+                        restores.push(Stmt::Bl {
+                            lv: class_lvalue(&transaction_id),
+                            e: class_expr(&entry.transaction_id),
+                        });
+                    }
+                    for ((_, target), slot) in fields.iter().zip(&entry.slots) {
+                        restores.push(Stmt::Bl {
+                            lv: class_lvalue(target),
+                            e: class_expr(slot),
+                        });
+                    }
+                    statements.push(Stmt::If {
+                        c: at(0, entry_index),
+                        t: Box::new(Stmt::Block(restores)),
+                        f: None,
+                    });
+                }
+                statements.push(Stmt::If {
+                    c: Expr::Bin {
+                        op: BinOp::Lt,
+                        a: Box::new(class_expr(&sequencer.response_head)),
+                        b: Box::new(Expr::Const(LogicWord::from_u64(head_width, 7))),
+                    },
+                    t: Box::new(Stmt::Bl {
+                        lv: class_lvalue(&sequencer.response_head),
+                        e: Expr::Bin {
+                            op: BinOp::Add,
+                            a: Box::new(class_expr(&sequencer.response_head)),
+                            b: Box::new(Expr::Const(LogicWord::from_u64(head_width, 1))),
+                        },
+                    }),
+                    f: Some(Box::new(Stmt::Bl {
+                        lv: class_lvalue(&sequencer.response_head),
+                        e: Expr::Const(LogicWord::zero(head_width)),
+                    })),
+                });
+                statements.push(Self::response_count_decrement(sequencer));
+            }
+            Some(selector) => {
+                for selected_offset in 0..8_usize {
+                    let selected_matches = Expr::Bin {
+                        op: BinOp::LogAnd,
+                        a: Box::new(Expr::Bin {
+                            op: BinOp::Gt,
+                            a: Box::new(count.clone()),
+                            b: Box::new(Expr::Const(LogicWord::from_u64(
+                                sequencer.response_count.width,
+                                selected_offset as u64,
+                            ))),
+                        }),
+                        b: Box::new(Expr::Bin {
+                            op: BinOp::Eq,
+                            a: Box::new(entry_transaction_id(selected_offset)),
+                            b: Box::new(selector.clone()),
+                        }),
+                    };
+                    selective_availability = Some(match selective_availability {
+                        Some(previous) => Expr::Bin {
+                            op: BinOp::LogOr,
+                            a: Box::new(previous),
+                            b: Box::new(selected_matches.clone()),
+                        },
+                        None => selected_matches.clone(),
+                    });
+                    let mut selected_statements = Vec::new();
+                    for (entry_index, entry) in sequencer.response_entries.iter().enumerate() {
+                        let mut restores = self.response_metadata_statements(
+                            target_key,
+                            [
+                                &entry.tag,
+                                &entry.id,
+                                &entry.name,
+                                &entry.full_name,
+                                &entry.parent_id,
+                            ],
+                            false,
+                        );
+                        if let Some(transaction_id) = self
+                            .uvm_sequence_transaction_ids
+                            .borrow()
+                            .get(target_key)
+                            .cloned()
+                        {
+                            restores.push(Stmt::Bl {
+                                lv: class_lvalue(&transaction_id),
+                                e: class_expr(&entry.transaction_id),
+                            });
+                        }
+                        for ((_, target), slot) in fields.iter().zip(&entry.slots) {
+                            restores.push(Stmt::Bl {
+                                lv: class_lvalue(target),
+                                e: class_expr(slot),
+                            });
+                        }
+                        selected_statements.push(Stmt::If {
+                            c: at(selected_offset, entry_index),
+                            t: Box::new(Stmt::Block(restores)),
+                            f: None,
+                        });
+                    }
+                    for shift_offset in (selected_offset + 1)..8_usize {
+                        let mut shift_statements = Vec::new();
+                        for (source_index, source_entry) in
+                            sequencer.response_entries.iter().enumerate()
+                        {
+                            for (target_index, target_entry) in
+                                sequencer.response_entries.iter().enumerate()
+                            {
+                                shift_statements.push(Stmt::If {
+                                    c: Expr::Bin {
+                                        op: BinOp::LogAnd,
+                                        a: Box::new(at(shift_offset, source_index)),
+                                        b: Box::new(at(shift_offset - 1, target_index)),
+                                    },
+                                    t: Box::new(Stmt::Block(Self::response_entry_copy_statements(
+                                        target_entry,
+                                        source_entry,
+                                    ))),
+                                    f: None,
+                                });
+                            }
+                        }
+                        selected_statements.push(Stmt::If {
+                            c: Expr::Bin {
+                                op: BinOp::Gt,
+                                a: Box::new(class_expr(&sequencer.response_count)),
+                                b: Box::new(Expr::Const(LogicWord::from_u64(
+                                    sequencer.response_count.width,
+                                    shift_offset as u64,
+                                ))),
+                            },
+                            t: Box::new(Stmt::Block(shift_statements)),
+                            f: None,
+                        });
+                    }
+                    selected_statements.push(Self::response_count_decrement(sequencer));
+                    statements.push(Stmt::If {
+                        c: selected_matches,
+                        t: Box::new(Stmt::Block(selected_statements)),
+                        f: None,
+                    });
+                }
+            }
         }
-        statements.push(Stmt::If {
-            c: Expr::Bin {
-                op: BinOp::Lt,
-                a: Box::new(class_expr(&sequencer.response_head)),
-                b: Box::new(Expr::Const(LogicWord::from_u64(
-                    sequencer.response_head.width,
-                    7,
-                ))),
+        let condition = match transaction_selector {
+            None => Expr::Bin {
+                op: BinOp::Gt,
+                a: Box::new(count),
+                b: Box::new(Expr::Const(LogicWord::zero(sequencer.response_count.width))),
             },
-            t: Box::new(Stmt::Bl {
-                lv: class_lvalue(&sequencer.response_head),
-                e: Expr::Bin {
-                    op: BinOp::Add,
-                    a: Box::new(class_expr(&sequencer.response_head)),
-                    b: Box::new(Expr::Const(LogicWord::from_u64(
-                        sequencer.response_head.width,
-                        1,
-                    ))),
-                },
-            }),
-            f: Some(Box::new(Stmt::Bl {
-                lv: class_lvalue(&sequencer.response_head),
-                e: Expr::Const(LogicWord::zero(sequencer.response_head.width)),
-            })),
-        });
-        statements.push(Stmt::Bl {
+            Some(_) => selective_availability.unwrap_or_else(|| Expr::Const(LogicWord::zero(1))),
+        };
+
+        Ok((condition, statements))
+    }
+
+    fn response_count_decrement(sequencer: &super::AstUvmSequencer) -> Stmt {
+        Stmt::Bl {
             lv: class_lvalue(&sequencer.response_count),
             e: Expr::Bin {
                 op: BinOp::Sub,
@@ -4260,8 +4573,35 @@ impl SlangAstLowerer {
                     1,
                 ))),
             },
-        });
-        Ok(statements)
+        }
+    }
+
+    fn response_entry_copy_statements(
+        target: &super::AstUvmSequencerResponseEntry,
+        source: &super::AstUvmSequencerResponseEntry,
+    ) -> Vec<Stmt> {
+        let assignments = [
+            (&target.transaction_id, &source.transaction_id),
+            (&target.tag, &source.tag),
+            (&target.id, &source.id),
+            (&target.name, &source.name),
+            (&target.full_name, &source.full_name),
+            (&target.parent_id, &source.parent_id),
+        ];
+        let mut statements = assignments
+            .into_iter()
+            .map(|(target_symbol, source_symbol)| Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            })
+            .collect::<Vec<_>>();
+        statements.extend(target.slots.iter().zip(&source.slots).map(
+            |(target_symbol, source_symbol)| Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            },
+        ));
+        statements
     }
 
     fn response_metadata_statements(

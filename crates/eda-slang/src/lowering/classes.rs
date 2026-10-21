@@ -952,6 +952,12 @@ impl SlangAstLowerer {
                 .map(|index| format!("{name}[{index}]"))
                 .unwrap_or_else(|| name.to_string());
             let object_key = format!("{handle_address} {element_name}");
+            if chain
+                .iter()
+                .any(|(owner, _)| owner.split('@').next() == Some("uvm_sequence_item"))
+            {
+                self.declare_uvm_sequence_transaction_id(&object_key);
+            }
             let synthetic_prefix = index
                 .map(|index| format!("{handle_address}_{index}"))
                 .unwrap_or_else(|| handle_address.to_string());
@@ -1617,6 +1623,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_tlm_port_call(call, receiver)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_sequence_transaction_id_task(call, receiver)? {
+            return Ok(Some(statement));
+        }
         if let Some(statement) = self.lower_uvm_sequence_start_call(call, receiver)? {
             return Ok(Some(statement));
         }
@@ -1977,6 +1986,9 @@ impl SlangAstLowerer {
             return Ok(Some(expression));
         }
         if let Some(expression) = self.lower_uvm_tlm_port_query(call, receiver)? {
+            return Ok(Some(expression));
+        }
+        if let Some(expression) = self.lower_uvm_sequence_transaction_id_query(call, receiver)? {
             return Ok(Some(expression));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {

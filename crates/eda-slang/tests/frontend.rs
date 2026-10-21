@@ -14280,6 +14280,165 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_sequence_selects_response_by_transaction_id() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-selective-response-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class SelectiveResponseTrace;
+  static int first_value = -1;
+  static int first_transaction_id = -1;
+  static int second_value = -1;
+  static int second_transaction_id = -1;
+  static int completed_responses = 0;
+endclass
+
+class selective_request extends uvm_sequence_item;
+  int value;
+
+  function new(string name = "selective_request");
+    super.new(name);
+  endfunction
+endclass
+
+class selective_response_sequence extends uvm_sequence#(selective_request);
+  selective_request item;
+  selective_request response;
+
+  function new(string name = "selective_response_sequence");
+    super.new(name);
+  endfunction
+
+  virtual task body();
+    item = new("first_item");
+    item.set_transaction_id(10);
+    start_item(item); item.value = 1; finish_item(item);
+
+    item = new("second_item");
+    item.set_transaction_id(11);
+    start_item(item); item.value = 2; finish_item(item);
+
+    response = new("selective_response");
+    get_response(response, 11);
+    SelectiveResponseTrace::first_value = response.value;
+    SelectiveResponseTrace::first_transaction_id = response.get_transaction_id();
+
+    get_response(response, 10);
+    SelectiveResponseTrace::second_value = response.value;
+    SelectiveResponseTrace::second_transaction_id = response.get_transaction_id();
+    SelectiveResponseTrace::completed_responses = 2;
+  endtask
+endclass
+
+class direct_selective_response_probe extends uvm_test;
+  uvm_sequencer#(selective_request) sequencer;
+  selective_response_sequence test_sequence;
+  selective_request request;
+  selective_request driver_response;
+
+  function new(string name = "direct_selective_response_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    sequencer = new("sequencer", this);
+    test_sequence = new("sequence");
+    request = new("driver_request");
+    driver_response = new("driver_response");
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fork
+      test_sequence.start(sequencer);
+      begin
+        sequencer.get_next_item(request);
+        driver_response.set_transaction_id(request.get_transaction_id());
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+
+        sequencer.get_next_item(request);
+        driver_response.set_transaction_id(request.get_transaction_id());
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+      end
+    join
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_selective_response_probe(
+  output int first_value,
+  output int first_transaction_id,
+  output int second_value,
+  output int second_transaction_id,
+  output int completed_responses
+);
+  initial begin
+    run_test("direct_selective_response_probe");
+    first_value = SelectiveResponseTrace::first_value;
+    first_transaction_id = SelectiveResponseTrace::first_transaction_id;
+    second_value = SelectiveResponseTrace::second_value;
+    second_transaction_id = SelectiveResponseTrace::second_transaction_id;
+    completed_responses = SelectiveResponseTrace::completed_responses;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM selective-response wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_selective_response_probe"),
+            &options,
+        )
+        .expect("directly lower selective UVM sequence responses");
+    let mut simulator = Simulator::new(&design).expect("create selective-response simulator");
+    simulator
+        .run_until(0)
+        .expect("run selective UVM response retrieval");
+    assert_eq!(simulator.read("first_value").unwrap().to_u64(), Some(102));
+    assert_eq!(
+        simulator.read("first_transaction_id").unwrap().to_u64(),
+        Some(11),
+        "transaction 11 should be selected before queued transaction 10"
+    );
+    assert_eq!(simulator.read("second_value").unwrap().to_u64(), Some(101));
+    assert_eq!(
+        simulator.read("second_transaction_id").unwrap().to_u64(),
+        Some(10),
+        "the remaining FIFO response should stay available after out-of-order removal"
+    );
+    assert_eq!(
+        simulator.read("completed_responses").unwrap().to_u64(),
+        Some(2)
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -167,10 +167,15 @@ direction mismatches, and detect endpoint cycles. A literal official-UVM sequenc
 bootstrap executes a user `uvm_sequence#(REQ)::body()` with prepared
 `uvm_sequence_item` handles, `start_item`/`finish_item`, a direct
 `uvm_sequencer#(REQ)`, `get_next_item`, `item_done(response)`, and blocking
-`get_response(response)` for request/response items with at most four scalar
-fields and an official-depth-eight FIFO response queue that fails closed on
-overflow. Dynamic run-time connections, arbitrary port graphs, class-valued
-request fields, and the remaining TLM transport APIs remain fail-closed.
+`get_response(response)` plus `set_transaction_id(...)`,
+`get_transaction_id()`, and runtime transaction-id-selective
+`get_response(response, transaction_id)` for request/response items with at
+most four scalar fields and an official-depth-eight FIFO response queue that
+fails closed on overflow. Selective removal preserves the FIFO order of
+remaining responses. Dynamic run-time connections, arbitrary port graphs,
+class-valued request fields, configurable response-queue depth, the official
+overflow/drop/warning policy, and the remaining TLM transport APIs remain
+fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
