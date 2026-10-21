@@ -4698,6 +4698,82 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_array_dimension_and_bit_queries() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-array-dimension-bits");
+    let source_path = root.join("array_dimension_bits.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module array_dimension_bits(
+  output int array_dimensions,
+  output int array_unpacked_dimensions,
+  output int array_bits,
+  output int packed_dimensions,
+  output int packed_unpacked_dimensions,
+  output int packed_bits,
+  output int scalar_dimensions,
+  output int scalar_unpacked_dimensions,
+  output int scalar_bits
+);
+  logic [7:0][3:0] values [2:0][1:4];
+  logic [15:0] packed_vector;
+  logic scalar;
+
+  initial begin
+    array_dimensions = $dimensions(values);
+    array_unpacked_dimensions = $unpacked_dimensions(values);
+    array_bits = $bits(values);
+
+    packed_dimensions = $dimensions(packed_vector);
+    packed_unpacked_dimensions = $unpacked_dimensions(packed_vector);
+    packed_bits = $bits(packed_vector);
+
+    scalar_dimensions = $dimensions(scalar);
+    scalar_unpacked_dimensions = $unpacked_dimensions(scalar);
+    scalar_bits = $bits(scalar);
+  end
+endmodule
+"#,
+    )
+    .expect("write array dimension/bit-query source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("array_dimension_bits"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower array dimension/bit queries");
+    assert_eq!(design.memories.len(), 1);
+
+    let mut simulator = Simulator::new(&design).expect("create dimension/bit-query simulator");
+    simulator
+        .run_until(0)
+        .expect("settle dimension/bit queries");
+    let expected = [
+        ("array_dimensions", 4),
+        ("array_unpacked_dimensions", 2),
+        ("array_bits", 384),
+        ("packed_dimensions", 1),
+        ("packed_unpacked_dimensions", 0),
+        ("packed_bits", 16),
+        ("scalar_dimensions", 0),
+        ("scalar_unpacked_dimensions", 0),
+        ("scalar_bits", 1),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong value for {name}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
