@@ -3111,6 +3111,92 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_rejects_wrong_sparse_memory_read_and_part_shapes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-summary");
+    let source_path = root.join("memory_summary.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory_summary(
+  input logic [1:0] address,
+  input logic [1:0] start,
+  output logic [7:0] data,
+  output logic [3:0] part
+);
+  logic [7:0] memory [0:3];
+  assign data = memory[address];
+  assign part = memory[address][start +: 4];
+endmodule
+"#,
+    )
+    .expect("write sparse-memory summary source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_summary"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory summary source");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory_summary"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize authoritative sparse-memory AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize authoritative sparse-memory AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact sparse-memory read fingerprint should match");
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "data")
+    {
+        target.rhs.operands[1].symbol = Some("0 wrong_address".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong sparse-memory index must fail structural validation");
+    assert!(
+        error.contains("MemoryRead:") && error.contains("wrong_address"),
+        "unexpected structural error: {error}"
+    );
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "data")
+    {
+        target.rhs.operands[1].symbol = Some("address".into());
+    }
+    summary
+        .validate_against_design(&design)
+        .expect("restored whole-element read should match");
+    let part = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "part")
+        .expect("sparse-memory part-read target");
+    part.rhs.operands[1].symbol = Some("0 wrong_start".into());
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong sparse-memory part start must fail structural validation");
+    assert!(
+        error.contains("MemoryReadPart:") && error.contains("wrong_start"),
+        "unexpected structural error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_uses_sparse_memory_part_selects() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -4661,6 +4747,7 @@ endmodule
                 kind: "BinaryOp".into(),
                 type_name: String::new(),
                 operator: "Add".into(),
+                selection_kind: String::new(),
                 type_width: None,
                 type_signed: None,
                 symbol: None,

@@ -274,6 +274,8 @@ pub struct SlangExpressionSummary {
     pub kind: String,
     pub type_name: String,
     pub operator: String,
+    /// `Simple`, `IndexedUp`, or `IndexedDown` for slang range selects.
+    pub selection_kind: String,
     /// Packed width for simple slang expression types. Complex/aggregate types
     /// remain unresolved.
     pub type_width: Option<usize>,

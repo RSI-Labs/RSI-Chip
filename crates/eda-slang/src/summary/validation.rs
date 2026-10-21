@@ -121,6 +121,11 @@ impl SlangAstSummary {
             }
         }
 
+        let memory_names: std::collections::BTreeSet<String> = design
+            .memories
+            .iter()
+            .map(|memory| memory.name.clone())
+            .collect();
         let mut expected_continuous_targets: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         for target in &self.continuous_targets {
@@ -128,15 +133,26 @@ impl SlangAstSummary {
                 .entry(target.name.clone())
                 .or_default()
                 .push(
-                    slang_expression_fingerprint_with_parameters(&target.rhs, &self.parameters)
-                        .unwrap_or_else(|| "?".to_string()),
+                    match slang_expression_fingerprint_with_parameters(
+                        &target.rhs,
+                        &self.parameters,
+                    ) {
+                        Some(fingerprint) => {
+                            let fingerprint =
+                                canonicalize_memory_fingerprint(&fingerprint, &memory_names);
+                            if strict_generated_hierarchy
+                                || !fingerprint.starts_with("MemoryRead")
+                                || memory_fingerprint_target_exists(&fingerprint, &memory_names)
+                            {
+                                fingerprint
+                            } else {
+                                "?".to_string()
+                            }
+                        }
+                        None => "?".to_string(),
+                    },
                 );
         }
-        let memory_names: std::collections::BTreeSet<String> = design
-            .memories
-            .iter()
-            .map(|memory| memory.name.clone())
-            .collect();
         let mut actual_continuous_targets: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         for assignment in &design.assigns {
@@ -224,7 +240,8 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
-                        let shape = if legacy_array_targets.contains(target)
+                        let shape = if !strict_generated_hierarchy
+                            && legacy_array_targets.contains(target)
                             || assignment.dynamic_packed_lvalue
                             || assignment.uses_class_static
                         {
@@ -235,11 +252,29 @@ impl SlangAstSummary {
                             // without guessing an equivalence.
                             "?".to_string()
                         } else {
-                            slang_expression_fingerprint_with_parameters(
+                            match slang_expression_fingerprint_with_parameters(
                                 &assignment.rhs,
                                 &self.parameters,
-                            )
-                            .unwrap_or_else(|| "?".to_string())
+                            ) {
+                                Some(fingerprint) => {
+                                    let fingerprint = canonicalize_memory_fingerprint(
+                                        &fingerprint,
+                                        &memory_names,
+                                    );
+                                    if strict_generated_hierarchy
+                                        || !fingerprint.starts_with("MemoryRead")
+                                        || memory_fingerprint_target_exists(
+                                            &fingerprint,
+                                            &memory_names,
+                                        )
+                                    {
+                                        fingerprint
+                                    } else {
+                                        "?".to_string()
+                                    }
+                                }
+                                None => "?".to_string(),
+                            }
                         };
                         expected_procedural_targets
                             .entry(target.clone())
@@ -346,4 +381,52 @@ impl SlangAstSummary {
             })
             .unwrap_or_default()
     }
+}
+
+fn canonicalize_memory_fingerprint(
+    fingerprint: &str,
+    memory_names: &std::collections::BTreeSet<String>,
+) -> String {
+    let Some(start) = fingerprint.find('[') else {
+        return fingerprint.to_string();
+    };
+    let Some(end) = fingerprint[start..].find(',').map(|offset| start + offset) else {
+        return fingerprint.to_string();
+    };
+    let Some(memory) = fingerprint.get(start + 1..end) else {
+        return fingerprint.to_string();
+    };
+    if memory_names.contains(memory) {
+        return fingerprint.to_string();
+    }
+    let hierarchical_matches = memory_names
+        .iter()
+        .filter(|candidate| candidate.ends_with(&format!(".{memory}")));
+    let hierarchical_matches = hierarchical_matches.collect::<Vec<_>>();
+    let Some(unique) = hierarchical_matches
+        .first()
+        .filter(|_| hierarchical_matches.len() == 1)
+    else {
+        return fingerprint.to_string();
+    };
+    format!(
+        "{}{unique}{}",
+        &fingerprint[..start + 1],
+        &fingerprint[end..]
+    )
+}
+
+fn memory_fingerprint_target_exists(
+    fingerprint: &str,
+    memory_names: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(start) = fingerprint.find('[') else {
+        return false;
+    };
+    let Some(end) = fingerprint[start..].find(',').map(|offset| start + offset) else {
+        return false;
+    };
+    fingerprint
+        .get(start + 1..end)
+        .is_some_and(|memory| memory_names.contains(memory))
 }
