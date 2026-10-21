@@ -212,7 +212,7 @@ operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
 and the sparse-memory regression extends to 1 MiB-by-8. Ordinary top-level
 ports use a separate `ArrayPortDecl` contract and child aliases use
 `ArrayConnection`; matching fixed arrays execute blocking/nonblocking whole-object
-copies and `$size`/bound/dimension-count/`$bits` queries; dedicated
+copies, positional/default unpacked assignment patterns, and `$size`/bound/dimension-count/`$bits` queries; dedicated
 `set_ordinary_array_input*` and `read_ordinary_array_output*` APIs enforce the
 Ordinary storage contract and reject sparse-memory ports, while sparse-memory
 APIs reject Ordinary arrays. Sparse memories

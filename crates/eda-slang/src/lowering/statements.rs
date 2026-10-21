@@ -1804,6 +1804,11 @@ impl SlangAstLowerer {
             return Ok(statement);
         }
         if let Some(statement) =
+            self.memory_pattern_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
+        {
+            return Ok(statement);
+        }
+        if let Some(statement) =
             self.whole_memory_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
         {
             return Ok(statement);
@@ -1911,6 +1916,206 @@ impl SlangAstLowerer {
             destination,
             nonblocking,
         }))
+    }
+
+    fn memory_pattern_assignment(
+        &self,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        nonblocking: bool,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let right_kind = string_field(right, "kind").unwrap_or_default();
+        if !matches!(
+            string_field(left, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) || !matches!(
+            right_kind.as_str(),
+            "SimpleAssignmentPattern" | "StructuredAssignmentPattern"
+        ) {
+            return Ok(None);
+        }
+        let destination = self.named_symbol(left)?;
+        let Some(memory) = destination.memory else {
+            return Ok(None);
+        };
+        let dimensions = self.design.memories[memory].dimensions.clone();
+        let flat_length = self.design.memories[memory].flat_length;
+        if flat_length > 4096 {
+            return Err(
+                "unpacked assignment pattern exceeds the 4096-element support limit".into(),
+            );
+        }
+        if right_kind == "StructuredAssignmentPattern" {
+            let [dimension] = dimensions.as_slice() else {
+                return Err(
+                    "structured multidimensional unpacked patterns are not supported".to_string(),
+                );
+            };
+            return self
+                .structured_memory_pattern_assignment(memory, dimension, right, nonblocking)
+                .map(Some);
+        }
+
+        fn visit(
+            lowerer: &SlangAstLowerer,
+            memory: usize,
+            dimensions: &[eda_core::ir::MemoryDimension],
+            pattern: &serde_json::Value,
+            indexes: &mut Vec<i64>,
+            statements: &mut Vec<eda_core::ir::Stmt>,
+            nonblocking: bool,
+        ) -> Result<(), String> {
+            if indexes.len() == dimensions.len() {
+                let value = lowerer.lower_expression(pattern)?;
+                let indexes = indexes
+                    .iter()
+                    .map(|index| {
+                        u64::try_from(*index).map(|index| {
+                            eda_core::ir::Expr::Const(eda_core::logic::LogicWord::from_u64(
+                                32, index,
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "unpacked assignment pattern index is negative".to_string())?;
+                statements.push(if nonblocking {
+                    eda_core::ir::Stmt::MemoryNBl {
+                        memory,
+                        indexes,
+                        e: value,
+                    }
+                } else {
+                    eda_core::ir::Stmt::MemoryBl {
+                        memory,
+                        indexes,
+                        e: value,
+                    }
+                });
+                return Ok(());
+            }
+
+            let elements = pattern
+                .get("elements")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "unpacked assignment pattern has no elements".to_string())?;
+            let dimension = dimensions[indexes.len()];
+            if elements.len() != dimension.length {
+                return Err(format!(
+                    "unpacked assignment-pattern dimension has {} elements, expected {}",
+                    elements.len(),
+                    dimension.length
+                ));
+            }
+            for (position, element) in elements.iter().enumerate() {
+                let logical_index = dimension.base + dimension.step * position as i64;
+                indexes.push(logical_index);
+                visit(
+                    lowerer,
+                    memory,
+                    dimensions,
+                    element,
+                    indexes,
+                    statements,
+                    nonblocking,
+                )?;
+                indexes.pop();
+            }
+            Ok(())
+        }
+
+        let mut statements = Vec::new();
+        let mut indexes = Vec::new();
+        visit(
+            self,
+            memory,
+            &dimensions,
+            right,
+            &mut indexes,
+            &mut statements,
+            nonblocking,
+        )?;
+        Ok(Some(eda_core::ir::Stmt::Block(statements)))
+    }
+
+    fn structured_memory_pattern_assignment(
+        &self,
+        memory: usize,
+        dimension: &eda_core::ir::MemoryDimension,
+        pattern: &serde_json::Value,
+        nonblocking: bool,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        if pattern.get("memberSetters").is_some() {
+            return Err("member-based unpacked assignment patterns are not supported".into());
+        }
+        let default = pattern
+            .get("defaultSetter")
+            .ok_or_else(|| "structured unpacked pattern has no default value".to_string())?;
+        let empty_setters = Vec::new();
+        let setters = pattern
+            .get("indexSetters")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_setters);
+        let mut values_by_index = std::collections::BTreeMap::new();
+        for setter in setters {
+            let index_value = setter
+                .get("index")
+                .ok_or_else(|| "structured unpacked pattern setter has no index".to_string())?;
+            let index = slang_constant_u64(index_value).map_err(|_| {
+                "structured unpacked pattern indexes must be nonnegative integer constants"
+                    .to_string()
+            })?;
+            let expression = setter
+                .get("expr")
+                .ok_or_else(|| "structured unpacked pattern setter has no value".to_string())?;
+            if values_by_index.insert(index, expression).is_some() {
+                return Err(format!(
+                    "duplicate structured unpacked pattern index {index}"
+                ));
+            }
+        }
+
+        let last = dimension.base + dimension.step * (dimension.length as i64 - 1);
+        let lower = dimension.base.min(last);
+        let upper = dimension.base.max(last);
+        for index in values_by_index.keys() {
+            if *index < lower as u64 || *index > upper as u64 {
+                return Err(format!(
+                    "structured unpacked pattern index {index} is outside {lower}..={upper}"
+                ));
+            }
+        }
+
+        let mut statements = Vec::new();
+        for position in 0..dimension.length {
+            let logical_index = dimension.base + dimension.step * position as i64;
+            if logical_index < 0 {
+                return Err(
+                    "negative structured unpacked pattern indexes are not yet lowered".to_string(),
+                );
+            }
+            let expression = values_by_index
+                .get(&(logical_index as u64))
+                .copied()
+                .unwrap_or(default);
+            let value = self.lower_expression(expression)?;
+            let indexes = vec![eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_u64(32, logical_index as u64),
+            )];
+            statements.push(if nonblocking {
+                eda_core::ir::Stmt::MemoryNBl {
+                    memory,
+                    indexes,
+                    e: value,
+                }
+            } else {
+                eda_core::ir::Stmt::MemoryBl {
+                    memory,
+                    indexes,
+                    e: value,
+                }
+            });
+        }
+        Ok(eda_core::ir::Stmt::Block(statements))
     }
 
     fn dynamic_packed_element_assignment(

@@ -4774,6 +4774,114 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_unpacked_assignment_patterns() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-unpacked-assignment-pattern");
+    let source_path = root.join("unpacked_assignment_pattern.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module unpacked_assignment_pattern(
+  input logic [7:0] a,
+  input logic [7:0] b,
+  output logic [7:0] blocking_first,
+  output logic [7:0] blocking_input,
+  output logic [7:0] blocking_last,
+  output logic [7:0] nonblocking_first,
+  output logic [7:0] nonblocking_input,
+  output logic [7:0] nonblocking_last,
+  output logic [7:0] multidimensional_first,
+  output logic [7:0] multidimensional_input,
+  output logic [7:0] multidimensional_last,
+  output logic [7:0] structured_zero,
+  output logic [7:0] structured_one,
+  output logic [7:0] structured_input,
+  output logic [7:0] structured_last
+);
+  logic [7:0] blocking_values [0:2];
+  logic [7:0] nonblocking_values [0:2];
+  logic [7:0] multidimensional_values [2:0][1:2];
+  logic [7:0] structured_values [0:3];
+
+  initial begin
+    #1;
+    blocking_values = '{8'h10, a, 8'h30};
+    nonblocking_values <= '{8'h40, a + 8'd1, 8'h60};
+    multidimensional_values = '{
+      '{8'h01, 8'h02},
+      '{8'h03, a},
+      '{b, 8'h06}
+    };
+    structured_values = '{0: 8'h71, 2: a, default: 8'h5a};
+  end
+
+  assign blocking_first = blocking_values[0];
+  assign blocking_input = blocking_values[1];
+  assign blocking_last = blocking_values[2];
+  assign nonblocking_first = nonblocking_values[0];
+  assign nonblocking_input = nonblocking_values[1];
+  assign nonblocking_last = nonblocking_values[2];
+  assign multidimensional_first = multidimensional_values[0][1];
+  assign multidimensional_input = multidimensional_values[1][2];
+  assign multidimensional_last = multidimensional_values[2][1];
+  assign structured_zero = structured_values[0];
+  assign structured_one = structured_values[1];
+  assign structured_input = structured_values[2];
+  assign structured_last = structured_values[3];
+endmodule
+"#,
+    )
+    .expect("write unpacked assignment-pattern source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("unpacked_assignment_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unpacked assignment patterns");
+    assert_eq!(design.memories.len(), 4);
+    assert!(design
+        .memories
+        .iter()
+        .all(|memory| memory.storage == eda_core::ir::MemoryStorage::Ordinary));
+
+    let mut simulator = Simulator::new(&design).expect("create assignment-pattern simulator");
+    simulator
+        .set_input("a", &LogicWord::from_u64(8, 0x22))
+        .unwrap();
+    simulator
+        .set_input("b", &LogicWord::from_u64(8, 0x44))
+        .unwrap();
+    simulator.run_until(1).expect("settle assignment patterns");
+
+    let expected = [
+        ("blocking_first", 0x10),
+        ("blocking_input", 0x22),
+        ("blocking_last", 0x30),
+        ("nonblocking_first", 0x40),
+        ("nonblocking_input", 0x23),
+        ("nonblocking_last", 0x60),
+        ("multidimensional_first", 0x44),
+        ("multidimensional_input", 0x22),
+        ("multidimensional_last", 0x01),
+        ("structured_zero", 0x71),
+        ("structured_one", 0x5a),
+        ("structured_input", 0x22),
+        ("structured_last", 0x5a),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong value for {name}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
