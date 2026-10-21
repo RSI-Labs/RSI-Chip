@@ -114,6 +114,105 @@ impl SlangAstLowerer {
         Ok(())
     }
 
+    pub(super) fn declare_uvm_sequencer(
+        &mut self,
+        member: &Value,
+        name: &str,
+    ) -> Result<(), String> {
+        let handle_address = member
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("UVM sequencer '{name}' has no symbol address"))?;
+        let object_key = format!("{handle_address} {name}");
+        let sanitized_name = object_key
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let request_ready = self.declare_class_internal_net(
+            &format!("__uvm_sequence_request_ready_{sanitized_name}"),
+            1,
+        );
+        let request_done =
+            self.declare_class_internal_net(&format!("__uvm_sequence_done_{sanitized_name}"), 1);
+        self.design.initials.extend([
+            Stmt::Bl {
+                lv: class_lvalue(&request_ready),
+                e: Expr::Const(LogicWord::zero(request_ready.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&request_done),
+                e: Expr::Const(LogicWord::zero(request_done.width)),
+            },
+        ]);
+        let tag = self.declare_class_internal_net(
+            &format!("__uvm_sequence_sequencer_tag_{sanitized_name}"),
+            32,
+        );
+        let id = self.declare_class_internal_net(
+            &format!("__uvm_sequence_sequencer_id_{sanitized_name}"),
+            64,
+        );
+        let name = self.declare_class_internal_net(
+            &format!("__uvm_sequence_sequencer_name_{sanitized_name}"),
+            crate::types::STRING_WIDTH,
+        );
+        let full_name = self.declare_class_internal_net(
+            &format!("__uvm_sequence_sequencer_full_name_{sanitized_name}"),
+            crate::types::STRING_WIDTH,
+        );
+        let parent_id = self.declare_class_internal_net(
+            &format!("__uvm_sequence_sequencer_parent_id_{sanitized_name}"),
+            64,
+        );
+        self.design.initials.extend([
+            Stmt::Bl {
+                lv: class_lvalue(&tag),
+                e: Expr::Const(LogicWord::zero(tag.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&id),
+                e: Expr::Const(LogicWord::zero(id.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&name),
+                e: Expr::Const(LogicWord::zero(name.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&full_name),
+                e: Expr::Const(LogicWord::zero(full_name.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&parent_id),
+                e: Expr::Const(LogicWord::zero(parent_id.width)),
+            },
+        ]);
+        self.class_objects
+            .insert(object_key.clone(), BTreeMap::new());
+        self.class_object_types
+            .insert(object_key.clone(), "uvm_sequencer".to_string());
+        self.class_object_tags.insert(object_key.clone(), tag);
+        self.class_object_ids.insert(object_key.clone(), id);
+        self.class_object_names.insert(object_key.clone(), name);
+        self.class_object_full_names
+            .insert(object_key.clone(), full_name);
+        self.class_object_parent_ids
+            .insert(object_key.clone(), parent_id);
+        self.uvm_sequencers.borrow_mut().insert(
+            object_key,
+            super::AstUvmSequencer {
+                request_ready,
+                request_done,
+            },
+        );
+        Ok(())
+    }
+
     pub(super) fn prepare_run_test_objects(&mut self, body: &Value) -> Result<(), String> {
         let mut calls = Vec::new();
         collect_run_test_calls(body, &mut calls);
@@ -3502,6 +3601,390 @@ impl SlangAstLowerer {
         self.lower_uvm_tlm_fifo_query(call, &fifo_receiver)
     }
 
+    pub(super) fn lower_uvm_sequencer_constructor(
+        &self,
+        construction: &Value,
+        object_key: &str,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(constructor) = construction.get("constructorCall") else {
+            return Err("UVM sequencer construction has no constructor call".to_string());
+        };
+        let empty_arguments = Vec::new();
+        let arguments = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() > 2 {
+            return Err("direct UVM sequencer construction requires at most two arguments".into());
+        }
+        let sequencer = self
+            .uvm_sequencers
+            .borrow()
+            .get(object_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{object_key}' has no sequencer state"))?;
+        self.uvm_sequence_items.borrow_mut().remove(object_key);
+        Ok(Some(Stmt::Block(vec![
+            Stmt::Bl {
+                lv: class_lvalue(&sequencer.request_ready),
+                e: Expr::Const(LogicWord::zero(sequencer.request_ready.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&sequencer.request_done),
+                e: Expr::Const(LogicWord::zero(sequencer.request_done.width)),
+            },
+        ])))
+    }
+
+    pub(super) fn lower_uvm_sequence_start_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if method_name != "start" {
+            return Ok(None);
+        }
+        let Some(sequence_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        let sequence_class = self
+            .class_object_types
+            .get(&sequence_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequence_key}' has no type"))?;
+        let chain = self.class_chain(&sequence_class)?;
+        let Some(official_index) = official_uvm_sequence_index(&chain) else {
+            return Ok(None);
+        };
+        let Some((owner, body)) = user_uvm_class_method(&chain, official_index, "body") else {
+            return Err(format!(
+                "UVM sequence class '{sequence_class}' has no user body task"
+            ));
+        };
+        if string_field(&body, "subroutineKind").as_deref() != Some("Task") {
+            return Err(format!(
+                "UVM sequence class '{sequence_class}' body must be a void task"
+            ));
+        }
+
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() || arguments.len() > 4 {
+            return Err(
+                "direct UVM sequence start requires a sequencer as its first argument".into(),
+            );
+        }
+        let sequencer_argument = unwrap_conversion(&arguments[0]);
+        let sequencer_key = self
+            .class_object_key_for_value(sequencer_argument)?
+            .ok_or_else(|| "UVM sequence start requires a sequencer handle".to_string())?;
+        if self
+            .class_object_types
+            .get(&sequencer_key)
+            .is_none_or(|class_name| class_name != "uvm_sequencer")
+        {
+            return Err("UVM sequence start requires a direct uvm_sequencer object".into());
+        }
+        self.require_initialized_class_object(&sequence_key)?;
+        self.require_initialized_class_object(&sequencer_key)?;
+        self.uvm_sequence_contexts
+            .borrow_mut()
+            .insert(sequence_key.clone(), sequencer_key);
+
+        let address = body
+            .get("addr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "UVM sequence body task has no address".to_string())?;
+        let body_call = json!({
+            "kind": "Call",
+            "type": "void",
+            "subroutine": format!("{address} body"),
+            "thisClass": {
+                "kind": "NamedValue",
+                "type": sequence_class,
+                "symbol": sequence_key,
+            },
+            "arguments": [],
+        });
+        let _ = owner;
+        self.lower_class_task_call(&body_call)
+    }
+
+    pub(super) fn lower_uvm_sequence_item_call(
+        &self,
+        call: &Value,
+        method_name: &str,
+    ) -> Result<Option<Stmt>, String> {
+        if !matches!(method_name, "start_item" | "finish_item") {
+            return Ok(None);
+        }
+        let Some(sequence_key) = self.active_class_objects.borrow().last().cloned() else {
+            return Ok(None);
+        };
+        let sequence_class = self
+            .class_object_types
+            .get(&sequence_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequence_key}' has no type"))?;
+        let chain = self.class_chain(&sequence_class)?;
+        if official_uvm_sequence_index(&chain).is_none() {
+            return Ok(None);
+        }
+        let sequencer_key = self
+            .uvm_sequence_contexts
+            .borrow()
+            .get(&sequence_key)
+            .cloned()
+            .ok_or_else(|| format!("UVM sequence '{sequence_key}' has no sequencer context"))?;
+        let sequencer = self
+            .uvm_sequencers
+            .borrow()
+            .get(&sequencer_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequencer_key}' has no sequencer state"))?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() || arguments.len() > 3 {
+            return Err(format!(
+                "UVM sequence {method_name} requires one transaction item"
+            ));
+        }
+        let item_key = self
+            .class_object_key_for_value(unwrap_conversion(&arguments[0]))?
+            .ok_or_else(|| format!("UVM sequence {method_name} requires an item handle"))?;
+        self.require_initialized_class_object(&item_key)?;
+
+        if method_name == "start_item" {
+            self.uvm_sequence_items
+                .borrow_mut()
+                .insert(sequencer_key, item_key);
+            return Ok(Some(Stmt::Block(Vec::new())));
+        }
+
+        let selected_item = self
+            .uvm_sequence_items
+            .borrow()
+            .get(&sequencer_key)
+            .cloned()
+            .ok_or_else(|| "UVM sequence finish_item has no start_item".to_string())?;
+        if selected_item != item_key {
+            return Err("UVM sequence finish_item transaction differs from its start_item".into());
+        }
+        let finish_body = Stmt::Block(vec![
+            Stmt::Bl {
+                lv: class_lvalue(&sequencer.request_ready),
+                e: Expr::Const(LogicWord::from_u64(sequencer.request_ready.width, 1)),
+            },
+            Stmt::Wait {
+                cond: Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(class_expr(&sequencer.request_done)),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(
+                        sequencer.request_done.width,
+                        1,
+                    ))),
+                },
+                body: Box::new(Stmt::Block(vec![
+                    Stmt::Bl {
+                        lv: class_lvalue(&sequencer.request_ready),
+                        e: Expr::Const(LogicWord::zero(sequencer.request_ready.width)),
+                    },
+                    Stmt::Bl {
+                        lv: class_lvalue(&sequencer.request_done),
+                        e: Expr::Const(LogicWord::zero(sequencer.request_done.width)),
+                    },
+                ])),
+            },
+        ]);
+        Ok(Some(finish_body))
+    }
+
+    pub(super) fn lower_uvm_sequencer_call(
+        &self,
+        call: &Value,
+        receiver: &Value,
+    ) -> Result<Option<Stmt>, String> {
+        let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
+            subroutine
+                .split_whitespace()
+                .next_back()
+                .map(str::to_string)
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(method_name.as_str(), "get_next_item" | "item_done") {
+            return Ok(None);
+        }
+        let Some(sequencer_key) = self.class_object_key_for_value(receiver)? else {
+            return Ok(None);
+        };
+        if self
+            .class_object_types
+            .get(&sequencer_key)
+            .is_none_or(|class_name| class_name != "uvm_sequencer")
+        {
+            return Ok(None);
+        }
+        self.require_initialized_class_object(&sequencer_key)?;
+        let sequencer = self
+            .uvm_sequencers
+            .borrow()
+            .get(&sequencer_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequencer_key}' has no sequencer state"))?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+
+        if method_name == "item_done" {
+            if arguments.len() > 1 {
+                return Err("UVM sequencer item_done requires at most one response".into());
+            }
+            if arguments.first().is_some_and(|response| {
+                string_field(unwrap_conversion(response), "kind").as_deref() != Some("NullLiteral")
+            }) {
+                return Err("non-null UVM sequencer item_done responses are unsupported".into());
+            }
+            let ready = class_expr(&sequencer.request_ready);
+            return Ok(Some(Stmt::If {
+                c: Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(ready),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(
+                        sequencer.request_ready.width,
+                        1,
+                    ))),
+                },
+                t: Box::new(Stmt::Block(vec![
+                    Stmt::Bl {
+                        lv: class_lvalue(&sequencer.request_ready),
+                        e: Expr::Const(LogicWord::zero(sequencer.request_ready.width)),
+                    },
+                    Stmt::Bl {
+                        lv: class_lvalue(&sequencer.request_done),
+                        e: Expr::Const(LogicWord::from_u64(sequencer.request_done.width, 1)),
+                    },
+                ])),
+                f: Some(Box::new(Stmt::Assert {
+                    cond: Expr::Const(LogicWord::zero(1)),
+                    message: Some(
+                        "UVM sequencer item_done has no outstanding get_next_item".into(),
+                    ),
+                })),
+            }));
+        }
+
+        if arguments.len() != 1 {
+            return Err("UVM sequencer get_next_item requires one output item".into());
+        }
+        let output = arguments[0]
+            .get("left")
+            .ok_or_else(|| "UVM sequencer get_next_item requires an output argument".to_string())?;
+        let output_key = self.class_object_key_for_value(output)?.ok_or_else(|| {
+            "UVM sequencer get_next_item requires a prepared output item".to_string()
+        })?;
+        let item_key = self
+            .uvm_sequence_items
+            .borrow()
+            .get(&sequencer_key)
+            .cloned()
+            .ok_or_else(|| {
+                "UVM sequencer get_next_item was lowered before a sequence start_item".to_string()
+            })?;
+        let copies = self.class_object_copy_statements(&output_key, &item_key)?;
+        Ok(Some(Stmt::Wait {
+            cond: Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(class_expr(&sequencer.request_ready)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.request_ready.width,
+                    1,
+                ))),
+            },
+            body: Box::new(Stmt::Block(copies)),
+        }))
+    }
+
+    fn class_object_copy_statements(
+        &self,
+        target_key: &str,
+        source_key: &str,
+    ) -> Result<Vec<Stmt>, String> {
+        if self
+            .class_composition_children
+            .keys()
+            .any(|(object_key, _)| object_key == source_key)
+        {
+            return Err(
+                "direct UVM sequence items with class-valued fields are unsupported".into(),
+            );
+        }
+        let source_fields = self
+            .class_objects
+            .get(source_key)
+            .ok_or_else(|| format!("class object '{source_key}' has no fields"))?;
+        let target_fields = self
+            .class_objects
+            .get(target_key)
+            .ok_or_else(|| format!("class object '{target_key}' has no fields"))?;
+        let mut statements = Vec::new();
+        for (source_symbol, target_symbol) in [
+            (
+                &self.class_object_tags[source_key],
+                &self.class_object_tags[target_key],
+            ),
+            (
+                &self.class_object_ids[source_key],
+                &self.class_object_ids[target_key],
+            ),
+            (
+                &self.class_object_names[source_key],
+                &self.class_object_names[target_key],
+            ),
+            (
+                &self.class_object_full_names[source_key],
+                &self.class_object_full_names[target_key],
+            ),
+            (
+                &self.class_object_parent_ids[source_key],
+                &self.class_object_parent_ids[target_key],
+            ),
+        ] {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            });
+        }
+        for (field_name, source_symbol) in source_fields {
+            let Some(target_symbol) = target_fields.get(field_name) else {
+                return Err(format!(
+                    "UVM sequence item output is missing field '{field_name}'"
+                ));
+            };
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(target_symbol),
+                e: class_expr(source_symbol),
+            });
+        }
+        Ok(statements)
+    }
+
     pub(super) fn lower_uvm_callback_mode_query(
         &self,
         call: &Value,
@@ -5498,6 +5981,19 @@ fn official_uvm_subscriber_index(chain: &[(String, Value)]) -> Option<usize> {
                 .and_then(|file| file.split('/').next_back().map(str::to_string))
                 .as_deref()
                 == Some("uvm_subscriber.svh")
+    })
+}
+
+fn official_uvm_sequence_index(chain: &[(String, Value)]) -> Option<usize> {
+    chain.iter().position(|(owner, class)| {
+        matches!(
+            owner.split('@').next(),
+            Some("uvm_sequence" | "uvm_sequence_base")
+        ) && string_field(class, "source_file")
+            .and_then(|file| file.split('/').next_back().map(str::to_string))
+            .is_some_and(|file| {
+                matches!(file.as_str(), "uvm_sequence.svh" | "uvm_sequence_base.svh")
+            })
     })
 }
 

@@ -448,6 +448,10 @@ impl SlangAstLowerer {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
         let type_name = string_field(member, "type").unwrap_or_default();
+        if type_name.contains("uvm_sequencer") {
+            self.declare_uvm_sequencer(member, &name)?;
+            return Ok(());
+        }
         if type_name.contains("uvm_tlm_fifo") {
             self.declare_uvm_tlm_fifo(member, &name)?;
             return Ok(());

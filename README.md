@@ -163,8 +163,12 @@ side-effecting `try_*` calls and transport APIs remain fail-closed. Literal `uvm
 `uvm_get_peek_port#(int)`, and `uvm_get_peek_export#(int)` objects can form
 matching endpoint chains that terminate at a bounded FIFO export, route
 `try_*`, blocking `put/get/peek`, and `can_*` operations to that FIFO, reject
-direction mismatches, and detect endpoint cycles. Dynamic run-time connections, arbitrary port graphs,
-and the remaining TLM transport APIs remain fail-closed.
+direction mismatches, and detect endpoint cycles. A literal official-UVM sequence
+bootstrap executes a user `uvm_sequence#(REQ)::body()` with prepared
+`uvm_sequence_item` handles, `start_item`/`finish_item`, a direct
+`uvm_sequencer#(REQ)`, `get_next_item`, and `item_done()` for scalar-field
+request items. Dynamic run-time connections, arbitrary port graphs, class-valued
+request fields, and the remaining TLM transport APIs remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
 synthetic, factory overrides and config entries are compile-time mappings, the
@@ -172,7 +176,7 @@ glob/regex/precedence/wait/spell model does not prove complete official POSIX
 dialect equivalence or all `uvm_resource_db` APIs and waiter pools,
 priority controls, resource-wide dictionaries, or dynamic resource-pool behavior,
 there is no parallel phase graph, callback-based objection scheduler, full
-dynamic callback pool, full TLM runtime, or sequence runtime.
+dynamic callback pool, full TLM runtime, or full sequence/methodology runtime.
 
 The bounded internal frontend still provides `HdlSource`, `SourceManager`, and
 `compile_sources` for named multi-unit compatibility testing; its explicit

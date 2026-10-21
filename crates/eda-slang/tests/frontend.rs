@@ -13970,6 +13970,136 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_sequence_sequencer_driver_handshake() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-sequence-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class SequenceTrace;
+  static int first = -1;
+  static int second = -1;
+  static int driver_done = 0;
+endclass
+
+class direct_request extends uvm_sequence_item;
+  int value;
+
+  function new(string name = "direct_request");
+    super.new(name);
+  endfunction
+endclass
+
+class direct_test_sequence extends uvm_sequence#(direct_request);
+  direct_request item;
+
+  function new(string name = "direct_test_sequence");
+    super.new(name);
+  endfunction
+
+  virtual task body();
+    item = new("first_item");
+    start_item(item);
+    item.value = 42;
+    finish_item(item);
+
+    item = new("second_item");
+    start_item(item);
+    item.value = 17;
+    finish_item(item);
+  endtask
+endclass
+
+class direct_sequence_probe extends uvm_test;
+  uvm_sequencer#(direct_request) sequencer;
+  direct_test_sequence test_sequence;
+  direct_request request;
+
+  function new(string name = "direct_sequence_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    sequencer = new("sequencer", this);
+    test_sequence = new("sequence");
+    request = new("driver_request");
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fork
+      test_sequence.start(sequencer);
+      begin
+        sequencer.get_next_item(request);
+        SequenceTrace::first = request.value;
+        sequencer.item_done();
+
+        sequencer.get_next_item(request);
+        SequenceTrace::second = request.value;
+        sequencer.item_done();
+        SequenceTrace::driver_done = 1;
+      end
+    join
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_sequence_probe(
+  output int first,
+  output int second,
+  output int driver_done
+);
+  initial begin
+    run_test("direct_sequence_probe");
+    first = SequenceTrace::first;
+    second = SequenceTrace::second;
+    driver_done = SequenceTrace::driver_done;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM sequence wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_sequence_probe"),
+            &options,
+        )
+        .expect("directly lower an official UVM sequence handshake");
+    let mut simulator = Simulator::new(&design).expect("create UVM sequence simulator");
+    simulator.run_until(0).expect("run UVM sequence handshake");
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(17));
+    assert_eq!(
+        simulator.read("driver_done").unwrap().to_u64(),
+        Some(1),
+        "sequence and driver handshake should complete"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -796,6 +796,10 @@ impl SlangAstLowerer {
         name: &str,
     ) -> Result<bool, String> {
         let type_name = string_field(member, "type").unwrap_or_default();
+        if type_name.contains("uvm_sequencer") {
+            self.declare_uvm_sequencer(member, name)?;
+            return Ok(true);
+        }
         if type_name.contains("uvm_tlm_fifo") {
             self.declare_uvm_tlm_fifo(member, name)?;
             return Ok(true);
@@ -855,7 +859,16 @@ impl SlangAstLowerer {
         }
         let chain = self.class_chain(&class_key)?;
         let official_uvm_derivation = chain.iter().any(|(owner, _)| {
-            matches!(owner.split('@').next(), Some("uvm_test" | "uvm_subscriber"))
+            matches!(
+                owner.split('@').next(),
+                Some(
+                    "uvm_test"
+                        | "uvm_subscriber"
+                        | "uvm_sequence"
+                        | "uvm_sequence_item"
+                        | "uvm_component"
+                )
+            )
         });
         let empty_members = Vec::new();
         let mut declared_properties = BTreeMap::new();
@@ -979,6 +992,21 @@ impl SlangAstLowerer {
                             })?;
                         let property_type = string_field(property, "type").unwrap_or_default();
                         let property_class_key = self.class_type_key(&property_type);
+                        if property_type.contains("uvm_sequencer") {
+                            if owner_name != &class_key {
+                                continue;
+                            }
+                            if !class_properties.iter().any(
+                                |candidate: &(String, Value, String)| candidate.0 == property_name,
+                            ) {
+                                class_properties.push((
+                                    property_name.clone(),
+                                    property.clone(),
+                                    "uvm_sequencer".to_string(),
+                                ));
+                            }
+                            continue;
+                        }
                         if self.class_definitions.contains_key(&property_class_key) {
                             if owner_name != &class_key {
                                 continue;
@@ -1253,6 +1281,13 @@ impl SlangAstLowerer {
         let Some(object_key) = self.class_object_key_for_value(left)? else {
             return Ok(None);
         };
+        if self
+            .class_object_types
+            .get(&object_key)
+            .is_some_and(|class_name| class_name == "uvm_sequencer")
+        {
+            return self.lower_uvm_sequencer_constructor(right, &object_key);
+        }
         if self
             .class_object_types
             .get(&object_key)
@@ -1580,6 +1615,12 @@ impl SlangAstLowerer {
             return Ok(Some(statement));
         }
         if let Some(statement) = self.lower_uvm_tlm_port_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_sequence_start_call(call, receiver)? {
+            return Ok(Some(statement));
+        }
+        if let Some(statement) = self.lower_uvm_sequencer_call(call, receiver)? {
             return Ok(Some(statement));
         }
         let object_key = self.class_object_key_for_value(receiver)?.or_else(|| {
@@ -3073,7 +3114,13 @@ impl SlangAstLowerer {
                     .ok_or_else(|| format!("class '{owner_class}' has no base constructor"))?;
                 if matches!(
                     class_name(&base).as_deref(),
-                    Some("uvm_test" | "uvm_subscriber")
+                    Some(
+                        "uvm_test"
+                            | "uvm_subscriber"
+                            | "uvm_sequence"
+                            | "uvm_sequence_item"
+                            | "uvm_component"
+                    )
                 ) {
                     return Ok(json!({"kind": "Empty"}));
                 }
@@ -3209,7 +3256,13 @@ impl SlangAstLowerer {
 }
 
 fn class_name(type_name: &str) -> Option<String> {
-    let raw_name = type_name.split_whitespace().next_back()?;
+    let mut words = type_name.split_whitespace();
+    let first = words.next()?;
+    let raw_name = if first.parse::<u64>().is_ok() {
+        words.next().unwrap_or(first)
+    } else {
+        first
+    };
     let base_name = raw_name.split(['#', '$']).next()?.trim();
     (!base_name.is_empty()).then(|| base_name.to_string())
 }
