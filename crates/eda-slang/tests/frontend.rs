@@ -14122,6 +14122,164 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_sequence_response_queue_reaches_depth_eight() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-response-queue-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class ResponseQueueTrace;
+  static int response_sum = 0;
+  static int completed_responses = 0;
+endclass
+
+class queued_request extends uvm_sequence_item;
+  int value;
+
+  function new(string name = "queued_request");
+    super.new(name);
+  endfunction
+endclass
+
+class queued_response_sequence extends uvm_sequence#(queued_request);
+  queued_request item;
+  queued_request response;
+
+  function new(string name = "queued_response_sequence");
+    super.new(name);
+  endfunction
+
+  virtual task body();
+    item = new("queued_item");
+    start_item(item); item.value = 1;  finish_item(item);
+    start_item(item); item.value = 2;  finish_item(item);
+    start_item(item); item.value = 3;  finish_item(item);
+    start_item(item); item.value = 4;  finish_item(item);
+    start_item(item); item.value = 5;  finish_item(item);
+    start_item(item); item.value = 6;  finish_item(item);
+    start_item(item); item.value = 7;  finish_item(item);
+    start_item(item); item.value = 8;  finish_item(item);
+
+    response = new("queued_response");
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    get_response(response); ResponseQueueTrace::response_sum = ResponseQueueTrace::response_sum + response.value;
+    ResponseQueueTrace::completed_responses = 8;
+  endtask
+endclass
+
+class direct_response_queue_probe extends uvm_test;
+  uvm_sequencer#(queued_request) sequencer;
+  queued_response_sequence test_sequence;
+  queued_request request;
+  queued_request driver_response;
+
+  function new(string name = "direct_response_queue_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    sequencer = new("sequencer", this);
+    test_sequence = new("sequence");
+    request = new("driver_request");
+    driver_response = new("driver_response");
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    fork
+      test_sequence.start(sequencer);
+      begin
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+        sequencer.get_next_item(request);
+        driver_response.value = request.value + 100;
+        sequencer.item_done(driver_response);
+      end    join
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_response_queue_probe(
+  output int response_sum,
+  output int completed_responses
+);
+  initial begin
+    run_test("direct_response_queue_probe");
+    response_sum = ResponseQueueTrace::response_sum;
+    completed_responses = ResponseQueueTrace::completed_responses;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM response-queue wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_response_queue_probe"),
+            &options,
+        )
+        .expect("directly lower official UVM response queue");
+    let mut simulator = Simulator::new(&design).expect("create UVM response-queue simulator");
+    simulator.run_until(0).expect("run UVM response queue");
+    assert_eq!(
+        simulator.read("response_sum").unwrap().to_u64(),
+        Some(836),
+        "eight queued responses should emerge in FIFO order"
+    );
+    assert_eq!(
+        simulator.read("completed_responses").unwrap().to_u64(),
+        Some(8)
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

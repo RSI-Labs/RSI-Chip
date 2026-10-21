@@ -475,13 +475,19 @@ pub(super) struct AstUvmTlmEndpointConnection {
 pub(super) struct AstUvmSequencer {
     pub(super) request_ready: AstLoweredSymbol,
     pub(super) request_done: AstLoweredSymbol,
-    pub(super) response_ready: AstLoweredSymbol,
-    pub(super) response_tag: AstLoweredSymbol,
-    pub(super) response_id: AstLoweredSymbol,
-    pub(super) response_name: AstLoweredSymbol,
-    pub(super) response_full_name: AstLoweredSymbol,
-    pub(super) response_parent_id: AstLoweredSymbol,
-    pub(super) response_slots: Vec<AstLoweredSymbol>,
+    pub(super) response_head: AstLoweredSymbol,
+    pub(super) response_count: AstLoweredSymbol,
+    pub(super) response_entries: Vec<AstUvmSequencerResponseEntry>,
+}
+
+#[derive(Clone)]
+pub(super) struct AstUvmSequencerResponseEntry {
+    pub(super) tag: AstLoweredSymbol,
+    pub(super) id: AstLoweredSymbol,
+    pub(super) name: AstLoweredSymbol,
+    pub(super) full_name: AstLoweredSymbol,
+    pub(super) parent_id: AstLoweredSymbol,
+    pub(super) slots: Vec<AstLoweredSymbol>,
 }
 
 impl Default for AstUvmReportControls {

@@ -140,143 +140,129 @@ impl SlangAstLowerer {
         );
         let request_done =
             self.declare_class_internal_net(&format!("__uvm_sequence_done_{sanitized_name}"), 1);
-        let response_ready = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_ready_{sanitized_name}"),
-            1,
-        );
-        let response_tag = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_tag_{sanitized_name}"),
+        let response_head = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_head_{sanitized_name}"),
             32,
         );
-        let response_id = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_id_{sanitized_name}"),
-            64,
+        let response_count = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_count_{sanitized_name}"),
+            32,
         );
-        let response_name = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_name_{sanitized_name}"),
-            crate::types::STRING_WIDTH,
-        );
-        let response_full_name = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_full_name_{sanitized_name}"),
-            crate::types::STRING_WIDTH,
-        );
-        let response_parent_id = self.declare_class_internal_net(
-            &format!("__uvm_sequence_response_parent_id_{sanitized_name}"),
-            64,
-        );
-        let mut response_slots = Vec::new();
-        for slot in 0..4_usize {
-            let symbol = self.declare_class_internal_net(
-                &format!("__uvm_sequence_response_slot_{slot}_{sanitized_name}"),
-                crate::types::STRING_WIDTH,
-            );
-            response_slots.push(symbol);
-        }
         self.design.initials.extend([
             Stmt::Bl {
-                lv: class_lvalue(&request_ready),
-                e: Expr::Const(LogicWord::zero(request_ready.width)),
+                lv: class_lvalue(&response_head),
+                e: Expr::Const(LogicWord::zero(response_head.width)),
             },
             Stmt::Bl {
-                lv: class_lvalue(&request_done),
-                e: Expr::Const(LogicWord::zero(request_done.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_ready),
-                e: Expr::Const(LogicWord::zero(response_ready.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_tag),
-                e: Expr::Const(LogicWord::zero(response_tag.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_id),
-                e: Expr::Const(LogicWord::zero(response_id.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_name),
-                e: Expr::Const(LogicWord::zero(response_name.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_full_name),
-                e: Expr::Const(LogicWord::zero(response_full_name.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&response_parent_id),
-                e: Expr::Const(LogicWord::zero(response_parent_id.width)),
+                lv: class_lvalue(&response_count),
+                e: Expr::Const(LogicWord::zero(response_count.width)),
             },
         ]);
-        for slot in &response_slots {
-            self.design.initials.push(Stmt::Bl {
-                lv: class_lvalue(slot),
-                e: Expr::Const(LogicWord::zero(slot.width)),
+        let mut response_entries = Vec::new();
+        for entry_index in 0..8_usize {
+            let tag = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_tag_{entry_index}_{sanitized_name}"),
+                32,
+            );
+            let id = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_id_{entry_index}_{sanitized_name}"),
+                64,
+            );
+            let name = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_name_{entry_index}_{sanitized_name}"),
+                crate::types::STRING_WIDTH,
+            );
+            let full_name = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_full_name_{entry_index}_{sanitized_name}"),
+                crate::types::STRING_WIDTH,
+            );
+            let parent_id = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_parent_id_{entry_index}_{sanitized_name}"),
+                64,
+            );
+            let mut slots = Vec::new();
+            for slot_index in 0..4_usize {
+                let slot = self.declare_class_internal_net(
+                    &format!(
+                        "__uvm_sequence_response_slot_{entry_index}_{slot_index}_{sanitized_name}"
+                    ),
+                    crate::types::STRING_WIDTH,
+                );
+                self.design.initials.push(Stmt::Bl {
+                    lv: class_lvalue(&slot),
+                    e: Expr::Const(LogicWord::zero(slot.width)),
+                });
+                slots.push(slot);
+            }
+            for symbol in [&tag, &id, &name, &full_name, &parent_id] {
+                self.design.initials.push(Stmt::Bl {
+                    lv: class_lvalue(symbol),
+                    e: Expr::Const(LogicWord::zero(symbol.width)),
+                });
+            }
+            response_entries.push(super::AstUvmSequencerResponseEntry {
+                tag,
+                id,
+                name,
+                full_name,
+                parent_id,
+                slots,
             });
         }
-        let tag = self.declare_class_internal_net(
+        let sequencer_tag = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_tag_{sanitized_name}"),
             32,
         );
-        let id = self.declare_class_internal_net(
+        let sequencer_id = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_id_{sanitized_name}"),
             64,
         );
-        let name = self.declare_class_internal_net(
+        let sequencer_name = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_name_{sanitized_name}"),
             crate::types::STRING_WIDTH,
         );
-        let full_name = self.declare_class_internal_net(
+        let sequencer_full_name = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_full_name_{sanitized_name}"),
             crate::types::STRING_WIDTH,
         );
-        let parent_id = self.declare_class_internal_net(
+        let sequencer_parent_id = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_parent_id_{sanitized_name}"),
             64,
         );
-        self.design.initials.extend([
-            Stmt::Bl {
-                lv: class_lvalue(&tag),
-                e: Expr::Const(LogicWord::zero(tag.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&id),
-                e: Expr::Const(LogicWord::zero(id.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&name),
-                e: Expr::Const(LogicWord::zero(name.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&full_name),
-                e: Expr::Const(LogicWord::zero(full_name.width)),
-            },
-            Stmt::Bl {
-                lv: class_lvalue(&parent_id),
-                e: Expr::Const(LogicWord::zero(parent_id.width)),
-            },
-        ]);
+        for symbol in [
+            &sequencer_tag,
+            &sequencer_id,
+            &sequencer_name,
+            &sequencer_full_name,
+            &sequencer_parent_id,
+        ] {
+            self.design.initials.push(Stmt::Bl {
+                lv: class_lvalue(symbol),
+                e: Expr::Const(LogicWord::zero(symbol.width)),
+            });
+        }
         self.class_objects
             .insert(object_key.clone(), BTreeMap::new());
         self.class_object_types
             .insert(object_key.clone(), "uvm_sequencer".to_string());
-        self.class_object_tags.insert(object_key.clone(), tag);
-        self.class_object_ids.insert(object_key.clone(), id);
-        self.class_object_names.insert(object_key.clone(), name);
+        self.class_object_tags
+            .insert(object_key.clone(), sequencer_tag);
+        self.class_object_ids
+            .insert(object_key.clone(), sequencer_id);
+        self.class_object_names
+            .insert(object_key.clone(), sequencer_name);
         self.class_object_full_names
-            .insert(object_key.clone(), full_name);
+            .insert(object_key.clone(), sequencer_full_name);
         self.class_object_parent_ids
-            .insert(object_key.clone(), parent_id);
+            .insert(object_key.clone(), sequencer_parent_id);
         self.uvm_sequencers.borrow_mut().insert(
             object_key,
             super::AstUvmSequencer {
                 request_ready,
                 request_done,
-                response_ready,
-                response_tag,
-                response_id,
-                response_name,
-                response_full_name,
-                response_parent_id,
-                response_slots,
+                response_head,
+                response_count,
+                response_entries,
             },
         );
         Ok(())
@@ -3706,8 +3692,12 @@ impl SlangAstLowerer {
                 e: Expr::Const(LogicWord::zero(sequencer.request_done.width)),
             },
             Stmt::Bl {
-                lv: class_lvalue(&sequencer.response_ready),
-                e: Expr::Const(LogicWord::zero(sequencer.response_ready.width)),
+                lv: class_lvalue(&sequencer.response_head),
+                e: Expr::Const(LogicWord::zero(sequencer.response_head.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&sequencer.response_count),
+                e: Expr::Const(LogicWord::zero(sequencer.response_count.width)),
             },
         ])))
     }
@@ -3974,10 +3964,6 @@ impl SlangAstLowerer {
                 }
                 let capture = self.response_capture_statements(&sequencer, &response_key)?;
                 completion.extend(capture);
-                completion.push(Stmt::Bl {
-                    lv: class_lvalue(&sequencer.response_ready),
-                    e: Expr::Const(LogicWord::from_u64(sequencer.response_ready.width, 1)),
-                });
             }
             let ready = class_expr(&sequencer.request_ready);
             return Ok(Some(Stmt::If {
@@ -4110,20 +4096,12 @@ impl SlangAstLowerer {
         self.uvm_sequence_response_types
             .borrow_mut()
             .insert(sequencer_key.clone(), output_class);
-        let restore = self.response_restore_statements(&sequencer, &output_key)?;
-        let mut body = restore;
-        body.push(Stmt::Bl {
-            lv: class_lvalue(&sequencer.response_ready),
-            e: Expr::Const(LogicWord::zero(sequencer.response_ready.width)),
-        });
+        let body = self.response_restore_statements(&sequencer, &output_key)?;
         Ok(Some(Stmt::Wait {
             cond: Expr::Bin {
-                op: BinOp::Eq,
-                a: Box::new(class_expr(&sequencer.response_ready)),
-                b: Box::new(Expr::Const(LogicWord::from_u64(
-                    sequencer.response_ready.width,
-                    1,
-                ))),
+                op: BinOp::Gt,
+                a: Box::new(class_expr(&sequencer.response_count)),
+                b: Box::new(Expr::Const(LogicWord::zero(sequencer.response_count.width))),
             },
             body: Box::new(Stmt::Block(body)),
         }))
@@ -4135,24 +4113,78 @@ impl SlangAstLowerer {
         source_key: &str,
     ) -> Result<Vec<Stmt>, String> {
         let fields = self.ordered_response_fields(source_key)?;
-        let mut statements = self.response_metadata_statements(
-            source_key,
-            [
-                &sequencer.response_tag,
-                &sequencer.response_id,
-                &sequencer.response_name,
-                &sequencer.response_full_name,
-                &sequencer.response_parent_id,
-            ],
-            true,
-        );
-        for ((_, source), slot) in fields.iter().zip(&sequencer.response_slots) {
-            statements.push(Stmt::Bl {
-                lv: class_lvalue(slot),
-                e: class_expr(source),
+        let head = class_expr(&sequencer.response_head);
+        let count = class_expr(&sequencer.response_count);
+        let tail = Expr::Bin {
+            op: BinOp::Mod,
+            a: Box::new(Expr::Bin {
+                op: BinOp::Add,
+                a: Box::new(head),
+                b: Box::new(count),
+            }),
+            b: Box::new(Expr::Const(LogicWord::from_u64(
+                sequencer.response_head.width,
+                8,
+            ))),
+        };
+        let mut entry_captures = Vec::new();
+        for (entry_index, entry) in sequencer.response_entries.iter().enumerate() {
+            let mut captures = self.response_metadata_statements(
+                source_key,
+                [
+                    &entry.tag,
+                    &entry.id,
+                    &entry.name,
+                    &entry.full_name,
+                    &entry.parent_id,
+                ],
+                true,
+            );
+            for ((_, source), slot) in fields.iter().zip(&entry.slots) {
+                captures.push(Stmt::Bl {
+                    lv: class_lvalue(slot),
+                    e: class_expr(source),
+                });
+            }
+            entry_captures.push(Stmt::If {
+                c: Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(tail.clone()),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(
+                        sequencer.response_head.width,
+                        entry_index as u64,
+                    ))),
+                },
+                t: Box::new(Stmt::Block(captures)),
+                f: None,
             });
         }
-        Ok(statements)
+        entry_captures.push(Stmt::Bl {
+            lv: class_lvalue(&sequencer.response_count),
+            e: Expr::Bin {
+                op: BinOp::Add,
+                a: Box::new(class_expr(&sequencer.response_count)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.response_count.width,
+                    1,
+                ))),
+            },
+        });
+        Ok(vec![Stmt::If {
+            c: Expr::Bin {
+                op: BinOp::Lt,
+                a: Box::new(class_expr(&sequencer.response_count)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.response_count.width,
+                    8,
+                ))),
+            },
+            t: Box::new(Stmt::Block(entry_captures)),
+            f: Some(Box::new(Stmt::Assert {
+                cond: Expr::Const(LogicWord::zero(1)),
+                message: Some("UVM sequence response queue overflowed depth 8".into()),
+            })),
+        }])
     }
 
     fn response_restore_statements(
@@ -4161,23 +4193,74 @@ impl SlangAstLowerer {
         target_key: &str,
     ) -> Result<Vec<Stmt>, String> {
         let fields = self.ordered_response_fields(target_key)?;
-        let mut statements = self.response_metadata_statements(
-            target_key,
-            [
-                &sequencer.response_tag,
-                &sequencer.response_id,
-                &sequencer.response_name,
-                &sequencer.response_full_name,
-                &sequencer.response_parent_id,
-            ],
-            false,
-        );
-        for ((_, target), slot) in fields.iter().zip(&sequencer.response_slots) {
-            statements.push(Stmt::Bl {
-                lv: class_lvalue(target),
-                e: class_expr(slot),
+        let mut statements = Vec::new();
+        for (entry_index, entry) in sequencer.response_entries.iter().enumerate() {
+            let mut restores = self.response_metadata_statements(
+                target_key,
+                [
+                    &entry.tag,
+                    &entry.id,
+                    &entry.name,
+                    &entry.full_name,
+                    &entry.parent_id,
+                ],
+                false,
+            );
+            for ((_, target), slot) in fields.iter().zip(&entry.slots) {
+                restores.push(Stmt::Bl {
+                    lv: class_lvalue(target),
+                    e: class_expr(slot),
+                });
+            }
+            statements.push(Stmt::If {
+                c: Expr::Bin {
+                    op: BinOp::Eq,
+                    a: Box::new(class_expr(&sequencer.response_head)),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(
+                        sequencer.response_head.width,
+                        entry_index as u64,
+                    ))),
+                },
+                t: Box::new(Stmt::Block(restores)),
+                f: None,
             });
         }
+        statements.push(Stmt::If {
+            c: Expr::Bin {
+                op: BinOp::Lt,
+                a: Box::new(class_expr(&sequencer.response_head)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.response_head.width,
+                    7,
+                ))),
+            },
+            t: Box::new(Stmt::Bl {
+                lv: class_lvalue(&sequencer.response_head),
+                e: Expr::Bin {
+                    op: BinOp::Add,
+                    a: Box::new(class_expr(&sequencer.response_head)),
+                    b: Box::new(Expr::Const(LogicWord::from_u64(
+                        sequencer.response_head.width,
+                        1,
+                    ))),
+                },
+            }),
+            f: Some(Box::new(Stmt::Bl {
+                lv: class_lvalue(&sequencer.response_head),
+                e: Expr::Const(LogicWord::zero(sequencer.response_head.width)),
+            })),
+        });
+        statements.push(Stmt::Bl {
+            lv: class_lvalue(&sequencer.response_count),
+            e: Expr::Bin {
+                op: BinOp::Sub,
+                a: Box::new(class_expr(&sequencer.response_count)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.response_count.width,
+                    1,
+                ))),
+            },
+        });
         Ok(statements)
     }
 
