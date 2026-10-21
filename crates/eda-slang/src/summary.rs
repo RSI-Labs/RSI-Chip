@@ -84,6 +84,72 @@ fn collect_class_static_property_symbols(
     }
 }
 
+fn collect_class_static_property_names(
+    value: &Value,
+    names: &mut std::collections::BTreeMap<String, String>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            if let Some(class_name) = string_field(value, "name") {
+                let empty_members = Vec::new();
+                let members = value
+                    .get("members")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_members);
+                for member in members {
+                    if string_field(member, "kind").as_deref() == Some("ClassProperty")
+                        && string_field(member, "lifetime").as_deref() == Some("Static")
+                    {
+                        let Some(property_name) = string_field(member, "name") else {
+                            continue;
+                        };
+                        if let Some(address) = member.get("addr").and_then(Value::as_u64) {
+                            names.insert(
+                                format!("{address} {property_name}"),
+                                format!("{class_name}_{property_name}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_class_static_property_names(nested, names);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_static_property_names(nested, names);
+        }
+    }
+}
+
+fn canonicalize_class_static_symbols(
+    value: &mut Value,
+    names: &std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        Value::Object(fields) => {
+            for (key, nested) in fields.iter_mut() {
+                if key == "symbol" {
+                    if let Some(symbol) = nested.as_str() {
+                        if let Some(canonical) = names.get(symbol) {
+                            *nested = Value::String(canonical.clone());
+                        }
+                    }
+                } else {
+                    canonicalize_class_static_symbols(nested, names);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                canonicalize_class_static_symbols(nested, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_class_type_names(value: &Value, class_types: &mut std::collections::BTreeSet<String>) {
     if let Some(fields) = value.as_object() {
         if string_field(value, "kind").as_deref() == Some("ClassType") {
@@ -390,6 +456,8 @@ impl SlangAstSummary {
             .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
         let document: Value = serde_json::from_str(&json[start..])
             .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
+        let mut class_static_names = std::collections::BTreeMap::new();
+        collect_class_static_property_names(&document, &mut class_static_names);
         let root = document.get("design").unwrap_or(&document);
         let root = if string_field(root, "kind").as_deref() == Some("Root") {
             root.get("members")
@@ -404,6 +472,7 @@ impl SlangAstSummary {
             root
         };
         let mut root = root.clone();
+        canonicalize_class_static_symbols(&mut root, &class_static_names);
         normalize_instance_bodies(&mut root);
         normalize_detailed_types(&mut root);
         let root = &root;

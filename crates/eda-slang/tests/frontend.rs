@@ -1409,6 +1409,41 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower static class members");
+    let static_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("static_class_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize authoritative static-class AST");
+    let mut static_summary = slang
+        .summarize_ast_json(&static_json)
+        .expect("summarize authoritative static-class AST");
+    static_summary
+        .validate_against_design(&design)
+        .expect("exact class-static property fingerprint should match");
+    if let Some(assignment) = static_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "direct_shared")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("Registry_wrong".into());
+    }
+    let error = static_summary
+        .validate_against_design(&design)
+        .expect_err("wrong class-static property must fail structural validation");
+    assert!(
+        error.contains("Ref:32:s[Registry_wrong]"),
+        "unexpected structural error: {error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create static-class simulator");
     simulator
         .set_input("replacement", &LogicWord::from_u64(32, 37))
@@ -10082,6 +10117,46 @@ endmodule
     inline_simulator.run_until(0).unwrap();
     assert_eq!(inline_simulator.read("y").unwrap().to_u64(), Some(0b1111));
     assert_eq!(inline_simulator.read("z").unwrap().to_u64(), Some(0b0011));
+    let inline_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&inline_local_path),
+            Some("inline_local"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize procedure-local loop AST");
+    let mut inline_summary = slang
+        .summarize_ast_json(&inline_json)
+        .expect("summarize procedure-local loop AST");
+    inline_summary
+        .validate_against_design(&inline_local)
+        .expect("procedure-local dynamic packed lvalue fingerprint should match");
+    if let Some(assignment) = inline_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "y")
+                    && assignment.dynamic_packed_lvalue_selector.is_some()
+            })
+        })
+    {
+        assignment
+            .dynamic_packed_lvalue_selector
+            .as_mut()
+            .expect("procedure-local dynamic selector")
+            .symbol = Some("wrong_local_selector".into());
+    }
+    let error = inline_summary
+        .validate_against_design(&inline_local)
+        .expect_err("wrong procedure-local dynamic selector must fail");
+    assert!(
+        error.contains("Ref:32:s[wrong_local_selector]"),
+        "unexpected structural error: {error}"
+    );
 
     let excessive_path = root.join("excessive.sv");
     std::fs::write(

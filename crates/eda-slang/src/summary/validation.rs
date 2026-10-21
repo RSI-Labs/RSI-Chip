@@ -268,12 +268,7 @@ impl SlangAstSummary {
                         } else if let Some(selector) =
                             assignment.dynamic_packed_lvalue_selector.as_ref()
                         {
-                            if !strict_generated_hierarchy
-                                || !expression_references_declared_symbols(
-                                    selector,
-                                    &declaration_names,
-                                )
-                            {
+                            if !strict_generated_hierarchy {
                                 "?".to_string()
                             } else {
                                 dynamic_packed_lvalue_fingerprint(
@@ -468,28 +463,6 @@ fn memory_fingerprint_target_exists(
     fingerprint
         .get(start + 1..end)
         .is_some_and(|memory| memory_names.contains(memory))
-}
-
-fn expression_references_declared_symbols(
-    expression: &super::SlangExpressionSummary,
-    declaration_names: &std::collections::BTreeSet<String>,
-) -> bool {
-    let visible = expression
-        .symbol
-        .as_deref()
-        .map(|symbol| {
-            let name = symbol
-                .rsplit_once(' ')
-                .map(|(_, name)| name)
-                .unwrap_or(symbol);
-            declaration_names.contains(name)
-        })
-        .unwrap_or(true);
-    visible
-        && expression
-            .operands
-            .iter()
-            .all(|operand| expression_references_declared_symbols(operand, declaration_names))
 }
 
 fn memory_member_lvalue_fingerprint(

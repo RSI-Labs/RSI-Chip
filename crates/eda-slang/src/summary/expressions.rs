@@ -1077,7 +1077,7 @@ pub(crate) fn design_expr_symbol(
                 .find(|declaration| {
                     *net >= declaration.base && *net < declaration.base + declaration.width
                 })
-                .map(|declaration| declaration.name.clone())
+                .map(|declaration| canonical_ref_symbol_name(&declaration.name))
         }),
         Expr::MemoryRead { memory, .. } | Expr::MemoryReadPart { memory, .. } => design
             .memories
@@ -1085,6 +1085,28 @@ pub(crate) fn design_expr_symbol(
             .map(|memory| memory.name.clone()),
         _ => None,
     }
+}
+
+fn canonical_ref_symbol_name(name: &str) -> String {
+    if let Some(local) = name.strip_prefix("__class_static_") {
+        let skip_address = local.find('_').map(|end| end + 1);
+        if let Some(start) = skip_address {
+            let tail = &local[start..];
+            if let Some(class_end) = tail.find('@') {
+                let after_class_address = &tail[class_end + 1..];
+                let property = after_class_address
+                    .find('_')
+                    .map(|end| &after_class_address[end + 1..])
+                    .unwrap_or(after_class_address);
+                return format!("{}_{property}", &tail[..class_end]);
+            }
+            return tail.to_string();
+        }
+    }
+    name.strip_prefix("__local_")
+        .and_then(|local| local.rsplit('_').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn clocking_sample_symbol(design: &Design, net: usize) -> Option<String> {
