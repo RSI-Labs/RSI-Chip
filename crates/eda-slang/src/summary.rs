@@ -1,7 +1,7 @@
 //! Typed summaries and structural validation for slang's elaborated AST.
 
 use super::ast_util::{
-    expression_target_names, instance_parameters, normalize_detailed_types,
+    expression_symbol_id, expression_target_names, instance_parameters, normalize_detailed_types,
     normalize_instance_bodies, parameter_summary, source_span, string_field,
 };
 use crate::types::simple_type_width;
@@ -123,12 +123,103 @@ fn collect_class_static_property_names(
     }
 }
 
+fn collect_simple_static_function_returns(
+    value: &Value,
+    static_properties: &std::collections::BTreeMap<String, String>,
+    returns: &mut std::collections::BTreeMap<String, Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            let empty_members = Vec::new();
+            let members = value
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_members);
+            for member in members {
+                if string_field(member, "kind").as_deref() != Some("Subroutine")
+                    || !string_field(member, "flags")
+                        .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"))
+                    || string_field(member, "subroutineKind").as_deref() != Some("Function")
+                {
+                    continue;
+                }
+                let Some(arguments) = member.get("arguments").and_then(Value::as_array) else {
+                    continue;
+                };
+                if !arguments.is_empty() {
+                    continue;
+                }
+                let Some(body) = member.get("body") else {
+                    continue;
+                };
+                if string_field(body, "kind").as_deref() != Some("Return") {
+                    continue;
+                }
+                let Some(expression) = body.get("expr") else {
+                    continue;
+                };
+                let returns_static_property = string_field(expression, "kind").as_deref()
+                    == Some("NamedValue")
+                    && expression_symbol_id(expression)
+                        .and_then(|symbol| static_properties.get(&symbol))
+                        .is_some();
+                if !returns_static_property {
+                    continue;
+                }
+                let mut member = member.clone();
+                normalize_detailed_types(&mut member);
+                let mut expression = expression.clone();
+                normalize_detailed_types(&mut expression);
+                let return_type = string_field(&member, "returnType").unwrap_or_default();
+                let expression_type = string_field(&expression, "type").unwrap_or_default();
+                if return_type != expression_type {
+                    continue;
+                }
+                let Some(address) = member.get("addr").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(name) = string_field(&member, "name") else {
+                    continue;
+                };
+                returns.insert(format!("{address} {name}"), expression);
+            }
+        }
+        for nested in fields.values() {
+            collect_simple_static_function_returns(nested, static_properties, returns);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_simple_static_function_returns(nested, static_properties, returns);
+        }
+    }
+}
+
 fn canonicalize_class_static_symbols(
     value: &mut Value,
     names: &std::collections::BTreeMap<String, String>,
+    simple_returns: &std::collections::BTreeMap<String, Value>,
 ) {
     match value {
         Value::Object(fields) => {
+            let is_call = fields
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "Call");
+            let subroutine = fields
+                .get("subroutine")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if is_call {
+                if let Some(subroutine) = subroutine {
+                    if let Some(expression) = simple_returns.get(&subroutine) {
+                        *value = expression.clone();
+                        canonicalize_class_static_symbols(value, names, simple_returns);
+                        return;
+                    }
+                }
+            }
             for (key, nested) in fields.iter_mut() {
                 if key == "symbol" {
                     if let Some(symbol) = nested.as_str() {
@@ -137,13 +228,13 @@ fn canonicalize_class_static_symbols(
                         }
                     }
                 } else {
-                    canonicalize_class_static_symbols(nested, names);
+                    canonicalize_class_static_symbols(nested, names, simple_returns);
                 }
             }
         }
         Value::Array(values) => {
             for nested in values {
-                canonicalize_class_static_symbols(nested, names);
+                canonicalize_class_static_symbols(nested, names, simple_returns);
             }
         }
         _ => {}
@@ -458,6 +549,12 @@ impl SlangAstSummary {
             .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
         let mut class_static_names = std::collections::BTreeMap::new();
         collect_class_static_property_names(&document, &mut class_static_names);
+        let mut simple_static_function_returns = std::collections::BTreeMap::new();
+        collect_simple_static_function_returns(
+            &document,
+            &class_static_names,
+            &mut simple_static_function_returns,
+        );
         let root = document.get("design").unwrap_or(&document);
         let root = if string_field(root, "kind").as_deref() == Some("Root") {
             root.get("members")
@@ -472,7 +569,11 @@ impl SlangAstSummary {
             root
         };
         let mut root = root.clone();
-        canonicalize_class_static_symbols(&mut root, &class_static_names);
+        canonicalize_class_static_symbols(
+            &mut root,
+            &class_static_names,
+            &simple_static_function_returns,
+        );
         normalize_instance_bodies(&mut root);
         normalize_detailed_types(&mut root);
         let root = &root;

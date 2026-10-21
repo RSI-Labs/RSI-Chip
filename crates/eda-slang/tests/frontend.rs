@@ -1431,6 +1431,41 @@ endmodule
                 assignment
                     .target_names
                     .first()
+                    .is_some_and(|name| name == "initial_shared")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("Registry_wrong".into());
+    }
+    let error = static_summary
+        .validate_against_design(&design)
+        .expect_err("wrong inlined static function return must fail");
+    assert!(
+        error.contains("Ref:32:s[Registry_wrong]"),
+        "unexpected structural error: {error}"
+    );
+    if let Some(assignment) = static_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "initial_shared")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("Registry_shared".into());
+    }
+    if let Some(assignment) = static_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
                     .is_some_and(|name| name == "direct_shared")
             })
         })

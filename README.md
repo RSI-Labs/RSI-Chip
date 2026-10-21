@@ -85,7 +85,7 @@ select physical-range fingerprints. Dynamic packed element reads plus module- an
 lvalue updates retain exact selector/per-bit conditional-tree fingerprints;
 simple, nested, and forward-declared packed sparse-memory member writes
 retain exact memory/index/member-path/RHS whole-element concatenation fingerprints; and
-direct class-static property reads retain exact class/property fingerprints. Unsupported
+direct class-static property reads and no-argument static functions that directly return a static property retain exact class/property fingerprints. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
 
