@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{
     SlangAssignmentSummary, SlangContinuousTarget, SlangExpressionSummary, SlangInstanceSummary,
-    SlangParameterSummary, SlangProceduralBlockSummary,
+    SlangMemoryMemberLvalueSummary, SlangParameterSummary, SlangProceduralBlockSummary,
 };
 
 pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
@@ -165,20 +165,33 @@ fn is_dynamic_packed_lvalue(value: &Value) -> bool {
     }
 }
 
-fn is_memory_member_lvalue(value: &Value) -> bool {
+fn memory_member_lvalue_summary(value: &Value) -> Option<SlangMemoryMemberLvalueSummary> {
     if string_field(value, "kind").as_deref() != Some("MemberAccess") {
-        return false;
+        return None;
     }
-    value
-        .get("value")
-        .map(|selected| {
-            if let Some(base) = selected.get("value") {
-                string_field(base, "type").is_some_and(|type_name| type_name.contains('$'))
-            } else {
-                false
-            }
-        })
-        .unwrap_or(false)
+    let selected = value.get("value")?;
+    let mut selectors = Vec::new();
+    let mut base = selected;
+    while string_field(base, "kind").as_deref() == Some("ElementSelect") {
+        selectors.push(
+            base.get("selector")
+                .map(expression_summary)
+                .unwrap_or_else(empty_expression_summary),
+        );
+        base = base.get("value")?;
+    }
+    if !string_field(base, "type").is_some_and(|type_name| type_name.contains('$')) {
+        return None;
+    }
+    selectors.reverse();
+    let member = string_field(value, "member")?
+        .split_whitespace()
+        .next_back()?
+        .to_string();
+    Some(SlangMemoryMemberLvalueSummary {
+        indexes: selectors,
+        member,
+    })
 }
 
 pub(crate) fn procedural_assignments(
@@ -206,7 +219,7 @@ pub(crate) fn procedural_assignments(
                 let dynamic_packed_lvalue_selector = dynamic_packed_lvalue
                     .then(|| left.get("selector").map(expression_summary))
                     .flatten();
-                let memory_member_lvalue = is_memory_member_lvalue(left);
+                let memory_member_lvalue = memory_member_lvalue_summary(left);
                 assignments.push(SlangAssignmentSummary {
                     target_names: expression_target_names(left),
                     rhs: expression_summary(right),

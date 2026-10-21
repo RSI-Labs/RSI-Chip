@@ -244,16 +244,27 @@ impl SlangAstSummary {
                     if declaration_names.contains(target) {
                         let legacy_array_shape =
                             !strict_generated_hierarchy && legacy_array_targets.contains(target);
-                        let shape = if legacy_array_shape
-                            || assignment.memory_member_lvalue
-                            || assignment.uses_class_static
-                        {
+                        let shape = if legacy_array_shape || assignment.uses_class_static {
                             // Small arrays still use the legacy bounded
                             // per-element expansion, whose expression tree is
                             // intentionally not structurally equivalent to the
                             // slang source. Preserve assignment-count checking
                             // without guessing an equivalence.
                             "?".to_string()
+                        } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
+                            if !strict_generated_hierarchy {
+                                "?".to_string()
+                            } else {
+                                memory_member_lvalue_fingerprint(
+                                    target,
+                                    member,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.type_layouts,
+                                    &self.parameters,
+                                )
+                                .unwrap_or_else(|| "?".to_string())
+                            }
                         } else if let Some(selector) =
                             assignment.dynamic_packed_lvalue_selector.as_ref()
                         {
@@ -481,7 +492,62 @@ fn expression_references_declared_symbols(
             .all(|operand| expression_references_declared_symbols(operand, declaration_names))
 }
 
-#[allow(clippy::too_many_arguments)]
+fn memory_member_lvalue_fingerprint(
+    target_name: &str,
+    member: &super::SlangMemoryMemberLvalueSummary,
+    value: &super::SlangExpressionSummary,
+    declarations: &[super::SlangDeclarationSummary],
+    type_layouts: &std::collections::BTreeMap<String, super::SlangTypeLayoutSummary>,
+    parameters: &[super::SlangParameterSummary],
+) -> Option<String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let alias = declaration
+        .type_name
+        .split('$')
+        .next()?
+        .trim()
+        .rsplit(['.', ':'])
+        .next()?
+        .trim();
+    let layout = type_layouts.get(alias)?;
+    let field = layout
+        .fields
+        .iter()
+        .find(|field| field.name == member.member)?;
+    let element_width = layout.element_width;
+    if field.offset + field.width > element_width {
+        return None;
+    }
+
+    let indexes = member
+        .indexes
+        .iter()
+        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters))
+        .collect::<Option<Vec<_>>>()?;
+    let old = format!(
+        "MemoryRead:{element_width}:u[{target_name},{}]",
+        indexes.join(",")
+    );
+    let value = slang_expression_fingerprint_with_parameters(value, parameters)?;
+    let mut parts = Vec::new();
+    if field.offset + field.width < element_width {
+        let lsb = field.offset + field.width;
+        let msb = element_width - 1;
+        parts.push(format!(
+            "PackedSelect:{}:u[{old},Range:{msb}:{lsb}]",
+            msb - lsb + 1
+        ));
+    }
+    parts.push(value);
+    if field.offset > 0 {
+        let msb = field.offset - 1;
+        parts.push(format!("PackedSelect:{}:u[{old},Range:{msb}:0]", msb + 1));
+    }
+    Some(format!("Concat:{element_width}:u[{}]", parts.join(",")))
+}
+
 fn dynamic_packed_lvalue_fingerprint(
     target_name: &str,
     selector: &super::SlangExpressionSummary,

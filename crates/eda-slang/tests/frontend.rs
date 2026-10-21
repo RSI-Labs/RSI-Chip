@@ -7755,6 +7755,122 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_rejects_wrong_memory_member_lvalue_shapes() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-member-summary");
+    let source_path = root.join("memory_member_summary.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory_member_summary(
+  input logic [1:0] address,
+  input logic [3:0] value,
+  output logic [7:0] observed
+);
+  typedef struct packed {
+    logic [3:0] high;
+    logic [3:0] low;
+  } pair_t;
+
+  pair_t pairs [0:3];
+  always_comb begin
+    pairs[address].high = value;
+  end
+  assign observed = pairs[address];
+endmodule
+"#,
+    )
+    .expect("write sparse-memory member summary source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_member_summary"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower sparse-memory member source");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory_member_summary"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize authoritative sparse-memory member AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize authoritative sparse-memory member AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact sparse-memory member fingerprint should match");
+
+    let assignment = summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+        .expect("sparse-memory member assignment");
+    assignment
+        .memory_member_lvalue
+        .as_mut()
+        .expect("sparse-memory member lvalue")
+        .indexes[0]
+        .literal = Some("32:00000000000000000000000000000001".into());
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong sparse-memory member index must fail");
+    assert!(
+        error.contains("MemoryRead:8:u[pairs,")
+            && error.contains("32:00000000000000000000000000000001"),
+        "unexpected structural error: {error}"
+    );
+
+    let assignment = summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+        .expect("sparse-memory member assignment");
+    assignment
+        .memory_member_lvalue
+        .as_mut()
+        .expect("sparse-memory member lvalue")
+        .indexes[0]
+        .literal = Some("32:00000000000000000000000000000000".into());
+    assignment
+        .memory_member_lvalue
+        .as_mut()
+        .expect("sparse-memory member lvalue")
+        .member = "low".into();
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong sparse-memory member field must fail");
+    assert!(
+        error.contains("Range:3:0") && error.contains("Range:7:4"),
+        "unexpected structural error: {error}"
+    );
+
+    let assignment = summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+        .expect("sparse-memory member assignment");
+    assignment
+        .memory_member_lvalue
+        .as_mut()
+        .expect("sparse-memory member lvalue")
+        .member = "high".into();
+    assignment.rhs.symbol = Some("wrong_value".into());
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong sparse-memory member RHS must fail");
+    assert!(
+        error.contains("Ref:4:u[wrong_value]"),
+        "unexpected structural error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_packed_union_arrays() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

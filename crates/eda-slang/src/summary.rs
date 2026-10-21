@@ -181,6 +181,59 @@ fn collect_instance_array_summary(
     Ok(())
 }
 
+fn type_layout_summary(member: &Value) -> Result<Option<(String, SlangTypeLayoutSummary)>, String> {
+    if string_field(member, "kind").as_deref() != Some("TypeAlias") {
+        return Ok(None);
+    }
+    let name = string_field(member, "name")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "slang TypeAlias has no name".to_string())?;
+    let mut target = member
+        .get("target")
+        .cloned()
+        .ok_or_else(|| format!("slang TypeAlias '{name}' has no target"))?;
+    normalize_detailed_types(&mut target);
+    if !matches!(
+        string_field(&target, "kind").as_deref(),
+        Some("PackedStructType" | "PackedUnionType")
+    ) {
+        return Ok(None);
+    }
+    let members = target
+        .get("members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("packed type '{name}' has no field layouts"))?;
+    let mut fields = Vec::new();
+    for field in members {
+        let field_name = string_field(field, "name")
+            .ok_or_else(|| format!("packed type '{name}' has a field without a name"))?;
+        let offset = field
+            .get("bitOffset")
+            .and_then(Value::as_u64)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no bit offset"))?;
+        let type_name = string_field(field, "type").unwrap_or_default();
+        let Some(width) = crate::types::simple_type_width(&type_name) else {
+            return Ok(None);
+        };
+        fields.push(SlangFieldLayoutSummary {
+            name: field_name,
+            offset,
+            width,
+        });
+    }
+    let Some(element_width) = fields.iter().map(|field| field.offset + field.width).max() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        name,
+        SlangTypeLayoutSummary {
+            element_width,
+            fields,
+        },
+    )))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
@@ -191,6 +244,7 @@ pub struct SlangAstSummary {
     pub continuous_targets: Vec<SlangContinuousTarget>,
     pub procedural_blocks: Vec<SlangProceduralBlockSummary>,
     pub instances: Vec<SlangInstanceSummary>,
+    pub type_layouts: std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
     pub kinds: std::collections::BTreeSet<String>,
 }
 
@@ -219,6 +273,25 @@ pub struct SlangDeclarationSummary {
     /// unpacked-array, string, class, and special SystemVerilog types are left
     /// unresolved rather than guessed.
     pub width: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangTypeLayoutSummary {
+    pub element_width: usize,
+    pub fields: Vec<SlangFieldLayoutSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangFieldLayoutSummary {
+    pub name: String,
+    pub offset: usize,
+    pub width: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangMemoryMemberLvalueSummary {
+    pub indexes: Vec<SlangExpressionSummary>,
+    pub member: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,8 +339,8 @@ pub struct SlangAssignmentSummary {
     pub dynamic_packed_lvalue: bool,
     pub dynamic_packed_lvalue_selector: Option<SlangExpressionSummary>,
     /// Member writes through a sparse-memory element are canonicalized into a
-    /// whole-memory-element concat; exact structural equivalence is deferred.
-    pub memory_member_lvalue: bool,
+    /// whole-memory-element concat.
+    pub memory_member_lvalue: Option<SlangMemoryMemberLvalueSummary>,
     /// Class static storage uses an internal IR name, so exact RHS symbol
     /// equivalence is deferred while assignment inventory remains checked.
     pub uses_class_static: bool,
@@ -352,6 +425,7 @@ impl SlangAstSummary {
         let mut continuous_targets = Vec::new();
         let mut procedural_blocks = Vec::new();
         let mut instances = Vec::new();
+        let mut type_layouts = std::collections::BTreeMap::new();
         for member in &members {
             let Some(kind) = string_field(member, "kind") else {
                 continue;
@@ -412,6 +486,11 @@ impl SlangAstSummary {
                     parameters.push(parameter_summary(member)?);
                     if let Some(span) = source_span(member) {
                         source_spans.insert(format!("parameter:{name}"), span);
+                    }
+                }
+                "TypeAlias" => {
+                    if let Some((name, layout)) = type_layout_summary(member)? {
+                        type_layouts.insert(name, layout);
                     }
                 }
                 "ContinuousAssign" => {
@@ -516,6 +595,7 @@ impl SlangAstSummary {
             continuous_targets,
             procedural_blocks,
             instances,
+            type_layouts,
             kinds,
         })
     }
