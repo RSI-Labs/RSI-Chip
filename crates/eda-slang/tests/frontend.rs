@@ -10246,6 +10246,142 @@ endmodule
 }
 
 #[test]
+fn slang_direct_and_bounded_paths_match_64_bit_and_unsigned_i64_boundaries() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("width-boundaries");
+    let source_path = root.join("width_boundaries.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module width_boundaries(
+  input logic [63:0] unsigned_value,
+  input logic signed [63:0] signed_min,
+  input logic [64:0] wide_value,
+  input logic signed [64:0] signed_wide_min,
+  output logic [63:0] wrapped_increment,
+  output logic [63:0] logical_right,
+  output logic above_i64_max,
+  output logic signed_negative,
+  output logic wide_above_u64,
+  output logic signed_wide_negative,
+  output logic [64:0] wide_wrapped_increment
+);
+  assign wrapped_increment = unsigned_value + 64'd1;
+  assign logical_right = unsigned_value >> 1;
+  assign above_i64_max = unsigned_value > 64'h7fffffffffffffff;
+  assign signed_negative = signed_min < 64'sd0;
+  assign wide_above_u64 = wide_value > 65'h0000ffffffffffffffff;
+  assign signed_wide_negative = signed_wide_min < 65'sd0;
+  assign wide_wrapped_increment = wide_value + 1'b1;
+endmodule
+"#,
+    )
+    .expect("write width-boundary source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("width_boundaries"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower 64-bit and wider boundary expressions");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("width_boundaries"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower boundary expressions through the bounded differential path");
+
+    let run_boundaries = |design: &eda_core::ir::Design| {
+        let mut simulator = Simulator::new(design).expect("create width-boundary simulator");
+        simulator
+            .set_input("unsigned_value", &LogicWord::ones(64))
+            .unwrap();
+        simulator
+            .set_input(
+                "signed_min",
+                &LogicWord::from_u64(64, 0x8000_0000_0000_0000),
+            )
+            .unwrap();
+        simulator
+            .set_input("wide_value", &LogicWord::ones(65))
+            .unwrap();
+        let signed_wide_minimum = {
+            let mut value = LogicWord::zero(65);
+            value.bits[64] = LogicValue::One;
+            value
+        };
+        simulator
+            .set_input("signed_wide_min", &signed_wide_minimum)
+            .unwrap();
+
+        assert_eq!(
+            simulator.read("wrapped_increment").unwrap().to_bin_str(),
+            LogicWord::zero(64).to_bin_str(),
+            "64-bit unsigned addition must wrap at U64::MAX"
+        );
+        assert_eq!(
+            simulator.read("logical_right").unwrap().to_bin_str(),
+            LogicWord::from_u64(64, 0x7fff_ffff_ffff_ffff).to_bin_str(),
+            "logical right shift must not sign-extend"
+        );
+        assert_eq!(
+            simulator.read("above_i64_max").unwrap().to_u64(),
+            Some(1),
+            "unsigned comparison must accept values above I64::MAX in {} path",
+            if std::ptr::eq(design, &direct) {
+                "direct"
+            } else {
+                "bounded"
+            }
+        );
+        assert_eq!(
+            simulator.read("signed_negative").unwrap().to_u64(),
+            Some(1),
+            "signed comparison must preserve sign in {} path",
+            if std::ptr::eq(design, &direct) {
+                "direct"
+            } else {
+                "bounded"
+            }
+        );
+        assert_eq!(
+            simulator.read("wide_above_u64").unwrap().to_u64(),
+            Some(1),
+            "unsigned ordering must work beyond U64::MAX in {} path",
+            if std::ptr::eq(design, &direct) {
+                "direct"
+            } else {
+                "bounded"
+            }
+        );
+        assert_eq!(
+            simulator.read("signed_wide_negative").unwrap().to_u64(),
+            Some(1),
+            "signed ordering must work beyond 64 bits in {} path",
+            if std::ptr::eq(design, &direct) {
+                "direct"
+            } else {
+                "bounded"
+            }
+        );
+        assert_eq!(
+            simulator
+                .read("wide_wrapped_increment")
+                .unwrap()
+                .to_bin_str(),
+            LogicWord::zero(65).to_bin_str(),
+            "65-bit addition must wrap beyond U64::MAX without i64 truncation"
+        );
+    };
+    run_boundaries(&direct);
+    run_boundaries(&bounded);
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_power_operator() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

@@ -286,7 +286,8 @@ impl LogicWord {
         if radix == 10 {
             let v: u64 = digits.parse().ok()?;
             for (i, bit) in bits.iter_mut().enumerate().take(width) {
-                *bit = LogicValue::bit((v >> i) & 1 == 1);
+                let set = i < u64::BITS as usize && (v >> i) & 1 == 1;
+                *bit = LogicValue::bit(set);
             }
             return Some(LogicWord { bits });
         }
@@ -607,6 +608,10 @@ mod tests {
         assert_eq!(LogicWord::parse(8, "'b1010").unwrap().to_u64(), Some(10));
         assert_eq!(LogicWord::parse(8, "'hzz").unwrap().to_hex_str(), "zz");
         assert_eq!(LogicWord::parse(4, "20").unwrap().to_u64(), Some(4)); // truncate
+        assert_eq!(
+            LogicWord::parse(65, "0").unwrap().to_bin_str(),
+            LogicWord::zero(65).to_bin_str()
+        );
         assert!(LogicWord::parse(4, "abc").is_none());
     }
 

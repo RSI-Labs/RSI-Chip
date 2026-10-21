@@ -2205,16 +2205,20 @@ impl<'d> Simulator<'d> {
                                     (*op == BinOp::Eq) == equal
                                 }
                                 _ => {
-                                    let (x, y) = if signed {
-                                        (sext_i64(&av, w), sext_i64(&bv, w))
+                                    let ordering = if signed {
+                                        compare_known_words(
+                                            &sext_word(&av, w),
+                                            &sext_word(&bv, w),
+                                            true,
+                                        )
                                     } else {
-                                        (zext_u64(&av, w) as i64, zext_u64(&bv, w) as i64)
+                                        compare_known_words(&av.sized(w), &bv.sized(w), false)
                                     };
                                     match op {
-                                        BinOp::Lt => x < y,
-                                        BinOp::Le => x <= y,
-                                        BinOp::Gt => x > y,
-                                        _ => x >= y,
+                                        BinOp::Lt => ordering.is_lt(),
+                                        BinOp::Le => !ordering.is_gt(),
+                                        BinOp::Gt => ordering.is_gt(),
+                                        _ => !ordering.is_lt(),
                                     }
                                 }
                             };
@@ -2526,6 +2530,27 @@ fn sext_i64(w: &LogicWord, _width: usize) -> i64 {
     } else {
         v as i64
     }
+}
+
+fn compare_known_words(left: &LogicWord, right: &LogicWord, signed: bool) -> std::cmp::Ordering {
+    debug_assert_eq!(left.width(), right.width());
+    let mut pairs = left.bits.iter().rev().zip(right.bits.iter().rev());
+    if signed {
+        let Some((left_sign, right_sign)) = pairs.next() else {
+            return std::cmp::Ordering::Equal;
+        };
+        let ordering = (*right_sign == LogicValue::One).cmp(&(*left_sign == LogicValue::One));
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    for (a, b) in pairs {
+        let ordering = (*a == LogicValue::One).cmp(&(*b == LogicValue::One));
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 fn sext_word(w: &LogicWord, width: usize) -> LogicWord {

@@ -312,12 +312,27 @@ pub(crate) fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) 
             simple_type_signed(&parameter.type_name)?,
         )
     };
-    let signed_label = if signed { "s" } else { "u" };
+    let bits = word.to_bin_str();
+    let signed_label = if signed && bits.starts_with('1') {
+        "s"
+    } else {
+        "u"
+    };
     Some(format!(
         "Const:{width}:{signed_label}[{}:{}]",
         word.width(),
-        word.to_bin_str()
+        bits
     ))
+}
+
+fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> Option<String> {
+    let (_, bits) = literal.split_once(':')?;
+    let signed_label = if signed && bits.starts_with('1') {
+        "s"
+    } else {
+        "u"
+    };
+    Some(format!("Const:{width}:{signed_label}[{literal}]"))
 }
 
 pub(crate) fn slang_expression_fingerprint_with_parameters(
@@ -361,7 +376,7 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     }
     if root == "Const" {
         let literal = expression.literal.as_deref()?;
-        return Some(format!("Const:{width}:{signed_label}[{literal}]"));
+        return canonical_literal_fingerprint(width, signed, literal);
     }
     let operands = expression
         .operands
@@ -620,11 +635,13 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
     } = expression
     {
         if let Expr::Const(word) = signed_operand.as_ref() {
+            let bits = word.to_bin_str();
+            let signed_label = if bits.starts_with('1') { "s" } else { "u" };
             return format!(
-                "Const:{}:s[{}:{}]",
+                "Const:{}:{signed_label}[{}:{}]",
                 word.width(),
                 word.width(),
-                word.to_bin_str()
+                bits
             );
         }
     }

@@ -75,8 +75,11 @@ read/write/handle-assignment subsets, null handle assignment/comparison,
 checked `$cast` statements/conditions between prepared handles with a provable dynamic source, and
 simple integral/string type aliases, class property initializers,
 first-class sparse memories, memory file tasks, and top-level and child
-memory-port sharing. It records slang source spans and
-validates lowered structure against the authoritative AST. Unsupported
+memory-port sharing. Relational ordering evaluates the full packed operand
+width, with direct-versus-bounded coverage for 64-bit wrap, unsigned values
+above `I64::MAX`, signed minima, and signed/unsigned 65-bit ordering. It
+records slang source spans and validates lowered structure against the
+authoritative AST. Unsupported
 constructs receive explicit diagnostics instead of a hidden preprocess/reparse
 fallback.
 
