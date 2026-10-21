@@ -23,6 +23,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
         name: "sparse_memory".into(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
+        array_ports: Vec::new(),
         net_decls: vec![NetDecl {
             name: "q".into(),
             width: 8,
@@ -88,6 +89,7 @@ fn ordinary_array_design() -> Design {
         name: "ordinary_array".into(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
+        array_ports: Vec::new(),
         net_decls: vec![NetDecl {
             name: "q".into(),
             width: 8,

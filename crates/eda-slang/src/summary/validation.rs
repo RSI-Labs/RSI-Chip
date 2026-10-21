@@ -34,6 +34,9 @@ impl SlangAstSummary {
                 if design.memory_ports.iter().any(|memory_port| {
                     memory_port.name == port.name
                         && memory_port.direction == eda_core::ir::MemoryPortDirection::InOut
+                }) || design.array_ports.iter().any(|array_port| {
+                    array_port.name == port.name
+                        && array_port.direction == eda_core::ir::MemoryPortDirection::InOut
                 }) {
                     return (port.name.clone(), "InOut");
                 }

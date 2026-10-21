@@ -261,6 +261,18 @@ pub struct MemoryPortDecl {
     pub memory: usize,
 }
 
+/// A top-level ordinary unpacked-array port.
+///
+/// Ordinary arrays use aggregate/value semantics and must not acquire sparse
+/// RAM/ROM port contracts. The direction representation is shared with memory
+/// ports, but the port object and storage contract are deliberately separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayPortDecl {
+    pub name: String,
+    pub direction: MemoryPortDirection,
+    pub array: usize,
+}
+
 impl MemoryDecl {
     pub fn physical_index(&self, indexes: &[i64]) -> Option<u64> {
         if indexes.len() != self.dimensions.len() {
@@ -866,6 +878,8 @@ pub struct Design {
     pub time_scale: TimeScale,
     /// First-class top-level sparse-memory port contracts.
     pub memory_ports: Vec<MemoryPortDecl>,
+    /// First-class top-level ordinary-array port contracts.
+    pub array_ports: Vec<ArrayPortDecl>,
     pub net_decls: Vec<NetDecl>,
     pub memories: Vec<MemoryDecl>,
     pub memory_connections: Vec<MemoryConnection>,
@@ -1014,6 +1028,37 @@ impl Design {
             memory.write_mask = write_mask;
             memory.byte_enable = byte_enable;
             memory.banking = banking;
+        }
+
+        let ports = std::mem::take(&mut self.memory_ports)
+            .into_iter()
+            .map(|port| (port.name, port.direction, port.memory))
+            .chain(
+                std::mem::take(&mut self.array_ports)
+                    .into_iter()
+                    .map(|port| (port.name, port.direction, port.array)),
+            )
+            .collect::<Vec<_>>();
+        self.array_ports.clear();
+        for (name, direction, memory) in ports {
+            let storage = self
+                .memories
+                .get(memory)
+                .map(|memory| memory.storage)
+                .unwrap_or(MemoryStorage::Sparse);
+            if storage == MemoryStorage::Ordinary {
+                self.array_ports.push(ArrayPortDecl {
+                    name,
+                    direction,
+                    array: memory,
+                });
+            } else {
+                self.memory_ports.push(MemoryPortDecl {
+                    name,
+                    direction,
+                    memory,
+                });
+            }
         }
     }
 
@@ -1444,6 +1489,67 @@ mod tests {
         assert_eq!(d.net_name(2), "a[2]");
         assert_eq!(d.net_name(4), "clk");
         assert_eq!(d.net_name(9), "net9");
+    }
+
+    #[test]
+    fn infer_memory_kinds_partitions_and_repartitions_ports() {
+        let mut design = Design {
+            name: "ports".into(),
+            ..Default::default()
+        };
+        design.memories.push(MemoryDecl {
+            name: "storage".into(),
+            element_width: 8,
+            element_msb: 7,
+            element_lsb: 0,
+            dimensions: vec![MemoryDimension {
+                base: 0,
+                step: 1,
+                length: 4,
+            }],
+            flat_length: 4,
+            storage: MemoryStorage::Ordinary,
+            kind: MemoryKind::Ram,
+            template: MemoryTemplate::Unmapped,
+            write_mask: None,
+            byte_enable: None,
+            banking: MemoryBanking::default(),
+        });
+        design.memory_ports.push(MemoryPortDecl {
+            name: "storage".into(),
+            direction: MemoryPortDirection::InOut,
+            memory: 0,
+        });
+        design.processes.push(Process {
+            sens: Sens::Comb,
+            body: Stmt::MemoryBl {
+                memory: 0,
+                indexes: vec![Expr::Const(LogicWord::from_u64(8, 1))],
+                e: Expr::Const(LogicWord::from_u64(8, 0x5a)),
+            },
+        });
+
+        design.infer_memory_kinds();
+        assert_eq!(design.memories[0].storage, MemoryStorage::Sparse);
+        assert_eq!(design.memory_ports.len(), 1);
+        assert_eq!(design.array_ports.len(), 0);
+
+        design.processes.clear();
+        design.infer_memory_kinds();
+        assert_eq!(design.memories[0].storage, MemoryStorage::Ordinary);
+        assert_eq!(design.memory_ports.len(), 0);
+        assert_eq!(
+            design.array_ports,
+            vec![ArrayPortDecl {
+                name: "storage".into(),
+                direction: MemoryPortDirection::InOut,
+                array: 0,
+            }]
+        );
+
+        design.infer_memory_kinds();
+        assert_eq!(design.memory_ports.len(), 0);
+        assert_eq!(design.array_ports.len(), 1);
     }
 
     #[test]

@@ -403,25 +403,292 @@ impl<'d> Simulator<'d> {
             .map(|v| v.render(&self.vals, &self.memory_elements))
     }
 
-    fn ordinary_array_port(&self, port: &str) -> Result<usize, String> {
-        let array_port = self
+    fn element_port(
+        &self,
+        port: &str,
+        ordinary: bool,
+    ) -> Result<(usize, eda_core::ir::MemoryPortDirection), String> {
+        if ordinary {
+            let Some(array_port) = self.design.array_ports.iter().find(|p| p.name == port) else {
+                if self.design.memory_ports.iter().any(|p| p.name == port) {
+                    return Err(format!(
+                        "array port '{port}' is sparse, not an ordinary array"
+                    ));
+                }
+                return Err(format!("no ordinary-array port named '{port}'"));
+            };
+            let array = self.canonical_memory(array_port.array);
+            let declaration = self
+                .design
+                .memories
+                .get(array)
+                .ok_or_else(|| format!("ordinary-array port '{port}' has no array object"))?;
+            if declaration.storage != eda_core::ir::MemoryStorage::Ordinary {
+                return Err(format!(
+                    "array port '{port}' is sparse, not an ordinary array"
+                ));
+            }
+            Ok((array, array_port.direction))
+        } else {
+            let Some(memory_port) = self.design.memory_ports.iter().find(|p| p.name == port) else {
+                if self.design.array_ports.iter().any(|p| p.name == port) {
+                    return Err(format!(
+                        "sparse-memory port '{port}' is ordinary, not a sparse memory"
+                    ));
+                }
+                return Err(format!("no sparse-memory port named '{port}'"));
+            };
+            let memory = self.canonical_memory(memory_port.memory);
+            let declaration = self
+                .design
+                .memories
+                .get(memory)
+                .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
+            if declaration.storage != eda_core::ir::MemoryStorage::Sparse {
+                return Err(format!(
+                    "sparse-memory port '{port}' is ordinary, not a sparse memory"
+                ));
+            }
+            Ok((memory, memory_port.direction))
+        }
+    }
+
+    fn element_port_label(ordinary: bool) -> &'static str {
+        if ordinary {
+            "ordinary-array"
+        } else {
+            "sparse-memory"
+        }
+    }
+
+    fn set_element_input(
+        &mut self,
+        port: &str,
+        indexes: &[i64],
+        value: &LogicWord,
+        ordinary: bool,
+    ) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("simulation cancelled".into());
+        }
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!(
+                "{} port '{port}' is not an input",
+                Self::element_port_label(ordinary)
+            ));
+        }
+        let physical = self
             .design
-            .memory_ports
-            .iter()
-            .find(|array_port| array_port.name == port)
-            .ok_or_else(|| format!("no ordinary-array port named '{port}'"))?;
-        let array = self.canonical_memory(array_port.memory);
+            .memories
+            .get(memory)
+            .and_then(|declaration| declaration.physical_index(indexes))
+            .ok_or_else(|| {
+                format!(
+                    "{} port '{port}' index is out of range",
+                    Self::element_port_label(ordinary)
+                )
+            })?;
+        self.apply_memory_update(memory, physical, value.clone())?;
+        self.settle()
+    }
+
+    fn set_element_input_bulk(
+        &mut self,
+        port: &str,
+        elements: &[(Vec<i64>, LogicWord)],
+        ordinary: bool,
+    ) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("simulation cancelled".into());
+        }
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!(
+                "{} port '{port}' is not an input",
+                Self::element_port_label(ordinary)
+            ));
+        }
+        let label = Self::element_port_label(ordinary);
         let declaration = self
             .design
             .memories
-            .get(array)
-            .ok_or_else(|| format!("ordinary-array port '{port}' has no array object"))?;
-        if declaration.storage != eda_core::ir::MemoryStorage::Ordinary {
+            .get(memory)
+            .ok_or_else(|| format!("{label} port '{port}' has no storage"))?;
+        let physical = elements
+            .iter()
+            .map(|(indexes, _)| {
+                declaration
+                    .physical_index(indexes)
+                    .ok_or_else(|| format!("{label} port '{port}' index is out of range"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for ((_, value), physical) in elements.iter().zip(physical) {
+            self.apply_memory_update(memory, physical, value.clone())?;
+        }
+        self.settle()
+    }
+
+    fn set_element_input_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+        values: &[LogicWord],
+        ordinary: bool,
+    ) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            return Err("simulation cancelled".into());
+        }
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
+        ) {
             return Err(format!(
-                "array port '{port}' is sparse, not an ordinary array"
+                "{} port '{port}' is not an input",
+                Self::element_port_label(ordinary)
             ));
         }
-        Ok(array)
+        let label = Self::element_port_label(ordinary);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("{label} port '{port}' has no storage"))?;
+        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
+        if physical.len() != values.len() {
+            return Err(format!(
+                "{label} port '{port}' range has {} elements but {} values were supplied",
+                physical.len(),
+                values.len()
+            ));
+        }
+        for (value, physical) in values.iter().zip(physical) {
+            self.apply_memory_update(memory, physical, value.clone())?;
+        }
+        self.settle()
+    }
+
+    fn read_element_output(
+        &mut self,
+        port: &str,
+        indexes: &[i64],
+        ordinary: bool,
+    ) -> Result<LogicWord, String> {
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!(
+                "{} port '{port}' is not an output",
+                Self::element_port_label(ordinary)
+            ));
+        }
+        let label = Self::element_port_label(ordinary);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("{label} port '{port}' has no storage"))?;
+        let physical = declaration
+            .physical_index(indexes)
+            .ok_or_else(|| format!("{label} port '{port}' index is out of range"))?;
+        Ok(self
+            .memory_elements
+            .get(memory)
+            .and_then(|elements| elements.get(physical))
+            .cloned()
+            .unwrap_or_else(|| LogicWord::xes(declaration.element_width)))
+    }
+
+    fn read_element_output_bulk(
+        &mut self,
+        port: &str,
+        indexes: &[Vec<i64>],
+        ordinary: bool,
+    ) -> Result<Vec<LogicWord>, String> {
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!(
+                "{} port '{port}' is not an output",
+                Self::element_port_label(ordinary)
+            ));
+        }
+        let label = Self::element_port_label(ordinary);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("{label} port '{port}' has no storage"))?;
+        let physical = indexes
+            .iter()
+            .map(|indexes| {
+                declaration
+                    .physical_index(indexes)
+                    .ok_or_else(|| format!("{label} port '{port}' index is out of range"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(physical
+            .into_iter()
+            .map(|physical| {
+                self.memory_elements
+                    .get(memory)
+                    .and_then(|elements| elements.get(physical))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
+            })
+            .collect())
+    }
+
+    fn read_element_output_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+        ordinary: bool,
+    ) -> Result<Vec<LogicWord>, String> {
+        self.settle()?;
+        let (memory, direction) = self.element_port(port, ordinary)?;
+        if !matches!(
+            direction,
+            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
+        ) {
+            return Err(format!(
+                "{} port '{port}' is not an output",
+                Self::element_port_label(ordinary)
+            ));
+        }
+        let label = Self::element_port_label(ordinary);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| format!("{label} port '{port}' has no storage"))?;
+        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
+        Ok(physical
+            .into_iter()
+            .map(|physical| {
+                self.memory_elements
+                    .get(memory)
+                    .and_then(|elements| elements.get(physical))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
+            })
+            .collect())
     }
 
     pub fn set_ordinary_array_input(
@@ -430,8 +697,7 @@ impl<'d> Simulator<'d> {
         indexes: &[i64],
         value: &LogicWord,
     ) -> Result<(), String> {
-        self.ordinary_array_port(port)?;
-        self.set_memory_input(port, indexes, value)
+        self.set_element_input(port, indexes, value, true)
     }
 
     pub fn set_ordinary_array_input_bulk(
@@ -439,8 +705,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         stimulus: &[(Vec<i64>, LogicWord)],
     ) -> Result<(), String> {
-        self.ordinary_array_port(port)?;
-        self.set_memory_input_bulk(port, stimulus)
+        self.set_element_input_bulk(port, stimulus, true)
     }
 
     pub fn set_ordinary_array_input_range(
@@ -449,8 +714,7 @@ impl<'d> Simulator<'d> {
         ranges: &[(i64, i64)],
         values: &[LogicWord],
     ) -> Result<(), String> {
-        self.ordinary_array_port(port)?;
-        self.set_memory_input_range(port, ranges, values)
+        self.set_element_input_range(port, ranges, values, true)
     }
 
     pub fn read_ordinary_array_output(
@@ -458,8 +722,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         indexes: &[i64],
     ) -> Result<LogicWord, String> {
-        self.ordinary_array_port(port)?;
-        self.read_memory_output(port, indexes)
+        self.read_element_output(port, indexes, true)
     }
 
     pub fn read_ordinary_array_output_bulk(
@@ -467,8 +730,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         indexes: &[Vec<i64>],
     ) -> Result<Vec<LogicWord>, String> {
-        self.ordinary_array_port(port)?;
-        self.read_memory_output_bulk(port, indexes)
+        self.read_element_output_bulk(port, indexes, true)
     }
 
     pub fn read_ordinary_array_output_range(
@@ -476,8 +738,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         ranges: &[(i64, i64)],
     ) -> Result<Vec<LogicWord>, String> {
-        self.ordinary_array_port(port)?;
-        self.read_memory_output_range(port, ranges)
+        self.read_element_output_range(port, ranges, true)
     }
 
     /// Set an input port by name; propagates immediately (delta cycles).
@@ -524,33 +785,7 @@ impl<'d> Simulator<'d> {
         indexes: &[i64],
         value: &LogicWord,
     ) -> Result<(), String> {
-        if self.cancellation.is_cancelled() {
-            return Err("simulation cancelled".into());
-        }
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an input"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = declaration
-            .physical_index(indexes)
-            .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))?;
-        self.apply_memory_update(memory, physical, value.clone())?;
-        self.settle()
+        self.set_element_input(port, indexes, value, false)
     }
 
     /// Set multiple elements of a top-level input or inout sparse-memory port.
@@ -562,40 +797,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         elements: &[(Vec<i64>, LogicWord)],
     ) -> Result<(), String> {
-        if self.cancellation.is_cancelled() {
-            return Err("simulation cancelled".into());
-        }
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an input"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = elements
-            .iter()
-            .map(|(indexes, _)| {
-                declaration
-                    .physical_index(indexes)
-                    .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        for ((_, value), physical) in elements.iter().zip(physical) {
-            self.apply_memory_update(memory, physical, value.clone())?;
-        }
-        self.settle()
+        self.set_element_input_bulk(port, elements, false)
     }
 
     /// Set a rectangular range of top-level input or inout sparse-memory
@@ -606,72 +808,12 @@ impl<'d> Simulator<'d> {
         ranges: &[(i64, i64)],
         values: &[LogicWord],
     ) -> Result<(), String> {
-        if self.cancellation.is_cancelled() {
-            return Err("simulation cancelled".into());
-        }
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::In | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an input"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
-        if physical.len() != values.len() {
-            return Err(format!(
-                "sparse-memory port '{port}' range has {} elements but {} values were supplied",
-                physical.len(),
-                values.len()
-            ));
-        }
-        for (value, physical) in values.iter().zip(physical) {
-            self.apply_memory_update(memory, physical, value.clone())?;
-        }
-        self.settle()
+        self.set_element_input_range(port, ranges, values, false)
     }
 
     /// Read one element from a top-level output or inout sparse-memory port.
     pub fn read_memory_output(&mut self, port: &str, indexes: &[i64]) -> Result<LogicWord, String> {
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an output"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = declaration
-            .physical_index(indexes)
-            .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))?;
-        Ok(self
-            .memory_elements
-            .get(memory)
-            .and_then(|elements| elements.get(physical))
-            .cloned()
-            .unwrap_or_else(|| LogicWord::xes(declaration.element_width)))
+        self.read_element_output(port, indexes, false)
     }
 
     /// Read multiple elements from a top-level output or inout sparse-memory
@@ -681,43 +823,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         indexes: &[Vec<i64>],
     ) -> Result<Vec<LogicWord>, String> {
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an output"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = indexes
-            .iter()
-            .map(|indexes| {
-                declaration
-                    .physical_index(indexes)
-                    .ok_or_else(|| format!("sparse-memory port '{port}' index is out of range"))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(physical
-            .into_iter()
-            .map(|physical| {
-                self.memory_elements
-                    .get(memory)
-                    .and_then(|elements| elements.get(physical))
-                    .cloned()
-                    .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
-            })
-            .collect())
+        self.read_element_output_bulk(port, indexes, false)
     }
 
     /// Read a rectangular range of top-level output or inout sparse-memory
@@ -727,36 +833,7 @@ impl<'d> Simulator<'d> {
         port: &str,
         ranges: &[(i64, i64)],
     ) -> Result<Vec<LogicWord>, String> {
-        self.settle()?;
-        let memory_port = self
-            .design
-            .memory_ports
-            .iter()
-            .find(|memory_port| memory_port.name == port)
-            .ok_or_else(|| format!("no sparse-memory port named '{port}'"))?;
-        if !matches!(
-            memory_port.direction,
-            eda_core::ir::MemoryPortDirection::Out | eda_core::ir::MemoryPortDirection::InOut
-        ) {
-            return Err(format!("sparse-memory port '{port}' is not an output"));
-        }
-        let memory = self.canonical_memory(memory_port.memory);
-        let declaration = self
-            .design
-            .memories
-            .get(memory)
-            .ok_or_else(|| format!("sparse-memory port '{port}' has no memory object"))?;
-        let physical = memory_range_physical_indexes(declaration, ranges, port)?;
-        Ok(physical
-            .into_iter()
-            .map(|physical| {
-                self.memory_elements
-                    .get(memory)
-                    .and_then(|elements| elements.get(physical))
-                    .cloned()
-                    .unwrap_or_else(|| LogicWord::xes(declaration.element_width))
-            })
-            .collect())
+        self.read_element_output_range(port, ranges, false)
     }
 
     /// Read a declaration (any net in the design) by name.

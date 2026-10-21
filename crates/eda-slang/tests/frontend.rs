@@ -4076,7 +4076,9 @@ fn slang_ast_direct_lowering_supports_directional_ordinary_array_ports() {
 module ordinary_array_ports(
   input wire logic [7:0] source [0:3],
   output logic [7:0] destination [0:3],
-  output logic [7:0] observed
+  inout wire logic [7:0] bidirectional [0:3],
+  output logic [7:0] observed,
+  output logic [7:0] observed_bidirectional
 );
   initial begin
     destination[0] = 8'h10;
@@ -4085,6 +4087,7 @@ module ordinary_array_ports(
     destination[3] = 8'h13;
   end
   assign observed = source[2];
+  assign observed_bidirectional = bidirectional[1];
 endmodule
 "#,
     )
@@ -4097,7 +4100,8 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower directional ordinary-array ports");
-    assert_eq!(design.memory_ports.len(), 2);
+    assert_eq!(design.memory_ports.len(), 0);
+    assert_eq!(design.array_ports.len(), 3);
     assert_eq!(
         design.memories[0].storage,
         eda_core::ir::MemoryStorage::Ordinary
@@ -4110,9 +4114,40 @@ endmodule
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::Unmapped
     );
-    assert_eq!(design.ports.len(), 3);
+    assert_eq!(
+        design.array_ports[0],
+        eda_core::ir::ArrayPortDecl {
+            name: "source".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::In,
+            array: 0,
+        }
+    );
+    assert_eq!(
+        design.array_ports[1],
+        eda_core::ir::ArrayPortDecl {
+            name: "destination".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::Out,
+            array: 1,
+        }
+    );
+    assert_eq!(
+        design.array_ports[2],
+        eda_core::ir::ArrayPortDecl {
+            name: "bidirectional".to_string(),
+            direction: eda_core::ir::MemoryPortDirection::InOut,
+            array: 2,
+        }
+    );
+    assert_eq!(design.ports.len(), 5);
 
     let mut simulator = Simulator::new(&design).expect("create ordinary-array-port simulator");
+    let error = simulator
+        .set_memory_input("source", &[2], &LogicWord::from_u64(8, 0x42))
+        .expect_err("sparse-memory APIs must reject ordinary arrays");
+    assert!(
+        error.contains("sparse-memory port 'source' is ordinary"),
+        "unexpected error: {error}"
+    );
     simulator
         .run_until(0)
         .expect("run ordinary-array initializers");
@@ -4120,6 +4155,19 @@ endmodule
         .set_ordinary_array_input("source", &[2], &LogicWord::from_u64(8, 0x42))
         .expect("set one ordinary-array input element");
     assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x42));
+    simulator
+        .set_ordinary_array_input("bidirectional", &[1], &LogicWord::from_u64(8, 0x5a))
+        .expect("set one ordinary-array inout element");
+    assert_eq!(
+        simulator
+            .read_ordinary_array_output("bidirectional", &[1])
+            .expect("read one ordinary-array inout element"),
+        LogicWord::from_u64(8, 0x5a)
+    );
+    assert_eq!(
+        simulator.read("observed_bidirectional").unwrap().to_u64(),
+        Some(0x5a)
+    );
     assert_eq!(
         simulator
             .read_ordinary_array_output("destination", &[2])
@@ -4191,6 +4239,7 @@ endmodule
         )
         .expect("directly lower top-level sparse-memory ports");
     assert_eq!(design.memory_ports.len(), 2);
+    assert_eq!(design.array_ports.len(), 0);
     assert_eq!(
         design.memories[0].storage,
         eda_core::ir::MemoryStorage::Sparse
