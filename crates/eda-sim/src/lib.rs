@@ -402,6 +402,83 @@ impl<'d> Simulator<'d> {
             .map(|v| v.render(&self.vals, &self.memory_elements))
     }
 
+    fn ordinary_array_port(&self, port: &str) -> Result<usize, String> {
+        let array_port = self
+            .design
+            .memory_ports
+            .iter()
+            .find(|array_port| array_port.name == port)
+            .ok_or_else(|| format!("no ordinary-array port named '{port}'"))?;
+        let array = self.canonical_memory(array_port.memory);
+        let declaration = self
+            .design
+            .memories
+            .get(array)
+            .ok_or_else(|| format!("ordinary-array port '{port}' has no array object"))?;
+        if declaration.storage != eda_core::ir::MemoryStorage::Ordinary {
+            return Err(format!(
+                "array port '{port}' is sparse, not an ordinary array"
+            ));
+        }
+        Ok(array)
+    }
+
+    pub fn set_ordinary_array_input(
+        &mut self,
+        port: &str,
+        indexes: &[i64],
+        value: &LogicWord,
+    ) -> Result<(), String> {
+        self.ordinary_array_port(port)?;
+        self.set_memory_input(port, indexes, value)
+    }
+
+    pub fn set_ordinary_array_input_bulk(
+        &mut self,
+        port: &str,
+        stimulus: &[(Vec<i64>, LogicWord)],
+    ) -> Result<(), String> {
+        self.ordinary_array_port(port)?;
+        self.set_memory_input_bulk(port, stimulus)
+    }
+
+    pub fn set_ordinary_array_input_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+        values: &[LogicWord],
+    ) -> Result<(), String> {
+        self.ordinary_array_port(port)?;
+        self.set_memory_input_range(port, ranges, values)
+    }
+
+    pub fn read_ordinary_array_output(
+        &mut self,
+        port: &str,
+        indexes: &[i64],
+    ) -> Result<LogicWord, String> {
+        self.ordinary_array_port(port)?;
+        self.read_memory_output(port, indexes)
+    }
+
+    pub fn read_ordinary_array_output_bulk(
+        &mut self,
+        port: &str,
+        indexes: &[Vec<i64>],
+    ) -> Result<Vec<LogicWord>, String> {
+        self.ordinary_array_port(port)?;
+        self.read_memory_output_bulk(port, indexes)
+    }
+
+    pub fn read_ordinary_array_output_range(
+        &mut self,
+        port: &str,
+        ranges: &[(i64, i64)],
+    ) -> Result<Vec<LogicWord>, String> {
+        self.ordinary_array_port(port)?;
+        self.read_memory_output_range(port, ranges)
+    }
+
     /// Set an input port by name; propagates immediately (delta cycles).
     pub fn set_input(&mut self, port: &str, value: &LogicWord) -> Result<(), String> {
         if self.cancellation.is_cancelled() {

@@ -208,7 +208,9 @@ macro plans, and emit VCD words only when touched, while process-accessed or
 >4,096-bit storage lowers to first-class sparse `MemoryDecl` objects backed by
 touched-element maps with explicit read, blocking-write, and NBA-write
 operations; a natural 4 KiB byte array uses 30 flat bits rather than 32,797,
-and the sparse-memory regression extends to 1 MiB-by-8. Sparse memories
+and the sparse-memory regression extends to 1 MiB-by-8. Dedicated
+`set_ordinary_array_input*` and `read_ordinary_array_output*` APIs enforce the
+Ordinary storage contract and reject sparse-memory ports. Sparse memories
 support indexed part-select reads and writes with runtime starts, reversed
 elements, continuous lvalue preservation, disjoint NBA-field merging, and
 large `inout` memory-port sharing through the hierarchy. Post-elaboration

@@ -4064,6 +4064,104 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_directional_ordinary_array_ports() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-ordinary-array-ports");
+    let source_path = root.join("ordinary_array_ports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module ordinary_array_ports(
+  input wire logic [7:0] source [0:3],
+  output logic [7:0] destination [0:3],
+  output logic [7:0] observed
+);
+  initial begin
+    destination[0] = 8'h10;
+    destination[1] = 8'h11;
+    destination[2] = 8'h12;
+    destination[3] = 8'h13;
+  end
+  assign observed = source[2];
+endmodule
+"#,
+    )
+    .expect("write directional ordinary-array port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("ordinary_array_ports"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower directional ordinary-array ports");
+    assert_eq!(design.memory_ports.len(), 2);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
+    assert_eq!(
+        design.memories[1].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::Unmapped
+    );
+    assert_eq!(design.ports.len(), 3);
+
+    let mut simulator = Simulator::new(&design).expect("create ordinary-array-port simulator");
+    simulator
+        .run_until(0)
+        .expect("run ordinary-array initializers");
+    simulator
+        .set_ordinary_array_input("source", &[2], &LogicWord::from_u64(8, 0x42))
+        .expect("set one ordinary-array input element");
+    assert_eq!(simulator.read("observed").unwrap().to_u64(), Some(0x42));
+    assert_eq!(
+        simulator
+            .read_ordinary_array_output("destination", &[2])
+            .expect("read one ordinary-array output element"),
+        LogicWord::from_u64(8, 0x12)
+    );
+
+    let stimulus = vec![
+        (vec![0], LogicWord::from_u64(8, 0x10)),
+        (vec![3], LogicWord::from_u64(8, 0x13)),
+    ];
+    simulator
+        .set_ordinary_array_input_bulk("source", &stimulus)
+        .expect("bulk-set ordinary-array input");
+    let values = simulator
+        .read_ordinary_array_output_bulk("destination", &[vec![3], vec![2], vec![0]])
+        .expect("bulk-read ordinary-array output");
+    assert_eq!(
+        values,
+        vec![
+            LogicWord::from_u64(8, 0x13),
+            LogicWord::from_u64(8, 0x12),
+            LogicWord::from_u64(8, 0x10),
+        ]
+    );
+
+    simulator
+        .set_ordinary_array_input_range(
+            "source",
+            &[(1, 2)],
+            &[LogicWord::from_u64(8, 0x21), LogicWord::from_u64(8, 0x22)],
+        )
+        .expect("range-set ordinary-array input");
+    assert_eq!(
+        simulator
+            .read_ordinary_array_output_range("destination", &[(2, 3)])
+            .expect("range-read ordinary-array output"),
+        vec![LogicWord::from_u64(8, 0x12), LogicWord::from_u64(8, 0x13),]
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_sparse_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
@@ -4074,8 +4172,8 @@ fn slang_ast_direct_lowering_supports_top_level_sparse_memory_ports() {
         &source_path,
         r#"
 module top(
-  input wire logic [7:0] source [0:3],
-  output wire logic [7:0] destination [0:3],
+  input wire logic [7:0] source [0:4096],
+  output wire logic [7:0] destination [0:4096],
   output logic [7:0] observed
 );
   assign observed = source[2];
@@ -4094,6 +4192,10 @@ endmodule
         .expect("directly lower top-level sparse-memory ports");
     assert_eq!(design.memory_ports.len(), 2);
     assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Sparse
+    );
+    assert_eq!(
         design.memory_ports[0],
         eda_core::ir::MemoryPortDecl {
             name: "source".to_string(),
@@ -4111,6 +4213,13 @@ endmodule
     );
 
     let mut simulator = Simulator::new(&design).expect("create top-memory simulator");
+    let error = simulator
+        .set_ordinary_array_input("source", &[2], &LogicWord::from_u64(8, 0x42))
+        .expect_err("ordinary-array APIs must reject sparse memories");
+    assert!(
+        error.contains("array port 'source' is sparse"),
+        "unexpected error: {error}"
+    );
     simulator
         .set_memory_input("source", &[2], &LogicWord::from_u64(8, 0x42))
         .expect("set top memory input");
