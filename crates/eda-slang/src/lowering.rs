@@ -475,6 +475,13 @@ pub(super) struct AstUvmTlmEndpointConnection {
 pub(super) struct AstUvmSequencer {
     pub(super) request_ready: AstLoweredSymbol,
     pub(super) request_done: AstLoweredSymbol,
+    pub(super) response_ready: AstLoweredSymbol,
+    pub(super) response_tag: AstLoweredSymbol,
+    pub(super) response_id: AstLoweredSymbol,
+    pub(super) response_name: AstLoweredSymbol,
+    pub(super) response_full_name: AstLoweredSymbol,
+    pub(super) response_parent_id: AstLoweredSymbol,
+    pub(super) response_slots: Vec<AstLoweredSymbol>,
 }
 
 impl Default for AstUvmReportControls {
@@ -606,6 +613,7 @@ pub(super) struct SlangAstLowerer {
     uvm_sequencers: std::cell::RefCell<std::collections::BTreeMap<String, AstUvmSequencer>>,
     uvm_sequence_contexts: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     uvm_sequence_items: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    uvm_sequence_response_types: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     active_uvm_phase: std::cell::RefCell<Option<String>>,
     class_composition_children: std::collections::BTreeMap<(String, String), String>,
     class_composition_parents: std::collections::BTreeMap<String, String>,
@@ -770,6 +778,7 @@ impl SlangAstLowerer {
             uvm_sequencers: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_contexts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            uvm_sequence_response_types: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

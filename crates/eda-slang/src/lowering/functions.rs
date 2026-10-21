@@ -276,6 +276,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_sequence_item_call(value, &task_name)? {
             return Ok(Some(statement));
         }
+        if let Some(statement) = self.lower_uvm_sequence_response_call(value, &task_name)? {
+            return Ok(Some(statement));
+        }
         if matches!(
             task_name.as_str(),
             "$display"

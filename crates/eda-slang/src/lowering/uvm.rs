@@ -140,6 +140,38 @@ impl SlangAstLowerer {
         );
         let request_done =
             self.declare_class_internal_net(&format!("__uvm_sequence_done_{sanitized_name}"), 1);
+        let response_ready = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_ready_{sanitized_name}"),
+            1,
+        );
+        let response_tag = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_tag_{sanitized_name}"),
+            32,
+        );
+        let response_id = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_id_{sanitized_name}"),
+            64,
+        );
+        let response_name = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_name_{sanitized_name}"),
+            crate::types::STRING_WIDTH,
+        );
+        let response_full_name = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_full_name_{sanitized_name}"),
+            crate::types::STRING_WIDTH,
+        );
+        let response_parent_id = self.declare_class_internal_net(
+            &format!("__uvm_sequence_response_parent_id_{sanitized_name}"),
+            64,
+        );
+        let mut response_slots = Vec::new();
+        for slot in 0..4_usize {
+            let symbol = self.declare_class_internal_net(
+                &format!("__uvm_sequence_response_slot_{slot}_{sanitized_name}"),
+                crate::types::STRING_WIDTH,
+            );
+            response_slots.push(symbol);
+        }
         self.design.initials.extend([
             Stmt::Bl {
                 lv: class_lvalue(&request_ready),
@@ -149,7 +181,37 @@ impl SlangAstLowerer {
                 lv: class_lvalue(&request_done),
                 e: Expr::Const(LogicWord::zero(request_done.width)),
             },
+            Stmt::Bl {
+                lv: class_lvalue(&response_ready),
+                e: Expr::Const(LogicWord::zero(response_ready.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&response_tag),
+                e: Expr::Const(LogicWord::zero(response_tag.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&response_id),
+                e: Expr::Const(LogicWord::zero(response_id.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&response_name),
+                e: Expr::Const(LogicWord::zero(response_name.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&response_full_name),
+                e: Expr::Const(LogicWord::zero(response_full_name.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&response_parent_id),
+                e: Expr::Const(LogicWord::zero(response_parent_id.width)),
+            },
         ]);
+        for slot in &response_slots {
+            self.design.initials.push(Stmt::Bl {
+                lv: class_lvalue(slot),
+                e: Expr::Const(LogicWord::zero(slot.width)),
+            });
+        }
         let tag = self.declare_class_internal_net(
             &format!("__uvm_sequence_sequencer_tag_{sanitized_name}"),
             32,
@@ -208,6 +270,13 @@ impl SlangAstLowerer {
             super::AstUvmSequencer {
                 request_ready,
                 request_done,
+                response_ready,
+                response_tag,
+                response_id,
+                response_name,
+                response_full_name,
+                response_parent_id,
+                response_slots,
             },
         );
         Ok(())
@@ -3624,6 +3693,9 @@ impl SlangAstLowerer {
             .cloned()
             .ok_or_else(|| format!("class object '{object_key}' has no sequencer state"))?;
         self.uvm_sequence_items.borrow_mut().remove(object_key);
+        self.uvm_sequence_response_types
+            .borrow_mut()
+            .remove(object_key);
         Ok(Some(Stmt::Block(vec![
             Stmt::Bl {
                 lv: class_lvalue(&sequencer.request_ready),
@@ -3632,6 +3704,10 @@ impl SlangAstLowerer {
             Stmt::Bl {
                 lv: class_lvalue(&sequencer.request_done),
                 e: Expr::Const(LogicWord::zero(sequencer.request_done.width)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&sequencer.response_ready),
+                e: Expr::Const(LogicWord::zero(sequencer.response_ready.width)),
             },
         ])))
     }
@@ -3856,10 +3932,52 @@ impl SlangAstLowerer {
             if arguments.len() > 1 {
                 return Err("UVM sequencer item_done requires at most one response".into());
             }
+            let mut completion = vec![
+                Stmt::Bl {
+                    lv: class_lvalue(&sequencer.request_ready),
+                    e: Expr::Const(LogicWord::zero(sequencer.request_ready.width)),
+                },
+                Stmt::Bl {
+                    lv: class_lvalue(&sequencer.request_done),
+                    e: Expr::Const(LogicWord::from_u64(sequencer.request_done.width, 1)),
+                },
+            ];
             if arguments.first().is_some_and(|response| {
                 string_field(unwrap_conversion(response), "kind").as_deref() != Some("NullLiteral")
             }) {
-                return Err("non-null UVM sequencer item_done responses are unsupported".into());
+                if arguments.len() != 1 {
+                    return Err("UVM sequencer item_done requires at most one response".into());
+                }
+                let response_key = self
+                    .class_object_key_for_value(unwrap_conversion(&arguments[0]))?
+                    .ok_or_else(|| {
+                        "UVM sequencer item_done requires a prepared response handle".to_string()
+                    })?;
+                self.require_initialized_class_object(&response_key)?;
+                let response_class = self
+                    .class_object_types
+                    .get(&response_key)
+                    .cloned()
+                    .ok_or_else(|| format!("class object '{response_key}' has no type"))?;
+                let expected_response = self
+                    .uvm_sequence_response_types
+                    .borrow()
+                    .get(&sequencer_key)
+                    .cloned();
+                if expected_response
+                    .as_ref()
+                    .is_some_and(|expected| *expected != response_class)
+                {
+                    return Err(format!(
+                        "UVM sequencer response type '{response_class}' does not match sequence response '{expected_response:?}'"
+                    ));
+                }
+                let capture = self.response_capture_statements(&sequencer, &response_key)?;
+                completion.extend(capture);
+                completion.push(Stmt::Bl {
+                    lv: class_lvalue(&sequencer.response_ready),
+                    e: Expr::Const(LogicWord::from_u64(sequencer.response_ready.width, 1)),
+                });
             }
             let ready = class_expr(&sequencer.request_ready);
             return Ok(Some(Stmt::If {
@@ -3871,16 +3989,7 @@ impl SlangAstLowerer {
                         1,
                     ))),
                 },
-                t: Box::new(Stmt::Block(vec![
-                    Stmt::Bl {
-                        lv: class_lvalue(&sequencer.request_ready),
-                        e: Expr::Const(LogicWord::zero(sequencer.request_ready.width)),
-                    },
-                    Stmt::Bl {
-                        lv: class_lvalue(&sequencer.request_done),
-                        e: Expr::Const(LogicWord::from_u64(sequencer.request_done.width, 1)),
-                    },
-                ])),
+                t: Box::new(Stmt::Block(completion)),
                 f: Some(Box::new(Stmt::Assert {
                     cond: Expr::Const(LogicWord::zero(1)),
                     message: Some(
@@ -3919,6 +4028,220 @@ impl SlangAstLowerer {
             },
             body: Box::new(Stmt::Block(copies)),
         }))
+    }
+
+    pub(super) fn lower_uvm_sequence_response_call(
+        &self,
+        call: &Value,
+        method_name: &str,
+    ) -> Result<Option<Stmt>, String> {
+        if method_name != "get_response" {
+            return Ok(None);
+        }
+        let Some(sequence_key) = self.active_class_objects.borrow().last().cloned() else {
+            return Ok(None);
+        };
+        let sequence_class = self
+            .class_object_types
+            .get(&sequence_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequence_key}' has no type"))?;
+        let chain = self.class_chain(&sequence_class)?;
+        if official_uvm_sequence_index(&chain).is_none() {
+            return Ok(None);
+        }
+        let sequencer_key = self
+            .uvm_sequence_contexts
+            .borrow()
+            .get(&sequence_key)
+            .cloned()
+            .ok_or_else(|| format!("UVM sequence '{sequence_key}' has no sequencer context"))?;
+        let sequencer = self
+            .uvm_sequencers
+            .borrow()
+            .get(&sequencer_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{sequencer_key}' has no sequencer state"))?;
+        let empty_arguments = Vec::new();
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() || arguments.len() > 2 {
+            return Err(
+                "UVM sequence get_response requires an output and optional transaction id".into(),
+            );
+        }
+        if let Some(transaction_id) = arguments.get(1) {
+            let transaction_id = unwrap_conversion(transaction_id);
+            let literal = match string_field(transaction_id, "kind").as_deref() {
+                Some("UnaryOp")
+                    if string_field(transaction_id, "op").as_deref() == Some("Minus") =>
+                {
+                    transaction_id
+                        .get("operand")
+                        .and_then(|operand| string_field(operand, "value"))
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .map(|value| -value)
+                }
+                _ => string_field(transaction_id, "value")
+                    .or_else(|| string_field(transaction_id, "constant"))
+                    .and_then(|value| value.parse::<i64>().ok()),
+            };
+            if literal != Some(-1) {
+                return Err(
+                    "direct UVM sequence get_response supports only the default transaction id"
+                        .into(),
+                );
+            }
+        }
+        let output = arguments[0]
+            .get("left")
+            .ok_or_else(|| "UVM sequence get_response requires an output argument".to_string())?;
+        let output_key = self.class_object_key_for_value(output)?.ok_or_else(|| {
+            "UVM sequence get_response requires a prepared response object".to_string()
+        })?;
+        self.require_initialized_class_object(&output_key)?;
+        let output_class = self
+            .class_object_types
+            .get(&output_key)
+            .cloned()
+            .ok_or_else(|| format!("class object '{output_key}' has no type"))?;
+        self.uvm_sequence_response_types
+            .borrow_mut()
+            .insert(sequencer_key.clone(), output_class);
+        let restore = self.response_restore_statements(&sequencer, &output_key)?;
+        let mut body = restore;
+        body.push(Stmt::Bl {
+            lv: class_lvalue(&sequencer.response_ready),
+            e: Expr::Const(LogicWord::zero(sequencer.response_ready.width)),
+        });
+        Ok(Some(Stmt::Wait {
+            cond: Expr::Bin {
+                op: BinOp::Eq,
+                a: Box::new(class_expr(&sequencer.response_ready)),
+                b: Box::new(Expr::Const(LogicWord::from_u64(
+                    sequencer.response_ready.width,
+                    1,
+                ))),
+            },
+            body: Box::new(Stmt::Block(body)),
+        }))
+    }
+
+    fn response_capture_statements(
+        &self,
+        sequencer: &super::AstUvmSequencer,
+        source_key: &str,
+    ) -> Result<Vec<Stmt>, String> {
+        let fields = self.ordered_response_fields(source_key)?;
+        let mut statements = self.response_metadata_statements(
+            source_key,
+            [
+                &sequencer.response_tag,
+                &sequencer.response_id,
+                &sequencer.response_name,
+                &sequencer.response_full_name,
+                &sequencer.response_parent_id,
+            ],
+            true,
+        );
+        for ((_, source), slot) in fields.iter().zip(&sequencer.response_slots) {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(slot),
+                e: class_expr(source),
+            });
+        }
+        Ok(statements)
+    }
+
+    fn response_restore_statements(
+        &self,
+        sequencer: &super::AstUvmSequencer,
+        target_key: &str,
+    ) -> Result<Vec<Stmt>, String> {
+        let fields = self.ordered_response_fields(target_key)?;
+        let mut statements = self.response_metadata_statements(
+            target_key,
+            [
+                &sequencer.response_tag,
+                &sequencer.response_id,
+                &sequencer.response_name,
+                &sequencer.response_full_name,
+                &sequencer.response_parent_id,
+            ],
+            false,
+        );
+        for ((_, target), slot) in fields.iter().zip(&sequencer.response_slots) {
+            statements.push(Stmt::Bl {
+                lv: class_lvalue(target),
+                e: class_expr(slot),
+            });
+        }
+        Ok(statements)
+    }
+
+    fn response_metadata_statements(
+        &self,
+        object_key: &str,
+        response_symbols: [&super::AstLoweredSymbol; 5],
+        capture: bool,
+    ) -> Vec<Stmt> {
+        let object_symbols = [
+            &self.class_object_tags[object_key],
+            &self.class_object_ids[object_key],
+            &self.class_object_names[object_key],
+            &self.class_object_full_names[object_key],
+            &self.class_object_parent_ids[object_key],
+        ];
+        object_symbols
+            .into_iter()
+            .zip(response_symbols)
+            .map(|(object_symbol, response_symbol)| {
+                let (target, source) = if capture {
+                    (response_symbol, object_symbol)
+                } else {
+                    (object_symbol, response_symbol)
+                };
+                Stmt::Bl {
+                    lv: class_lvalue(target),
+                    e: class_expr(source),
+                }
+            })
+            .collect()
+    }
+
+    fn ordered_response_fields(
+        &self,
+        object_key: &str,
+    ) -> Result<Vec<(String, super::AstLoweredSymbol)>, String> {
+        if self
+            .class_composition_children
+            .keys()
+            .any(|(key, _)| key == object_key)
+        {
+            return Err(
+                "direct UVM sequence responses with class-valued fields are unsupported".into(),
+            );
+        }
+        let fields = self
+            .class_objects
+            .get(object_key)
+            .ok_or_else(|| format!("class object '{object_key}' has no fields"))?;
+        if fields.len() > 4 {
+            return Err("direct UVM sequence responses support at most four scalar fields".into());
+        }
+        fields
+            .iter()
+            .map(|(name, symbol)| {
+                if symbol.width > crate::types::STRING_WIDTH {
+                    return Err(format!(
+                        "UVM sequence response field '{name}' is wider than the bounded response storage"
+                    ));
+                }
+                Ok((name.clone(), symbol.clone()))
+            })
+            .collect()
     }
 
     fn class_object_copy_statements(

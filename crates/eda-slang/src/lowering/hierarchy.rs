@@ -1080,6 +1080,7 @@ impl super::SlangAstLowerer {
             uvm_sequencers: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_contexts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             uvm_sequence_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            uvm_sequence_response_types: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             active_uvm_phase: std::cell::RefCell::new(None),
             class_composition_children: std::collections::BTreeMap::new(),
             class_composition_parents: std::collections::BTreeMap::new(),

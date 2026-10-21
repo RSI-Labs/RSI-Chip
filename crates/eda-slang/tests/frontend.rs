@@ -14000,6 +14000,8 @@ import uvm_pkg::*;
 class SequenceTrace;
   static int first = -1;
   static int second = -1;
+  static int first_response = -1;
+  static int second_response = -1;
   static int driver_done = 0;
 endclass
 
@@ -14013,6 +14015,7 @@ endclass
 
 class direct_test_sequence extends uvm_sequence#(direct_request);
   direct_request item;
+  direct_request response;
 
   function new(string name = "direct_test_sequence");
     super.new(name);
@@ -14023,11 +14026,17 @@ class direct_test_sequence extends uvm_sequence#(direct_request);
     start_item(item);
     item.value = 42;
     finish_item(item);
+    response = new("first_sequence_response");
+    get_response(response);
+    SequenceTrace::first_response = response.value;
 
     item = new("second_item");
     start_item(item);
     item.value = 17;
     finish_item(item);
+    response = new("second_sequence_response");
+    get_response(response);
+    SequenceTrace::second_response = response.value;
   endtask
 endclass
 
@@ -14035,6 +14044,7 @@ class direct_sequence_probe extends uvm_test;
   uvm_sequencer#(direct_request) sequencer;
   direct_test_sequence test_sequence;
   direct_request request;
+  direct_request driver_response;
 
   function new(string name = "direct_sequence_probe",
                uvm_component parent = null);
@@ -14045,6 +14055,7 @@ class direct_sequence_probe extends uvm_test;
     sequencer = new("sequencer", this);
     test_sequence = new("sequence");
     request = new("driver_request");
+    driver_response = new("driver_response");
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -14053,11 +14064,13 @@ class direct_sequence_probe extends uvm_test;
       begin
         sequencer.get_next_item(request);
         SequenceTrace::first = request.value;
-        sequencer.item_done();
+        driver_response.value = 99;
+        sequencer.item_done(driver_response);
 
         sequencer.get_next_item(request);
         SequenceTrace::second = request.value;
-        sequencer.item_done();
+        driver_response.value = 84;
+        sequencer.item_done(driver_response);
         SequenceTrace::driver_done = 1;
       end
     join
@@ -14069,12 +14082,16 @@ endclass
 module official_uvm_sequence_probe(
   output int first,
   output int second,
+  output int first_response,
+  output int second_response,
   output int driver_done
 );
   initial begin
     run_test("direct_sequence_probe");
     first = SequenceTrace::first;
     second = SequenceTrace::second;
+    first_response = SequenceTrace::first_response;
+    second_response = SequenceTrace::second_response;
     driver_done = SequenceTrace::driver_done;
   end
 endmodule
@@ -14092,6 +14109,11 @@ endmodule
     simulator.run_until(0).expect("run UVM sequence handshake");
     assert_eq!(simulator.read("first").unwrap().to_u64(), Some(42));
     assert_eq!(simulator.read("second").unwrap().to_u64(), Some(17));
+    assert_eq!(simulator.read("first_response").unwrap().to_u64(), Some(99));
+    assert_eq!(
+        simulator.read("second_response").unwrap().to_u64(),
+        Some(84)
+    );
     assert_eq!(
         simulator.read("driver_done").unwrap().to_u64(),
         Some(1),

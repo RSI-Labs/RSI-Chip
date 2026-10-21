@@ -166,8 +166,9 @@ matching endpoint chains that terminate at a bounded FIFO export, route
 direction mismatches, and detect endpoint cycles. A literal official-UVM sequence
 bootstrap executes a user `uvm_sequence#(REQ)::body()` with prepared
 `uvm_sequence_item` handles, `start_item`/`finish_item`, a direct
-`uvm_sequencer#(REQ)`, `get_next_item`, and `item_done()` for scalar-field
-request items. Dynamic run-time connections, arbitrary port graphs, class-valued
+`uvm_sequencer#(REQ)`, `get_next_item`, `item_done(response)`, and blocking
+`get_response(response)` for request/response items with at most four scalar
+fields. Dynamic run-time connections, arbitrary port graphs, class-valued
 request fields, and the remaining TLM transport APIs remain fail-closed.
 This is still a bootstrap:
 the registry, config entries, and timeout are finite, phase objects are
