@@ -238,6 +238,7 @@ fn collect_simple_function_definitions(
 struct SimpleInstanceMethodIndex {
     methods: std::collections::BTreeMap<String, Value>,
     properties: std::collections::BTreeMap<String, String>,
+    property_definitions: std::collections::BTreeMap<String, Value>,
 }
 
 fn collect_simple_instance_methods(
@@ -258,7 +259,11 @@ fn collect_simple_instance_methods(
                         member.get("addr").and_then(Value::as_u64),
                         string_field(member, "name"),
                     ) {
-                        index.properties.insert(format!("{address} {name}"), name);
+                        let symbol = format!("{address} {name}");
+                        index.properties.insert(symbol.clone(), name);
+                        let mut definition = member.clone();
+                        normalize_detailed_types(&mut definition);
+                        index.property_definitions.insert(symbol, definition);
                     }
                 }
             }
@@ -379,6 +384,77 @@ fn canonicalize_simple_instance_method_calls(
     };
     for nested in fields.values_mut() {
         canonicalize_simple_instance_method_calls(nested, classes);
+    }
+}
+
+fn canonicalize_simple_class_property_reads(
+    value: &mut Value,
+    classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
+) {
+    if string_field(value, "kind").as_deref() == Some("MemberAccess") {
+        if let (Some(member), Some(receiver), Some(receiver_type)) = (
+            string_field(value, "member"),
+            value.get("value"),
+            value
+                .get("value")
+                .and_then(|receiver| string_field(receiver, "type")),
+        ) {
+            let class_name = receiver_type
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .rsplit(['.', '#', ':'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if let Some(index) = classes.get(&class_name) {
+                if let Some(property) = index.property_definitions.get(&member) {
+                    let is_static = string_field(property, "flags")
+                        .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"));
+                    let property_type = string_field(property, "type").unwrap_or_default();
+                    let simple_property = simple_type_width(&property_type).is_some();
+                    let receiver_is_named = matches!(
+                        string_field(receiver, "kind").as_deref(),
+                        Some("NamedValue" | "HierarchicalValue")
+                    );
+                    if !is_static
+                        && simple_property
+                        && receiver_is_named
+                        && matches!(
+                            string_field(receiver, "symbol"),
+                            Some(symbol) if !symbol.trim().is_empty()
+                        )
+                    {
+                        let receiver_symbol = string_field(receiver, "symbol").unwrap_or_default();
+                        let receiver_name = receiver_symbol
+                            .split_whitespace()
+                            .next_back()
+                            .unwrap_or_default();
+                        let property_name = index.properties.get(&member);
+                        if let Some(property_name) = property_name {
+                            *value = serde_json::json!({
+                                "kind": "NamedValue",
+                                "type": property_type,
+                                "symbol": format!("{receiver_name}.{property_name}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Value::Array(values) = value {
+        for nested in values {
+            canonicalize_simple_class_property_reads(nested, classes);
+        }
+        return;
+    }
+    let Value::Object(fields) = value else {
+        return;
+    };
+    for nested in fields.values_mut() {
+        canonicalize_simple_class_property_reads(nested, classes);
     }
 }
 
@@ -1208,6 +1284,7 @@ impl SlangAstSummary {
         let mut simple_instance_methods = std::collections::BTreeMap::new();
         collect_simple_instance_methods(&document, &mut simple_instance_methods);
         canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
+        canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
         let root = &root;
         if string_field(root, "kind").as_deref() != Some("Instance") {

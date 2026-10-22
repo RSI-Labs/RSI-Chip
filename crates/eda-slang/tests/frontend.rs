@@ -181,6 +181,42 @@ endmodule
             "missing class field {field}"
         );
     }
+    let class_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("class_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize simple-class AST");
+    let mut class_summary = slang
+        .summarize_ast_json(&class_json)
+        .expect("summarize simple-class AST");
+    class_summary
+        .validate_against_design(&design)
+        .expect("exact direct class-property fingerprints should match");
+    if let Some(assignment) = class_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "observed2")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("second.wrong".into());
+    }
+    let property_error = class_summary
+        .validate_against_design(&design)
+        .expect_err("wrong direct class property must fail");
+    assert!(
+        property_error.contains("Ref:32:s[second.wrong]")
+            && property_error.contains("Ref:32:s[second.value]"),
+        "unexpected direct class-property error: {property_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create class simulator");
     simulator.run_until(0).expect("run class initial block");
