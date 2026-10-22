@@ -9098,6 +9098,13 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower sparse-memory member source");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("memory_member_summary"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower sparse-memory member source through the bounded differential path");
     let json = slang
         .ast_json_with_options(
             std::slice::from_ref(&source_path),
@@ -9112,6 +9119,30 @@ endmodule
     summary
         .validate_against_design(&design)
         .expect("exact sparse-memory member fingerprint should match");
+    summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("bounded sparse-memory member fingerprint should be exact");
+    let mut legacy_summary = summary.clone();
+    if let Some(assignment) = legacy_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("bounded sparse-memory member lvalue")
+            .indexes[0]
+            .literal = Some("32:00000000000000000000000000000001".into());
+    }
+    let legacy_error = legacy_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("bounded sparse-memory member index must not use a wildcard");
+    assert!(
+        legacy_error.contains("MemoryRead:8:u[pairs,")
+            && legacy_error.contains("32:00000000000000000000000000000001"),
+        "unexpected bounded structural error: {legacy_error}"
+    );
 
     let assignment = summary
         .procedural_blocks
