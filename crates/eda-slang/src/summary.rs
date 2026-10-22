@@ -1,10 +1,11 @@
 //! Typed summaries and structural validation for slang's elaborated AST.
 
 use super::ast_util::{
-    expression_symbol_id, expression_target_names, instance_parameters, normalize_detailed_types,
-    normalize_instance_bodies, parameter_summary, source_span, string_field,
+    canonical_detailed_type, expression_symbol_id, expression_target_names, instance_parameters,
+    literal_word, normalize_detailed_types, normalize_instance_bodies, parameter_summary,
+    source_span, string_field,
 };
-use crate::types::simple_type_width;
+use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
 use expressions::{
     collect_generate_summary, collect_kinds, empty_expression_summary, expression_summary,
@@ -404,6 +405,170 @@ fn type_layout_summary(
     )))
 }
 
+#[derive(Default)]
+struct SlangTypeAliasIndex {
+    exact: std::collections::BTreeMap<String, Value>,
+    by_name: std::collections::BTreeMap<String, Vec<Value>>,
+}
+
+fn collect_type_alias_targets(value: &Value, aliases: &mut SlangTypeAliasIndex) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("TypeAlias") {
+            if let (Some(address), Some(name), Some(target)) = (
+                value.get("addr").and_then(Value::as_u64),
+                string_field(value, "name"),
+                value.get("target"),
+            ) {
+                aliases
+                    .exact
+                    .insert(format!("{address} {name}"), target.clone());
+                aliases
+                    .by_name
+                    .entry(name)
+                    .or_default()
+                    .push(target.clone());
+            }
+        }
+        for nested in fields.values() {
+            collect_type_alias_targets(nested, aliases);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_type_alias_targets(nested, aliases);
+        }
+    }
+}
+
+fn collect_enum_type_summaries(
+    value: &Value,
+    aliases: &SlangTypeAliasIndex,
+    enums: &mut std::collections::BTreeMap<String, Vec<SlangEnumTypeSummary>>,
+) -> Result<(), String> {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("EnumType") {
+            if string_field(value, "name").is_none_or(|name| name.is_empty()) {
+                for nested in fields.values() {
+                    collect_enum_type_summaries(nested, aliases, enums)?;
+                }
+                return Ok(());
+            }
+            let definition = enum_type_summary(value, aliases)?;
+            enums.entry(definition.0).or_default().push(definition.1);
+        }
+        for nested in fields.values() {
+            collect_enum_type_summaries(nested, aliases, enums)?;
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_enum_type_summaries(nested, aliases, enums)?;
+        }
+    }
+    Ok(())
+}
+
+fn enum_type_summary(
+    member: &Value,
+    aliases: &SlangTypeAliasIndex,
+) -> Result<(String, SlangEnumTypeSummary), String> {
+    let name = string_field(member, "name")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "slang EnumType has no name".to_string())?;
+    let raw_base_type = member
+        .get("baseType")
+        .ok_or_else(|| format!("enum type '{name}' has no base type"))?;
+    let base_type_name = enum_base_type_name(raw_base_type, aliases, 0)
+        .filter(|type_name| !type_name.is_empty())
+        .ok_or_else(|| format!("enum type '{name}' has an unresolved base type"))?;
+    let width = simple_type_width(&base_type_name)
+        .ok_or_else(|| format!("enum type '{name}' has an unresolved base width"))?;
+    let signed = simple_type_signed(&base_type_name)
+        .ok_or_else(|| format!("enum type '{name}' has unresolved base signedness"))?;
+    let members = member
+        .get("members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("enum type '{name}' has no values"))?;
+    let mut summaries = Vec::with_capacity(members.len());
+    for value in members {
+        let value_name = string_field(value, "name")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("enum type '{name}' has an unnamed value"))?;
+        let raw = string_field(value, "value")
+            .ok_or_else(|| format!("enum value '{name}.{value_name}' has no value"))?;
+        let word = literal_word(&base_type_name, &raw)
+            .ok_or_else(|| format!("enum value '{name}.{value_name}' is invalid"))?;
+        summaries.push(SlangEnumMemberSummary {
+            name: value_name,
+            literal: format!("{}:{}", word.width(), word.to_bin_str()),
+        });
+    }
+    Ok((
+        name,
+        SlangEnumTypeSummary {
+            base_type_name,
+            width,
+            signed,
+            members: summaries,
+        },
+    ))
+}
+
+fn enum_base_type_name(
+    value: &Value,
+    aliases: &SlangTypeAliasIndex,
+    depth: usize,
+) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(reference) = value.as_str() {
+        let target = aliases.exact.get(reference).or_else(|| {
+            let name = reference
+                .split_whitespace()
+                .next_back()?
+                .rsplit(['.', '#', ':'])
+                .next()?;
+            let candidates = aliases.by_name.get(name)?;
+            (candidates.len() == 1).then(|| &candidates[0])
+        })?;
+        return enum_base_type_name(target, aliases, depth + 1);
+    }
+    canonical_detailed_type(value)
+}
+
+fn annotate_enum_name_calls(
+    expression: &mut super::SlangExpressionSummary,
+    enums: &std::collections::BTreeMap<String, Vec<SlangEnumTypeSummary>>,
+) {
+    if expression.kind == "Call" {
+        let method = expression
+            .operator
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default();
+        if method == "name" {
+            if let Some(receiver) = expression.operands.first() {
+                let enum_name = receiver
+                    .type_name
+                    .split_whitespace()
+                    .next_back()
+                    .unwrap_or_default()
+                    .rsplit(['.', '#', ':'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(definitions) = enums.get(&enum_name) {
+                    if definitions.len() == 1 {
+                        expression.enum_definition = Some(definitions[0].clone());
+                    }
+                }
+            }
+        }
+    }
+    for operand in &mut expression.operands {
+        annotate_enum_name_calls(operand, enums);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
@@ -450,6 +615,21 @@ pub struct SlangDeclarationSummary {
 pub struct SlangTypeLayoutSummary {
     pub element_width: usize,
     pub fields: Vec<SlangFieldLayoutSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangEnumTypeSummary {
+    pub base_type_name: String,
+    pub width: usize,
+    pub signed: bool,
+    pub members: Vec<SlangEnumMemberSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangEnumMemberSummary {
+    pub name: String,
+    /// Canonical literal bits (`width:bits`, MSB first).
+    pub literal: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -540,6 +720,9 @@ pub struct SlangExpressionSummary {
     pub repeat_count: Option<usize>,
     /// Normalized decimal exponent for elaborated `$time`/`$stime` calls.
     pub simulation_time_unit: Option<i8>,
+    /// Definition used to construct the conditional tree emitted by direct
+    /// lowering for an enum `.name()` call.
+    pub enum_definition: Option<SlangEnumTypeSummary>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 
@@ -607,6 +790,10 @@ impl SlangAstSummary {
         let mut class_handles = std::collections::BTreeSet::new();
         collect_class_handle_names(root, &class_types, &mut class_handles);
         collect_class_static_property_symbols(&document, &mut class_handles);
+        let mut type_aliases = SlangTypeAliasIndex::default();
+        collect_type_alias_targets(root, &mut type_aliases);
+        let mut enum_types = std::collections::BTreeMap::<String, Vec<SlangEnumTypeSummary>>::new();
+        collect_enum_type_summaries(root, &type_aliases, &mut enum_types)?;
         let mut ports = Vec::new();
         let mut declarations = Vec::new();
         let mut parameters = Vec::new();
@@ -790,10 +977,12 @@ impl SlangAstSummary {
         collect_kinds(root, &mut kinds);
         for target in &mut continuous_targets {
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
+            annotate_enum_name_calls(&mut target.rhs, &enum_types);
         }
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
                 annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
+                annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
             }
         }
         Ok(Self {

@@ -13,8 +13,9 @@ use eda_core::logic::LogicWord;
 use serde_json::Value;
 
 use super::{
-    SlangAssignmentSummary, SlangContinuousTarget, SlangExpressionSummary, SlangInstanceSummary,
-    SlangMemoryMemberLvalueSummary, SlangParameterSummary, SlangProceduralBlockSummary,
+    SlangAssignmentSummary, SlangContinuousTarget, SlangEnumTypeSummary, SlangExpressionSummary,
+    SlangInstanceSummary, SlangMemoryMemberLvalueSummary, SlangParameterSummary,
+    SlangProceduralBlockSummary,
 };
 
 pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
@@ -43,6 +44,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         literal,
         repeat_count: repeat_count(value),
         simulation_time_unit: None,
+        enum_definition: None,
         operands: expression_operands(value),
     }
 }
@@ -59,6 +61,7 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         literal: None,
         repeat_count: None,
         simulation_time_unit: None,
+        enum_definition: None,
         operands: Vec::new(),
     }
 }
@@ -808,6 +811,61 @@ fn string_method_fingerprint(
     }
 }
 
+fn enum_name_receiver_fingerprint(
+    receiver: &SlangExpressionSummary,
+    definition: &SlangEnumTypeSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let mut normalized = receiver.clone();
+    normalized.type_name = definition.base_type_name.clone();
+    normalized.type_width = Some(definition.width);
+    normalized.type_signed = Some(definition.signed);
+    if normalized.literal.is_none() && matches!(normalized.kind.as_str(), "NamedValue") {
+        let symbol = normalized.symbol.as_deref()?;
+        let constant_name = symbol
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#', ':'])
+            .next()
+            .unwrap_or_default();
+        normalized.literal = definition
+            .members
+            .iter()
+            .find(|member| member.name == constant_name)
+            .map(|member| member.literal.clone());
+    }
+    slang_expression_fingerprint_with_parameters(&normalized, parameters, mode)
+}
+
+fn enum_name_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if mode != ExpressionFingerprintMode::Direct {
+        return None;
+    }
+    let definition = expression.enum_definition.as_ref()?;
+    let receiver = expression.operands.first()?;
+    let receiver = enum_name_receiver_fingerprint(receiver, definition, parameters, mode)?;
+
+    let zeros = "0".repeat(STRING_WIDTH);
+    let mut result = format!("Const:{STRING_WIDTH}:u[{STRING_WIDTH}:{zeros}]");
+    for member in &definition.members {
+        let enum_value = format!("Const:{}:u[{}]", definition.width, member.literal);
+        let name = string_literal_word(&member.name)?;
+        let rendered = format!(
+            "Const:{STRING_WIDTH}:u[{STRING_WIDTH}:{}]",
+            name.to_bin_str()
+        );
+        let condition = format!("Eq:1:u[{receiver},{enum_value}]");
+        result = format!("Cond:{STRING_WIDTH}:u[{condition},{rendered},{result}]");
+    }
+    Some(result)
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -856,6 +914,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                     mode,
                 )?;
                 return Some(format!("AssocTraversal:{operation}:u[{memory},{key}]"));
+            }
+        }
+        if method == "name" {
+            if let Some(fingerprint) = enum_name_fingerprint(expression, parameters, mode) {
+                return Some(fingerprint);
             }
         }
         if let Some(fingerprint) = string_method_fingerprint(expression, parameters, mode) {

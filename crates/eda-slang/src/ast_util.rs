@@ -40,7 +40,7 @@ pub(super) fn normalize_detailed_types(value: &mut Value) {
     }
 }
 
-fn canonical_detailed_type(value: &Value) -> Option<String> {
+pub(super) fn canonical_detailed_type(value: &Value) -> Option<String> {
     let kind = value.get("kind").and_then(Value::as_str)?;
     match kind {
         "ScalarType" => {

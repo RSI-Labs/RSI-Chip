@@ -23,8 +23,8 @@ use lowering::{
 };
 pub use summary::{
     SlangAssignmentSummary, SlangAstSummary, SlangContinuousTarget, SlangDeclarationSummary,
-    SlangExpressionSummary, SlangInstanceSummary, SlangParameterSummary, SlangPortSummary,
-    SlangProceduralBlockSummary, SlangSourceSpan,
+    SlangEnumMemberSummary, SlangEnumTypeSummary, SlangExpressionSummary, SlangInstanceSummary,
+    SlangParameterSummary, SlangPortSummary, SlangProceduralBlockSummary, SlangSourceSpan,
 };
 
 #[derive(Clone, Debug)]

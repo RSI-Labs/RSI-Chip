@@ -6826,6 +6826,7 @@ endmodule
                 literal: None,
                 repeat_count: None,
                 simulation_time_unit: None,
+                enum_definition: None,
                 operands: Vec::new(),
             },
         });
@@ -10321,6 +10322,7 @@ module strings(
   output string literal_joined,
   output string state_name,
   output string constant_name,
+  output string alias_constant_name,
   output string invalid_name,
   output int left_length,
   output int right_length,
@@ -10352,6 +10354,12 @@ module strings(
     C = 2'b10
   } state_t;
 
+  typedef bit [1:0] alias_base_t;
+  typedef enum alias_base_t {
+    ALIAS_A = 2'b00,
+    ALIAS_B = 2'b01
+  } alias_state_t;
+
   string literal_source = "aBcD";
   int conversion_source = -42;
   state_t state;
@@ -10376,6 +10384,7 @@ module strings(
   assign literal_joined = {"AB", "CD"};
   assign state_name = state.name();
   assign constant_name = B.name();
+  assign alias_constant_name = ALIAS_B.name();
   assign invalid_name = state_t'(2'b11).name();
   assign left_length = left.len();
   assign right_length = right.len();
@@ -10405,7 +10414,7 @@ endmodule
         )
         .expect("lower strings and enum names");
     assert_eq!(design.processes.len(), 1);
-    assert_eq!(design.assigns.len(), 23);
+    assert_eq!(design.assigns.len(), 24);
     assert_eq!(
         design
             .net_decls
@@ -10429,6 +10438,74 @@ endmodule
     string_summary
         .validate_against_design(&design)
         .expect("exact direct string method fingerprints should match");
+
+    let mut enum_receiver_summary = string_summary.clone();
+    if let Some(target) = enum_receiver_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "state_name")
+    {
+        target.rhs.operands[0].symbol = Some("wrong_state".into());
+    }
+    let enum_receiver_error = enum_receiver_summary
+        .validate_against_design(&design)
+        .expect_err("wrong enum-name receiver must fail");
+    assert!(
+        enum_receiver_error.contains("Ref:2:u[wrong_state]")
+            && enum_receiver_error.contains("Ref:2:u[state]"),
+        "unexpected enum-name receiver error: {enum_receiver_error}"
+    );
+
+    let mut enum_value_summary = string_summary.clone();
+    if let Some(definition) = enum_value_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "state_name")
+        .and_then(|target| target.rhs.enum_definition.as_mut())
+    {
+        definition.members[0].literal = "2:11".into();
+    }
+    let enum_value_error = enum_value_summary
+        .validate_against_design(&design)
+        .expect_err("wrong enum-name value must fail");
+    assert!(
+        enum_value_error.contains("Const:2:u[2:00]")
+            && enum_value_error.contains("Const:2:u[2:11]"),
+        "unexpected enum-name value error: {enum_value_error}"
+    );
+
+    let mut enum_member_name_summary = string_summary.clone();
+    if let Some(definition) = enum_member_name_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "state_name")
+        .and_then(|target| target.rhs.enum_definition.as_mut())
+    {
+        definition.members[1].name = "WRONG".into();
+    }
+    assert!(
+        enum_member_name_summary
+            .validate_against_design(&design)
+            .is_err(),
+        "wrong enum member name must fail"
+    );
+
+    let mut enum_order_summary = string_summary.clone();
+    if let Some(definition) = enum_order_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "state_name")
+        .and_then(|target| target.rhs.enum_definition.as_mut())
+    {
+        definition.members.swap(0, 1);
+    }
+    let enum_order_error = enum_order_summary
+        .validate_against_design(&design)
+        .expect_err("wrong enum member order must fail");
+    assert!(
+        enum_order_error.contains("state_name") && enum_order_error.contains("Cond:512:u["),
+        "unexpected enum member order error: {enum_order_error}"
+    );
 
     let mut case_summary = string_summary.clone();
     if let Some(target) = case_summary
@@ -10601,6 +10678,13 @@ endmodule
                 .unwrap()
                 .to_ascii_string_nul_terminated(),
             "B"
+        );
+        assert_eq!(
+            simulator
+                .read("alias_constant_name")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "ALIAS_B"
         );
         assert_eq!(
             simulator
