@@ -5,7 +5,8 @@ use crate::ast_util::{
     integer_literal_word, literal_word, named_constant_word, slang_constant_u64, string_field,
 };
 use crate::types::{
-    simple_type_shape, simple_type_signed, simple_type_width, string_literal_word, STRING_WIDTH,
+    memory_type, simple_type_shape, simple_type_signed, simple_type_width, string_literal_word,
+    STRING_WIDTH,
 };
 use eda_core::ir::Design;
 use serde_json::Value;
@@ -91,6 +92,11 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
         "Conversion" => {
             if let Some(operand) = value.get("operand") {
                 operands.push(expression_summary(operand));
+            }
+        }
+        "NewArray" => {
+            if let Some(size) = value.get("sizeExpr") {
+                operands.push(expression_summary(size));
             }
         }
         "Concatenation" => {
@@ -726,6 +732,33 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 return Some(format!("MemorySize:32:s[{memory}]"));
             }
         }
+        if method == "$size" {
+            let selected = expression.operands.first()?;
+            if selected.type_name.contains('$') {
+                let selected_symbol = selected.symbol.as_deref()?;
+                let memory = selected_symbol
+                    .rsplit_once(' ')
+                    .map(|(_, memory)| memory)
+                    .unwrap_or(selected_symbol);
+                if selected.type_name.contains("$[]")
+                    || selected.type_name.contains("$queue")
+                    || selected.type_name.contains("$assoc[")
+                {
+                    return Some(format!("MemorySize:32:s[{memory}]"));
+                }
+                if let Some(array) = memory_type(&selected.type_name) {
+                    let dimension = expression
+                        .operands
+                        .get(1)
+                        .and_then(summary_literal_i64)
+                        .unwrap_or(1);
+                    let dimension = usize::try_from(dimension).ok()?;
+                    let dimension = array.dimensions.get(dimension.checked_sub(1)?)?;
+                    let bits = format!("32:{:032b}", dimension.length);
+                    return Some(format!("Const:32:u[{bits}]"));
+                }
+            }
+        }
         if method == "exists" {
             let selected = expression.operands.first()?;
             if selected.type_name.contains("$assoc[") {
@@ -742,6 +775,34 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 return Some(format!("AssocExists:1:u[{memory},{key}]"));
             }
         }
+    }
+    if expression.kind == "NewArray" {
+        let size = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!("MemoryNew:{size}"));
+    }
+    if expression.kind == "Call" && matches!(expression.operator.as_str(), "pop_front" | "pop_back")
+    {
+        let selected = expression.operands.first()?;
+        if selected.type_name.contains("$queue") {
+            let front = expression.operator == "pop_front";
+            let selected_symbol = selected.symbol.as_deref()?;
+            let memory = selected_symbol
+                .rsplit_once(' ')
+                .map(|(_, memory)| memory)
+                .unwrap_or(selected_symbol);
+            return Some(format!("QueuePop:{front}:{memory}"));
+        }
+    }
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && expression.type_name.contains('$')
+        && expression.type_name != "event"
+    {
+        let symbol = expression.symbol.as_deref()?;
+        return Some(format!("MemoryCopy:{symbol}"));
     }
     if expression.kind == "ElementSelect"
         && expression
@@ -1528,16 +1589,19 @@ pub(crate) fn design_stmt_assignments(
             destination,
             front,
         } => {
-            assignments.extend(design.net_decls.iter().find_map(|declaration| {
-                (destination.net >= declaration.base
-                    && destination.net < declaration.base + declaration.width)
-                    .then(|| {
-                        (
-                            declaration.name.clone(),
-                            format!("QueuePop:{front}:{}", memory),
-                        )
-                    })
-            }));
+            if let Some(destination_name) = design_lvalue_name(design, destination) {
+                assignments.push((
+                    destination_name,
+                    format!(
+                        "QueuePop:{front}:{}",
+                        design
+                            .memories
+                            .get(*memory)
+                            .map(|memory| memory.name.as_str())
+                            .unwrap_or("<unknown>")
+                    ),
+                ));
+            }
         }
         Stmt::QueueInsert {
             memory,

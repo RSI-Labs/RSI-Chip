@@ -4491,6 +4491,42 @@ endmodule
         .memories
         .iter()
         .all(|memory| memory.storage == eda_core::ir::MemoryStorage::Ordinary));
+    let fixed_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("fixed_array_copy_size"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize fixed-array AST");
+    let mut fixed_summary = slang
+        .summarize_ast_json(&fixed_json)
+        .expect("summarize fixed-array AST");
+    fixed_summary
+        .validate_against_design(&design)
+        .expect("exact fixed-array copy and size fingerprints should match");
+    if let Some(assignment) = fixed_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "second_dimension")
+            })
+        })
+    {
+        assignment.rhs.operands[0].operator = "size".into();
+    }
+    let size_error = fixed_summary
+        .validate_against_design(&design)
+        .expect_err("wrong fixed-array dimension size must fail");
+    assert!(
+        size_error.contains("MemorySize:32:s[source]")
+            && size_error.contains("Const:32:u[32:00000000000000000000000000000011]"),
+        "unexpected fixed-array size error: {size_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create fixed-array simulator");
     simulator.run_until(0).expect("settle fixed-array copies");
@@ -5247,6 +5283,38 @@ endmodule
         )
         .expect("directly lower dynamic-container copies");
     assert_eq!(design.memories.len(), 11);
+    let copy_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_container_copies"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize dynamic-container copy AST");
+    let mut copy_summary = slang
+        .summarize_ast_json(&copy_json)
+        .expect("summarize dynamic-container copy AST");
+    copy_summary
+        .validate_against_design(&design)
+        .expect("exact dynamic-container copy fingerprint should match");
+    if let Some(assignment) = copy_summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "dynamic_destination")
+        })
+    }) {
+        assignment.rhs.symbol = Some("wrong_dynamic_source".into());
+    }
+    let copy_error = copy_summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic-container copy source must fail");
+    assert!(
+        copy_error.contains("MemoryCopy:wrong_dynamic_source")
+            && copy_error.contains("MemoryCopy:dynamic_source"),
+        "unexpected dynamic-container copy error: {copy_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create dynamic-container-copy simulator");
     simulator
@@ -5347,6 +5415,43 @@ endmodule
     assert_eq!(
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::Unmapped
+    );
+    let dynamic_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_array_lifecycle"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize dynamic-array lifecycle AST");
+    let mut dynamic_summary = slang
+        .summarize_ast_json(&dynamic_json)
+        .expect("summarize dynamic-array lifecycle AST");
+    dynamic_summary
+        .validate_against_design(&design)
+        .expect("exact dynamic-array allocation fingerprint should match");
+    if let Some(assignment) = dynamic_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "blocking_values")
+                    && assignment.rhs.kind == "NewArray"
+            })
+        })
+    {
+        assignment.rhs.operands[0].symbol = Some("wrong_requested_size".into());
+    }
+    let allocation_error = dynamic_summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic-array allocation size must fail");
+    assert!(
+        allocation_error.contains("MemoryNew:Ref:32:s[wrong_requested_size]")
+            && allocation_error.contains("MemoryNew:Ref:32:s[requested_size]"),
+        "unexpected allocation error: {allocation_error}"
     );
 
     let mut simulator = Simulator::new(&design).expect("create dynamic-array simulator");
@@ -5488,6 +5593,7 @@ endmodule
     queue_summary
         .validate_against_design(&design)
         .expect("exact queue method fingerprint should match");
+    let mut pop_summary = queue_summary.clone();
     if let Some(assignment) = queue_summary
         .procedural_blocks
         .iter_mut()
@@ -5509,6 +5615,23 @@ endmodule
         queue_method_error.contains("MemorySize:32:s[bounded]")
             && queue_method_error.contains("MemorySize:32:s[values]"),
         "unexpected queue method error: {queue_method_error}"
+    );
+    if let Some(assignment) = pop_summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "front")
+        })
+    }) {
+        assignment.rhs.operands[0].symbol = Some("0 bounded".into());
+    }
+    let pop_error = pop_summary
+        .validate_against_design(&design)
+        .expect_err("wrong queue pop receiver must fail");
+    assert!(
+        pop_error.contains("QueuePop:true:bounded") && pop_error.contains("QueuePop:true:values"),
+        "unexpected queue pop error: {pop_error}"
     );
     let mut simulator = Simulator::new(&design).expect("create queue simulator");
     simulator
