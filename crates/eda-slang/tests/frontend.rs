@@ -2217,6 +2217,42 @@ endmodule
         .compile_files_via_ast(&files, Some("timescale_top"), &PreprocessOptions::default())
         .expect("directly lower module timescales");
     assert_eq!(design.time_scale.precision_exponent, -12);
+    let timescale_json = slang
+        .ast_json_with_options(
+            &files,
+            Some("timescale_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize module-timescale AST");
+    let mut timescale_summary = slang
+        .summarize_ast_json(&timescale_json)
+        .expect("summarize module-timescale AST");
+    timescale_summary
+        .validate_against_design(&design)
+        .expect("exact module simulation-time fingerprint should match");
+    if let Some(assignment) = timescale_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "top_time")
+            })
+        })
+    {
+        assignment.rhs.simulation_time_unit = Some(-6);
+    }
+    let timescale_error = timescale_summary
+        .validate_against_design(&design)
+        .expect_err("wrong module simulation-time unit must fail");
+    assert!(
+        timescale_error.contains("SimulationTime:64:s[Unit-7]")
+            && timescale_error.contains("SimulationTime:64:s[Unit-6]"),
+        "unexpected simulation-time error: {timescale_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create timescale simulator");
     simulator.enable_vcd();
@@ -6789,6 +6825,7 @@ endmodule
                 symbol: None,
                 literal: None,
                 repeat_count: None,
+                simulation_time_unit: None,
                 operands: Vec::new(),
             },
         });

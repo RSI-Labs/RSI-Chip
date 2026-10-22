@@ -41,6 +41,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         symbol: expression_symbol(value),
         literal,
         repeat_count: repeat_count(value),
+        simulation_time_unit: None,
         operands: expression_operands(value),
     }
 }
@@ -56,6 +57,7 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         symbol: None,
         literal: None,
         repeat_count: None,
+        simulation_time_unit: None,
         operands: Vec::new(),
     }
 }
@@ -597,6 +599,9 @@ fn conversion_fingerprint(
     if mode == ExpressionFingerprintMode::BoundedCompatibility {
         return Some(operand_fingerprint);
     }
+    if operand.kind == "IntegerLiteral" && expression.type_name == "time" {
+        return Some(operand_fingerprint);
+    }
 
     let target_shape = simple_type_shape(&expression.type_name)?;
     let source_shape = simple_type_shape(&operand.type_name)?;
@@ -786,6 +791,12 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         }
         if let Some(fingerprint) = string_method_fingerprint(expression, parameters, mode) {
             return Some(fingerprint);
+        }
+        if matches!(method, "$time" | "$stime") && mode == ExpressionFingerprintMode::Direct {
+            let width = if method == "$time" { 64 } else { 32 };
+            let signed_label = if method == "$time" { "s" } else { "u" };
+            let unit = expression.simulation_time_unit?;
+            return Some(format!("SimulationTime:{width}:{signed_label}[Unit{unit}]"));
         }
         if matches!(method, "size" | "num") {
             let selected = expression.operands.first()?;
@@ -1377,6 +1388,15 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             expression.width(),
             design_expr_fingerprint(design, e)
         );
+    }
+    if let Expr::SimulationTime {
+        width,
+        signed,
+        unit_exponent,
+    } = expression
+    {
+        let signed_label = if *signed { "s" } else { "u" };
+        return format!("SimulationTime:{width}:{signed_label}[Unit{unit_exponent}]");
     }
     if let Expr::MemorySize {
         memory,

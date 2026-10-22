@@ -407,6 +407,7 @@ fn type_layout_summary(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
+    pub time_unit_exponent: i8,
     pub source_spans: std::collections::BTreeMap<String, SlangSourceSpan>,
     pub ports: Vec<SlangPortSummary>,
     pub declarations: Vec<SlangDeclarationSummary>,
@@ -537,6 +538,8 @@ pub struct SlangExpressionSummary {
     pub literal: Option<String>,
     /// Elaborated replication count for slang `Replication` nodes.
     pub repeat_count: Option<usize>,
+    /// Normalized decimal exponent for elaborated `$time`/`$stime` calls.
+    pub simulation_time_unit: Option<i8>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 
@@ -589,6 +592,7 @@ impl SlangAstSummary {
         let top_name = string_field(root, "name")
             .or_else(|| string_field(body, "name"))
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
+        let time_unit_exponent = summary_time_unit_exponent(&document, body);
         let mut source_spans = std::collections::BTreeMap::new();
         if let Some(span) = source_span(root) {
             source_spans.insert("top".to_string(), span);
@@ -784,8 +788,17 @@ impl SlangAstSummary {
         }
         let mut kinds = std::collections::BTreeSet::new();
         collect_kinds(root, &mut kinds);
+        for target in &mut continuous_targets {
+            annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
+        }
+        for block in &mut procedural_blocks {
+            for assignment in &mut block.assignments {
+                annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
+            }
+        }
         Ok(Self {
             top_name,
+            time_unit_exponent,
             source_spans,
             ports,
             declarations,
@@ -797,4 +810,73 @@ impl SlangAstSummary {
             kinds,
         })
     }
+}
+
+fn annotate_simulation_time_units(expression: &mut SlangExpressionSummary, exponent: i8) {
+    if expression.kind == "Call" && matches!(expression.operator.as_str(), "$time" | "$stime") {
+        expression.simulation_time_unit = Some(exponent);
+    }
+    for operand in &mut expression.operands {
+        annotate_simulation_time_units(operand, exponent);
+    }
+}
+
+fn summary_time_unit_exponent(document: &Value, body: &Value) -> i8 {
+    if let (Some(magnitude), Some(exponent)) = (
+        body.get("eda_time_unit_magnitude").and_then(Value::as_u64),
+        body.get("eda_time_unit_exponent")
+            .and_then(Value::as_i64)
+            .and_then(|value| i8::try_from(value).ok()),
+    ) {
+        let trailing_zeros = match magnitude {
+            1 => 0,
+            10 => 1,
+            100 => 2,
+            _ => 0,
+        };
+        return exponent.saturating_add(trailing_zeros);
+    }
+    let definition = body
+        .get("definition")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let scale = document
+        .get("definitions")
+        .and_then(Value::as_array)
+        .and_then(|definitions| {
+            definitions.iter().find(|candidate| {
+                let address = candidate.get("addr").and_then(Value::as_u64);
+                let name = string_field(candidate, "name").unwrap_or_default();
+                address
+                    .map(|address| format!("{address} {name}"))
+                    .is_some_and(|reference| reference == definition)
+            })
+        })
+        .and_then(|candidate| string_field(candidate, "timeScale"))
+        .and_then(|scale| scale.split('/').next().map(|unit| unit.trim().to_string()));
+    let Some(scale) = scale else {
+        return -9;
+    };
+    let digits_end = scale
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(scale.len());
+    let Ok(magnitude) = scale[..digits_end].parse::<u64>() else {
+        return -9;
+    };
+    let exponent: i8 = match scale[digits_end..].trim() {
+        "s" => 0,
+        "ms" => -3,
+        "us" => -6,
+        "ns" => -9,
+        "ps" => -12,
+        "fs" => -15,
+        _ => -9,
+    };
+    let trailing_zeros = match magnitude {
+        1 => 0,
+        10 => 1,
+        100 => 2,
+        _ => 0,
+    };
+    exponent.saturating_add(trailing_zeros)
 }
