@@ -1423,6 +1423,29 @@ endmodule
     static_summary
         .validate_against_design(&design)
         .expect("exact class-static property fingerprint should match");
+    let mut wrong_instance_method = static_summary.clone();
+    if let Some(assignment) = wrong_instance_method
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "first_id")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("first.wrong".into());
+    }
+    let instance_method_error = wrong_instance_method
+        .validate_against_design(&design)
+        .expect_err("wrong simple instance-method receiver/property must fail");
+    assert!(
+        instance_method_error.contains("Ref:32:s[first.wrong]")
+            && instance_method_error.contains("Ref:32:s[first.id]"),
+        "unexpected simple instance-method error: {instance_method_error}"
+    );
     if let Some(assignment) = static_summary
         .procedural_blocks
         .iter_mut()
