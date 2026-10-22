@@ -10464,6 +10464,26 @@ endmodule
         "unexpected string comparison error: {comparison_error}"
     );
 
+    let mut byte_summary = string_summary.clone();
+    if let Some(assignment) = byte_summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "dynamic_byte")
+        })
+    }) {
+        assignment.rhs.operands[1].symbol = Some("wrong_byte_index".into());
+    }
+    let byte_error = byte_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string byte index must fail");
+    assert!(
+        byte_error.contains("Ref:32:s[wrong_byte_index]")
+            && byte_error.contains("Ref:32:s[byte_index]"),
+        "unexpected string byte error: {byte_error}"
+    );
+
     let mut radix_summary = string_summary;
     if let Some(target) = radix_summary
         .continuous_targets

@@ -910,6 +910,25 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             "MemoryRead:{width}:{signed_label}[{memory},{index}]"
         ));
     }
+    if expression.kind == "ElementSelect"
+        && expression
+            .operands
+            .first()
+            .is_some_and(|selected| selected.type_name == "string")
+        && mode == ExpressionFingerprintMode::Direct
+    {
+        let selected = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let index = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!("StringGetByte:8:u[{selected},{index}]"));
+    }
     if expression.kind == "RangeSelect"
         && expression.operands.first().is_some_and(|selected| {
             selected.kind == "ElementSelect"
