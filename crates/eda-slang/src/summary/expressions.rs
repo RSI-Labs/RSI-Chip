@@ -9,6 +9,7 @@ use crate::types::{
     STRING_WIDTH,
 };
 use eda_core::ir::Design;
+use eda_core::logic::LogicWord;
 use serde_json::Value;
 
 use super::{
@@ -72,7 +73,8 @@ pub(crate) fn expression_literal(value: &Value) -> Option<String> {
     };
     let type_name = string_field(value, "type")?;
     let word = if kind == "StringLiteral" {
-        string_literal_word(&raw)?
+        let width = simple_type_width(&type_name).unwrap_or(STRING_WIDTH);
+        LogicWord::from_bytes_le(width, raw.as_bytes())
     } else {
         literal_word(&type_name, &raw)?
     };
@@ -596,6 +598,9 @@ fn conversion_fingerprint(
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let operand = expression.operands.first()?;
+    if expression.type_name == "string" && mode == ExpressionFingerprintMode::Direct {
+        return direct_string_conversion_fingerprint(operand, parameters, mode);
+    }
     if expression.type_name == "string" || operand.type_name == "string" {
         return None;
     }
@@ -638,6 +643,49 @@ fn conversion_fingerprint(
     };
     let signed_label = if target_signed { "s" } else { "u" };
     Some(format!("Signed:{target_width}:{signed_label}[{resized}]"))
+}
+
+fn direct_string_conversion_fingerprint(
+    operand: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if operand.kind == "Concatenation" {
+        let left =
+            direct_string_conversion_fingerprint(operand.operands.first()?, parameters, mode)?;
+        let right =
+            direct_string_conversion_fingerprint(operand.operands.get(1)?, parameters, mode)?;
+        return Some(format!("StringConcat:512:u[{left},{right}]"));
+    }
+    if operand.type_name == "string" {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
+
+    let source_shape = simple_type_shape(&operand.type_name)?;
+    let source_width = source_shape.width;
+    let source_signed = simple_type_signed(&operand.type_name)?;
+    let operand_fingerprint =
+        slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+    if source_width == STRING_WIDTH && !source_signed {
+        return Some(operand_fingerprint);
+    }
+    if source_width > STRING_WIDTH {
+        return None;
+    }
+
+    let extension = STRING_WIDTH - source_width;
+    let padding = if source_signed {
+        let sign_bit = source_width.saturating_sub(1);
+        format!(
+            "Repeat:{extension}:u[PackedSelect:1:u[{operand_fingerprint},Range:{sign_bit}:{sign_bit}]]"
+        )
+    } else {
+        let zeros = "0".repeat(extension);
+        format!("Const:{extension}:u[{extension}:{zeros}]")
+    };
+    Some(format!(
+        "Signed:512:u[Concat:512:u[{padding},{operand_fingerprint}]]"
+    ))
 }
 
 fn unary_composition_fingerprint(

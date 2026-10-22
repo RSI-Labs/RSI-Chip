@@ -10482,6 +10482,24 @@ endmodule
         "unexpected string concatenation error: {concatenation_error}"
     );
 
+    let mut literal_conversion_summary = string_summary.clone();
+    if let Some(target) = literal_conversion_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "literal_value")
+    {
+        target.rhs.operands[0].literal = Some(format!("40:{}", "1".repeat(40)));
+    }
+    let literal_conversion_error = literal_conversion_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string literal conversion must fail");
+    let ready_bits = LogicWord::from_bytes_le(40, b"READY").to_bin_str();
+    assert!(
+        literal_conversion_error.contains(&format!("Const:40:u[40:{ready_bits}]"))
+            && literal_conversion_error.contains(&format!("Const:40:u[40:{}]", "1".repeat(40))),
+        "unexpected string literal conversion error: {literal_conversion_error}"
+    );
+
     let mut byte_summary = string_summary.clone();
     if let Some(assignment) = byte_summary.procedural_blocks.iter_mut().find_map(|block| {
         block.assignments.iter_mut().find(|assignment| {
