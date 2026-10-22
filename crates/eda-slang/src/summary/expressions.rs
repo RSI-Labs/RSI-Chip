@@ -600,6 +600,32 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 return Some(format!("AssocTraversal:{operation}:u[{memory},{key}]"));
             }
         }
+        if matches!(method, "size" | "num") {
+            let selected = expression.operands.first()?;
+            if selected.type_name.contains('$') {
+                let selected_symbol = selected.symbol.as_deref()?;
+                let memory = selected_symbol
+                    .rsplit_once(' ')
+                    .map(|(_, memory)| memory)
+                    .unwrap_or(selected_symbol);
+                return Some(format!("MemorySize:32:s[{memory}]"));
+            }
+        }
+        if method == "exists" {
+            let selected = expression.operands.first()?;
+            if selected.type_name.contains("$assoc[") {
+                let selected_symbol = selected.symbol.as_deref()?;
+                let memory = selected_symbol
+                    .rsplit_once(' ')
+                    .map(|(_, memory)| memory)
+                    .unwrap_or(selected_symbol);
+                let key = slang_expression_fingerprint_with_parameters(
+                    expression.operands.get(1)?,
+                    parameters,
+                )?;
+                return Some(format!("AssocExists:1:u[{memory},{key}]"));
+            }
+        }
     }
     if expression.kind == "ElementSelect"
         && expression
@@ -695,6 +721,24 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             return None;
         }
         return slang_expression_fingerprint_with_parameters(operand, parameters);
+    }
+    if expression.kind == "BinaryOp"
+        && expression
+            .operands
+            .first()
+            .zip(expression.operands.get(1))
+            .is_some_and(|(left, right)| left.type_name == "string" || right.type_name == "string")
+    {
+        let left =
+            slang_expression_fingerprint_with_parameters(expression.operands.first()?, parameters)?;
+        let right =
+            slang_expression_fingerprint_with_parameters(expression.operands.get(1)?, parameters)?;
+        let comparison = format!("StringCompare:32:s[{left},{right}]");
+        let root = slang_expression_shape(expression)?;
+        return Some(format!(
+            "{root}:1:u[{comparison},Const:32:u[32:{}]]",
+            "0".repeat(32)
+        ));
     }
     let root = slang_expression_shape(expression)?;
     let width = expression.type_width?;

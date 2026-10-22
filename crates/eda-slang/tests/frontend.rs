@@ -5474,6 +5474,42 @@ endmodule
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::Unmapped
     );
+    let queue_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("queue_lifecycle"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize queue lifecycle AST");
+    let mut queue_summary = slang
+        .summarize_ast_json(&queue_json)
+        .expect("summarize queue lifecycle AST");
+    queue_summary
+        .validate_against_design(&design)
+        .expect("exact queue method fingerprint should match");
+    if let Some(assignment) = queue_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "back_size")
+            })
+        })
+    {
+        assignment.rhs.operands[0].symbol = Some("0 bounded".into());
+    }
+    let queue_method_error = queue_summary
+        .validate_against_design(&design)
+        .expect_err("wrong queue size receiver must fail");
+    assert!(
+        queue_method_error.contains("MemorySize:32:s[bounded]")
+            && queue_method_error.contains("MemorySize:32:s[values]"),
+        "unexpected queue method error: {queue_method_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create queue simulator");
     simulator
         .set_input("data", &LogicWord::from_u64(8, 0x20))
@@ -5678,6 +5714,42 @@ endmodule
     assert_eq!(
         design.memories[0].template,
         eda_core::ir::MemoryTemplate::Unmapped
+    );
+    let associative_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("associative_array_lifecycle"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize associative lifecycle AST");
+    let mut associative_summary = slang
+        .summarize_ast_json(&associative_json)
+        .expect("summarize associative lifecycle AST");
+    associative_summary
+        .validate_against_design(&design)
+        .expect("exact associative method fingerprint should match");
+    if let Some(assignment) = associative_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "exists_before")
+            })
+        })
+    {
+        assignment.rhs.operands[1].symbol = Some("wrong_key".into());
+    }
+    let associative_method_error = associative_summary
+        .validate_against_design(&design)
+        .expect_err("wrong associative exists key must fail");
+    assert!(
+        associative_method_error.contains("Ref:32:s[wrong_key]")
+            && associative_method_error.contains("Ref:32:s[key]"),
+        "unexpected associative method error: {associative_method_error}"
     );
 
     let mut simulator = Simulator::new(&design).expect("create associative simulator");
