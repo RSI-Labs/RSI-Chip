@@ -341,7 +341,7 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("BinaryOp", "Modulus") => Some("Mod"),
         ("BinaryOp", "BinaryAnd") => Some("And"),
         ("BinaryOp", "BinaryOr") => Some("Or"),
-        ("BinaryOp", "BitwiseXor") => Some("Xor"),
+        ("BinaryOp", "BinaryXor" | "BitwiseXor") => Some("Xor"),
         ("BinaryOp", "LogicalShiftLeft" | "ArithmeticShiftLeft") => Some("Shl"),
         ("BinaryOp", "LogicalShiftRight" | "ArithmeticShiftRight") => Some("Shr"),
         ("BinaryOp", "LogicalAnd") => Some("LogAnd"),
@@ -624,6 +624,63 @@ fn conversion_fingerprint(
     Some(format!("Signed:{target_width}:{signed_label}[{resized}]"))
 }
 
+fn unary_composition_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let operand = expression.operands.first()?;
+    let operand_fingerprint =
+        slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+    match expression.operator.as_str() {
+        "Plus" => Some(operand_fingerprint),
+        "Minus" => {
+            let width = expression.type_width?;
+            let signed_label = if expression.type_signed? { "s" } else { "u" };
+            let zeros = "0".repeat(width);
+            Some(format!(
+                "Sub:{width}:{signed_label}[Const:{width}:u[{width}:{zeros}],{operand_fingerprint}]"
+            ))
+        }
+        "BitwiseAnd" => Some(format!("AndR:1:u[{operand_fingerprint}]")),
+        "BitwiseOr" => Some(format!("OrR:1:u[{operand_fingerprint}]")),
+        "BitwiseXor" => Some(format!("XorR:1:u[{operand_fingerprint}]")),
+        "BitwiseNand" => Some(format!("Not:1:u[AndR:1:u[{operand_fingerprint}]]")),
+        "BitwiseNor" => Some(format!("Not:1:u[OrR:1:u[{operand_fingerprint}]]")),
+        "BitwiseXnor" => Some(format!("Not:1:u[XorR:1:u[{operand_fingerprint}]]")),
+        _ => None,
+    }
+}
+
+fn binary_composition_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let left = slang_expression_fingerprint_with_parameters(
+        expression.operands.first()?,
+        parameters,
+        mode,
+    )?;
+    let right = slang_expression_fingerprint_with_parameters(
+        expression.operands.get(1)?,
+        parameters,
+        mode,
+    )?;
+    let width = expression.type_width?;
+    let signed_label = if expression.type_signed? { "s" } else { "u" };
+    match expression.operator.as_str() {
+        "BinaryXnor" => Some(format!(
+            "Not:{width}:{signed_label}[Xor:{width}:{signed_label}[{left},{right}]]"
+        )),
+        "LogicalImplication" => Some(format!("LogOr:1:u[Not:1:u[{left}],{right}]")),
+        "LogicalEquivalence" => Some(format!(
+            "LogAnd:1:u[LogOr:1:u[Not:1:u[{left}],{right}],LogOr:1:u[Not:1:u[{right}],{left}]]"
+        )),
+        _ => None,
+    }
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -762,11 +819,16 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             return Some(fingerprint);
         }
     }
+    if expression.kind == "UnaryOp" {
+        if let Some(fingerprint) = unary_composition_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
+        }
+    }
     if expression.kind == "UnaryOp" && expression.operator == "LogicalNot" {
         let operand = expression.operands.first()?;
         let operand_fingerprint =
             slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
-        return Some(format!("Not:1:u[Reduction:1:u[{operand_fingerprint}]]"));
+        return Some(format!("Not:1:u[OrR:1:u[{operand_fingerprint}]]"));
     }
     if expression.kind == "Replication" {
         let count = expression.repeat_count?;
@@ -801,6 +863,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             "{root}:1:u[{comparison},Const:32:u[32:{}]]",
             "0".repeat(32)
         ));
+    }
+    if expression.kind == "BinaryOp" {
+        if let Some(fingerprint) = binary_composition_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
+        }
     }
     let root = slang_expression_shape(expression)?;
     let width = expression.type_width?;
@@ -1004,7 +1071,9 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::Ref { .. } | Expr::MemoryRead { .. } | Expr::MemoryReadPart { .. } => "Ref",
         Expr::Un { op, .. } => match op {
             UnOp::Not => "Not",
-            UnOp::AndR | UnOp::OrR | UnOp::XorR => "Reduction",
+            UnOp::AndR => "AndR",
+            UnOp::OrR => "OrR",
+            UnOp::XorR => "XorR",
         },
         Expr::Bin { op, .. } => match op {
             BinOp::Add => "Add",

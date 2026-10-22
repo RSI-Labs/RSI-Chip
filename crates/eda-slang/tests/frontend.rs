@@ -6938,7 +6938,6 @@ endmodule
         )
         .expect("lower generated assignments");
     assert_eq!(design.assigns.len(), 8);
-
     let mut simulator = Simulator::new(&design).expect("create generate simulator");
     simulator
         .set_input("a", &LogicWord::from_u64(1, 1))
@@ -13810,6 +13809,35 @@ endmodule
         )
         .expect("lower unary operators");
     assert_eq!(design.assigns.len(), 8);
+    let unary_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("unary_operators"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize unary-operator AST");
+    let mut unary_summary = slang
+        .summarize_ast_json(&unary_json)
+        .expect("summarize unary-operator AST");
+    unary_summary
+        .validate_against_design(&design)
+        .expect("exact unary-operator fingerprint should match");
+    if let Some(target) = unary_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "reduction_xor")
+    {
+        target.rhs.operator = "BitwiseAnd".into();
+    }
+    let unary_error = unary_summary
+        .validate_against_design(&design)
+        .expect_err("wrong unary reduction operator must fail");
+    assert!(
+        unary_error.contains("XorR:1:u[Ref:4:u[bits]]")
+            && unary_error.contains("AndR:1:u[Ref:4:u[bits]]"),
+        "unexpected unary structural error: {unary_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create unary simulator");
     simulator
@@ -13848,7 +13876,10 @@ module logical_composition(
   output logic equiv_00,
   output logic equiv_01,
   output logic equiv_10,
-  output logic equiv_11
+  output logic equiv_11,
+  output logic binary_xor,
+  output logic binary_xnor,
+  output logic binary_xnor_operator
 );
   assign imply_00 = a -> b;
   assign imply_01 = a -> b;
@@ -13858,6 +13889,9 @@ module logical_composition(
   assign equiv_01 = a <-> b;
   assign equiv_10 = a <-> b;
   assign equiv_11 = a <-> b;
+  assign binary_xor = a ^ b;
+  assign binary_xnor = ~(a ^ b);
+  assign binary_xnor_operator = a ~^ b;
 endmodule
 "#,
     )
@@ -13870,7 +13904,66 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower logical composition");
-    assert_eq!(design.assigns.len(), 8);
+    assert_eq!(design.assigns.len(), 11);
+    let logical_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("logical_composition"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize logical-composition AST");
+    let mut logical_summary = slang
+        .summarize_ast_json(&logical_json)
+        .expect("summarize logical-composition AST");
+    let mut binary_summary = logical_summary.clone();
+    logical_summary
+        .validate_against_design(&design)
+        .expect("exact logical-composition fingerprint should match");
+    if let Some(target) = logical_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "imply_00")
+    {
+        target.rhs.operator = "LogicalEquivalence".into();
+    }
+    let logical_error = logical_summary
+        .validate_against_design(&design)
+        .expect_err("wrong logical composition operator must fail");
+    assert!(
+        logical_error.contains("LogOr:1:u[Not:1:u[Ref:1:u[a]],Ref:1:u[b]]")
+            && logical_error.contains("LogAnd:1:u["),
+        "unexpected logical structural error: {logical_error}"
+    );
+    if let Some(target) = binary_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "binary_xor")
+    {
+        target.rhs.operator = "BinaryOr".into();
+    }
+    let binary_error = binary_summary
+        .validate_against_design(&design)
+        .expect_err("wrong binary xor operator must fail");
+    assert!(
+        binary_error.contains("Xor:1:u[Ref:1:u[a],Ref:1:u[b]]")
+            && binary_error.contains("Or:1:u[Ref:1:u[a],Ref:1:u[b]]"),
+        "unexpected binary structural error: {binary_error}"
+    );
+    if let Some(target) = binary_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "binary_xnor_operator")
+    {
+        target.rhs.operator = "BinaryXor".into();
+    }
+    let xnor_error = binary_summary
+        .validate_against_design(&design)
+        .expect_err("wrong binary xnor operator must fail");
+    assert!(
+        xnor_error.contains("Not:1:u[Xor:1:u[Ref:1:u[a],Ref:1:u[b]]]"),
+        "unexpected xnor structural error: {xnor_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create logical simulator");
     for (a, b, label) in [
@@ -13892,6 +13985,18 @@ endmodule
         assert_eq!(
             simulator.read(&format!("equiv_{label}")).unwrap().to_u64(),
             Some((a == b) as u64)
+        );
+        assert_eq!(
+            simulator.read("binary_xor").unwrap().to_u64(),
+            Some((a ^ b) as u64)
+        );
+        assert_eq!(
+            simulator.read("binary_xnor").unwrap().to_u64(),
+            Some((!(a ^ b)) as u64)
+        );
+        assert_eq!(
+            simulator.read("binary_xnor_operator").unwrap().to_u64(),
+            Some((!(a ^ b)) as u64)
         );
     }
 }
