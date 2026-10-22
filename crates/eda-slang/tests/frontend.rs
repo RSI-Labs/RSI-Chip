@@ -11973,6 +11973,13 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower dynamic packed lvalue");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_lvalue"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower dynamic packed lvalue through the bounded differential path");
     assert_eq!(design.initials.len(), 0);
     assert_eq!(design.processes.len(), 1);
     let json = slang
@@ -11989,6 +11996,10 @@ endmodule
     summary
         .validate_against_design(&design)
         .expect("exact dynamic packed-lvalue fingerprint should match");
+    summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("bounded dynamic packed-lvalue fingerprint should be exact");
+    let mut legacy_summary = summary.clone();
     {
         let assignment = summary
             .procedural_blocks
@@ -12007,6 +12018,24 @@ endmodule
     assert!(
         error.contains("Eq:1:u[Ref:3:u[clk],"),
         "unexpected structural error: {error}"
+    );
+    if let Some(assignment) = legacy_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment
+            .dynamic_packed_lvalue_selector
+            .as_mut()
+            .expect("bounded dynamic packed-lvalue selector")
+            .symbol = Some("clk".into());
+    }
+    let legacy_error = legacy_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("bounded dynamic packed-lvalue selector must not use a wildcard");
+    assert!(
+        legacy_error.contains("Eq:1:u[Ref:3:u[clk],"),
+        "unexpected bounded structural error: {legacy_error}"
     );
     {
         let assignment = summary
