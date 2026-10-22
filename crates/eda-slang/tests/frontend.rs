@@ -14905,6 +14905,53 @@ endmodule
         )
         .expect("lower wildcard equality");
     assert_eq!(design.assigns.len(), 2);
+    let wildcard_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("wildcard_equality"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize wildcard-equality AST");
+    let wildcard_summary = slang
+        .summarize_ast_json(&wildcard_json)
+        .expect("summarize wildcard-equality AST");
+    wildcard_summary
+        .validate_against_design(&design)
+        .expect("exact direct wildcard-equality fingerprints should match");
+
+    let mut changed_pattern = wildcard_summary.clone();
+    if let Some(target) = changed_pattern
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "equal")
+    {
+        target.rhs.operands[1].literal = Some("8:1010zz11".into());
+    }
+    let pattern_error = changed_pattern
+        .validate_against_design(&design)
+        .expect_err("wrong wildcard-equality pattern must fail");
+    assert!(
+        pattern_error.contains("Const:8:u[8:11110011]")
+            && pattern_error.contains("Const:8:u[8:10100011]"),
+        "unexpected wildcard-equality pattern error: {pattern_error}"
+    );
+
+    let mut changed_direction = wildcard_summary;
+    if let Some(target) = changed_direction
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "equal")
+    {
+        target.rhs.operator = "WildcardInequality".into();
+    }
+    let direction_error = changed_direction
+        .validate_against_design(&design)
+        .expect_err("wrong wildcard-equality direction must fail");
+    assert!(
+        direction_error.contains("Not:1:u[Eq:1:u[") && direction_error.contains("Eq:1:u[And:8:u["),
+        "unexpected wildcard-equality direction error: {direction_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create wildcard simulator");
     for (value, expected) in [(0xa5_u64, true), (0xa1, true), (0x85, false), (0xa4, false)] {

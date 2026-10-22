@@ -748,6 +748,50 @@ fn binary_composition_fingerprint(
     }
 }
 
+fn wildcard_equality_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if mode != ExpressionFingerprintMode::Direct {
+        return None;
+    }
+    if !matches!(
+        expression.operator.as_str(),
+        "WildcardEquality" | "WildcardInequality"
+    ) {
+        return None;
+    }
+    let left = slang_expression_fingerprint_with_parameters(
+        expression.operands.first()?,
+        parameters,
+        mode,
+    )?;
+    let pattern = expression.operands.get(1)?;
+    let (width, bits) = pattern.literal.as_deref()?.split_once(':')?;
+    let width = width.parse::<usize>().ok()?;
+    let mut mask_bits = String::with_capacity(bits.len());
+    let mut expected_bits = String::with_capacity(bits.len());
+    for bit in bits.chars() {
+        if matches!(bit, 'x' | 'X' | 'z' | 'Z') {
+            mask_bits.push('0');
+            expected_bits.push('0');
+        } else if matches!(bit, '0' | '1') {
+            mask_bits.push('1');
+            expected_bits.push(bit);
+        } else {
+            return None;
+        }
+    }
+    let equality = format!(
+        "Eq:1:u[And:{width}:u[{left},Const:{width}:u[{width}:{mask_bits}]],Const:{width}:u[{width}:{expected_bits}]]"
+    );
+    if expression.operator == "WildcardInequality" {
+        return Some(format!("Not:1:u[{equality}]"));
+    }
+    Some(equality)
+}
+
 fn string_method_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1155,6 +1199,9 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     }
     if expression.kind == "BinaryOp" {
         if let Some(fingerprint) = binary_composition_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
+        }
+        if let Some(fingerprint) = wildcard_equality_fingerprint(expression, parameters, mode) {
             return Some(fingerprint);
         }
     }
