@@ -10378,6 +10378,71 @@ endmodule
             .width,
         512
     );
+    let string_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("strings"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize string AST");
+    let string_summary = slang
+        .summarize_ast_json(&string_json)
+        .expect("summarize string AST");
+    string_summary
+        .validate_against_design(&design)
+        .expect("exact direct string method fingerprints should match");
+
+    let mut case_summary = string_summary.clone();
+    if let Some(target) = case_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "upper_value")
+    {
+        target.rhs.operator = "tolower".into();
+    }
+    let case_error = case_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string case direction must fail");
+    assert!(
+        case_error.contains("StringCase:512:u[Upper:Ref:512:u[mixed]]")
+            && case_error.contains("StringCase:512:u[Lower:Ref:512:u[mixed]]"),
+        "unexpected string case error: {case_error}"
+    );
+
+    let mut comparison_summary = string_summary.clone();
+    if let Some(target) = comparison_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "compare_result")
+    {
+        target.rhs.operator = "icompare".into();
+    }
+    let comparison_error = comparison_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string comparison mode must fail");
+    assert!(
+        comparison_error.contains("StringCompare:32:s[CaseSensitive:")
+            && comparison_error.contains("StringCompare:32:s[IgnoreCase:"),
+        "unexpected string comparison error: {comparison_error}"
+    );
+
+    let mut radix_summary = string_summary;
+    if let Some(target) = radix_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "decimal_value")
+    {
+        target.rhs.operands[0].operator = "atohex".into();
+    }
+    let radix_error = radix_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string parse radix must fail");
+    assert!(
+        radix_error.contains("StringToRadix:32:s[Radix10:")
+            && radix_error.contains("StringToRadix:32:s[Radix16:"),
+        "unexpected string radix error: {radix_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create string simulator");
     for (selector, name) in [(0, "A"), (1, "B"), (2, "C")] {

@@ -687,6 +687,69 @@ fn binary_composition_fingerprint(
     }
 }
 
+fn string_method_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if mode == ExpressionFingerprintMode::BoundedCompatibility {
+        return None;
+    }
+    let receiver = expression.operands.first()?;
+    if receiver.type_name != "string" {
+        return None;
+    }
+    let receiver = slang_expression_fingerprint_with_parameters(receiver, parameters, mode)?;
+    match expression.operator.as_str() {
+        "len" => Some(format!("StringLength:32:s[{receiver}]")),
+        "getc" => {
+            let index = slang_expression_fingerprint_with_parameters(
+                expression.operands.get(1)?,
+                parameters,
+                mode,
+            )?;
+            Some(format!("StringGetByte:8:u[{receiver},{index}]"))
+        }
+        "toupper" => Some(format!("StringCase:512:u[Upper:{receiver}]")),
+        "tolower" => Some(format!("StringCase:512:u[Lower:{receiver}]")),
+        "compare" => {
+            let right = slang_expression_fingerprint_with_parameters(
+                expression.operands.get(1)?,
+                parameters,
+                mode,
+            )?;
+            Some(format!(
+                "StringCompare:32:s[CaseSensitive:{receiver},{right}]"
+            ))
+        }
+        "icompare" => {
+            let right = slang_expression_fingerprint_with_parameters(
+                expression.operands.get(1)?,
+                parameters,
+                mode,
+            )?;
+            Some(format!("StringCompare:32:s[IgnoreCase:{receiver},{right}]"))
+        }
+        "substr" => {
+            let left = slang_expression_fingerprint_with_parameters(
+                expression.operands.get(1)?,
+                parameters,
+                mode,
+            )?;
+            let right = slang_expression_fingerprint_with_parameters(
+                expression.operands.get(2)?,
+                parameters,
+                mode,
+            )?;
+            Some(format!("StringSubstr:512:u[{receiver},{left},{right}]"))
+        }
+        "atoi" => Some(format!("StringToRadix:32:s[Radix10:{receiver}]")),
+        "atohex" => Some(format!("StringToRadix:32:s[Radix16:{receiver}]")),
+        "atobin" => Some(format!("StringToRadix:32:s[Radix2:{receiver}]")),
+        _ => None,
+    }
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -720,6 +783,9 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 )?;
                 return Some(format!("AssocTraversal:{operation}:u[{memory},{key}]"));
             }
+        }
+        if let Some(fingerprint) = string_method_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
         }
         if matches!(method, "size" | "num") {
             let selected = expression.operands.first()?;
@@ -918,7 +984,7 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             parameters,
             mode,
         )?;
-        let comparison = format!("StringCompare:32:s[{left},{right}]");
+        let comparison = format!("StringCompare:32:s[CaseSensitive:{left},{right}]");
         let root = slang_expression_shape(expression)?;
         return Some(format!(
             "{root}:1:u[{comparison},Const:32:u[32:{}]]",
@@ -1276,6 +1342,41 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
     }
     if let Expr::Repeat { times, e } = expression {
         return format!("Repeat:{times}:u[{}]", design_expr_fingerprint(design, e));
+    }
+    if let Expr::StringCase { e, upper } = expression {
+        let direction = if *upper { "Upper" } else { "Lower" };
+        return format!(
+            "StringCase:{}:u[{}:{}]",
+            expression.width(),
+            direction,
+            design_expr_fingerprint(design, e)
+        );
+    }
+    if let Expr::StringCompare {
+        left,
+        right,
+        ignore_case,
+    } = expression
+    {
+        let mode = if *ignore_case {
+            "IgnoreCase"
+        } else {
+            "CaseSensitive"
+        };
+        return format!(
+            "StringCompare:{}:s[{}:{},{}]",
+            expression.width(),
+            mode,
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right)
+        );
+    }
+    if let Expr::StringToRadix { e, radix } = expression {
+        return format!(
+            "StringToRadix:{}:s[Radix{radix}:{}]",
+            expression.width(),
+            design_expr_fingerprint(design, e)
+        );
     }
     if let Expr::MemorySize {
         memory,
