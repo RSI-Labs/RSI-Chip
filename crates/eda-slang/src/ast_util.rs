@@ -90,6 +90,20 @@ fn canonical_detailed_type(value: &Value) -> Option<String> {
             };
             Some(format!("{element}$[]"))
         }
+        "QueueType" => {
+            let element = value.get("elementType")?;
+            let element = if let Some(element_name) = element.as_str() {
+                element_name.to_string()
+            } else {
+                canonical_detailed_type(element)?
+            };
+            let max_bound = value.get("maxBound").and_then(Value::as_i64).unwrap_or(0);
+            if max_bound > 0 {
+                Some(format!("{element}$queue[$:{max_bound}]"))
+            } else {
+                Some(format!("{element}$queue[$]"))
+            }
+        }
         _ => None,
     }
 }

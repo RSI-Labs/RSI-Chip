@@ -273,6 +273,9 @@ impl<'a> Synth<'a> {
             Stmt::MemoryNew { .. } | Stmt::MemoryDelete { .. } => {
                 Err("dynamic-array allocation is not synthesizable yet".into())
             }
+            Stmt::QueuePush { .. } | Stmt::QueuePop { .. } => {
+                Err("queue operations are not synthesizable yet".into())
+            }
             Stmt::MemoryBlPart { .. } | Stmt::MemoryNBlPart { .. } => {
                 Err("first-class sparse-memory part-select writes are not synthesizable yet".into())
             }

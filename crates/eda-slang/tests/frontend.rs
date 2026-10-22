@@ -4972,6 +4972,106 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_queue_lifecycle() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-queue-lifecycle");
+    let source_path = root.join("queue_lifecycle.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module queue_lifecycle(
+  input logic [7:0] data,
+  output int initial_size,
+  output int pushed_size,
+  output int popped_size,
+  output int deleted_size,
+  output int bounded_size,
+  output int queue_bits,
+  output logic [7:0] first,
+  output logic [7:0] second,
+  output logic [7:0] front,
+  output logic [7:0] popped,
+  output logic [7:0] back,
+  output int back_size,
+  output logic [7:0] empty_pop
+);
+  logic [7:0] values[$];
+  logic [7:0] bounded[$:3];
+  logic [7:0] empty[$];
+
+  initial begin
+    #1;
+    initial_size = values.size();
+    values.push_back(data);
+    values.push_back(data + 8'd1);
+    values.push_front(data + 8'd2);
+    pushed_size = values.size();
+    queue_bits = $bits(values);
+    first = values[0];
+    second = values[1];
+    front = values.pop_front();
+    popped_size = values.size();
+    popped = values.pop_front();
+    back = values.pop_back();
+    back_size = values.size();
+    values.delete();
+    deleted_size = values.size();
+    empty_pop = empty.pop_front();
+
+    bounded.push_back(data);
+    bounded.push_back(data + 8'd3);
+    bounded_size = bounded.size();
+  end
+endmodule
+"#,
+    )
+    .expect("write queue lifecycle source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("queue_lifecycle"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower queue lifecycle");
+    assert_eq!(design.memories.len(), 3);
+    assert!(design.memories.iter().all(|memory| memory.queue));
+    assert!(design.memories.iter().all(|memory| memory.dynamic));
+    assert_eq!(design.memories[0].flat_length, 256);
+    assert_eq!(design.memories[1].flat_length, 4);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::Unmapped
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create queue simulator");
+    simulator
+        .set_input("data", &LogicWord::from_u64(8, 0x20))
+        .expect("set queue data");
+    simulator.run_until(1).expect("run queue lifecycle");
+
+    assert_eq!(simulator.read("initial_size").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("pushed_size").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("queue_bits").unwrap().to_u64(), Some(24));
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(0x22));
+    assert_eq!(simulator.read("second").unwrap().to_u64(), Some(0x20));
+    assert_eq!(simulator.read("front").unwrap().to_u64(), Some(0x22));
+    assert_eq!(simulator.read("popped_size").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("popped").unwrap().to_u64(), Some(0x20));
+    assert_eq!(simulator.read("back").unwrap().to_u64(), Some(0x21));
+    assert_eq!(simulator.read("back_size").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("empty_pop").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("bounded_size").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

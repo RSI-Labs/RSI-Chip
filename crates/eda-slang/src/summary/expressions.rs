@@ -1235,6 +1235,30 @@ pub(crate) fn design_stmt_assignments(
                     .map(|memory| (memory.name.clone(), "MemoryDelete".to_string())),
             );
         }
+        Stmt::QueuePush { memory, value, .. } => {
+            assignments.extend(design.memories.get(*memory).map(|memory| {
+                (
+                    memory.name.clone(),
+                    format!("QueuePush:{}", design_expr_fingerprint(design, value)),
+                )
+            }));
+        }
+        Stmt::QueuePop {
+            memory,
+            destination,
+            front,
+        } => {
+            assignments.extend(design.net_decls.iter().find_map(|declaration| {
+                (destination.net >= declaration.base
+                    && destination.net < declaration.base + declaration.width)
+                    .then(|| {
+                        (
+                            declaration.name.clone(),
+                            format!("QueuePop:{front}:{}", memory),
+                        )
+                    })
+            }));
+        }
         Stmt::BlIndexed { net, e, .. } | Stmt::NBlIndexed { net, e, .. } => {
             assignments.extend(design.net_decls.iter().find_map(|declaration| {
                 (*net >= declaration.base && *net < declaration.base + declaration.width)

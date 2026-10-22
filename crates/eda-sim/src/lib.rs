@@ -1335,6 +1335,122 @@ impl<'d> Simulator<'d> {
         self.notify_memory_write(memory)
     }
 
+    fn queue_push(&mut self, memory: usize, value: &LogicWord, front: bool) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, capacity, element_width, queue) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("queue push target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.flat_length,
+                declaration.element_width,
+                declaration.queue,
+            )
+        };
+        if !queue {
+            return Err(format!("queue push target '{name}' is not a queue"));
+        }
+        let length = self.dynamic_lengths[memory];
+        if length >= capacity {
+            return Err(format!("queue '{name}' is full; capacity is {capacity}"));
+        }
+        let value = value.sized(element_width);
+        let old_values = if front {
+            (0..length)
+                .map(|index| {
+                    self.memory_elements
+                        .get(memory)
+                        .and_then(|elements| elements.get(index))
+                        .cloned()
+                        .unwrap_or_else(|| LogicWord::xes(element_width))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.dynamic_lengths[memory] = length + 1;
+        if front {
+            for (index, old_value) in old_values.into_iter().enumerate().rev() {
+                self.apply_memory_update(memory, index as u64 + 1, old_value)?;
+            }
+            self.apply_memory_update(memory, 0, value)?;
+        } else {
+            self.apply_memory_update(memory, length, value)?;
+        }
+        Ok(())
+    }
+
+    fn queue_pop(
+        &mut self,
+        memory: usize,
+        destination: &LValue,
+        front: bool,
+    ) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, element_width, queue) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("queue pop target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.element_width,
+                declaration.queue,
+            )
+        };
+        if !queue {
+            return Err(format!("queue pop target '{name}' is not a queue"));
+        }
+        let length = self.dynamic_lengths[memory];
+        if length == 0 {
+            let value = LogicWord::xes(destination.range.width());
+            self.assign_scalar(destination, value);
+            return Ok(());
+        }
+
+        let physical_index = if front { 0 } else { length - 1 };
+        let popped = self
+            .memory_elements
+            .get(memory)
+            .and_then(|elements| elements.get(physical_index))
+            .cloned()
+            .unwrap_or_else(|| LogicWord::xes(element_width))
+            .sized(destination.range.width());
+        let old_values = if front {
+            (1..length)
+                .map(|index| {
+                    self.memory_elements
+                        .get(memory)
+                        .and_then(|elements| elements.get(index))
+                        .cloned()
+                        .unwrap_or_else(|| LogicWord::xes(element_width))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.dynamic_lengths[memory] = length - 1;
+        if front {
+            for (index, old_value) in old_values.into_iter().enumerate() {
+                self.apply_memory_update(memory, index as u64, old_value)?;
+            }
+        }
+        self.apply_memory_update(memory, length - 1, LogicWord::xes(element_width))?;
+        self.assign_scalar(destination, popped);
+        Ok(())
+    }
+
+    fn assign_scalar(&mut self, destination: &LValue, value: LogicWord) {
+        let width = destination.range.width();
+        for (bit, net) in lv_bits(destination).into_iter().enumerate() {
+            self.schedule(Update {
+                net,
+                val: value.bit(bit.min(width.saturating_sub(1))),
+                driver: None,
+            });
+        }
+    }
+
     fn apply_memory_update(
         &mut self,
         memory: usize,
@@ -1963,6 +2079,19 @@ impl<'d> Simulator<'d> {
                     let memory = self.canonical_memory(*memory);
                     self.allocate_dynamic_memory(memory, 0)?;
                 }
+                Stmt::QueuePush {
+                    memory,
+                    value,
+                    front,
+                } => {
+                    let value = self.eval(value);
+                    self.queue_push(*memory, &value, *front)?;
+                }
+                Stmt::QueuePop {
+                    memory,
+                    destination,
+                    front,
+                } => self.queue_pop(*memory, destination, *front)?,
                 Stmt::MemoryBlPart {
                     memory,
                     indexes,
@@ -3480,6 +3609,11 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(size, out);
         }
         Stmt::MemoryDelete { memory } => out.push(*memory),
+        Stmt::QueuePush { memory, value, .. } => {
+            out.push(*memory);
+            walk_expr_memories(value, out);
+        }
+        Stmt::QueuePop { memory, .. } => out.push(*memory),
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -3589,6 +3723,8 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryNew { size, .. } => reads.extend(expr_nets(size)),
         Stmt::MemoryDelete { .. } => {}
+        Stmt::QueuePush { value, .. } => reads.extend(expr_nets(value)),
+        Stmt::QueuePop { destination, .. } => writes.extend(lv_bits(destination)),
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -3710,6 +3846,8 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryNew { size, .. } => walk_expr(size, out),
         Stmt::MemoryDelete { .. } => {}
+        Stmt::QueuePush { value, .. } => walk_expr(value, out),
+        Stmt::QueuePop { .. } => {}
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }

@@ -34,9 +34,11 @@ pub(super) struct AstMemoryType {
     pub flat_length: u64,
     pub signed: bool,
     pub dynamic: bool,
+    pub queue: bool,
 }
 
 pub(super) const DYNAMIC_ARRAY_CAPACITY: usize = 256;
+pub(super) const QUEUE_CAPACITY: usize = 256;
 
 pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
     simple_type_width(type_name).map(|_| {
@@ -124,6 +126,7 @@ pub(super) fn memory_type_with_element(
         flat_length,
         signed,
         dynamic: false,
+        queue: false,
     })
 }
 
@@ -146,6 +149,45 @@ pub(super) fn dynamic_memory_type(type_name: &str) -> Option<AstMemoryType> {
         simple_type_signed(element_type)?,
     )?;
     memory.dynamic = true;
+    memory.queue = false;
+    Some(memory)
+}
+
+pub(super) fn queue_memory_type(type_name: &str) -> Option<AstMemoryType> {
+    let type_name = type_name.trim();
+    let unbounded = type_name.ends_with("$queue[$]");
+    let bounded_marker = "$queue[$:";
+    let bounded = !unbounded && type_name.contains(bounded_marker) && type_name.ends_with(']');
+    if !unbounded && !bounded {
+        return None;
+    }
+    let separator = type_name.find("$queue")?;
+    let element_type = type_name[..separator].trim();
+    let shape = simple_type_shape(element_type)?;
+    let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
+    let bounds = shape.bounds.unwrap_or((element_msb, 0));
+    let capacity = if unbounded {
+        QUEUE_CAPACITY
+    } else {
+        let start = separator + bounded_marker.len();
+        let end = type_name.len().saturating_sub(1);
+        let max_bound = type_name.get(start..end)?.parse::<usize>().ok()?;
+        max_bound.checked_add(1)?
+    };
+    if capacity > QUEUE_CAPACITY {
+        return None;
+    }
+    let capacity_msb = i64::try_from(capacity.saturating_sub(1)).ok()?;
+    let fixed_type_name =
+        type_name.split("$queue").next()?.to_string() + &format!("$[0:{capacity_msb}]");
+    let mut memory = memory_type_with_element(
+        &fixed_type_name,
+        shape.width,
+        bounds,
+        simple_type_signed(element_type)?,
+    )?;
+    memory.dynamic = true;
+    memory.queue = true;
     Some(memory)
 }
 

@@ -229,6 +229,8 @@ pub struct MemoryDecl {
     /// Dynamic arrays use runtime allocation semantics over a fixed maximum
     /// elaboration capacity; fixed arrays and sparse memories do not.
     pub dynamic: bool,
+    /// Dynamic FIFO storage with logical indexes remapped after each pop.
+    pub queue: bool,
     pub storage: MemoryStorage,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
@@ -669,6 +671,19 @@ pub enum Stmt {
     /// Delete a dynamic array and set its runtime size to zero.
     MemoryDelete {
         memory: usize,
+    },
+    /// Push a sampled value onto either end of a queue. A full queue errors.
+    QueuePush {
+        memory: usize,
+        value: Expr,
+        front: bool,
+    },
+    /// Pop from either end of a queue into a scalar/vector destination. An
+    /// empty queue writes X and leaves the queue empty.
+    QueuePop {
+        memory: usize,
+        destination: LValue,
+        front: bool,
     },
     /// Blocking indexed part-select write to a sparse-memory element.
     MemoryBlPart {
@@ -1377,6 +1392,10 @@ fn collect_memory_accesses(
             collect_memory_expr_reads(size, synchronous, false, accesses)
         }
         Stmt::MemoryDelete { .. } => {}
+        Stmt::QueuePush { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, false, accesses)
+        }
+        Stmt::QueuePop { .. } => {}
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -1620,6 +1639,7 @@ mod tests {
             }],
             flat_length: 4,
             dynamic: false,
+            queue: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1701,6 +1721,7 @@ mod tests {
             ],
             flat_length: 8,
             dynamic: false,
+            queue: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1738,6 +1759,7 @@ mod tests {
             }],
             flat_length: 513,
             dynamic: false,
+            queue: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

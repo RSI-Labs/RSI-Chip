@@ -242,6 +242,11 @@ impl SlangAstLowerer {
                 return Ok(Some(statement));
             }
         }
+        if matches!(task_name.as_str(), "push_back" | "push_front") {
+            if let Some(statement) = self.lower_queue_push(value, task_name == "push_front")? {
+                return Ok(Some(statement));
+            }
+        }
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
@@ -1003,6 +1008,44 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         Ok(Some(eda_core::ir::Stmt::MemoryDelete { memory }))
+    }
+
+    fn lower_queue_push(
+        &self,
+        value: &Value,
+        front: bool,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 2 {
+            return Ok(None);
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "queue push has no receiver".to_string())?;
+        let pushed = arguments
+            .get(1)
+            .ok_or_else(|| "queue push has no value".to_string())?;
+        let name = expression_symbol(receiver)
+            .ok_or_else(|| "queue push receiver has no symbol".to_string())?;
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if !self.design.memories[memory].queue {
+            return Ok(None);
+        }
+        let value = self.lower_expression(pushed)?;
+        Ok(Some(eda_core::ir::Stmt::QueuePush {
+            memory,
+            value,
+            front,
+        }))
     }
 
     fn lower_fixed_array_bound(

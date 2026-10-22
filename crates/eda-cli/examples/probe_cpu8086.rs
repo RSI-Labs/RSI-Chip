@@ -83,6 +83,8 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::MemoryCopy { .. } => {}
             Stmt::MemoryNew { size, .. } => expr_nets(size, reads),
             Stmt::MemoryDelete { .. } => {}
+            Stmt::QueuePush { value, .. } => expr_nets(value, reads),
+            Stmt::QueuePop { .. } => {}
             Stmt::MemoryBlPart {
                 indexes, start, e, ..
             }

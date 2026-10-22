@@ -1803,6 +1803,9 @@ impl SlangAstLowerer {
         if let Some(statement) = self.memory_struct_member_assignment(assignment, left, right)? {
             return Ok(statement);
         }
+        if let Some(statement) = self.queue_pop_assignment(left, right)? {
+            return Ok(statement);
+        }
         if let Some(statement) =
             self.dynamic_array_allocation(left, right, bool_field(assignment, "isNonBlocking"))?
         {
@@ -1956,6 +1959,56 @@ impl SlangAstLowerer {
             memory,
             size,
             nonblocking,
+        }))
+    }
+
+    fn queue_pop_assignment(
+        &self,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        if string_field(right, "kind").as_deref() != Some("Call") {
+            return Ok(None);
+        }
+        let front = match string_field(right, "subroutine").as_deref() {
+            Some("pop_front") => true,
+            Some("pop_back") => false,
+            _ => return Ok(None),
+        };
+        let arguments = right
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 1 {
+            return Err("queue pop expects exactly one receiver".into());
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| "queue pop has no receiver".to_string())?;
+        let name = expression_symbol(receiver)
+            .ok_or_else(|| "queue pop receiver has no symbol".to_string())?;
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if !self.design.memories[memory].queue {
+            return Ok(None);
+        }
+        let destination = self.lower_lvalue(left)?;
+        if destination.range.width() != self.design.memories[memory].element_width {
+            return Err(format!(
+                "queue pop destination width {} does not match element width {}",
+                destination.range.width(),
+                self.design.memories[memory].element_width
+            ));
+        }
+        Ok(Some(eda_core::ir::Stmt::QueuePop {
+            memory,
+            destination,
+            front,
         }))
     }
 
