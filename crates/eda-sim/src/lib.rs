@@ -1725,6 +1725,93 @@ impl<'d> Simulator<'d> {
         self.notify_memory_write(memory)
     }
 
+    fn read_lvalue(&self, destination: &LValue) -> LogicWord {
+        let bits = lv_bits(destination)
+            .into_iter()
+            .map(|net| self.vals.get(net).copied().unwrap_or(LogicValue::X))
+            .collect();
+        LogicWord { bits }
+    }
+
+    fn assign_scalar_immediate(&mut self, destination: &LValue, value: LogicWord) {
+        self.assign_scalar(destination, value.clone());
+        let width = destination.range.width();
+        for (bit, net) in lv_bits(destination).into_iter().enumerate() {
+            if let Some(target) = self.vals.get_mut(net) {
+                *target = value.bit(bit.min(width.saturating_sub(1)));
+            }
+        }
+    }
+
+    fn apply_associative_traversal(
+        &mut self,
+        memory: usize,
+        operation: eda_core::ir::AssocTraversalOp,
+        key: &LValue,
+        destination: &LValue,
+    ) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, index_width, index_signed, associative) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("associative traversal target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.index_width,
+                declaration.index_signed,
+                declaration.associative,
+            )
+        };
+        if !associative {
+            return Err(format!(
+                "associative traversal target '{name}' is not associative"
+            ));
+        }
+        if key.range.width() != index_width {
+            return Err(format!(
+                "associative traversal key width {} does not match index width {index_width}",
+                key.range.width()
+            ));
+        }
+
+        let compare = |left: &u64, right: &u64| {
+            associative_key_compare(*left, *right, index_width, index_signed)
+        };
+        let keys = self
+            .associative_elements
+            .get(memory)
+            .ok_or_else(|| format!("associative array '{name}' has no storage"))?
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let found = match operation {
+            eda_core::ir::AssocTraversalOp::First => keys.into_iter().min_by(compare),
+            eda_core::ir::AssocTraversalOp::Last => keys.into_iter().max_by(compare),
+            eda_core::ir::AssocTraversalOp::Next | eda_core::ir::AssocTraversalOp::Prev => {
+                let current = self.read_lvalue(key);
+                match current.to_u64() {
+                    Some(current) => {
+                        let wanted = match operation {
+                            eda_core::ir::AssocTraversalOp::Next => std::cmp::Ordering::Greater,
+                            _ => std::cmp::Ordering::Less,
+                        };
+                        keys.into_iter()
+                            .filter(|candidate| compare(candidate, &current) == wanted)
+                            .min_by(compare)
+                    }
+                    None => None,
+                }
+            }
+        };
+
+        let status = u64::from(found.is_some());
+        self.assign_scalar_immediate(destination, LogicWord::from_u64(1, status));
+        if let Some(found) = found {
+            self.assign_scalar_immediate(key, LogicWord::from_u64(index_width, found));
+        }
+        Ok(())
+    }
+
     fn assign_scalar(&mut self, destination: &LValue, value: LogicWord) {
         let width = destination.range.width();
         for (bit, net) in lv_bits(destination).into_iter().enumerate() {
@@ -2621,6 +2708,12 @@ impl<'d> Simulator<'d> {
                     };
                     self.apply_associative_delete(*memory, key)?;
                 }
+                Stmt::AssocTraversal {
+                    memory,
+                    operation,
+                    key,
+                    destination,
+                } => self.apply_associative_traversal(*memory, *operation, key, destination)?,
                 Stmt::MemoryBlPart {
                     memory,
                     indexes,
@@ -4168,6 +4261,7 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(size, out);
         }
         Stmt::MemoryDelete { memory } => out.push(*memory),
+        Stmt::AssocTraversal { memory, .. } => out.push(*memory),
         Stmt::QueuePush { memory, value, .. } => {
             out.push(*memory);
             walk_expr_memories(value, out);
@@ -4318,6 +4412,12 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             reads.extend(expr_nets(value));
         }
         Stmt::QueueDelete { index, .. } => reads.extend(expr_nets(index)),
+        Stmt::AssocTraversal {
+            key, destination, ..
+        } => {
+            reads.extend(lv_bits(key));
+            writes.extend(lv_bits(destination));
+        }
         Stmt::AssocWrite { index, value, .. } => {
             reads.extend(expr_nets(index));
             reads.extend(expr_nets(value));
@@ -4448,6 +4548,12 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryNew { size, .. } => walk_expr(size, out),
         Stmt::MemoryDelete { .. } => {}
+        Stmt::AssocTraversal {
+            key, destination, ..
+        } => {
+            out.extend(lv_bits(key));
+            out.extend(lv_bits(destination));
+        }
         Stmt::QueuePush { value, .. } => walk_expr(value, out),
         Stmt::QueuePop { .. } => {}
         Stmt::QueueInsert { index, value, .. } => {
@@ -4563,6 +4669,31 @@ fn collect_monitors<'d>(s: &'d Stmt, out: &mut Vec<(&'d [eda_core::ir::DispPart]
         }
         Stmt::Block(v) => v.iter().for_each(|x| collect_monitors(x, out)),
         _ => {}
+    }
+}
+
+fn associative_key_compare(
+    left: u64,
+    right: u64,
+    width: usize,
+    signed: bool,
+) -> std::cmp::Ordering {
+    if signed {
+        signed_associative_key(left, width).cmp(&signed_associative_key(right, width))
+    } else {
+        left.cmp(&right)
+    }
+}
+
+fn signed_associative_key(key: u64, width: usize) -> i64 {
+    if width >= 64 {
+        return key as i64;
+    }
+    let sign = 1_u64 << width;
+    if key & (sign >> 1) != 0 {
+        key as i64 - sign as i64
+    } else {
+        key as i64
     }
 }
 

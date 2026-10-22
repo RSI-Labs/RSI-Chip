@@ -1074,6 +1074,72 @@ impl SlangAstLowerer {
         }))
     }
 
+    pub(super) fn lower_associative_traversal_assignment(
+        &self,
+        left: &Value,
+        right: &Value,
+        nonblocking: bool,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        if string_field(right, "kind").as_deref() != Some("Call") {
+            return Ok(None);
+        }
+        let Some(subroutine) = string_field(right, "subroutine") else {
+            return Ok(None);
+        };
+        let method = subroutine
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default();
+        let operation = match method {
+            "first" => eda_core::ir::AssocTraversalOp::First,
+            "last" => eda_core::ir::AssocTraversalOp::Last,
+            "next" => eda_core::ir::AssocTraversalOp::Next,
+            "prev" => eda_core::ir::AssocTraversalOp::Prev,
+            _ => return Ok(None),
+        };
+        let Some(memory) = self.associative_receiver(right, "associative traversal")? else {
+            return Ok(None);
+        };
+        let arguments = right
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 2 {
+            return Err(format!(
+                "associative-array {method} expects one receiver and one ref key"
+            ));
+        }
+        if nonblocking {
+            return Err(format!(
+                "associative-array {method} is not supported as a nonblocking assignment"
+            ));
+        }
+        let key_argument = arguments
+            .get(1)
+            .ok_or_else(|| format!("associative-array {method} has no ref key"))?;
+        let key = self.lower_lvalue(key_argument)?;
+        let destination = self.lower_lvalue(left)?;
+        if key.range.width() != self.design.memories[memory].index_width {
+            return Err(format!(
+                "associative-array {method} key width {} does not match index width {}",
+                key.range.width(),
+                self.design.memories[memory].index_width
+            ));
+        }
+        if destination.range.width() == 0 || destination.range.width() > 32 {
+            return Err(format!(
+                "associative-array {method} status destination must be 1..=32 bits"
+            ));
+        }
+        Ok(Some(eda_core::ir::Stmt::AssocTraversal {
+            memory,
+            operation,
+            key,
+            destination,
+        }))
+    }
+
     fn lower_associative_array_exists(
         &self,
         value: &Value,

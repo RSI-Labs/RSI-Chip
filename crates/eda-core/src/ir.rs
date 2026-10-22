@@ -734,6 +734,14 @@ pub enum Stmt {
         memory: usize,
         index: Option<Expr>,
     },
+    /// Execute an associative-array traversal method, assign the found key to
+    /// the caller's lvalue, and assign the one-bit success result.
+    AssocTraversal {
+        memory: usize,
+        operation: AssocTraversalOp,
+        key: LValue,
+        destination: LValue,
+    },
     /// Blocking indexed part-select write to a sparse-memory element.
     MemoryBlPart {
         memory: usize,
@@ -904,6 +912,16 @@ pub enum MemoryCopyKind {
     DynamicArray,
     Queue,
     Associative,
+}
+
+/// Associative-array traversal direction for built-in `first`, `last`,
+/// `next`, and `prev` methods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssocTraversalOp {
+    First,
+    Last,
+    Next,
+    Prev,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1478,6 +1496,13 @@ fn collect_memory_accesses(
         Stmt::AssocDelete { index, .. } => {
             if let Some(index) = index {
                 collect_memory_expr_reads(index, synchronous, false, accesses);
+            }
+        }
+        Stmt::AssocTraversal { memory, .. } => {
+            if synchronous {
+                accesses.sync_reads.insert(*memory);
+            } else {
+                accesses.async_reads.insert(*memory);
             }
         }
         Stmt::MemoryBlPart {

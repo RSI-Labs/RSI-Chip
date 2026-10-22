@@ -17,6 +17,11 @@ use super::{
 
 pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     let kind = string_field(value, "kind").unwrap_or_default();
+    let operator = string_field(value, "op").or_else(|| {
+        (kind == "Call")
+            .then(|| string_field(value, "subroutine"))
+            .flatten()
+    });
     let literal = expression_literal(value);
     // The bounded IR folds parameter constants to unsigned 32-bit Const nodes.
     // Keep those leaves comparable without inventing a signed Constant type.
@@ -28,7 +33,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     SlangExpressionSummary {
         kind,
         type_name: string_field(value, "type").unwrap_or_default(),
-        operator: string_field(value, "op").unwrap_or_default(),
+        operator: operator.unwrap_or_default(),
         selection_kind: string_field(value, "selectionKind").unwrap_or_default(),
         type_width: string_field(value, "type").and_then(|type_name| simple_type_width(&type_name)),
         type_signed,
@@ -129,6 +134,11 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
                 if let Some(bound) = value.get(field) {
                     operands.push(expression_summary(bound));
                 }
+            }
+        }
+        "Call" => {
+            if let Some(arguments) = value.get("arguments").and_then(Value::as_array) {
+                operands.extend(arguments.iter().map(expression_summary));
             }
         }
         _ => {}
@@ -554,6 +564,35 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
 ) -> Option<String> {
+    if expression.kind == "Call" {
+        let method = expression
+            .operator
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default();
+        let operation = match method {
+            "first" => "First",
+            "last" => "Last",
+            "next" => "Next",
+            "prev" => "Prev",
+            _ => "",
+        };
+        if !operation.is_empty() {
+            let selected = expression.operands.first()?;
+            if selected.type_name.contains("$assoc[") {
+                let selected_symbol = selected.symbol.as_deref()?;
+                let memory = selected_symbol
+                    .rsplit_once(' ')
+                    .map(|(_, memory)| memory)
+                    .unwrap_or(selected_symbol);
+                let key = slang_expression_fingerprint_with_parameters(
+                    expression.operands.get(1)?,
+                    parameters,
+                )?;
+                return Some(format!("AssocTraversal:{operation}:u[{memory},{key}]"));
+            }
+        }
+    }
     if expression.kind == "ElementSelect"
         && expression
             .operands
@@ -1249,6 +1288,34 @@ pub(crate) fn design_stmt_assignments(
             }));
         }
         Stmt::AssocDelete { .. } => {}
+        Stmt::AssocTraversal {
+            memory,
+            operation,
+            key,
+            destination,
+        } => {
+            let Some(declaration) = design.memories.get(*memory) else {
+                return Vec::new();
+            };
+            let operation = match operation {
+                eda_core::ir::AssocTraversalOp::First => "First",
+                eda_core::ir::AssocTraversalOp::Last => "Last",
+                eda_core::ir::AssocTraversalOp::Next => "Next",
+                eda_core::ir::AssocTraversalOp::Prev => "Prev",
+            };
+            let signed_label = if declaration.index_signed { "s" } else { "u" };
+            let key_name =
+                design_lvalue_name(design, key).unwrap_or_else(|| "<unknown>".to_string());
+            if let Some(destination_name) = design_lvalue_name(design, destination) {
+                assignments.push((
+                    destination_name,
+                    format!(
+                        "AssocTraversal:{operation}:u[{},Ref:{}:{signed_label}[{}]]",
+                        declaration.name, declaration.index_width, key_name
+                    ),
+                ));
+            }
+        }
         Stmt::MemoryNew { memory, size, .. } => {
             assignments.extend(design.memories.get(*memory).map(|memory| {
                 (

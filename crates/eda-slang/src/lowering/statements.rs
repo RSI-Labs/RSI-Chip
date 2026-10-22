@@ -1780,6 +1780,13 @@ impl SlangAstLowerer {
         if self.is_external_input_lvalue(left)? {
             return Err("modport input variable cannot be assigned directly".into());
         }
+        if let Some(statement) = self.lower_associative_traversal_assignment(
+            left,
+            right,
+            bool_field(assignment, "isNonBlocking"),
+        )? {
+            return Ok(statement);
+        }
         if let Some(statement) = self.lower_class_parent_assignment(assignment, left, right)? {
             return Ok(statement);
         }

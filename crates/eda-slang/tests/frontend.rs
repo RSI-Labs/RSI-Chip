@@ -4992,6 +4992,185 @@ endmodule
             "wrong value for {name}"
         );
     }
+
+    let nonblocking_path = root.join("nonblocking_traversal.sv");
+    std::fs::write(
+        &nonblocking_path,
+        r#"
+module nonblocking_traversal;
+  logic [7:0] values[int];
+  int key;
+  int status;
+  initial status <= values.first(key);
+endmodule
+"#,
+    )
+    .expect("write nonblocking traversal source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&nonblocking_path),
+            Some("nonblocking_traversal"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("associative traversal must reject nonblocking assignment");
+    assert!(
+        error.contains("associative-array first is not supported as a nonblocking assignment"),
+        "unexpected nonblocking error: {error}"
+    );
+
+    let mismatch_path = root.join("traversal_key_mismatch.sv");
+    std::fs::write(
+        &mismatch_path,
+        r#"
+module traversal_key_mismatch;
+  logic [7:0] values[int];
+  byte key;
+  int status;
+  initial status = values.first(key);
+endmodule
+"#,
+    )
+    .expect("write traversal key mismatch source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&mismatch_path),
+            Some("traversal_key_mismatch"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("associative traversal key width mismatches must fail closed");
+    assert!(
+        error.contains("associative-array first key width 8 does not match index width 32"),
+        "unexpected key mismatch error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_associative_array_traversal() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-associative-traversal");
+    let source_path = root.join("associative_traversal.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module associative_traversal(
+  output int first_status,
+  output int next_status,
+  output int next_last_status,
+  output int next_failure_status,
+  output int prev_status,
+  output int last_status,
+  output int empty_status,
+  output int cursor_final,
+  output int empty_cursor_final,
+  output int cursor_after_first,
+  output int cursor_after_next,
+  output int cursor_after_prev
+);
+  logic [7:0] values[int];
+  logic [7:0] empty[int];
+  int cursor;
+  int empty_cursor;
+
+  initial begin
+    #1;
+    values[-3] = 8'h10;
+    values[2] = 8'h21;
+    values[7] = 8'h32;
+
+    first_status = values.first(cursor);
+    cursor_after_first = cursor;
+    next_status = values.next(cursor);
+    cursor_after_next = cursor;
+    next_last_status = values.next(cursor);
+    next_failure_status = values.next(cursor);
+    prev_status = values.prev(cursor);
+    cursor_after_prev = cursor;
+    last_status = values.last(cursor);
+    cursor_final = cursor;
+
+    empty_status = empty.first(empty_cursor);
+    empty_cursor_final = empty_cursor;
+  end
+endmodule
+"#,
+    )
+    .expect("write associative traversal source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("associative_traversal"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower associative traversal");
+    assert_eq!(design.memories.len(), 2);
+    let traversal_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("associative_traversal"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize associative-traversal AST");
+    let mut traversal_summary = slang
+        .summarize_ast_json(&traversal_json)
+        .expect("summarize associative-traversal AST");
+    traversal_summary
+        .validate_against_design(&design)
+        .expect("exact associative-traversal fingerprint should match");
+    if let Some(assignment) = traversal_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "first_status")
+            })
+        })
+    {
+        let original = assignment.rhs.operator.clone();
+        assignment.rhs.operator = original
+            .split_once(' ')
+            .map(|(receiver, _)| format!("{receiver} last"))
+            .unwrap_or_else(|| "last".into());
+    }
+    let traversal_error = traversal_summary
+        .validate_against_design(&design)
+        .expect_err("wrong associative-traversal direction must fail");
+    assert!(
+        traversal_error.contains("AssocTraversal:Last:u[values,"),
+        "unexpected traversal structural error: {traversal_error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create associative-traversal simulator");
+    simulator
+        .run_until(1)
+        .expect("execute associative traversal");
+    let expected = [
+        ("first_status", 1),
+        ("next_status", 1),
+        ("next_last_status", 1),
+        ("next_failure_status", 0),
+        ("prev_status", 1),
+        ("last_status", 1),
+        ("empty_status", 0),
+        ("cursor_final", 7),
+        ("empty_cursor_final", 0),
+        ("cursor_after_first", u32::MAX as u64),
+        ("cursor_after_next", 2),
+        ("cursor_after_prev", 2),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong value for {name}"
+        );
+    }
 }
 
 #[test]

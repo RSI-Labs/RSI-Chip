@@ -385,6 +385,12 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
         Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryNew { size, .. } => remap_expression(size, offset),
         Stmt::MemoryDelete { .. } => {}
+        Stmt::AssocTraversal {
+            key, destination, ..
+        } => {
+            key.net += offset;
+            destination.net += offset;
+        }
         Stmt::QueuePush { value, .. } => remap_expression(value, offset),
         Stmt::QueuePop { destination, .. } => destination.net += offset,
         Stmt::QueueInsert { index, value, .. } => {
@@ -614,6 +620,12 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
         Stmt::MemoryCopy { .. } => {}
         Stmt::MemoryNew { size, .. } => rewrite_expression_nets(size, rewrites),
         Stmt::MemoryDelete { .. } => {}
+        Stmt::AssocTraversal {
+            key, destination, ..
+        } => {
+            rewrite_lvalue_nets(key, rewrites);
+            rewrite_lvalue_nets(destination, rewrites);
+        }
         Stmt::QueuePush { value, .. } => rewrite_expression_nets(value, rewrites),
         Stmt::QueuePop { destination, .. } => rewrite_lvalue_nets(destination, rewrites),
         Stmt::QueueInsert { index, value, .. } => {
@@ -878,6 +890,7 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             remap_expression_memory_ids(size, offset);
         }
         Stmt::MemoryDelete { memory } => *memory += offset,
+        Stmt::AssocTraversal { memory, .. } => *memory += offset,
         Stmt::QueuePush { memory, value, .. } => {
             *memory += offset;
             remap_expression_memory_ids(value, offset);

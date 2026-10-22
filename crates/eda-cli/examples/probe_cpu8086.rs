@@ -94,6 +94,12 @@ fn feedback(s: &Stmt) -> bool {
                 expr_nets(value, reads);
             }
             Stmt::QueueDelete { index, .. } => expr_nets(index, reads),
+            Stmt::AssocTraversal {
+                key, destination, ..
+            } => {
+                reads.extend(lv_bits(key));
+                writes.extend(lv_bits(destination));
+            }
             Stmt::AssocWrite { index, value, .. } => {
                 expr_nets(index, reads);
                 expr_nets(value, reads);

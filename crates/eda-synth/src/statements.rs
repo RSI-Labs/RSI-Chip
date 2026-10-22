@@ -280,6 +280,9 @@ impl<'a> Synth<'a> {
             Stmt::AssocWrite { .. } | Stmt::AssocDelete { .. } => {
                 Err("associative-array operations are not synthesizable yet".into())
             }
+            Stmt::AssocTraversal { .. } => {
+                Err("associative-array traversal methods are not synthesizable yet".into())
+            }
             Stmt::MemoryBlPart { .. } | Stmt::MemoryNBlPart { .. } => {
                 Err("first-class sparse-memory part-select writes are not synthesizable yet".into())
             }
