@@ -12938,6 +12938,16 @@ fn slang_ast_direct_lowering_supports_integral_conversions() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
     };
+    fn set_conversion_leaf_symbol(
+        expression: &mut eda_slang::SlangExpressionSummary,
+        symbol: &str,
+    ) {
+        if let Some(operand) = expression.operands.first_mut() {
+            set_conversion_leaf_symbol(operand, symbol);
+        } else {
+            expression.symbol = Some(symbol.to_string());
+        }
+    }
     let root = temporary_directory("direct-ast-conversions");
     let source_path = root.join("conversions.sv");
     std::fs::write(
@@ -12971,6 +12981,35 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower integral conversions");
+    let conversion_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("conversions"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize integral conversion AST");
+    let mut conversion_summary = slang
+        .summarize_ast_json(&conversion_json)
+        .expect("summarize integral conversion AST");
+    conversion_summary
+        .validate_against_design(&design)
+        .expect("exact direct integral conversion fingerprint should match");
+    if let Some(target) = conversion_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "widen")
+    {
+        set_conversion_leaf_symbol(&mut target.rhs, "wrong_source");
+    }
+    let direct_conversion_error = conversion_summary
+        .validate_against_design(&design)
+        .expect_err("wrong direct conversion operand must fail");
+    assert!(
+        direct_conversion_error.contains("Ref:8:s[wrong_source]")
+            && direct_conversion_error.contains("Ref:8:s[source]"),
+        "unexpected direct conversion error: {direct_conversion_error}"
+    );
     let signed_output = design
         .net_decls
         .iter()
@@ -12997,6 +13036,66 @@ endmodule
     assert_eq!(
         simulator.read("unsigned_lt_zero").unwrap().to_u64(),
         Some(0)
+    );
+
+    let bounded_conversion_path = root.join("bounded_conversion.sv");
+    std::fs::write(
+        &bounded_conversion_path,
+        r#"
+module bounded_conversion(
+  input byte signed source,
+  output logic [15:0] widened
+);
+  assign widened = source;
+endmodule
+"#,
+    )
+    .expect("write bounded-compatible conversion source");
+    let bounded_conversion_direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&bounded_conversion_path),
+            Some("bounded_conversion"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower implicit conversion");
+    let bounded_conversion = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&bounded_conversion_path),
+            Some("bounded_conversion"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower implicit conversion through the bounded differential path");
+    let bounded_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&bounded_conversion_path),
+            Some("bounded_conversion"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize implicit conversion AST");
+    let mut bounded_summary = slang
+        .summarize_ast_json(&bounded_json)
+        .expect("summarize implicit conversion AST");
+    bounded_summary
+        .validate_against_design(&bounded_conversion_direct)
+        .expect("exact direct implicit conversion fingerprint should match");
+    bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded_conversion)
+        .expect("exact bounded implicit conversion fingerprint should match");
+    if let Some(target) = bounded_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "widened")
+    {
+        set_conversion_leaf_symbol(&mut target.rhs, "wrong_source");
+    }
+    let bounded_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded_conversion)
+        .expect_err("wrong bounded conversion operand must fail");
+    assert!(
+        bounded_error.contains("Ref:8:s[wrong_source]")
+            && bounded_error.contains("Ref:8:s[source]"),
+        "unexpected bounded conversion error: {bounded_error}"
     );
 }
 

@@ -2,7 +2,7 @@
 
 use super::expressions::{
     contains_expected_shapes, design_expr_fingerprint, design_lvalue_name, design_stmt_assignments,
-    slang_expression_fingerprint_with_parameters,
+    slang_expression_fingerprint_with_parameters, ExpressionFingerprintMode,
 };
 use super::*;
 use crate::types::simple_type_shape;
@@ -20,6 +20,11 @@ impl SlangAstSummary {
     }
 
     fn validate(&self, design: &Design, strict_generated_hierarchy: bool) -> Result<(), String> {
+        let fingerprint_mode = if strict_generated_hierarchy {
+            ExpressionFingerprintMode::Direct
+        } else {
+            ExpressionFingerprintMode::BoundedCompatibility
+        };
         if design.name != self.top_name {
             return Err(format!(
                 "bounded elaborator top '{}' does not match slang top '{}'",
@@ -140,6 +145,7 @@ impl SlangAstSummary {
                     match slang_expression_fingerprint_with_parameters(
                         &target.rhs,
                         &self.parameters,
+                        fingerprint_mode,
                     ) {
                         Some(fingerprint) => {
                             let fingerprint =
@@ -268,6 +274,7 @@ impl SlangAstSummary {
                                     &self.declarations,
                                     &self.type_layouts,
                                     &self.parameters,
+                                    fingerprint_mode,
                                 )
                                 .unwrap_or_else(|| "?".to_string())
                             }
@@ -283,6 +290,7 @@ impl SlangAstSummary {
                                     &assignment.rhs,
                                     &self.declarations,
                                     &self.parameters,
+                                    fingerprint_mode,
                                 )
                                 .ok_or_else(|| {
                                     format!(
@@ -294,6 +302,7 @@ impl SlangAstSummary {
                             match slang_expression_fingerprint_with_parameters(
                                 &assignment.rhs,
                                 &self.parameters,
+                                fingerprint_mode,
                             ) {
                                 Some(fingerprint) => {
                                     let fingerprint = canonicalize_memory_fingerprint(
@@ -478,6 +487,7 @@ fn memory_member_lvalue_fingerprint(
     declarations: &[super::SlangDeclarationSummary],
     type_layouts: &std::collections::BTreeMap<String, super::SlangTypeLayoutSummary>,
     parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let declaration = declarations
         .iter()
@@ -521,13 +531,13 @@ fn memory_member_lvalue_fingerprint(
     let indexes = member
         .indexes
         .iter()
-        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters))
+        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
         .collect::<Option<Vec<_>>>()?;
     let old = format!(
         "MemoryRead:{element_width}:u[{target_name},{}]",
         indexes.join(",")
     );
-    let value = slang_expression_fingerprint_with_parameters(value, parameters)?;
+    let value = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
     let mut parts = Vec::new();
     if offset + field_width < element_width {
         let lsb = offset + field_width;
@@ -551,6 +561,7 @@ fn dynamic_packed_lvalue_fingerprint(
     value: &super::SlangExpressionSummary,
     declarations: &[super::SlangDeclarationSummary],
     parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let declaration = declarations
         .iter()
@@ -560,8 +571,9 @@ fn dynamic_packed_lvalue_fingerprint(
     let base_width = shape.width;
     let group_width = dimension.element_width;
     let selector_width = selector.type_width?.max(1);
-    let selector_fingerprint = slang_expression_fingerprint_with_parameters(selector, parameters)?;
-    let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters)?;
+    let selector_fingerprint =
+        slang_expression_fingerprint_with_parameters(selector, parameters, mode)?;
+    let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
     let old_fingerprint = format!("Ref:{base_width}:u[{target_name}]");
     let mut physical_bits = vec![None; base_width];
 

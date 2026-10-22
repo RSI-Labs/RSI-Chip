@@ -418,9 +418,16 @@ fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option<i64> {
     Some(value)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExpressionFingerprintMode {
+    Direct,
+    BoundedCompatibility,
+}
+
 fn constant_packed_select_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let selected = expression.operands.first()?;
     if selected.type_name.contains('$') {
@@ -495,7 +502,7 @@ fn constant_packed_select_fingerprint(
         let width = usize::try_from(physical_msb - physical_lsb + 1).ok()?;
         (physical_msb, physical_lsb, width)
     };
-    let base = slang_expression_fingerprint_with_parameters(selected, parameters)?;
+    let base = slang_expression_fingerprint_with_parameters(selected, parameters, mode)?;
     Some(format!(
         "PackedSelect:{width}:u[{base},Range:{physical_msb}:{physical_lsb}]"
     ))
@@ -504,6 +511,7 @@ fn constant_packed_select_fingerprint(
 fn dynamic_packed_element_select_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     if expression.kind != "ElementSelect" {
         return None;
@@ -524,8 +532,9 @@ fn dynamic_packed_element_select_fingerprint(
     }
 
     let selector_width = selector.type_width?.max(1);
-    let selector_fingerprint = slang_expression_fingerprint_with_parameters(selector, parameters)?;
-    let base = slang_expression_fingerprint_with_parameters(selected, parameters)?;
+    let selector_fingerprint =
+        slang_expression_fingerprint_with_parameters(selector, parameters, mode)?;
+    let base = slang_expression_fingerprint_with_parameters(selected, parameters, mode)?;
     let lower = dimension.msb.min(dimension.lsb);
     let upper = dimension.msb.max(dimension.lsb);
     let mut selected_fingerprint = format!("Const:{width}:u[{width}:{}]", "x".repeat(width));
@@ -568,9 +577,57 @@ fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> O
     Some(format!("Const:{width}:{signed_label}[{literal}]"))
 }
 
+fn conversion_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let operand = expression.operands.first()?;
+    if expression.type_name == "string" || operand.type_name == "string" {
+        return None;
+    }
+    let operand_fingerprint =
+        slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+    if mode == ExpressionFingerprintMode::BoundedCompatibility {
+        return Some(operand_fingerprint);
+    }
+
+    let target_shape = simple_type_shape(&expression.type_name)?;
+    let source_shape = simple_type_shape(&operand.type_name)?;
+    let target_signed = simple_type_signed(&expression.type_name)?;
+    let source_signed = simple_type_signed(&operand.type_name)?;
+    let target_width = target_shape.width;
+    let source_width = source_shape.width;
+    if target_width == source_width && target_signed == source_signed {
+        return Some(operand_fingerprint);
+    }
+
+    let resized = if target_width < source_width {
+        let msb = target_width - 1;
+        format!("PackedSelect:{target_width}:u[{operand_fingerprint},Range:{msb}:0]")
+    } else if target_width > source_width {
+        let extension = target_width - source_width;
+        let padding = if source_signed {
+            let sign_bit = source_width - 1;
+            format!(
+                "Repeat:{extension}:u[PackedSelect:1:u[{operand_fingerprint},Range:{sign_bit}:{sign_bit}]]"
+            )
+        } else {
+            let zeros = "0".repeat(extension);
+            format!("Const:{extension}:u[{extension}:{zeros}]")
+        };
+        format!("Concat:{target_width}:u[{padding},{operand_fingerprint}]")
+    } else {
+        operand_fingerprint
+    };
+    let signed_label = if target_signed { "s" } else { "u" };
+    Some(format!("Signed:{target_width}:{signed_label}[{resized}]"))
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     if expression.kind == "Call" {
         let method = expression
@@ -596,6 +653,7 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 let key = slang_expression_fingerprint_with_parameters(
                     expression.operands.get(1)?,
                     parameters,
+                    mode,
                 )?;
                 return Some(format!("AssocTraversal:{operation}:u[{memory},{key}]"));
             }
@@ -622,6 +680,7 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 let key = slang_expression_fingerprint_with_parameters(
                     expression.operands.get(1)?,
                     parameters,
+                    mode,
                 )?;
                 return Some(format!("AssocExists:1:u[{memory},{key}]"));
             }
@@ -639,8 +698,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             .rsplit_once(' ')
             .map(|(_, memory)| memory)
             .unwrap_or(selected_symbol);
-        let index =
-            slang_expression_fingerprint_with_parameters(expression.operands.get(1)?, parameters)?;
+        let index = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
         let width = expression.type_width?;
         let signed = expression.type_signed?;
         let signed_label = if signed { "s" } else { "u" };
@@ -673,14 +735,14 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             .operands
             .iter()
             .skip(1)
-            .map(|index| slang_expression_fingerprint_with_parameters(index, parameters))
+            .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
             .collect::<Option<Vec<_>>>()?;
         let start_operand = match expression.selection_kind.as_str() {
             "Simple" => expression.operands.get(2)?,
             "IndexedUp" | "IndexedDown" => expression.operands.get(1)?,
             _ => return None,
         };
-        let start = slang_expression_fingerprint_with_parameters(start_operand, parameters)?;
+        let start = slang_expression_fingerprint_with_parameters(start_operand, parameters, mode)?;
         let width = expression.type_width?;
         let ascending = expression.selection_kind != "IndexedDown";
         let direction = if ascending { "Ascending" } else { "Descending" };
@@ -690,10 +752,12 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         ));
     }
     if matches!(expression.kind.as_str(), "ElementSelect" | "RangeSelect") {
-        if let Some(fingerprint) = constant_packed_select_fingerprint(expression, parameters) {
+        if let Some(fingerprint) = constant_packed_select_fingerprint(expression, parameters, mode)
+        {
             return Some(fingerprint);
         }
-        if let Some(fingerprint) = dynamic_packed_element_select_fingerprint(expression, parameters)
+        if let Some(fingerprint) =
+            dynamic_packed_element_select_fingerprint(expression, parameters, mode)
         {
             return Some(fingerprint);
         }
@@ -701,26 +765,18 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     if expression.kind == "UnaryOp" && expression.operator == "LogicalNot" {
         let operand = expression.operands.first()?;
         let operand_fingerprint =
-            slang_expression_fingerprint_with_parameters(operand, parameters)?;
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
         return Some(format!("Not:1:u[Reduction:1:u[{operand_fingerprint}]]"));
     }
     if expression.kind == "Replication" {
         let count = expression.repeat_count?;
         let operand = expression.operands.first()?;
         let operand_fingerprint =
-            slang_expression_fingerprint_with_parameters(operand, parameters)?;
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
         return Some(format!("Repeat:{count}:u[{operand_fingerprint}]"));
     }
     if expression.kind == "Conversion" {
-        let operand = expression.operands.first()?;
-        if operand.kind != "IntegerLiteral"
-            || expression.type_width.is_none()
-            || expression.type_width != operand.type_width
-            || expression.type_signed != operand.type_signed
-        {
-            return None;
-        }
-        return slang_expression_fingerprint_with_parameters(operand, parameters);
+        return conversion_fingerprint(expression, parameters, mode);
     }
     if expression.kind == "BinaryOp"
         && expression
@@ -729,10 +785,16 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             .zip(expression.operands.get(1))
             .is_some_and(|(left, right)| left.type_name == "string" || right.type_name == "string")
     {
-        let left =
-            slang_expression_fingerprint_with_parameters(expression.operands.first()?, parameters)?;
-        let right =
-            slang_expression_fingerprint_with_parameters(expression.operands.get(1)?, parameters)?;
+        let left = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let right = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
         let comparison = format!("StringCompare:32:s[{left},{right}]");
         let root = slang_expression_shape(expression)?;
         return Some(format!(
@@ -758,7 +820,7 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     let operands = expression
         .operands
         .iter()
-        .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters))
+        .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters, mode))
         .collect::<Option<Vec<_>>>()?;
     Some(format!(
         "{}:{width}:{signed_label}[{}]",
