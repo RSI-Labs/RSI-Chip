@@ -72,6 +72,7 @@ fn ordinary_arrays_do_not_become_sparse_memory_macro_plans() {
         flat_length: 4,
         dynamic: false,
         queue: false,
+        queue_bound: None,
         associative: false,
         index_width: 0,
         index_signed: false,

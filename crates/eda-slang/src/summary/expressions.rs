@@ -1297,6 +1297,30 @@ pub(crate) fn design_stmt_assignments(
                     })
             }));
         }
+        Stmt::QueueInsert {
+            memory,
+            index,
+            value,
+        } => {
+            assignments.extend(design.memories.get(*memory).map(|memory| {
+                (
+                    memory.name.clone(),
+                    format!(
+                        "QueueInsert:{},{}",
+                        design_expr_fingerprint(design, index),
+                        design_expr_fingerprint(design, value)
+                    ),
+                )
+            }));
+        }
+        Stmt::QueueDelete { memory, index } => {
+            assignments.extend(design.memories.get(*memory).map(|memory| {
+                (
+                    memory.name.clone(),
+                    format!("QueueDelete:{}", design_expr_fingerprint(design, index)),
+                )
+            }));
+        }
         Stmt::AssocWrite { memory, value, .. } => {
             assignments.extend(
                 design

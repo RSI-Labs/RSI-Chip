@@ -387,6 +387,11 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => remap_expression(value, offset),
         Stmt::QueuePop { destination, .. } => destination.net += offset,
+        Stmt::QueueInsert { index, value, .. } => {
+            remap_expression(index, offset);
+            remap_expression(value, offset);
+        }
+        Stmt::QueueDelete { index, .. } => remap_expression(index, offset),
         Stmt::AssocWrite { index, value, .. } => {
             remap_expression(index, offset);
             remap_expression(value, offset);
@@ -611,6 +616,11 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => rewrite_expression_nets(value, rewrites),
         Stmt::QueuePop { destination, .. } => rewrite_lvalue_nets(destination, rewrites),
+        Stmt::QueueInsert { index, value, .. } => {
+            rewrite_expression_nets(index, rewrites);
+            rewrite_expression_nets(value, rewrites);
+        }
+        Stmt::QueueDelete { index, .. } => rewrite_expression_nets(index, rewrites),
         Stmt::AssocWrite { index, value, .. } => {
             rewrite_expression_nets(index, rewrites);
             rewrite_expression_nets(value, rewrites);
@@ -873,6 +883,19 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             remap_expression_memory_ids(value, offset);
         }
         Stmt::QueuePop { memory, .. } => *memory += offset,
+        Stmt::QueueInsert {
+            memory,
+            index,
+            value,
+        } => {
+            *memory += offset;
+            remap_expression_memory_ids(index, offset);
+            remap_expression_memory_ids(value, offset);
+        }
+        Stmt::QueueDelete { memory, index } => {
+            *memory += offset;
+            remap_expression_memory_ids(index, offset);
+        }
         Stmt::AssocWrite {
             memory,
             index,

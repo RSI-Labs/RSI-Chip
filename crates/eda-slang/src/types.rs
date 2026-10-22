@@ -35,6 +35,7 @@ pub(super) struct AstMemoryType {
     pub signed: bool,
     pub dynamic: bool,
     pub queue: bool,
+    pub queue_bound: Option<usize>,
     pub associative: bool,
     pub index_width: usize,
     pub index_signed: bool,
@@ -131,6 +132,7 @@ pub(super) fn memory_type_with_element(
         signed,
         dynamic: false,
         queue: false,
+        queue_bound: None,
         associative: false,
         index_width: 0,
         index_signed: false,
@@ -174,13 +176,16 @@ pub(super) fn queue_memory_type(type_name: &str) -> Option<AstMemoryType> {
     let shape = simple_type_shape(element_type)?;
     let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
     let bounds = shape.bounds.unwrap_or((element_msb, 0));
-    let capacity = if unbounded {
-        QUEUE_CAPACITY
+    let max_bound = if unbounded {
+        None
     } else {
         let start = separator + bounded_marker.len();
         let end = type_name.len().saturating_sub(1);
-        let max_bound = type_name.get(start..end)?.parse::<usize>().ok()?;
-        max_bound.checked_add(1)?
+        Some(type_name.get(start..end)?.parse::<usize>().ok()?)
+    };
+    let capacity = match max_bound {
+        None => QUEUE_CAPACITY,
+        Some(bound) => bound.checked_add(1)?,
     };
     if capacity > QUEUE_CAPACITY {
         return None;
@@ -196,6 +201,7 @@ pub(super) fn queue_memory_type(type_name: &str) -> Option<AstMemoryType> {
     )?;
     memory.dynamic = true;
     memory.queue = true;
+    memory.queue_bound = if unbounded { None } else { max_bound };
     memory.associative = false;
     Some(memory)
 }

@@ -1644,6 +1644,7 @@ impl<'a> Elaborator<'a> {
             flat_length: array.length as u64,
             dynamic: false,
             queue: false,
+            queue_bound: None,
             associative: false,
             index_width: 0,
             index_signed: false,

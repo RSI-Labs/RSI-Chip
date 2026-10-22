@@ -231,6 +231,9 @@ pub struct MemoryDecl {
     pub dynamic: bool,
     /// Dynamic FIFO storage with logical indexes remapped after each pop.
     pub queue: bool,
+    /// Declared inclusive upper index for a bounded queue, or `None` for an
+    /// unbounded queue. The runtime capacity is `queue_bound + 1`.
+    pub queue_bound: Option<usize>,
     /// Sparse key/value storage; logical keys are not physical array indexes.
     pub associative: bool,
     pub index_width: usize,
@@ -703,6 +706,19 @@ pub enum Stmt {
         memory: usize,
         destination: LValue,
         front: bool,
+    },
+    /// Insert a sampled value before a queue index. Unknown, negative, and
+    /// greater-than-size indexes leave the queue unchanged.
+    QueueInsert {
+        memory: usize,
+        index: Expr,
+        value: Expr,
+    },
+    /// Delete one queue index. Unknown and out-of-range indexes leave the
+    /// queue unchanged.
+    QueueDelete {
+        memory: usize,
+        index: Expr,
     },
     /// Write one associative-array key. Unknown keys and capacity overflow
     /// fail closed.
@@ -1436,6 +1452,13 @@ fn collect_memory_accesses(
         Stmt::QueuePush { value, .. } => {
             collect_memory_expr_reads(value, synchronous, false, accesses)
         }
+        Stmt::QueueInsert { index, value, .. } => {
+            collect_memory_expr_reads(index, synchronous, false, accesses);
+            collect_memory_expr_reads(value, synchronous, false, accesses)
+        }
+        Stmt::QueueDelete { index, .. } => {
+            collect_memory_expr_reads(index, synchronous, false, accesses)
+        }
         Stmt::QueuePop { .. } => {}
         Stmt::AssocWrite { index, value, .. } => {
             collect_memory_expr_reads(index, synchronous, false, accesses);
@@ -1700,6 +1723,7 @@ mod tests {
             flat_length: 4,
             dynamic: false,
             queue: false,
+            queue_bound: None,
             associative: false,
             index_width: 0,
             index_signed: false,
@@ -1785,6 +1809,7 @@ mod tests {
             flat_length: 8,
             dynamic: false,
             queue: false,
+            queue_bound: None,
             associative: false,
             index_width: 0,
             index_signed: false,
@@ -1826,6 +1851,7 @@ mod tests {
             flat_length: 513,
             dynamic: false,
             queue: false,
+            queue_bound: None,
             associative: false,
             index_width: 0,
             index_signed: false,

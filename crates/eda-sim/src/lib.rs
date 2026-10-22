@@ -1365,7 +1365,7 @@ impl<'d> Simulator<'d> {
 
     fn queue_push(&mut self, memory: usize, value: &LogicWord, front: bool) -> Result<(), String> {
         let memory = self.canonical_memory(memory);
-        let (name, capacity, element_width, queue) = {
+        let (name, capacity, element_width, queue, queue_bound) = {
             let Some(declaration) = self.design.memories.get(memory) else {
                 return Err("queue push target is missing".into());
             };
@@ -1374,13 +1374,40 @@ impl<'d> Simulator<'d> {
                 declaration.flat_length,
                 declaration.element_width,
                 declaration.queue,
+                declaration.queue_bound,
             )
         };
         if !queue {
             return Err(format!("queue push target '{name}' is not a queue"));
         }
         let length = self.dynamic_lengths[memory];
-        if length >= capacity {
+        let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if length >= capacity as u64 {
+            if queue_bound.is_some() {
+                // IEEE 1800-2023 7.10.5: writes beyond a bounded queue's
+                // declared bound discard the out-of-bounds tail. Pushing at
+                // the back therefore leaves a full bounded queue unchanged,
+                // while pushing at the front drops its final element.
+                if !front {
+                    return Ok(());
+                }
+                let old_values = (0..length)
+                    .map(|index| {
+                        self.memory_elements
+                            .get(memory)
+                            .and_then(|elements| elements.get(index))
+                            .cloned()
+                            .unwrap_or_else(|| LogicWord::xes(element_width))
+                    })
+                    .collect::<Vec<_>>();
+                for (index, old_value) in old_values.into_iter().enumerate().rev() {
+                    if index + 1 < capacity {
+                        self.apply_memory_update(memory, index as u64 + 1, old_value)?;
+                    }
+                }
+                self.apply_memory_update(memory, 0, value.sized(element_width))?;
+                return Ok(());
+            }
             return Err(format!("queue '{name}' is full; capacity is {capacity}"));
         }
         let value = value.sized(element_width);
@@ -1465,6 +1492,143 @@ impl<'d> Simulator<'d> {
         }
         self.apply_memory_update(memory, length - 1, LogicWord::xes(element_width))?;
         self.assign_scalar(destination, popped);
+        Ok(())
+    }
+
+    fn queue_index(&self, index: &Expr) -> Result<Option<i64>, String> {
+        let value = self.eval(index);
+        if value.width() > u64::BITS as usize {
+            return Err("queue index exceeds 64 bits".into());
+        }
+        if !value.is_fully_known() {
+            return Ok(None);
+        }
+        let bits = value.to_u64().expect("known queue index is numeric");
+        let signed =
+            if value.width() < u64::BITS as usize && bits & (1_u64 << (value.width() - 1)) != 0 {
+                bits as i64 - (1_i64 << value.width())
+            } else {
+                bits as i64
+            };
+        Ok(Some(signed))
+    }
+
+    fn queue_insert(
+        &mut self,
+        memory: usize,
+        index: &Expr,
+        value: &LogicWord,
+    ) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, capacity, element_width, queue, queue_bound) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("queue insert target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.flat_length,
+                declaration.element_width,
+                declaration.queue,
+                declaration.queue_bound,
+            )
+        };
+        if !queue {
+            return Err(format!("queue insert target '{name}' is not a queue"));
+        }
+        let Some(index) = self.queue_index(index)? else {
+            return Ok(());
+        };
+        let length = self.dynamic_lengths[memory];
+        let Some(length) = i64::try_from(length).ok() else {
+            return Err(format!("queue '{name}' length is too large"));
+        };
+        if index < 0 || index > length {
+            return Ok(());
+        }
+        let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
+        let index =
+            usize::try_from(index).map_err(|_| format!("queue '{name}' index is too large"))?;
+        let length =
+            usize::try_from(length).map_err(|_| format!("queue '{name}' length is too large"))?;
+        let value = value.sized(element_width);
+
+        if length < capacity {
+            let moved = (index..length)
+                .map(|old_index| {
+                    self.memory_elements
+                        .get(memory)
+                        .and_then(|elements| elements.get(old_index as u64))
+                        .cloned()
+                        .unwrap_or_else(|| LogicWord::xes(element_width))
+                })
+                .collect::<Vec<_>>();
+            self.dynamic_lengths[memory] = length as u64 + 1;
+            for (offset, old_value) in moved.into_iter().enumerate().rev() {
+                self.apply_memory_update(memory, index as u64 + offset as u64 + 1, old_value)?;
+            }
+            self.apply_memory_update(memory, index as u64, value)?;
+        } else if queue_bound.is_some() {
+            if index == capacity {
+                return Ok(());
+            }
+            let last_retained = length.saturating_sub(1);
+            let moved = (index..last_retained)
+                .map(|old_index| {
+                    self.memory_elements
+                        .get(memory)
+                        .and_then(|elements| elements.get(old_index as u64))
+                        .cloned()
+                        .unwrap_or_else(|| LogicWord::xes(element_width))
+                })
+                .collect::<Vec<_>>();
+            for (offset, old_value) in moved.into_iter().enumerate().rev() {
+                self.apply_memory_update(memory, index as u64 + offset as u64 + 1, old_value)?;
+            }
+            self.apply_memory_update(memory, index as u64, value)?;
+        } else {
+            return Err(format!("queue '{name}' is full; capacity is {capacity}"));
+        }
+        Ok(())
+    }
+
+    fn queue_delete(&mut self, memory: usize, index: &Expr) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, element_width, queue) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("queue delete target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.element_width,
+                declaration.queue,
+            )
+        };
+        if !queue {
+            return Err(format!("queue delete target '{name}' is not a queue"));
+        }
+        let Some(index) = self.queue_index(index)? else {
+            return Ok(());
+        };
+        let length = self.dynamic_lengths[memory];
+        if index < 0 || index >= length as i64 {
+            return Ok(());
+        }
+        let index =
+            usize::try_from(index).map_err(|_| format!("queue '{name}' index is too large"))?;
+        let moved = (index as u64 + 1..length)
+            .map(|old_index| {
+                self.memory_elements
+                    .get(memory)
+                    .and_then(|elements| elements.get(old_index))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(element_width))
+            })
+            .collect::<Vec<_>>();
+        self.dynamic_lengths[memory] = length - 1;
+        for (offset, old_value) in moved.into_iter().enumerate() {
+            self.apply_memory_update(memory, index as u64 + offset as u64, old_value)?;
+        }
+        self.apply_memory_update(memory, length - 1, LogicWord::xes(element_width))?;
         Ok(())
     }
 
@@ -2206,6 +2370,15 @@ impl<'d> Simulator<'d> {
                     destination,
                     front,
                 } => self.queue_pop(*memory, destination, *front)?,
+                Stmt::QueueInsert {
+                    memory,
+                    index,
+                    value,
+                } => {
+                    let value = self.eval(value);
+                    self.queue_insert(*memory, index, &value)?;
+                }
+                Stmt::QueueDelete { memory, index } => self.queue_delete(*memory, index)?,
                 Stmt::AssocWrite {
                     memory,
                     index,
@@ -3792,6 +3965,19 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(value, out);
         }
         Stmt::QueuePop { memory, .. } => out.push(*memory),
+        Stmt::QueueInsert {
+            memory,
+            index,
+            value,
+        } => {
+            out.push(*memory);
+            walk_expr_memories(index, out);
+            walk_expr_memories(value, out);
+        }
+        Stmt::QueueDelete { memory, index } => {
+            out.push(*memory);
+            walk_expr_memories(index, out);
+        }
         Stmt::AssocWrite {
             memory,
             index,
@@ -3919,6 +4105,11 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => reads.extend(expr_nets(value)),
         Stmt::QueuePop { destination, .. } => writes.extend(lv_bits(destination)),
+        Stmt::QueueInsert { index, value, .. } => {
+            reads.extend(expr_nets(index));
+            reads.extend(expr_nets(value));
+        }
+        Stmt::QueueDelete { index, .. } => reads.extend(expr_nets(index)),
         Stmt::AssocWrite { index, value, .. } => {
             reads.extend(expr_nets(index));
             reads.extend(expr_nets(value));
@@ -4051,6 +4242,11 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => walk_expr(value, out),
         Stmt::QueuePop { .. } => {}
+        Stmt::QueueInsert { index, value, .. } => {
+            walk_expr(index, out);
+            walk_expr(value, out);
+        }
+        Stmt::QueueDelete { index, .. } => walk_expr(index, out),
         Stmt::AssocWrite { index, value, .. } => {
             walk_expr(index, out);
             walk_expr(value, out);

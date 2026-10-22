@@ -569,6 +569,7 @@ impl SlangAstLowerer {
             flat_length: memory.flat_length,
             dynamic: memory.dynamic,
             queue: memory.queue,
+            queue_bound: memory.queue_bound,
             associative: memory.associative,
             index_width: memory.index_width,
             index_signed: memory.index_signed,

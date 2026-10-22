@@ -4995,11 +4995,21 @@ module queue_lifecycle(
   output logic [7:0] popped,
   output logic [7:0] back,
   output int back_size,
-  output logic [7:0] empty_pop
+  output logic [7:0] empty_pop,
+  output int inserted_size,
+  output logic [7:0] inserted_first,
+  output logic [7:0] inserted_second,
+  output logic [7:0] inserted_third,
+  output int deleted_size,
+  output logic [7:0] deleted_first,
+  output logic [7:0] deleted_second,
+  output int invalid_insert_size,
+  output int invalid_delete_size
 );
   logic [7:0] values[$];
   logic [7:0] bounded[$:3];
   logic [7:0] empty[$];
+  logic [7:0] methods[$];
 
   initial begin
     #1;
@@ -5023,6 +5033,22 @@ module queue_lifecycle(
     bounded.push_back(data);
     bounded.push_back(data + 8'd3);
     bounded_size = bounded.size();
+
+    methods.push_back(data);
+    methods.push_back(data + 8'd1);
+    methods.insert(1, data + 8'd2);
+    inserted_size = methods.size();
+    inserted_first = methods[0];
+    inserted_second = methods[1];
+    inserted_third = methods[2];
+    methods.delete(0);
+    deleted_size = methods.size();
+    deleted_first = methods[0];
+    deleted_second = methods[1];
+    methods.insert(-1, data + 8'd3);
+    invalid_insert_size = methods.size();
+    methods.delete(2);
+    invalid_delete_size = methods.size();
   end
 endmodule
 "#,
@@ -5036,7 +5062,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower queue lifecycle");
-    assert_eq!(design.memories.len(), 3);
+    assert_eq!(design.memories.len(), 4);
     assert!(design.memories.iter().all(|memory| memory.queue));
     assert!(design.memories.iter().all(|memory| memory.dynamic));
     assert_eq!(design.memories[0].flat_length, 256);
@@ -5069,6 +5095,118 @@ endmodule
     assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(0));
     assert_eq!(simulator.read("empty_pop").unwrap().to_u64(), None);
     assert_eq!(simulator.read("bounded_size").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("inserted_size").unwrap().to_u64(), Some(3));
+    assert_eq!(
+        simulator.read("inserted_first").unwrap().to_u64(),
+        Some(0x20)
+    );
+    assert_eq!(
+        simulator.read("inserted_second").unwrap().to_u64(),
+        Some(0x22)
+    );
+    assert_eq!(
+        simulator.read("inserted_third").unwrap().to_u64(),
+        Some(0x21)
+    );
+    assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("deleted_first").unwrap().to_u64(),
+        Some(0x22)
+    );
+    assert_eq!(
+        simulator.read("deleted_second").unwrap().to_u64(),
+        Some(0x21)
+    );
+    assert_eq!(
+        simulator.read("invalid_insert_size").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        simulator.read("invalid_delete_size").unwrap().to_u64(),
+        Some(2)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_discards_bounded_queue_overflow() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-queue-overflow");
+    let source_path = root.join("queue_overflow.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module queue_overflow(
+  input logic [7:0] data,
+  output int back_overflow_size,
+  output int front_overflow_size,
+  output int inserted_overflow_size,
+  output logic [7:0] inserted_first,
+  output logic [7:0] inserted_last,
+  output logic [7:0] first,
+  output logic [7:0] last
+);
+  logic [7:0] values[$:1];
+
+  initial begin
+    #1;
+    values.push_back(data);
+    values.push_back(data + 8'd1);
+    back_overflow_size = values.size();
+    values.insert(1, data + 8'd3);
+    inserted_overflow_size = values.size();
+    inserted_first = values[0];
+    inserted_last = values[1];
+    values.push_front(data + 8'd4);
+    front_overflow_size = values.size();
+    first = values[0];
+    last = values[1];
+  end
+endmodule
+"#,
+    )
+    .expect("write bounded queue overflow source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("queue_overflow"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower bounded queue overflow");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].flat_length, 2);
+
+    let mut simulator = Simulator::new(&design).expect("create queue overflow simulator");
+    simulator
+        .set_input("data", &LogicWord::from_u64(8, 0x20))
+        .expect("set queue overflow data");
+    simulator
+        .run_until(1)
+        .expect("bounded queue overflow follows discard semantics");
+    assert_eq!(
+        simulator.read("back_overflow_size").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        simulator.read("front_overflow_size").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        simulator.read("inserted_overflow_size").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        simulator.read("inserted_first").unwrap().to_u64(),
+        Some(0x23)
+    );
+    assert_eq!(
+        simulator.read("inserted_last").unwrap().to_u64(),
+        Some(0x20)
+    );
+    assert_eq!(simulator.read("first").unwrap().to_u64(), Some(0x24));
+    assert_eq!(simulator.read("last").unwrap().to_u64(), Some(0x23));
 }
 
 #[test]

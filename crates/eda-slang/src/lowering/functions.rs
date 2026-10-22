@@ -254,9 +254,17 @@ impl SlangAstLowerer {
             if let Some(statement) = self.lower_dynamic_array_delete(value)? {
                 return Ok(Some(statement));
             }
+            if let Some(statement) = self.lower_queue_delete(value)? {
+                return Ok(Some(statement));
+            }
         }
         if matches!(task_name.as_str(), "push_back" | "push_front") {
             if let Some(statement) = self.lower_queue_push(value, task_name == "push_front")? {
+                return Ok(Some(statement));
+            }
+        }
+        if task_name == "insert" {
+            if let Some(statement) = self.lower_queue_insert(value)? {
                 return Ok(Some(statement));
             }
         }
@@ -1166,6 +1174,85 @@ impl SlangAstLowerer {
             value,
             front,
         }))
+    }
+
+    fn lower_queue_insert(&self, value: &Value) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 3 {
+            return Ok(None);
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| String::from("queue insert has no receiver"))?;
+        let Some(memory) = self.queue_receiver(receiver, "queue insert")? else {
+            return Ok(None);
+        };
+        let index = arguments
+            .get(1)
+            .ok_or_else(|| String::from("queue insert has no index"))?;
+        let inserted = arguments
+            .get(2)
+            .ok_or_else(|| String::from("queue insert has no value"))?;
+        let index = self.lower_expression(index)?;
+        if index.width() > u64::BITS as usize {
+            return Err("queue insert index exceeds 64 bits".into());
+        }
+        let value = self.lower_expression(inserted)?;
+        Ok(Some(eda_core::ir::Stmt::QueueInsert {
+            memory,
+            index,
+            value,
+        }))
+    }
+
+    fn lower_queue_delete(&self, value: &Value) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 2 {
+            return Ok(None);
+        }
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| String::from("queue delete has no receiver"))?;
+        let Some(memory) = self.queue_receiver(receiver, "queue delete")? else {
+            return Ok(None);
+        };
+        let index = arguments
+            .get(1)
+            .ok_or_else(|| String::from("queue delete has no index"))?;
+        let index = self.lower_expression(index)?;
+        if index.width() > u64::BITS as usize {
+            return Err("queue delete index exceeds 64 bits".into());
+        }
+        Ok(Some(eda_core::ir::Stmt::QueueDelete { memory, index }))
+    }
+
+    fn queue_receiver(
+        &self,
+        receiver: &Value,
+        function_name: &str,
+    ) -> Result<Option<usize>, String> {
+        let Some(name) = expression_symbol(receiver) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if !self.design.memories[memory].queue {
+            return Ok(None);
+        }
+        let _ = function_name;
+        Ok(Some(memory))
     }
 
     fn lower_fixed_array_bound(

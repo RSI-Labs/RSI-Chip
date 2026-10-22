@@ -89,6 +89,11 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::MemoryDelete { .. } => {}
             Stmt::QueuePush { value, .. } => expr_nets(value, reads),
             Stmt::QueuePop { .. } => {}
+            Stmt::QueueInsert { index, value, .. } => {
+                expr_nets(index, reads);
+                expr_nets(value, reads);
+            }
+            Stmt::QueueDelete { index, .. } => expr_nets(index, reads),
             Stmt::AssocWrite { index, value, .. } => {
                 expr_nets(index, reads);
                 expr_nets(value, reads);

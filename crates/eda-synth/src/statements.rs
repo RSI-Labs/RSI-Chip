@@ -273,9 +273,10 @@ impl<'a> Synth<'a> {
             Stmt::MemoryNew { .. } | Stmt::MemoryDelete { .. } => {
                 Err("dynamic-array allocation is not synthesizable yet".into())
             }
-            Stmt::QueuePush { .. } | Stmt::QueuePop { .. } => {
-                Err("queue operations are not synthesizable yet".into())
-            }
+            Stmt::QueuePush { .. }
+            | Stmt::QueuePop { .. }
+            | Stmt::QueueInsert { .. }
+            | Stmt::QueueDelete { .. } => Err("queue operations are not synthesizable yet".into()),
             Stmt::AssocWrite { .. } | Stmt::AssocDelete { .. } => {
                 Err("associative-array operations are not synthesizable yet".into())
             }
