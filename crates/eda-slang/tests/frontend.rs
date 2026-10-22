@@ -3715,6 +3715,56 @@ endmodule
         eda_core::ir::MemoryBanking { count: 2, depth: 2 }
     );
     assert_eq!(direct.n_nets, 27);
+    let direct_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory2d"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize multidimensional-memory AST");
+    let direct_summary = slang
+        .summarize_ast_json(&direct_json)
+        .expect("summarize multidimensional-memory AST");
+    direct_summary
+        .validate_against_design(&direct)
+        .expect("exact multidimensional memory fingerprints should match");
+
+    let mut wrong_first_index = direct_summary.clone();
+    if let Some(assignment) = wrong_first_index
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        assignment.rhs.operands[0].operands[0].operands[1].symbol = Some("wrong_x".into());
+    }
+    let first_index_error = wrong_first_index
+        .validate_against_design(&direct)
+        .expect_err("wrong first multidimensional-memory index must fail");
+    assert!(
+        first_index_error.contains("Ref:2:u[wrong_x]")
+            && first_index_error.contains("Ref:2:u[x]")
+            && first_index_error.contains("MemoryReadPart:4:u[mem,"),
+        "unexpected first multidimensional-memory index error: {first_index_error}"
+    );
+
+    let mut wrong_second_index = direct_summary;
+    if let Some(target) = wrong_second_index
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("wrong_y".into());
+    }
+    let second_index_error = wrong_second_index
+        .validate_against_design(&direct)
+        .expect_err("wrong second multidimensional-memory index must fail");
+    assert!(
+        second_index_error.contains("Ref:3:u[wrong_y]")
+            && second_index_error.contains("Ref:3:u[y]")
+            && second_index_error.contains("MemoryReadPart:4:u[mem,"),
+        "unexpected second multidimensional-memory index error: {second_index_error}"
+    );
 
     let mut direct_simulator = Simulator::new(&direct).expect("create direct 2D simulator");
     direct_simulator
@@ -9741,6 +9791,23 @@ endmodule
     summary
         .validate_against_design(&design)
         .expect("exact sparse-memory member fingerprint should match");
+    let mut wrong_whole_element = summary.clone();
+    if let Some(target) = wrong_whole_element
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_address".into());
+    }
+    let whole_element_error = wrong_whole_element
+        .validate_against_design(&design)
+        .expect_err("wrong whole sparse-memory element index must fail");
+    assert!(
+        whole_element_error.contains("Ref:2:u[wrong_address]")
+            && whole_element_error.contains("Ref:2:u[address]")
+            && whole_element_error.contains("MemoryRead:8:u[pairs,"),
+        "unexpected whole sparse-memory element error: {whole_element_error}"
+    );
     let assignment = summary
         .procedural_blocks
         .iter_mut()

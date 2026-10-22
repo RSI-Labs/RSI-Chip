@@ -792,6 +792,35 @@ fn wildcard_equality_fingerprint(
     Some(equality)
 }
 
+fn memory_selection(
+    expression: &SlangExpressionSummary,
+) -> Option<(&SlangExpressionSummary, Vec<&SlangExpressionSummary>)> {
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && expression.type_name.contains('$')
+        && expression.type_name != "event"
+    {
+        return Some((expression, Vec::new()));
+    }
+    if expression.kind != "ElementSelect" {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    let selector = expression.operands.get(1)?;
+    let (memory, mut indexes) = memory_selection(selected)?;
+    indexes.push(selector);
+    Some((memory, indexes))
+}
+
+fn memory_symbol_name(memory: &SlangExpressionSummary) -> Option<&str> {
+    let symbol = memory.symbol.as_deref()?;
+    Some(
+        symbol
+            .rsplit_once(' ')
+            .map(|(_, name)| name)
+            .unwrap_or(symbol),
+    )
+}
+
 fn string_method_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1057,34 +1086,32 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         let symbol = expression.symbol.as_deref()?;
         return Some(format!("MemoryCopy:{symbol}"));
     }
-    if expression.kind == "ElementSelect"
-        && expression
-            .operands
-            .first()
-            .is_some_and(|selected| selected.type_name.contains('$'))
-    {
-        let selected = expression.operands.first()?;
-        let selected_symbol = selected.symbol.as_deref()?;
-        let memory = selected_symbol
-            .rsplit_once(' ')
-            .map(|(_, memory)| memory)
-            .unwrap_or(selected_symbol);
-        let index = slang_expression_fingerprint_with_parameters(
-            expression.operands.get(1)?,
-            parameters,
-            mode,
-        )?;
-        let width = expression.type_width?;
-        let signed = expression.type_signed?;
-        let signed_label = if signed { "s" } else { "u" };
-        if selected.type_name.contains("$assoc[") {
+    if expression.kind == "ElementSelect" {
+        if let Some((memory_base, indexes)) = memory_selection(expression) {
+            let memory = memory_symbol_name(memory_base)?;
+            let indexes = indexes
+                .into_iter()
+                .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
+                .collect::<Option<Vec<_>>>()?;
+            let memory_shape = memory_type(&memory_base.type_name);
+            let width = expression
+                .type_width
+                .or_else(|| memory_shape.as_ref().map(|shape| shape.element_width))?;
+            let signed = expression
+                .type_signed
+                .or_else(|| memory_shape.as_ref().map(|shape| shape.signed))?;
+            let signed_label = if signed { "s" } else { "u" };
+            if memory_base.type_name.contains("$assoc[") {
+                return Some(format!(
+                    "AssocRead:{width}:{signed_label}[{memory},{}]",
+                    indexes.join(",")
+                ));
+            }
             return Some(format!(
-                "AssocRead:{width}:{signed_label}[{memory},{index}]"
+                "MemoryRead:{width}:{signed_label}[{memory},{}]",
+                indexes.join(",")
             ));
         }
-        return Some(format!(
-            "MemoryRead:{width}:{signed_label}[{memory},{index}]"
-        ));
     }
     if expression.kind == "ElementSelect"
         && expression
@@ -1105,41 +1132,29 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         )?;
         return Some(format!("StringGetByte:8:u[{selected},{index}]"));
     }
-    if expression.kind == "RangeSelect"
-        && expression.operands.first().is_some_and(|selected| {
-            selected.kind == "ElementSelect"
-                && selected
-                    .operands
-                    .first()
-                    .is_some_and(|memory| memory.type_name.contains('$'))
-        })
-    {
+    if expression.kind == "RangeSelect" {
         let selected = expression.operands.first()?;
-        let memory_expression = selected.operands.first()?;
-        let selected_symbol = memory_expression.symbol.as_deref()?;
-        let memory = selected_symbol
-            .rsplit_once(' ')
-            .map(|(_, memory)| memory)
-            .unwrap_or(selected_symbol);
-        let indexes = selected
-            .operands
-            .iter()
-            .skip(1)
-            .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
-            .collect::<Option<Vec<_>>>()?;
-        let start_operand = match expression.selection_kind.as_str() {
-            "Simple" => expression.operands.get(2)?,
-            "IndexedUp" | "IndexedDown" => expression.operands.get(1)?,
-            _ => return None,
-        };
-        let start = slang_expression_fingerprint_with_parameters(start_operand, parameters, mode)?;
-        let width = expression.type_width?;
-        let ascending = expression.selection_kind != "IndexedDown";
-        let direction = if ascending { "Ascending" } else { "Descending" };
-        return Some(format!(
-            "MemoryReadPart:{width}:u[{memory},{},{start},{direction}]",
-            indexes.join(",")
-        ));
+        if let Some((memory_base, indexes)) = memory_selection(selected) {
+            let memory = memory_symbol_name(memory_base)?;
+            let indexes = indexes
+                .iter()
+                .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
+                .collect::<Option<Vec<_>>>()?;
+            let start_operand = match expression.selection_kind.as_str() {
+                "Simple" => expression.operands.get(2)?,
+                "IndexedUp" | "IndexedDown" => expression.operands.get(1)?,
+                _ => return None,
+            };
+            let start =
+                slang_expression_fingerprint_with_parameters(start_operand, parameters, mode)?;
+            let width = expression.type_width?;
+            let ascending = expression.selection_kind != "IndexedDown";
+            let direction = if ascending { "Ascending" } else { "Descending" };
+            return Some(format!(
+                "MemoryReadPart:{width}:u[{memory},{},{start},{direction}]",
+                indexes.join(",")
+            ));
+        }
     }
     if matches!(expression.kind.as_str(), "ElementSelect" | "RangeSelect") {
         if let Some(fingerprint) = constant_packed_select_fingerprint(expression, parameters, mode)

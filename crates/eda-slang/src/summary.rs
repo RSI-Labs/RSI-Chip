@@ -569,6 +569,41 @@ fn annotate_enum_name_calls(
     }
 }
 
+fn annotate_memory_element_shapes(
+    expression: &mut SlangExpressionSummary,
+    type_layouts: &std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
+) {
+    if expression.kind == "ElementSelect" {
+        let mut selected = expression.operands.first();
+        while let Some(node) = selected {
+            if node.kind == "ElementSelect" {
+                selected = node.operands.first();
+            } else {
+                break;
+            }
+        }
+        if let Some(memory) = selected {
+            if memory.type_name.contains('$') {
+                let element_type = memory.type_name.split('$').next().unwrap_or_default();
+                let alias = element_type
+                    .split_whitespace()
+                    .next_back()
+                    .unwrap_or_default()
+                    .rsplit(['.', '#', ':'])
+                    .next()
+                    .unwrap_or_default();
+                if let Some(layout) = type_layouts.get(alias) {
+                    expression.type_width.get_or_insert(layout.element_width);
+                    expression.type_signed.get_or_insert(false);
+                }
+            }
+        }
+    }
+    for operand in &mut expression.operands {
+        annotate_memory_element_shapes(operand, type_layouts);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
@@ -978,11 +1013,21 @@ impl SlangAstSummary {
         for target in &mut continuous_targets {
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
             annotate_enum_name_calls(&mut target.rhs, &enum_types);
+            annotate_memory_element_shapes(&mut target.rhs, &type_layouts);
         }
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
                 annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
                 annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
+                annotate_memory_element_shapes(&mut assignment.rhs, &type_layouts);
+                if let Some(selector) = assignment.dynamic_packed_lvalue_selector.as_mut() {
+                    annotate_memory_element_shapes(selector, &type_layouts);
+                }
+                if let Some(member) = assignment.memory_member_lvalue.as_mut() {
+                    for index in &mut member.indexes {
+                        annotate_memory_element_shapes(index, &type_layouts);
+                    }
+                }
             }
         }
         Ok(Self {
