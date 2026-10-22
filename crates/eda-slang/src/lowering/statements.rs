@@ -1915,25 +1915,67 @@ impl SlangAstLowerer {
         };
         let source_memory = &self.design.memories[source];
         let destination_memory = &self.design.memories[destination];
-        let shapes_match = source_memory.element_width == destination_memory.element_width
+        let elements_match = source_memory.element_width == destination_memory.element_width
             && source_memory.element_msb == destination_memory.element_msb
-            && source_memory.element_lsb == destination_memory.element_lsb
-            && source_memory.dimensions == destination_memory.dimensions
-            && source_memory.flat_length == destination_memory.flat_length;
-        if !shapes_match {
-            return Err(
-                "whole unpacked-array assignment source and destination shapes do not match".into(),
-            );
-        }
-        if source_memory.flat_length > 4096 {
-            return Err(
-                "whole unpacked-array assignment exceeds the 4096-element support limit".into(),
-            );
-        }
+            && source_memory.element_lsb == destination_memory.element_lsb;
+        let kind = if source_memory.associative {
+            if !destination_memory.associative
+                || !elements_match
+                || source_memory.index_width != destination_memory.index_width
+                || source_memory.index_signed != destination_memory.index_signed
+                || source_memory.flat_length != destination_memory.flat_length
+            {
+                return Err(
+                    "whole associative-array assignment source and destination shapes do not match"
+                        .into(),
+                );
+            }
+            eda_core::ir::MemoryCopyKind::Associative
+        } else if source_memory.queue {
+            if !destination_memory.queue || !elements_match {
+                return Err(
+                    "whole queue assignment source and destination element shapes do not match"
+                        .into(),
+                );
+            }
+            eda_core::ir::MemoryCopyKind::Queue
+        } else if source_memory.dynamic {
+            if !destination_memory.dynamic
+                || destination_memory.queue
+                || destination_memory.associative
+                || !elements_match
+                || source_memory.dimensions != destination_memory.dimensions
+                || source_memory.flat_length != destination_memory.flat_length
+            {
+                return Err(
+                    "whole dynamic-array assignment source and destination shapes do not match"
+                        .into(),
+                );
+            }
+            eda_core::ir::MemoryCopyKind::DynamicArray
+        } else {
+            if destination_memory.dynamic
+                || !elements_match
+                || source_memory.dimensions != destination_memory.dimensions
+                || source_memory.flat_length != destination_memory.flat_length
+            {
+                return Err(
+                    "whole unpacked-array assignment source and destination shapes do not match"
+                        .into(),
+                );
+            }
+            if source_memory.flat_length > 4096 {
+                return Err(
+                    "whole unpacked-array assignment exceeds the 4096-element support limit".into(),
+                );
+            }
+            eda_core::ir::MemoryCopyKind::FixedArray
+        };
         Ok(Some(eda_core::ir::Stmt::MemoryCopy {
             source,
             destination,
             nonblocking,
+            kind,
         }))
     }
 

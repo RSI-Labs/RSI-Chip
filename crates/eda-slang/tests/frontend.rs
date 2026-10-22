@@ -4810,6 +4810,80 @@ endmodule
             "wrong value for {name}"
         );
     }
+
+    let mismatch_path = root.join("dynamic_container_copy_mismatch.sv");
+    std::fs::write(
+        &mismatch_path,
+        r#"
+module dynamic_container_copy_mismatch;
+  logic [7:0] source[];
+  logic [9:0] destination[];
+  initial destination = source;
+endmodule
+"#,
+    )
+    .expect("write dynamic-array copy mismatch source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&mismatch_path),
+            Some("dynamic_container_copy_mismatch"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("dynamic-array element mismatches must fail closed");
+    assert!(
+        error.contains("whole dynamic-array assignment source and destination shapes do not match"),
+        "unexpected dynamic-array mismatch error: {error}"
+    );
+
+    let queue_mismatch_path = root.join("queue_copy_mismatch.sv");
+    std::fs::write(
+        &queue_mismatch_path,
+        r#"
+module queue_copy_mismatch;
+  logic [7:0] source[$];
+  int destination[$];
+  initial destination = source;
+endmodule
+"#,
+    )
+    .expect("write queue copy mismatch source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&queue_mismatch_path),
+            Some("queue_copy_mismatch"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("queue element mismatches must fail closed");
+    assert!(
+        error.contains("whole queue assignment source and destination element shapes do not match"),
+        "unexpected queue mismatch error: {error}"
+    );
+
+    let associative_mismatch_path = root.join("associative_copy_mismatch.sv");
+    std::fs::write(
+        &associative_mismatch_path,
+        r#"
+module associative_copy_mismatch;
+  logic [7:0] source[int];
+  logic [7:0] destination[byte];
+  initial destination = source;
+endmodule
+"#,
+    )
+    .expect("write associative-array copy mismatch source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&associative_mismatch_path),
+            Some("associative_copy_mismatch"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("associative index mismatches must fail closed");
+    assert!(
+        error.contains(
+            "whole associative-array assignment source and destination shapes do not match"
+        ),
+        "unexpected associative mismatch error: {error}"
+    );
 }
 
 #[test]
@@ -4910,6 +4984,141 @@ endmodule
         ("structured_one", 0x5a),
         ("structured_input", 0x22),
         ("structured_last", 0x5a),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong value for {name}"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_container_copies() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-container-copies");
+    let source_path = root.join("dynamic_container_copies.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_container_copies(
+  output int dynamic_size,
+  output int nonblocking_dynamic_size,
+  output int queue_size,
+  output int bounded_queue_size,
+  output int associative_count,
+  output int nonblocking_associative_count,
+  output logic [7:0] dynamic_first,
+  output logic [7:0] dynamic_last,
+  output logic [7:0] nonblocking_dynamic_first,
+  output logic [7:0] nonblocking_dynamic_last,
+  output logic [7:0] queue_first,
+  output logic [7:0] queue_last,
+  output logic [7:0] bounded_queue_first,
+  output logic [7:0] bounded_queue_last,
+  output logic [7:0] associative_first,
+  output logic [7:0] associative_second,
+  output logic [7:0] nonblocking_associative_first,
+  output logic [7:0] nonblocking_associative_second
+);
+  logic [7:0] dynamic_source[];
+  logic [7:0] dynamic_destination[];
+  logic [7:0] nonblocking_dynamic_source[];
+  logic [7:0] nonblocking_dynamic_destination[];
+  logic [7:0] queue_source[$];
+  logic [7:0] queue_destination[$];
+  logic [7:0] bounded_queue_destination[$:1];
+  logic [7:0] associative_source[int];
+  logic [7:0] associative_destination[int];
+  logic [7:0] nonblocking_associative_source[int];
+  logic [7:0] nonblocking_associative_destination[int];
+
+  initial begin
+    #1;
+    dynamic_source = new[3];
+    dynamic_source[0] = 8'h10;
+    dynamic_source[1] = 8'h21;
+    dynamic_source[2] = 8'h32;
+    dynamic_destination = dynamic_source;
+
+    nonblocking_dynamic_source = new[2];
+    nonblocking_dynamic_source[0] = 8'h40;
+    nonblocking_dynamic_source[1] = 8'd81;
+    nonblocking_dynamic_destination <= nonblocking_dynamic_source;
+
+    queue_source.push_back(8'h50);
+    queue_source.push_back(8'd91);
+    queue_source.push_back(8'ha2);
+    queue_destination = queue_source;
+    bounded_queue_destination = queue_source;
+
+    associative_source[41] = 8'h60;
+    associative_source[42] = 8'ha1;
+    associative_destination = associative_source;
+
+    nonblocking_associative_source[43] = 8'h70;
+    nonblocking_associative_source[44] = 8'b1;
+    nonblocking_associative_destination <= nonblocking_associative_source;
+  end
+
+  assign dynamic_size = dynamic_destination.size();
+  assign nonblocking_dynamic_size = nonblocking_dynamic_destination.size();
+  assign queue_size = queue_destination.size();
+  assign bounded_queue_size = bounded_queue_destination.size();
+  assign associative_count = associative_destination.num();
+  assign nonblocking_associative_count = nonblocking_associative_destination.num();
+  assign dynamic_first = dynamic_destination[0];
+  assign dynamic_last = dynamic_destination[2];
+  assign nonblocking_dynamic_first = nonblocking_dynamic_destination[0];
+  assign nonblocking_dynamic_last = nonblocking_dynamic_destination[1];
+  assign queue_first = queue_destination[0];
+  assign queue_last = queue_destination[2];
+  assign bounded_queue_first = bounded_queue_destination[0];
+  assign bounded_queue_last = bounded_queue_destination[1];
+  assign associative_first = associative_destination[41];
+  assign associative_second = associative_destination[42];
+  assign nonblocking_associative_first = nonblocking_associative_destination[43];
+  assign nonblocking_associative_second = nonblocking_associative_destination[44];
+endmodule
+"#,
+    )
+    .expect("write dynamic-container copy source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_container_copies"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic-container copies");
+    assert_eq!(design.memories.len(), 12);
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic-container-copy simulator");
+    simulator
+        .run_until(1)
+        .expect("execute dynamic-container copies");
+    let expected = [
+        ("dynamic_size", 3),
+        ("nonblocking_dynamic_size", 2),
+        ("queue_size", 3),
+        ("bounded_queue_size", 2),
+        ("associative_count", 2),
+        ("nonblocking_associative_count", 2),
+        ("dynamic_first", 0x10),
+        ("dynamic_last", 0x32),
+        ("nonblocking_dynamic_first", 0x40),
+        ("nonblocking_dynamic_last", 81),
+        ("queue_first", 0x50),
+        ("queue_last", 0xa2),
+        ("bounded_queue_first", 0x50),
+        ("bounded_queue_last", 91),
+        ("associative_first", 0x60),
+        ("associative_second", 0xa1),
+        ("nonblocking_associative_first", 0x70),
+        ("nonblocking_associative_second", 1),
     ];
     for (name, value) in expected {
         assert_eq!(

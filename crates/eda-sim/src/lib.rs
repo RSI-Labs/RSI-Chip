@@ -52,6 +52,10 @@ enum AssocNbaUpdate {
         key: u64,
         value: LogicWord,
     },
+    Replace {
+        memory: usize,
+        elements: AssociativeElements,
+    },
 }
 
 struct Cont<'d> {
@@ -1116,6 +1120,9 @@ impl<'d> Simulator<'d> {
                         AssocNbaUpdate::Write { memory, key, value } => {
                             self.apply_associative_write(memory, key, value)?
                         }
+                        AssocNbaUpdate::Replace { memory, elements } => {
+                            self.apply_associative_copy(memory, elements)?
+                        }
                     }
                 }
                 for update in memory_updates {
@@ -1788,6 +1795,174 @@ impl<'d> Simulator<'d> {
         Ok(values)
     }
 
+    fn sample_dense_dynamic_copy(
+        &self,
+        source: usize,
+        destination: usize,
+        kind: eda_core::ir::MemoryCopyKind,
+    ) -> Result<Vec<LogicWord>, String> {
+        let source = self.canonical_memory(source);
+        let destination = self.canonical_memory(destination);
+        let source_declaration = self
+            .design
+            .memories
+            .get(source)
+            .ok_or_else(|| "dynamic copy source is missing".to_string())?;
+        let destination_declaration = self
+            .design
+            .memories
+            .get(destination)
+            .ok_or_else(|| "dynamic copy destination is missing".to_string())?;
+        let category_matches = match kind {
+            eda_core::ir::MemoryCopyKind::DynamicArray => {
+                source_declaration.dynamic
+                    && !source_declaration.queue
+                    && !source_declaration.associative
+                    && destination_declaration.dynamic
+                    && !destination_declaration.queue
+                    && !destination_declaration.associative
+            }
+            eda_core::ir::MemoryCopyKind::Queue => {
+                source_declaration.queue && destination_declaration.queue
+            }
+            _ => false,
+        };
+        if !category_matches
+            || source_declaration.element_width != destination_declaration.element_width
+            || source_declaration.element_msb != destination_declaration.element_msb
+            || source_declaration.element_lsb != destination_declaration.element_lsb
+        {
+            return Err("dynamic copy source and destination shapes do not match".into());
+        }
+
+        let source_length = self.dynamic_lengths[source];
+        if source_length > source_declaration.flat_length {
+            return Err(format!(
+                "dynamic copy source '{}' has invalid length {source_length}",
+                source_declaration.name
+            ));
+        }
+        let mut length = usize::try_from(source_length).map_err(|_| {
+            format!(
+                "dynamic copy source '{}' is too large",
+                source_declaration.name
+            )
+        })?;
+        let destination_capacity =
+            usize::try_from(destination_declaration.flat_length).unwrap_or(usize::MAX);
+        if length > destination_capacity {
+            if kind == eda_core::ir::MemoryCopyKind::Queue
+                && destination_declaration.queue_bound.is_some()
+            {
+                length = destination_capacity;
+            } else {
+                return Err(format!(
+                    "dynamic copy destination '{}' cannot hold {length} elements",
+                    destination_declaration.name
+                ));
+            }
+        }
+
+        let element_width = source_declaration.element_width;
+        Ok((0..length)
+            .map(|index| {
+                self.memory_elements
+                    .get(source)
+                    .and_then(|elements| elements.get(index as u64))
+                    .cloned()
+                    .unwrap_or_else(|| LogicWord::xes(element_width))
+                    .sized(element_width)
+            })
+            .collect())
+    }
+
+    fn apply_dense_dynamic_copy(
+        &mut self,
+        destination: usize,
+        values: Vec<LogicWord>,
+    ) -> Result<(), String> {
+        let destination = self.canonical_memory(destination);
+        let length = u64::try_from(values.len())
+            .map_err(|_| "dynamic copy destination length is too large".to_string())?;
+        self.allocate_dynamic_memory(destination, length)?;
+        for (index, value) in values.into_iter().enumerate() {
+            self.apply_memory_update(destination, index as u64, value)?;
+        }
+        Ok(())
+    }
+
+    fn sample_associative_copy(
+        &self,
+        source: usize,
+        destination: usize,
+    ) -> Result<AssociativeElements, String> {
+        let source = self.canonical_memory(source);
+        let destination = self.canonical_memory(destination);
+        let source_declaration = self
+            .design
+            .memories
+            .get(source)
+            .ok_or_else(|| "associative copy source is missing".to_string())?;
+        let destination_declaration = self
+            .design
+            .memories
+            .get(destination)
+            .ok_or_else(|| "associative copy destination is missing".to_string())?;
+        if !source_declaration.associative
+            || !destination_declaration.associative
+            || source_declaration.element_width != destination_declaration.element_width
+            || source_declaration.element_msb != destination_declaration.element_msb
+            || source_declaration.element_lsb != destination_declaration.element_lsb
+            || source_declaration.index_width != destination_declaration.index_width
+            || source_declaration.index_signed != destination_declaration.index_signed
+        {
+            return Err("associative copy source and destination shapes do not match".into());
+        }
+        Ok(self
+            .associative_elements
+            .get(source)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn apply_associative_copy(
+        &mut self,
+        destination: usize,
+        elements: AssociativeElements,
+    ) -> Result<(), String> {
+        let destination = self.canonical_memory(destination);
+        let (name, capacity, associative) = {
+            let Some(declaration) = self.design.memories.get(destination) else {
+                return Err("associative copy destination is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.flat_length,
+                declaration.associative,
+            )
+        };
+        if !associative {
+            return Err(format!(
+                "associative copy target '{name}' is not associative"
+            ));
+        }
+        let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if elements.len() > capacity {
+            return Err(format!(
+                "associative copy destination '{name}' cannot hold {} elements",
+                elements.len()
+            ));
+        }
+        let destination_elements = self
+            .associative_elements
+            .get_mut(destination)
+            .ok_or_else(|| format!("associative array '{name}' has no storage"))?;
+        destination_elements.clear();
+        destination_elements.extend(elements);
+        self.dynamic_lengths[destination] = destination_elements.len() as u64;
+        self.notify_memory_write(destination)
+    }
+
     fn apply_memory_part_update(
         &mut self,
         memory: usize,
@@ -2316,24 +2491,57 @@ impl<'d> Simulator<'d> {
                     source,
                     destination,
                     nonblocking,
-                } => {
-                    let destination = self.canonical_memory(*destination);
-                    let values = self.sample_memory_copy(*source, destination)?;
-                    if *nonblocking {
-                        self.memory_nba.reserve(values.len());
-                        for (index, value) in values {
-                            self.memory_nba.push(MemoryNbaUpdate::Whole {
-                                memory: destination,
-                                index,
-                                value,
-                            });
-                        }
-                    } else {
-                        for (index, value) in values {
-                            self.apply_memory_update(destination, index, value)?;
+                    kind,
+                } => match kind {
+                    eda_core::ir::MemoryCopyKind::FixedArray => {
+                        let destination = self.canonical_memory(*destination);
+                        let values = self.sample_memory_copy(*source, destination)?;
+                        if *nonblocking {
+                            self.memory_nba.reserve(values.len());
+                            for (index, value) in values {
+                                self.memory_nba.push(MemoryNbaUpdate::Whole {
+                                    memory: destination,
+                                    index,
+                                    value,
+                                });
+                            }
+                        } else {
+                            for (index, value) in values {
+                                self.apply_memory_update(destination, index, value)?;
+                            }
                         }
                     }
-                }
+                    eda_core::ir::MemoryCopyKind::DynamicArray
+                    | eda_core::ir::MemoryCopyKind::Queue => {
+                        let values =
+                            self.sample_dense_dynamic_copy(*source, *destination, *kind)?;
+                        if *nonblocking {
+                            let destination = self.canonical_memory(*destination);
+                            self.dynamic_nba.push((destination, values.len() as u64));
+                            self.memory_nba.reserve(values.len());
+                            for (index, value) in values.into_iter().enumerate() {
+                                self.memory_nba.push(MemoryNbaUpdate::Whole {
+                                    memory: destination,
+                                    index: index as u64,
+                                    value,
+                                });
+                            }
+                        } else {
+                            self.apply_dense_dynamic_copy(*destination, values)?;
+                        }
+                    }
+                    eda_core::ir::MemoryCopyKind::Associative => {
+                        let elements = self.sample_associative_copy(*source, *destination)?;
+                        if *nonblocking {
+                            self.associative_nba.push(AssocNbaUpdate::Replace {
+                                memory: self.canonical_memory(*destination),
+                                elements,
+                            });
+                        } else {
+                            self.apply_associative_copy(*destination, elements)?;
+                        }
+                    }
+                },
                 Stmt::MemoryNew {
                     memory,
                     size,

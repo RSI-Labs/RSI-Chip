@@ -676,12 +676,13 @@ pub enum Stmt {
         indexes: Vec<Expr>,
         e: Expr,
     },
-    /// Whole fixed-array copy. Source elements are sampled before blocking
-    /// destination updates; nonblocking copies commit in the NBA region.
+    /// Whole-object copy selected by `kind`. Source values are sampled before
+    /// blocking destination updates; nonblocking copies commit in the NBA region.
     MemoryCopy {
         source: usize,
         destination: usize,
         nonblocking: bool,
+        kind: MemoryCopyKind,
     },
     /// Allocate a dynamic array. Blocking allocation replaces all elements with
     /// X; nonblocking allocation samples size and commits in the NBA region.
@@ -893,6 +894,16 @@ pub enum Stmt {
         finish: Option<Expr>,
     },
     Finish,
+}
+
+/// Distinguishes whole-object assignment semantics for storage families that
+/// share the first-class memory representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryCopyKind {
+    FixedArray,
+    DynamicArray,
+    Queue,
+    Associative,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
