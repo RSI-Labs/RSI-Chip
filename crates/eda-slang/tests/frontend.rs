@@ -2395,6 +2395,58 @@ endmodule
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(45));
     assert_eq!(simulator.read("doubled_offset").unwrap().to_u64(), Some(85));
 
+    let package_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("package_import"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize package-import AST");
+    let package_summary = slang
+        .summarize_ast_json(&package_json)
+        .expect("summarize package-import AST");
+    package_summary
+        .validate_against_design(&design)
+        .expect("exact inlined package-function fingerprints should match");
+
+    let mut wrong_function_body = package_summary.clone();
+    if let Some(target) = wrong_function_body
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "doubled_offset")
+    {
+        target.rhs.operands[0].operands[0].operands[0].literal = Some(format!("32:{:032b}", 3));
+    }
+    let function_body_error = wrong_function_body
+        .validate_against_design(&design)
+        .expect_err("wrong inlined package-function body must fail");
+    assert!(
+        function_body_error.contains("Mul:32:s[")
+            && function_body_error.contains(&format!("Const:32:u[32:{:032b}]", 2))
+            && function_body_error.contains(&format!("Const:32:u[32:{:032b}]", 3)),
+        "unexpected inlined package-function body error: {function_body_error}"
+    );
+
+    let mut wrong_function_argument = package_summary;
+    if let Some(target) = wrong_function_argument
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "doubled_offset")
+    {
+        target.rhs.operands[0].operands[0].operands[1].operands[0].symbol =
+            Some("wrong_OFFSET".into());
+    }
+    let function_argument_error = wrong_function_argument
+        .validate_against_design(&design)
+        .expect_err("wrong inlined package-function argument must fail");
+    assert!(
+        function_argument_error.contains("Ref:32:s[wrong_OFFSET]")
+            && function_argument_error.contains("Const:32:u[")
+            && function_argument_error.contains("Mul:32:s["),
+        "unexpected inlined package-function argument error: {function_argument_error}"
+    );
+
     let explicit_path = root.join("explicit_import.sv");
     std::fs::write(
         &explicit_path,

@@ -197,6 +197,263 @@ fn collect_simple_static_function_returns(
     }
 }
 
+fn collect_simple_function_definitions(
+    value: &Value,
+    in_class: bool,
+    functions: &mut std::collections::BTreeMap<String, Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        let in_class = in_class || string_field(value, "kind").as_deref() == Some("ClassType");
+        if !in_class
+            && string_field(value, "kind").as_deref() == Some("Subroutine")
+            && string_field(value, "subroutineKind").as_deref() == Some("Function")
+        {
+            if let (Some(address), Some(name)) = (
+                value.get("addr").and_then(Value::as_u64),
+                string_field(value, "name"),
+            ) {
+                let mut definition = value.clone();
+                normalize_detailed_types(&mut definition);
+                if simple_function_return_expression(
+                    &definition,
+                    &std::collections::BTreeMap::new(),
+                )
+                .is_some()
+                {
+                    functions.insert(format!("{address} {name}"), definition);
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_simple_function_definitions(nested, in_class, functions);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_simple_function_definitions(nested, in_class, functions);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SlangPackageImports {
+    wildcard: std::collections::BTreeSet<String>,
+    explicit: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+fn collect_package_parameters(
+    value: &Value,
+    current_package: Option<&str>,
+    imports: &SlangPackageImports,
+    parameters: &mut Vec<SlangParameterSummary>,
+) {
+    if let Some(fields) = value.as_object() {
+        let mut current_package = current_package.map(str::to_string);
+        if string_field(value, "kind").as_deref() == Some("Package") {
+            if let (Some(address), Some(name)) = (
+                value.get("addr").and_then(Value::as_u64),
+                string_field(value, "name"),
+            ) {
+                current_package = Some(format!("{address} {name}"));
+            }
+        }
+        if let Some(package) = current_package.as_deref() {
+            let wildcard = imports.wildcard.contains(package);
+            let explicitly_imported = string_field(value, "name").is_some_and(|name| {
+                imports
+                    .explicit
+                    .get(package)
+                    .is_some_and(|names| names.contains(&name))
+            });
+            if (wildcard || explicitly_imported)
+                && string_field(value, "kind").as_deref() == Some("Parameter")
+            {
+                let mut parameter = value.clone();
+                normalize_detailed_types(&mut parameter);
+                if let Ok(parameter) = parameter_summary(&parameter) {
+                    parameters.push(parameter);
+                }
+            }
+        }
+        let current_package = current_package.as_deref();
+        for nested in fields.values() {
+            collect_package_parameters(nested, current_package, imports, parameters);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_package_parameters(nested, current_package, imports, parameters);
+        }
+    }
+}
+
+fn collect_visible_package_imports(value: &Value, imports: &mut SlangPackageImports) {
+    if let Some(fields) = value.as_object() {
+        let kind = string_field(value, "kind");
+        if kind.as_deref() == Some("WildcardImport") {
+            if let Some(package) = string_field(value, "package") {
+                imports.wildcard.insert(package);
+            }
+        } else if kind.as_deref() == Some("ExplicitImport") {
+            if let (Some(package), Some(import), Some(name)) = (
+                string_field(value, "package"),
+                string_field(value, "import"),
+                string_field(value, "name"),
+            ) {
+                if import
+                    .rsplit_once(' ')
+                    .is_some_and(|(_, imported)| imported == name)
+                {
+                    imports.explicit.entry(package).or_default().insert(name);
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_visible_package_imports(nested, imports);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_visible_package_imports(nested, imports);
+        }
+    }
+}
+
+fn canonicalize_simple_function_calls(
+    value: &mut Value,
+    functions: &std::collections::BTreeMap<String, Value>,
+) {
+    if string_field(value, "kind").as_deref() == Some("Call") {
+        if let Some(subroutine) = string_field(value, "subroutine") {
+            if let Some(definition) = functions.get(&subroutine) {
+                let empty_arguments = Vec::new();
+                let arguments = value
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_arguments);
+                let empty_formals = Vec::new();
+                let formals = definition
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .unwrap_or(&empty_formals);
+                if arguments.len() == formals.len() {
+                    let mut environment = std::collections::BTreeMap::new();
+                    let mut exact = true;
+                    for (formal, actual) in formals.iter().zip(arguments) {
+                        let Some(name) = formal.get("name").and_then(Value::as_str) else {
+                            exact = false;
+                            break;
+                        };
+                        let Some(address) = formal.get("addr").and_then(Value::as_u64) else {
+                            exact = false;
+                            break;
+                        };
+                        let Some(type_name) = string_field(formal, "type") else {
+                            exact = false;
+                            break;
+                        };
+                        if !matches!(
+                            string_field(formal, "direction").as_deref(),
+                            None | Some("In")
+                        ) {
+                            exact = false;
+                            break;
+                        }
+                        environment.insert(
+                            format!("{address} {name}"),
+                            serde_json::json!({
+                                "kind": "Conversion",
+                                "type": type_name,
+                                "operand": actual,
+                            }),
+                        );
+                    }
+                    if exact {
+                        if let Some(expression) =
+                            simple_function_return_expression(definition, &environment)
+                        {
+                            *value = expression;
+                            canonicalize_simple_function_calls(value, functions);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Value::Array(values) = value {
+        for nested in values {
+            canonicalize_simple_function_calls(nested, functions);
+        }
+        return;
+    }
+    let Value::Object(fields) = value else {
+        return;
+    };
+    for nested in fields.values_mut() {
+        canonicalize_simple_function_calls(nested, functions);
+    }
+}
+
+fn simple_function_return_expression(
+    definition: &Value,
+    environment: &std::collections::BTreeMap<String, Value>,
+) -> Option<Value> {
+    let body = definition.get("body")?;
+    if string_field(body, "kind").as_deref() != Some("ExpressionStatement") {
+        return None;
+    }
+    let assignment = body.get("expr")?;
+    if string_field(assignment, "kind").as_deref() != Some("Assignment") {
+        return None;
+    }
+    let left = assignment.get("left")?;
+    let function_name = string_field(definition, "name")?;
+    let return_name = string_field(left, "symbol")
+        .or_else(|| string_field(left, "name"))?
+        .split_whitespace()
+        .next_back()?
+        .to_string();
+    if return_name != function_name {
+        return None;
+    }
+    let expression = assignment.get("right")?.clone();
+    let expression = substitute_simple_function_values(&expression, environment)?;
+    let return_type = string_field(definition, "returnType")?;
+    Some(serde_json::json!({
+        "kind": "Conversion",
+        "type": return_type,
+        "operand": expression,
+    }))
+}
+
+fn substitute_simple_function_values(
+    value: &Value,
+    environment: &std::collections::BTreeMap<String, Value>,
+) -> Option<Value> {
+    if let Some(symbol) = string_field(value, "symbol") {
+        if let Some(replacement) = environment.get(&symbol) {
+            return Some(replacement.clone());
+        }
+    }
+    match value {
+        Value::Object(fields) => {
+            let mut result = serde_json::Map::new();
+            for (key, nested) in fields {
+                result.insert(
+                    key.clone(),
+                    substitute_simple_function_values(nested, environment)?,
+                );
+            }
+            Some(Value::Object(result))
+        }
+        Value::Array(values) => Some(Value::Array(
+            values
+                .iter()
+                .map(|nested| substitute_simple_function_values(nested, environment))
+                .collect::<Option<_>>()?,
+        )),
+        scalar => Some(scalar.clone()),
+    }
+}
+
 fn canonicalize_class_static_symbols(
     value: &mut Value,
     names: &std::collections::BTreeMap<String, String>,
@@ -797,6 +1054,9 @@ impl SlangAstSummary {
         );
         normalize_instance_bodies(&mut root);
         normalize_detailed_types(&mut root);
+        let mut simple_functions = std::collections::BTreeMap::new();
+        collect_simple_function_definitions(&document, false, &mut simple_functions);
+        canonicalize_simple_function_calls(&mut root, &simple_functions);
         let root = &root;
         if string_field(root, "kind").as_deref() != Some("Instance") {
             return Err("slang AST root is not an elaborated Instance".into());
@@ -1008,6 +1268,19 @@ impl SlangAstSummary {
                 }
             }
         }
+        let mut package_parameters = Vec::new();
+        let mut package_imports = SlangPackageImports::default();
+        collect_visible_package_imports(root, &mut package_imports);
+        collect_package_parameters(&document, None, &package_imports, &mut package_parameters);
+        let visible_parameter_names = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        parameters.extend(
+            package_parameters
+                .into_iter()
+                .filter(|parameter| !visible_parameter_names.contains(&parameter.name)),
+        );
         let mut kinds = std::collections::BTreeSet::new();
         collect_kinds(root, &mut kinds);
         for target in &mut continuous_targets {

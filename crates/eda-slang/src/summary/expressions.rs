@@ -792,6 +792,74 @@ fn wildcard_equality_fingerprint(
     Some(equality)
 }
 
+fn direct_lowered_signed(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+) -> Option<bool> {
+    match expression.kind.as_str() {
+        "IntegerLiteral" => expression.type_signed,
+        "NamedValue" | "HierarchicalValue" => {
+            let symbol = expression.symbol.as_deref()?;
+            if parameters.iter().any(|parameter| parameter.name == symbol) {
+                return Some(false);
+            }
+            expression.type_signed
+        }
+        "Conversion" => {
+            let operand = expression.operands.first()?;
+            let operand_signed = direct_lowered_signed(operand, parameters)?;
+            let target_width = simple_type_shape(&expression.type_name)?.width;
+            let source_width = simple_type_shape(&operand.type_name)?.width;
+            let target_signed = simple_type_signed(&expression.type_name)?;
+            let source_signed = simple_type_signed(&operand.type_name)?;
+            if target_width == source_width
+                && target_signed == source_signed
+                && operand_signed == target_signed
+            {
+                Some(operand_signed)
+            } else {
+                Some(target_signed)
+            }
+        }
+        "UnaryOp" => match expression.operator.as_str() {
+            "BitwiseNot" | "LogicalNot" => {
+                direct_lowered_signed(expression.operands.first()?, parameters)
+            }
+            "BitwiseAnd" | "BitwiseOr" | "BitwiseXor" | "BitwiseNand" | "BitwiseNor"
+            | "BitwiseXnor" | "Plus" | "Minus" => Some(false),
+            _ => None,
+        },
+        "BinaryOp" => {
+            let left = direct_lowered_signed(expression.operands.first()?, parameters)?;
+            let right = direct_lowered_signed(expression.operands.get(1)?, parameters)?;
+            match expression.operator.as_str() {
+                "LogicalShiftLeft"
+                | "ArithmeticShiftLeft"
+                | "LogicalShiftRight"
+                | "ArithmeticShiftRight" => Some(left),
+                "Add" | "Subtract" | "Multiply" | "Divide" | "Modulus" | "Power" | "BinaryAnd"
+                | "BinaryOr" | "BinaryXor" | "BitwiseXor" => Some(left && right),
+                "Equality" | "Inequality" | "CaseEquality" | "CaseInequality" | "LessThan"
+                | "LessThanEqual" | "GreaterThan" | "GreaterThanEqual" | "LogicalAnd"
+                | "LogicalOr" | "LogicalImplication" | "LogicalEquivalence" => Some(false),
+                _ => None,
+            }
+        }
+        "ConditionalOp" => {
+            if expression.operands.len() == 3 {
+                let left = direct_lowered_signed(expression.operands.get(1)?, parameters)?;
+                let right = direct_lowered_signed(expression.operands.get(2)?, parameters)?;
+                Some(left && right)
+            } else {
+                None
+            }
+        }
+        "Concatenation" | "StringLiteral" | "NewArray" => Some(false),
+        "Replication" => direct_lowered_signed(expression.operands.first()?, parameters),
+        _ => None,
+    }
+}
+
 fn memory_selection(
     expression: &SlangExpressionSummary,
 ) -> Option<(&SlangExpressionSummary, Vec<&SlangExpressionSummary>)> {
@@ -1222,7 +1290,15 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     }
     let root = slang_expression_shape(expression)?;
     let width = expression.type_width?;
-    let signed = expression.type_signed?;
+    let signed = if mode == ExpressionFingerprintMode::Direct
+        && matches!(
+            expression.kind.as_str(),
+            "BinaryOp" | "ConditionalOp" | "Replication"
+        ) {
+        direct_lowered_signed(expression, parameters).or(expression.type_signed)?
+    } else {
+        expression.type_signed?
+    };
     let signed_label = if signed { "s" } else { "u" };
     if root == "Ref" {
         let symbol = expression.symbol.as_deref()?;
