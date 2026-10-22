@@ -151,10 +151,20 @@ impl SlangAstSummary {
                             {
                                 fingerprint
                             } else {
-                                "?".to_string()
+                                let error = format!(
+                                    "slang summary references an unresolved memory target in continuous assignment '{}': {}",
+                                    target.name, fingerprint
+                                ) + &self.span_note(&format!("continuous:{}:", target.name));
+                                return Err(error);
                             }
                         }
-                        None => "?".to_string(),
+                        None => {
+                            let error = format!(
+                                "slang summary cannot fingerprint continuous assignment RHS for '{}': kind '{}', operator '{}'",
+                                target.name, target.rhs.kind, target.rhs.operator
+                            ) + &self.span_note(&format!("continuous:{}:", target.name));
+                            return Err(error);
+                        }
                     },
                 );
         }
@@ -247,14 +257,13 @@ impl SlangAstSummary {
                     if declaration_names.contains(target) {
                         let legacy_array_shape =
                             !strict_generated_hierarchy && legacy_array_targets.contains(target);
-                        let shape = if legacy_array_shape || assignment.uses_class_static {
-                            // Small arrays still use the legacy bounded
-                            // per-element expansion, whose expression tree is
-                            // intentionally not structurally equivalent to the
-                            // slang source. Preserve assignment-count checking
-                            // without guessing an equivalence.
-                            "?".to_string()
-                        } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
+                        if legacy_array_shape {
+                            let error = format!(
+                                "bounded legacy array expansion has no exact source fingerprint for '{target}'"
+                            ) + &self.span_note("procedural:");
+                            return Err(error);
+                        }
+                        let shape = if let Some(member) = assignment.memory_member_lvalue.as_ref() {
                             memory_member_lvalue_fingerprint(
                                 target,
                                 member,
@@ -263,7 +272,12 @@ impl SlangAstSummary {
                                 &self.type_layouts,
                                 &self.parameters,
                             )
-                            .unwrap_or_else(|| "?".to_string())
+                            .ok_or_else(|| {
+                                format!(
+                                    "slang summary cannot resolve memory-member lvalue '{target}' path '{}'",
+                                    member.members.join(".")
+                                )
+                            })?
                         } else if let Some(selector) =
                             assignment.dynamic_packed_lvalue_selector.as_ref()
                         {
@@ -299,10 +313,20 @@ impl SlangAstSummary {
                                     {
                                         fingerprint
                                     } else {
-                                        "?".to_string()
+                                        let error = format!(
+                                            "slang summary references an unresolved memory target in procedural assignment '{}': {}",
+                                            target, fingerprint
+                                        ) + &self.span_note("procedural:");
+                                        return Err(error);
                                     }
                                 }
-                                None => "?".to_string(),
+                                None => {
+                                    let error = format!(
+                                        "slang summary cannot fingerprint procedural assignment RHS for '{}': kind '{}', operator '{}'",
+                                        target, assignment.rhs.kind, assignment.rhs.operator
+                                    ) + &self.span_note("procedural:");
+                                    return Err(error);
+                                }
                             }
                         };
                         expected_procedural_targets

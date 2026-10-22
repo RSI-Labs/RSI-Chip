@@ -1423,6 +1423,45 @@ endmodule
     static_summary
         .validate_against_design(&design)
         .expect("exact class-static property fingerprint should match");
+    let mut class_static_flag = static_summary.clone();
+    if let Some(assignment) = class_static_flag
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "direct_shared")
+            })
+        })
+    {
+        assignment.uses_class_static = true;
+    }
+    class_static_flag
+        .validate_against_design(&design)
+        .expect("class-static flag must not relax structural validation");
+    if let Some(assignment) = class_static_flag
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "direct_shared")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("Registry_wrong".into());
+    }
+    let error = class_static_flag
+        .validate_against_design(&design)
+        .expect_err("wrong class-static RHS must fail even when flagged");
+    assert!(
+        error.contains("Ref:32:s[Registry_wrong]"),
+        "unexpected structural error: {error}"
+    );
     if let Some(assignment) = static_summary
         .procedural_blocks
         .iter_mut()
@@ -6148,6 +6187,136 @@ endmodule
         .validate_against_design_legacy_compatibility(&design)
         .expect("slang and bounded design inventories agree");
 
+    let mut unsupported_continuous = summary.clone();
+    if let Some(target) = unsupported_continuous
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+    {
+        target.rhs.kind = "Call".into();
+        target.rhs.operator.clear();
+        target.rhs.operands.clear();
+    }
+    assert!(unsupported_continuous
+        .validate_against_design_legacy_compatibility(&design)
+        .unwrap_err()
+        .contains("slang summary cannot fingerprint continuous assignment RHS for 'sum'"));
+
+    let mut unsupported_procedural = summary.clone();
+    let assignment = unsupported_procedural
+        .procedural_blocks
+        .iter_mut()
+        .find(|block| block.procedure_kind == "Initial")
+        .expect("initial block summary")
+        .assignments
+        .first_mut()
+        .expect("initial assignment summary");
+    assignment.rhs.kind = "Call".into();
+    assignment.rhs.operator.clear();
+    assignment.rhs.operands.clear();
+    assert!(unsupported_procedural
+        .validate_against_design_legacy_compatibility(&design)
+        .unwrap_err()
+        .contains("slang summary cannot fingerprint procedural assignment RHS for 'held'"));
+
+    let mut unresolved_continuous_memory = summary.clone();
+    if let Some(target) = unresolved_continuous_memory
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "sum")
+    {
+        target.rhs.kind = "ElementSelect".into();
+        target.rhs.operator.clear();
+        target.rhs.type_width = Some(4);
+        target.rhs.type_signed = Some(false);
+        target.rhs.operands = vec![
+            eda_slang::SlangExpressionSummary {
+                kind: "NamedValue".into(),
+                type_name: "logic[7:0]$[0:0]".into(),
+                operator: String::new(),
+                selection_kind: String::new(),
+                type_width: Some(8),
+                type_signed: Some(false),
+                symbol: Some("0 missing_memory".into()),
+                literal: None,
+                repeat_count: None,
+                operands: Vec::new(),
+            },
+            eda_slang::SlangExpressionSummary {
+                kind: "NamedValue".into(),
+                type_name: "logic[3:0]".into(),
+                operator: String::new(),
+                selection_kind: String::new(),
+                type_width: Some(4),
+                type_signed: Some(false),
+                symbol: Some("a".into()),
+                literal: None,
+                repeat_count: None,
+                operands: Vec::new(),
+            },
+        ];
+    }
+    assert!(unresolved_continuous_memory
+        .validate_against_design_legacy_compatibility(&design)
+        .unwrap_err()
+        .contains("unresolved memory target in continuous assignment 'sum'"));
+
+    let mut unresolved_procedural_memory = summary.clone();
+    if let Some(assignment) = unresolved_procedural_memory
+        .procedural_blocks
+        .iter_mut()
+        .find(|block| block.procedure_kind == "Initial")
+        .and_then(|block| block.assignments.first_mut())
+    {
+        assignment.rhs.kind = "ElementSelect".into();
+        assignment.rhs.operator.clear();
+        assignment.rhs.type_width = Some(1);
+        assignment.rhs.type_signed = Some(false);
+        assignment.rhs.operands = vec![
+            eda_slang::SlangExpressionSummary {
+                kind: "NamedValue".into(),
+                type_name: "logic[7:0]$[0:0]".into(),
+                operator: String::new(),
+                selection_kind: String::new(),
+                type_width: Some(8),
+                type_signed: Some(false),
+                symbol: Some("0 missing_memory".into()),
+                literal: None,
+                repeat_count: None,
+                operands: Vec::new(),
+            },
+            eda_slang::SlangExpressionSummary {
+                kind: "NamedValue".into(),
+                type_name: "logic[3:0]".into(),
+                operator: String::new(),
+                selection_kind: String::new(),
+                type_width: Some(4),
+                type_signed: Some(false),
+                symbol: Some("a".into()),
+                literal: None,
+                repeat_count: None,
+                operands: Vec::new(),
+            },
+        ];
+    }
+    assert!(unresolved_procedural_memory
+        .validate_against_design_legacy_compatibility(&design)
+        .unwrap_err()
+        .contains("unresolved memory target in procedural assignment 'held'"));
+
+    let mut legacy_array_shape = summary.clone();
+    if let Some(declaration) = legacy_array_shape
+        .declarations
+        .iter_mut()
+        .find(|declaration| declaration.name == "held")
+    {
+        declaration.type_name = "logic$[0:0]".into();
+    }
+    assert!(legacy_array_shape
+        .validate_against_design_legacy_compatibility(&design)
+        .unwrap_err()
+        .contains("bounded legacy array expansion has no exact source fingerprint for 'held'"));
+
     let mut dropped_port = summary.clone();
     dropped_port.ports.pop();
     assert!(dropped_port
@@ -6326,6 +6495,29 @@ endmodule
         .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
         .contains("direct instances"));
+}
+
+#[test]
+fn slang_structural_validation_has_no_wildcard_fingerprints() {
+    fn check_directory(path: &Path) {
+        for entry in std::fs::read_dir(path).expect("read summary validator directory") {
+            let entry = entry.expect("read summary validator entry");
+            let path = entry.path();
+            if path.is_dir() {
+                check_directory(&path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                assert!(
+                    !source.contains("\"?\""),
+                    "wildcard fingerprint reintroduced in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    check_directory(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/summary"));
 }
 
 #[test]
@@ -9122,6 +9314,29 @@ endmodule
     summary
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("bounded sparse-memory member fingerprint should be exact");
+    let mut unresolved_member = summary.clone();
+    if let Some(assignment) = unresolved_member
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("sparse-memory member lvalue")
+            .members = vec!["missing".into()];
+    }
+    let unresolved_error = unresolved_member
+        .validate_against_design(&design)
+        .expect_err("unknown sparse-memory member path must fail closed");
+    assert!(
+        unresolved_error.contains("cannot resolve memory-member lvalue 'pairs' path 'missing'"),
+        "unexpected unresolved-member error: {unresolved_error}"
+    );
+    assert!(unresolved_member
+        .validate_against_design_legacy_compatibility(&bounded)
+        .unwrap_err()
+        .contains("cannot resolve memory-member lvalue 'pairs' path 'missing'"));
     let mut legacy_summary = summary.clone();
     if let Some(assignment) = legacy_summary
         .procedural_blocks
