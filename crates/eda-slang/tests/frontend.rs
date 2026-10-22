@@ -10464,6 +10464,24 @@ endmodule
         "unexpected string comparison error: {comparison_error}"
     );
 
+    let mut concatenation_summary = string_summary.clone();
+    if let Some(target) = concatenation_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "joined")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_right".into());
+    }
+    let concatenation_error = concatenation_summary
+        .validate_against_design(&design)
+        .expect_err("wrong string concatenation operand must fail");
+    assert!(
+        concatenation_error.contains("StringConcat:512:u[")
+            && concatenation_error.contains("Ref:512:u[wrong_right]")
+            && concatenation_error.contains("Ref:512:u[right]"),
+        "unexpected string concatenation error: {concatenation_error}"
+    );
+
     let mut byte_summary = string_summary.clone();
     if let Some(assignment) = byte_summary.procedural_blocks.iter_mut().find_map(|block| {
         block.assignments.iter_mut().find(|assignment| {

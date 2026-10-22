@@ -67,10 +67,15 @@ pub(crate) fn expression_literal(value: &Value) -> Option<String> {
     let raw = match kind.as_str() {
         "IntegerLiteral" => string_field(value, "value")?,
         "NamedValue" => string_field(value, "constant")?,
+        "StringLiteral" => string_field(value, "literal")?,
         _ => return None,
     };
     let type_name = string_field(value, "type")?;
-    let word = literal_word(&type_name, &raw)?;
+    let word = if kind == "StringLiteral" {
+        string_literal_word(&raw)?
+    } else {
+        literal_word(&type_name, &raw)?
+    };
     let width = word.width();
     Some(format!("{width}:{}", word.to_bin_str()))
 }
@@ -760,6 +765,22 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    if expression.kind == "Concatenation"
+        && expression.type_name == "string"
+        && mode == ExpressionFingerprintMode::Direct
+    {
+        let left = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let right = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!("StringConcat:512:u[{left},{right}]"));
+    }
     if expression.kind == "Call" {
         let method = expression
             .operator
