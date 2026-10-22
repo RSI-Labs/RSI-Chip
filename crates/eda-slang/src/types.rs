@@ -93,6 +93,12 @@ pub(super) fn memory_type(type_name: &str) -> Option<AstMemoryType> {
     )
 }
 
+pub(super) fn is_dynamic_container_type(type_name: &str) -> bool {
+    dynamic_memory_type(type_name).is_some()
+        || queue_memory_type(type_name).is_some()
+        || associative_memory_type(type_name).is_some()
+}
+
 pub(super) fn memory_type_with_element(
     type_name: &str,
     element_width: usize,

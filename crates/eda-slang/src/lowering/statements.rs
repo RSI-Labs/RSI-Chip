@@ -7,7 +7,7 @@ use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
     slang_constant_u64, string_field, usize_field, with_source_span,
 };
-use crate::types::{memory_type, AstPackedDimension};
+use crate::types::{is_dynamic_container_type, memory_type, AstPackedDimension};
 use eda_core::logic::{LogicValue, LogicWord};
 use serde_json::Value;
 
@@ -1787,6 +1787,11 @@ impl SlangAstLowerer {
         )? {
             return Ok(statement);
         }
+        if let Some(statement) =
+            self.whole_memory_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
+        {
+            return Ok(statement);
+        }
         if let Some(statement) = self.lower_class_parent_assignment(assignment, left, right)? {
             return Ok(statement);
         }
@@ -1820,11 +1825,6 @@ impl SlangAstLowerer {
         }
         if let Some(statement) =
             self.memory_pattern_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
-        {
-            return Ok(statement);
-        }
-        if let Some(statement) =
-            self.whole_memory_assignment(left, right, bool_field(assignment, "isNonBlocking"))?
         {
             return Ok(statement);
         }
@@ -1907,8 +1907,13 @@ impl SlangAstLowerer {
         ) {
             return Ok(None);
         }
-        if memory_type(&string_field(left, "type").unwrap_or_default()).is_none()
-            || memory_type(&string_field(right, "type").unwrap_or_default()).is_none()
+        if !is_dynamic_container_type(&string_field(left, "type").unwrap_or_default())
+            && memory_type(&string_field(left, "type").unwrap_or_default()).is_none()
+        {
+            return Ok(None);
+        }
+        if !is_dynamic_container_type(&string_field(right, "type").unwrap_or_default())
+            && memory_type(&string_field(right, "type").unwrap_or_default()).is_none()
         {
             return Ok(None);
         }

@@ -1733,14 +1733,28 @@ impl<'d> Simulator<'d> {
         LogicWord { bits }
     }
 
-    fn assign_scalar_immediate(&mut self, destination: &LValue, value: LogicWord) {
-        self.assign_scalar(destination, value.clone());
+    fn assign_scalar_immediate(
+        &mut self,
+        destination: &LValue,
+        value: LogicWord,
+    ) -> Result<(), String> {
         let width = destination.range.width();
+        let mut changes = Vec::new();
         for (bit, net) in lv_bits(destination).into_iter().enumerate() {
-            if let Some(target) = self.vals.get_mut(net) {
-                *target = value.bit(bit.min(width.saturating_sub(1)));
+            let new_value = value.bit(bit.min(width.saturating_sub(1)));
+            if self.forced_values.contains_key(&net) {
+                continue;
+            }
+            if let Some(current) = self.vals.get_mut(net) {
+                let old = *current;
+                if old != new_value {
+                    *current = new_value;
+                    self.mark_vcd_change(net);
+                    changes.push((net, old, new_value));
+                }
             }
         }
+        self.notify_direct_changes(changes)
     }
 
     fn apply_associative_traversal(
@@ -1795,9 +1809,13 @@ impl<'d> Simulator<'d> {
                             eda_core::ir::AssocTraversalOp::Next => std::cmp::Ordering::Greater,
                             _ => std::cmp::Ordering::Less,
                         };
-                        keys.into_iter()
-                            .filter(|candidate| compare(candidate, &current) == wanted)
-                            .min_by(compare)
+                        let candidates = keys
+                            .into_iter()
+                            .filter(|candidate| compare(candidate, &current) == wanted);
+                        match operation {
+                            eda_core::ir::AssocTraversalOp::Next => candidates.min_by(compare),
+                            _ => candidates.max_by(compare),
+                        }
                     }
                     None => None,
                 }
@@ -1805,9 +1823,12 @@ impl<'d> Simulator<'d> {
         };
 
         let status = u64::from(found.is_some());
-        self.assign_scalar_immediate(destination, LogicWord::from_u64(1, status));
+        self.assign_scalar_immediate(
+            destination,
+            LogicWord::from_u64(destination.range.width(), status),
+        )?;
         if let Some(found) = found {
-            self.assign_scalar_immediate(key, LogicWord::from_u64(index_width, found));
+            self.assign_scalar_immediate(key, LogicWord::from_u64(index_width, found))?;
         }
         Ok(())
     }
