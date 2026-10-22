@@ -276,6 +276,9 @@ impl<'a> Synth<'a> {
             Stmt::QueuePush { .. } | Stmt::QueuePop { .. } => {
                 Err("queue operations are not synthesizable yet".into())
             }
+            Stmt::AssocWrite { .. } | Stmt::AssocDelete { .. } => {
+                Err("associative-array operations are not synthesizable yet".into())
+            }
             Stmt::MemoryBlPart { .. } | Stmt::MemoryNBlPart { .. } => {
                 Err("first-class sparse-memory part-select writes are not synthesizable yet".into())
             }

@@ -130,6 +130,12 @@ impl<'a> Synth<'a> {
             Expr::MemorySize { .. } => {
                 return Err("dynamic-array size queries are not synthesizable yet".into())
             }
+            Expr::AssocRead { .. } => {
+                return Err("associative-array reads are not synthesizable yet".into())
+            }
+            Expr::AssocExists { .. } => {
+                return Err("associative-array queries are not synthesizable yet".into())
+            }
             Expr::StringLength { .. } => {
                 return Err("bounded string methods are not synthesizable yet".into())
             }

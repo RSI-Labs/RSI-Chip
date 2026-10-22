@@ -579,6 +579,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         let width = expression.type_width?;
         let signed = expression.type_signed?;
         let signed_label = if signed { "s" } else { "u" };
+        if selected.type_name.contains("$assoc[") {
+            return Some(format!(
+                "AssocRead:{width}:{signed_label}[{memory},{index}]"
+            ));
+        }
         return Some(format!(
             "MemoryRead:{width}:{signed_label}[{memory},{index}]"
         ));
@@ -896,6 +901,8 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::EventTriggered { .. } => "EventTriggered",
         Expr::SimulationTime { .. } => "SimulationTime",
         Expr::MemorySize { .. } => "MemorySize",
+        Expr::AssocRead { .. } => "AssocRead",
+        Expr::AssocExists { .. } => "AssocExists",
     }
 }
 
@@ -1009,12 +1016,42 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         let signed_label = if *signed { "s" } else { "u" };
         return format!("MemorySize:{width}:{signed_label}[{memory_name}]");
     }
+    if let Expr::AssocRead {
+        memory,
+        index,
+        width,
+    } = expression
+    {
+        let memory_name = design
+            .memories
+            .get(*memory)
+            .map(|memory| memory.name.as_str())
+            .unwrap_or("<unknown>");
+        return format!(
+            "AssocRead:{width}:u[{memory_name},{}]",
+            design_expr_fingerprint(design, index)
+        );
+    }
+    if let Expr::AssocExists { memory, index } = expression {
+        let memory_name = design
+            .memories
+            .get(*memory)
+            .map(|memory| memory.name.as_str())
+            .unwrap_or("<unknown>");
+        return format!(
+            "AssocExists:1:u[{memory_name},{}]",
+            design_expr_fingerprint(design, index)
+        );
+    }
     let operands: Vec<String> = match expression {
         Expr::Const(_)
         | Expr::Ref { .. }
         | Expr::MemoryRead { .. }
         | Expr::SimulationTime { .. }
         | Expr::MemorySize { .. } => Vec::new(),
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
+            vec![design_expr_fingerprint(design, index)]
+        }
         Expr::MemoryReadPart { indexes, start, .. } => indexes
             .iter()
             .chain(std::iter::once(start.as_ref()))
@@ -1219,6 +1256,7 @@ pub(crate) fn design_stmt_assignments(
                 (destination.name.clone(), format!("MemoryCopy:{source}"))
             }));
         }
+        Stmt::AssocDelete { .. } => {}
         Stmt::MemoryNew { memory, size, .. } => {
             assignments.extend(design.memories.get(*memory).map(|memory| {
                 (
@@ -1258,6 +1296,14 @@ pub(crate) fn design_stmt_assignments(
                         )
                     })
             }));
+        }
+        Stmt::AssocWrite { memory, value, .. } => {
+            assignments.extend(
+                design
+                    .memories
+                    .get(*memory)
+                    .map(|memory| (memory.name.clone(), design_expr_fingerprint(design, value))),
+            );
         }
         Stmt::BlIndexed { net, e, .. } | Stmt::NBlIndexed { net, e, .. } => {
             assignments.extend(design.net_decls.iter().find_map(|declaration| {

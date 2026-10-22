@@ -73,6 +73,16 @@ impl SlangAstLowerer {
                 return Ok(expression);
             }
         }
+        if subroutine == "num" {
+            if let Some(expression) = self.lower_associative_array_num(value)? {
+                return Ok(expression);
+            }
+        }
+        if subroutine == "exists" {
+            if let Some(expression) = self.lower_associative_array_exists(value)? {
+                return Ok(expression);
+            }
+        }
         match subroutine.as_str() {
             "next" | "prev" => {
                 return self.lower_enum_next_prev(value, subroutine == "next");
@@ -238,6 +248,9 @@ impl SlangAstLowerer {
             .unwrap_or_default()
             .to_string();
         if task_name == "delete" {
+            if let Some(statement) = self.lower_associative_array_delete(value)? {
+                return Ok(Some(statement));
+            }
             if let Some(statement) = self.lower_dynamic_array_delete(value)? {
                 return Ok(Some(statement));
             }
@@ -1008,6 +1021,113 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         Ok(Some(eda_core::ir::Stmt::MemoryDelete { memory }))
+    }
+
+    fn associative_receiver(
+        &self,
+        value: &Value,
+        function_name: &str,
+    ) -> Result<Option<usize>, String> {
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let receiver = arguments
+            .first()
+            .ok_or_else(|| format!("{function_name} has no receiver"))?;
+        let Some(name) = expression_symbol(receiver) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Ok(None);
+        };
+        let Some(memory) = symbol.memory else {
+            return Ok(None);
+        };
+        if self.design.memories[memory].associative {
+            Ok(Some(memory))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn lower_associative_array_num(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        let Some(memory) = self.associative_receiver(value, "associative num")? else {
+            return Ok(None);
+        };
+        Ok(Some(eda_core::ir::Expr::MemorySize {
+            memory,
+            width: 32,
+            signed: true,
+        }))
+    }
+
+    fn lower_associative_array_exists(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Expr>, String> {
+        let Some(memory) = self.associative_receiver(value, "associative exists")? else {
+            return Ok(None);
+        };
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() != 2 {
+            return Err("associative exists expects one receiver and one key".into());
+        }
+        let key = arguments
+            .get(1)
+            .ok_or_else(|| "associative exists has no key".to_string())?;
+        let index = self.lower_expression(key)?;
+        if index.width() > self.design.memories[memory].index_width {
+            return Err(format!(
+                "associative exists key width {} exceeds index width {}",
+                index.width(),
+                self.design.memories[memory].index_width
+            ));
+        }
+        Ok(Some(eda_core::ir::Expr::AssocExists {
+            memory,
+            index: Box::new(index),
+        }))
+    }
+
+    fn lower_associative_array_delete(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let Some(memory) = self.associative_receiver(value, "associative delete")? else {
+            return Ok(None);
+        };
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if arguments.len() > 2 {
+            return Err("associative delete expects at most one key".into());
+        }
+        let index = match arguments.get(1) {
+            Some(key) => {
+                let index = self.lower_expression(key)?;
+                if index.width() > self.design.memories[memory].index_width {
+                    return Err(format!(
+                        "associative delete key width {} exceeds index width {}",
+                        index.width(),
+                        self.design.memories[memory].index_width
+                    ));
+                }
+                Some(index)
+            }
+            None => None,
+        };
+        Ok(Some(eda_core::ir::Stmt::AssocDelete { memory, index }))
     }
 
     fn lower_queue_push(

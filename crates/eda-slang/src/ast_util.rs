@@ -104,6 +104,21 @@ fn canonical_detailed_type(value: &Value) -> Option<String> {
                 Some(format!("{element}$queue[$]"))
             }
         }
+        "AssociativeArrayType" => {
+            let element = value.get("elementType")?;
+            let element = if let Some(element_name) = element.as_str() {
+                element_name.to_string()
+            } else {
+                canonical_detailed_type(element)?
+            };
+            let index = value.get("indexType")?;
+            let index = if let Some(index_name) = index.as_str() {
+                index_name.to_string()
+            } else {
+                canonical_detailed_type(index)?
+            };
+            Some(format!("{element}$assoc[{index}]"))
+        }
         _ => None,
     }
 }

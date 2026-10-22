@@ -231,6 +231,10 @@ pub struct MemoryDecl {
     pub dynamic: bool,
     /// Dynamic FIFO storage with logical indexes remapped after each pop.
     pub queue: bool,
+    /// Sparse key/value storage; logical keys are not physical array indexes.
+    pub associative: bool,
+    pub index_width: usize,
+    pub index_signed: bool,
     pub storage: MemoryStorage,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
@@ -450,6 +454,17 @@ pub enum Expr {
         width: usize,
         signed: bool,
     },
+    /// Read an associative-array element; missing or unknown keys yield X.
+    AssocRead {
+        memory: usize,
+        index: Box<Expr>,
+        width: usize,
+    },
+    /// Test whether an associative-array key exists.
+    AssocExists {
+        memory: usize,
+        index: Box<Expr>,
+    },
     /// Part-select of an arbitrary sub-expression: `[msb:lsb]`.
     Index {
         e: Box<Expr>,
@@ -553,6 +568,8 @@ impl Expr {
             Expr::MemoryRead { width, .. } => *width,
             Expr::MemoryReadPart { width, .. } => *width,
             Expr::MemorySize { width, .. } => *width,
+            Expr::AssocRead { width, .. } => *width,
+            Expr::AssocExists { .. } => 1,
             Expr::Index { msb, lsb, .. } => msb - lsb + 1,
             Expr::StringLength { .. } => 32,
             Expr::StringConcat { left, .. } => left.width(),
@@ -598,6 +615,8 @@ impl Expr {
             // A part-select is unsigned even when its base declaration is signed.
             Expr::MemoryReadPart { .. } => false,
             Expr::MemorySize { signed, .. } => *signed,
+            Expr::AssocRead { .. } => false,
+            Expr::AssocExists { .. } => false,
             Expr::Index { .. } => false,
             Expr::StringLength { .. } => true,
             Expr::StringConcat { .. } => false,
@@ -684,6 +703,19 @@ pub enum Stmt {
         memory: usize,
         destination: LValue,
         front: bool,
+    },
+    /// Write one associative-array key. Unknown keys and capacity overflow
+    /// fail closed.
+    AssocWrite {
+        memory: usize,
+        index: Expr,
+        value: Expr,
+        nonblocking: bool,
+    },
+    /// Delete one key, or clear the associative array when index is `None`.
+    AssocDelete {
+        memory: usize,
+        index: Option<Expr>,
     },
     /// Blocking indexed part-select write to a sparse-memory element.
     MemoryBlPart {
@@ -1047,6 +1079,15 @@ impl Design {
         let aliases = self.memory_alias_roots();
         let accesses = accesses.canonicalize(&aliases);
         for (index, memory) in self.memories.iter_mut().enumerate() {
+            if memory.associative {
+                memory.storage = MemoryStorage::Ordinary;
+                memory.kind = MemoryKind::Ram;
+                memory.template = MemoryTemplate::Unmapped;
+                memory.write_mask = None;
+                memory.byte_enable = None;
+                memory.banking = MemoryBanking::default();
+                continue;
+            }
             if memory.dynamic {
                 memory.storage = MemoryStorage::Ordinary;
                 memory.kind = MemoryKind::Ram;
@@ -1396,6 +1437,15 @@ fn collect_memory_accesses(
             collect_memory_expr_reads(value, synchronous, false, accesses)
         }
         Stmt::QueuePop { .. } => {}
+        Stmt::AssocWrite { index, value, .. } => {
+            collect_memory_expr_reads(index, synchronous, false, accesses);
+            collect_memory_expr_reads(value, synchronous, false, accesses);
+        }
+        Stmt::AssocDelete { index, .. } => {
+            if let Some(index) = index {
+                collect_memory_expr_reads(index, synchronous, false, accesses);
+            }
+        }
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -1476,6 +1526,16 @@ fn collect_memory_expr_reads(
         | Expr::Ref { .. }
         | Expr::SimulationTime { .. }
         | Expr::MemorySize { .. } => {}
+        Expr::AssocRead { memory, index, .. } | Expr::AssocExists { memory, index } => {
+            if continuous {
+                accesses.continuous_reads.insert(*memory);
+            } else if synchronous {
+                accesses.sync_reads.insert(*memory);
+            } else {
+                accesses.async_reads.insert(*memory);
+            }
+            collect_memory_expr_reads(index, synchronous, continuous, accesses);
+        }
         Expr::MemoryRead {
             memory, indexes, ..
         } => {
@@ -1640,6 +1700,9 @@ mod tests {
             flat_length: 4,
             dynamic: false,
             queue: false,
+            associative: false,
+            index_width: 0,
+            index_signed: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1722,6 +1785,9 @@ mod tests {
             flat_length: 8,
             dynamic: false,
             queue: false,
+            associative: false,
+            index_width: 0,
+            index_signed: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -1760,6 +1826,9 @@ mod tests {
             flat_length: 513,
             dynamic: false,
             queue: false,
+            associative: false,
+            index_width: 0,
+            index_signed: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

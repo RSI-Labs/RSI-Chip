@@ -46,6 +46,14 @@ enum MemoryNbaUpdate {
     },
 }
 
+enum AssocNbaUpdate {
+    Write {
+        memory: usize,
+        key: u64,
+        value: LogicWord,
+    },
+}
+
 struct Cont<'d> {
     process: Option<usize>,
     join: Option<usize>,
@@ -98,6 +106,8 @@ pub(crate) enum MemoryElementStorage {
     Ordinary(OrdinaryArrayElements),
     Sparse(HashMap<u64, LogicWord>),
 }
+
+type AssociativeElements = HashMap<u64, LogicWord>;
 
 impl MemoryElementStorage {
     fn get(&self, index: u64) -> Option<&LogicWord> {
@@ -184,6 +194,8 @@ pub struct Simulator<'d> {
     memory_nba: Vec<MemoryNbaUpdate>,
     dynamic_lengths: Vec<u64>,
     dynamic_nba: Vec<(usize, u64)>,
+    associative_elements: Vec<AssociativeElements>,
+    associative_nba: Vec<AssocNbaUpdate>,
     memory_readers: Vec<Vec<usize>>,
     memory_assign_fanin: Vec<Vec<usize>>,
     assign_fanin: Vec<Vec<usize>>,
@@ -226,7 +238,9 @@ impl<'d> Simulator<'d> {
             }
             let total_bits =
                 u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
-            if memory.storage == eda_core::ir::MemoryStorage::Ordinary {
+            if memory.associative {
+                memory_elements.push(MemoryElementStorage::Sparse(HashMap::new()));
+            } else if memory.storage == eda_core::ir::MemoryStorage::Ordinary {
                 if total_bits > 4096 {
                     return Err(format!(
                         "ordinary array '{}' exceeds the 4096-bit dense-storage limit",
@@ -332,6 +346,8 @@ impl<'d> Simulator<'d> {
             memory_nba: Vec::new(),
             dynamic_lengths: vec![0; design.memories.len()],
             dynamic_nba: Vec::new(),
+            associative_elements: vec![HashMap::new(); design.memories.len()],
+            associative_nba: Vec::new(),
             memory_readers,
             memory_assign_fanin,
             assign_fanin,
@@ -1069,7 +1085,8 @@ impl<'d> Simulator<'d> {
             if !did
                 && (!self.nba.is_empty()
                     || !self.memory_nba.is_empty()
-                    || !self.dynamic_nba.is_empty())
+                    || !self.dynamic_nba.is_empty()
+                    || !self.associative_nba.is_empty())
             {
                 let updates = std::mem::take(&mut self.nba);
                 for (net, val) in updates {
@@ -1084,11 +1101,22 @@ impl<'d> Simulator<'d> {
                 }
                 let memory_updates = std::mem::take(&mut self.memory_nba);
                 let dynamic_updates = std::mem::take(&mut self.dynamic_nba);
+                let associative_updates = std::mem::take(&mut self.associative_nba);
                 for (memory, size) in dynamic_updates {
                     if self.cancellation.is_cancelled() {
                         return Err("simulation cancelled".into());
                     }
                     self.allocate_dynamic_memory(memory, size)?;
+                }
+                for update in associative_updates {
+                    if self.cancellation.is_cancelled() {
+                        return Err("simulation cancelled".into());
+                    }
+                    match update {
+                        AssocNbaUpdate::Write { memory, key, value } => {
+                            self.apply_associative_write(memory, key, value)?
+                        }
+                    }
                 }
                 for update in memory_updates {
                     if self.cancellation.is_cancelled() {
@@ -1438,6 +1466,92 @@ impl<'d> Simulator<'d> {
         self.apply_memory_update(memory, length - 1, LogicWord::xes(element_width))?;
         self.assign_scalar(destination, popped);
         Ok(())
+    }
+
+    fn associative_key(&self, memory: usize, index: &Expr) -> Result<Option<u64>, String> {
+        let memory = self.canonical_memory(memory);
+        let declaration = self
+            .design
+            .memories
+            .get(memory)
+            .ok_or_else(|| "associative-array operation target is missing".to_string())?;
+        if !declaration.associative {
+            return Err(format!(
+                "associative-array operation target '{}' is not associative",
+                declaration.name
+            ));
+        }
+        let value = self.eval(index).sized(declaration.index_width);
+        if !value.is_fully_known() {
+            return Ok(None);
+        }
+
+        Ok(value.to_u64())
+    }
+
+    fn apply_associative_write(
+        &mut self,
+        memory: usize,
+        key: u64,
+        value: LogicWord,
+    ) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, capacity, element_width, associative) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("associative-array write target is missing".into());
+            };
+            (
+                declaration.name.clone(),
+                declaration.flat_length,
+                declaration.element_width,
+                declaration.associative,
+            )
+        };
+        if !associative {
+            return Err(format!(
+                "associative-array write target '{name}' is not associative"
+            ));
+        }
+        let elements = self
+            .associative_elements
+            .get_mut(memory)
+            .ok_or_else(|| format!("associative array '{name}' has no storage"))?;
+        let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if !elements.contains_key(&key) && elements.len() >= capacity {
+            return Err(format!(
+                "associative array '{name}' is full; capacity is {capacity}"
+            ));
+        }
+        elements.insert(key, value.sized(element_width));
+        self.dynamic_lengths[memory] = elements.len() as u64;
+        self.notify_memory_write(memory)
+    }
+
+    fn apply_associative_delete(&mut self, memory: usize, key: Option<u64>) -> Result<(), String> {
+        let memory = self.canonical_memory(memory);
+        let (name, associative) = {
+            let Some(declaration) = self.design.memories.get(memory) else {
+                return Err("associative-array delete target is missing".into());
+            };
+            (declaration.name.clone(), declaration.associative)
+        };
+        if !associative {
+            return Err(format!(
+                "associative-array delete target '{name}' is not associative"
+            ));
+        }
+        let elements = self
+            .associative_elements
+            .get_mut(memory)
+            .ok_or_else(|| format!("associative array '{name}' has no storage"))?;
+        match key {
+            Some(key) => {
+                elements.remove(&key);
+            }
+            None => elements.clear(),
+        }
+        self.dynamic_lengths[memory] = elements.len() as u64;
+        self.notify_memory_write(memory)
     }
 
     fn assign_scalar(&mut self, destination: &LValue, value: LogicWord) {
@@ -2092,6 +2206,40 @@ impl<'d> Simulator<'d> {
                     destination,
                     front,
                 } => self.queue_pop(*memory, destination, *front)?,
+                Stmt::AssocWrite {
+                    memory,
+                    index,
+                    value,
+                    nonblocking,
+                } => {
+                    let key = self.associative_key(*memory, index)?;
+                    let Some(key) = key else {
+                        return Err("associative-array write key must be known".into());
+                    };
+                    let value = self.eval(value);
+                    if *nonblocking {
+                        self.associative_nba.push(AssocNbaUpdate::Write {
+                            memory: self.canonical_memory(*memory),
+                            key,
+                            value,
+                        });
+                    } else {
+                        self.apply_associative_write(*memory, key, value)?;
+                    }
+                }
+                Stmt::AssocDelete { memory, index } => {
+                    let key = match index {
+                        Some(index) => {
+                            let key = self.associative_key(*memory, index)?;
+                            let Some(key) = key else {
+                                return Err("associative-array delete key must be known".into());
+                            };
+                            Some(key)
+                        }
+                        None => None,
+                    };
+                    self.apply_associative_delete(*memory, key)?;
+                }
                 Stmt::MemoryBlPart {
                     memory,
                     indexes,
@@ -2931,6 +3079,31 @@ impl<'d> Simulator<'d> {
                 let size = self.dynamic_lengths.get(memory).copied().unwrap_or(0);
                 LogicWord::from_u64(*width, size)
             }
+            Expr::AssocRead {
+                memory,
+                index,
+                width,
+            } => {
+                let key = self.associative_key(*memory, index).ok().flatten();
+                match key {
+                    Some(key) => self
+                        .associative_elements
+                        .get(self.canonical_memory(*memory))
+                        .and_then(|elements| elements.get(&key))
+                        .cloned()
+                        .unwrap_or_else(|| LogicWord::xes(*width)),
+                    None => LogicWord::xes(*width),
+                }
+            }
+            Expr::AssocExists { memory, index } => {
+                let key = self.associative_key(*memory, index).ok().flatten();
+                let exists = key.is_some_and(|key| {
+                    self.associative_elements
+                        .get(self.canonical_memory(*memory))
+                        .is_some_and(|elements| elements.contains_key(&key))
+                });
+                LogicWord::from_u64(1, u64::from(exists))
+            }
         }
     }
 
@@ -3419,6 +3592,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(start, out);
         }
         Expr::MemorySize { .. } => {}
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => walk_expr(index, out),
     }
 }
 
@@ -3571,6 +3745,10 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(start, out);
         }
         Expr::MemorySize { memory, .. } => out.push(*memory),
+        Expr::AssocRead { memory, index, .. } | Expr::AssocExists { memory, index } => {
+            out.push(*memory);
+            walk_expr_memories(index, out);
+        }
     }
 }
 
@@ -3614,6 +3792,22 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_expr_memories(value, out);
         }
         Stmt::QueuePop { memory, .. } => out.push(*memory),
+        Stmt::AssocWrite {
+            memory,
+            index,
+            value,
+            ..
+        } => {
+            out.push(*memory);
+            walk_expr_memories(index, out);
+            walk_expr_memories(value, out);
+        }
+        Stmt::AssocDelete { memory, index } => {
+            out.push(*memory);
+            if let Some(index) = index {
+                walk_expr_memories(index, out);
+            }
+        }
         Stmt::MemoryBlPart {
             memory,
             indexes,
@@ -3725,6 +3919,15 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => reads.extend(expr_nets(value)),
         Stmt::QueuePop { destination, .. } => writes.extend(lv_bits(destination)),
+        Stmt::AssocWrite { index, value, .. } => {
+            reads.extend(expr_nets(index));
+            reads.extend(expr_nets(value));
+        }
+        Stmt::AssocDelete { index, .. } => {
+            if let Some(index) = index {
+                reads.extend(expr_nets(index));
+            }
+        }
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -3848,6 +4051,15 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => walk_expr(value, out),
         Stmt::QueuePop { .. } => {}
+        Stmt::AssocWrite { index, value, .. } => {
+            walk_expr(index, out);
+            walk_expr(value, out);
+        }
+        Stmt::AssocDelete { index, .. } => {
+            if let Some(index) = index {
+                walk_expr(index, out);
+            }
+        }
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }

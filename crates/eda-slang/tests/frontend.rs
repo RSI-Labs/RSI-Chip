@@ -5072,6 +5072,132 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_associative_array_lifecycle() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-associative-array-lifecycle");
+    let source_path = root.join("associative_array_lifecycle.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module associative_array_lifecycle(
+  input int key,
+  input logic [7:0] value,
+  output int initial_count,
+  output int written_count,
+  output int system_size,
+  output int array_bits,
+  output int exists_before,
+  output int exists_after,
+  output int deleted_count,
+  output int cleared_count,
+  output logic [7:0] hit,
+  output logic [7:0] missing,
+  output logic [7:0] unused
+);
+  logic [7:0] values [int];
+
+  initial begin
+    #1;
+    initial_count = values.num();
+    values[key] = value;
+    values[key + 1] = value + 8'd1;
+    written_count = values.num();
+    system_size = $size(values);
+    array_bits = $bits(values);
+    exists_before = values.exists(key);
+    hit = values[key];
+    missing = values[key + 99];
+
+    values.delete(key);
+    exists_after = values.exists(key);
+    deleted_count = values.num();
+    values.delete();
+    cleared_count = values.num();
+  end
+endmodule
+"#,
+    )
+    .expect("write associative-array lifecycle source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("associative_array_lifecycle"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower associative-array lifecycle");
+    assert_eq!(design.memories.len(), 1);
+    assert!(design
+        .memories
+        .iter()
+        .all(|memory| memory.associative && memory.dynamic && !memory.queue));
+    assert_eq!(design.memories[0].flat_length, 256);
+    assert_eq!(design.memories[0].index_width, 32);
+    assert!(design.memories[0].index_signed);
+    assert_eq!(
+        design.memories[0].storage,
+        eda_core::ir::MemoryStorage::Ordinary
+    );
+    assert_eq!(
+        design.memories[0].template,
+        eda_core::ir::MemoryTemplate::Unmapped
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create associative simulator");
+    simulator
+        .set_input("key", &LogicWord::from_u64(32, 10))
+        .expect("set associative key");
+    simulator
+        .set_input("value", &LogicWord::from_u64(8, 0x30))
+        .expect("set associative value");
+    simulator.run_until(1).expect("run associative lifecycle");
+
+    assert_eq!(simulator.read("initial_count").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("written_count").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("system_size").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("array_bits").unwrap().to_u64(), Some(16));
+    assert_eq!(simulator.read("exists_before").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("hit").unwrap().to_u64(), Some(0x30));
+    assert_eq!(simulator.read("missing").unwrap().to_u64(), None);
+    assert_eq!(simulator.read("exists_after").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("deleted_count").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("cleared_count").unwrap().to_u64(), Some(0));
+
+    let full_path = root.join("associative_array_full.sv");
+    std::fs::write(
+        &full_path,
+        r#"
+module associative_array_full;
+  logic [7:0] values [int];
+  initial begin
+    for (int index = 0; index < 257; index = index + 1) begin
+      values[index] = 8'h00;
+    end
+  end
+endmodule
+"#,
+    )
+    .expect("write full associative-array source");
+    let full = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&full_path),
+            Some("associative_array_full"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower full associative-array source");
+    let mut full_simulator = Simulator::new(&full).expect("create full associative simulator");
+    let error = full_simulator
+        .run_until(0)
+        .expect_err("inserting 257 keys must fail closed");
+    assert!(
+        error.contains("associative array 'values' is full; capacity is 256"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

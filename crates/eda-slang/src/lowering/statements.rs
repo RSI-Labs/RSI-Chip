@@ -1826,6 +1826,17 @@ impl SlangAstLowerer {
         }
         if let Some((memory, indexes)) = self.memory_element_select(left)? {
             let expression = self.lower_expression(right)?;
+            if self.design.memories[memory].associative {
+                let [index] = indexes.as_slice() else {
+                    return Err("associative array assignment requires one index".into());
+                };
+                return Ok(Stmt::AssocWrite {
+                    memory,
+                    index: index.clone(),
+                    value: expression,
+                    nonblocking: bool_field(assignment, "isNonBlocking"),
+                });
+            }
             return Ok(if bool_field(assignment, "isNonBlocking") {
                 Stmt::MemoryNBl {
                     memory,
@@ -2649,6 +2660,9 @@ fn collect_expression_references(
             collect_expression_references(start, references);
         }
         Expr::MemorySize { .. } => {}
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
+            collect_expression_references(index, references)
+        }
         Expr::Index { e, .. } => collect_expression_references(e, references),
         Expr::StringConcat { left, right } | Expr::StringCompare { left, right, .. } => {
             collect_expression_references(left, references);

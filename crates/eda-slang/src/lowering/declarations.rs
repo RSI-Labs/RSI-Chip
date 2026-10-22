@@ -7,9 +7,9 @@ use crate::ast_util::{
     bool_field, literal_word, memory_initializer_statements, string_field, usize_field,
 };
 use crate::types::{
-    dynamic_memory_type, memory_type, memory_type_with_element, queue_memory_type,
-    simple_type_shape, simple_type_signed, simple_type_width, string_literal_word, AstMemoryType,
-    AstPackedDimension, AstTypeShape, STRING_WIDTH,
+    associative_memory_type, dynamic_memory_type, memory_type, memory_type_with_element,
+    queue_memory_type, simple_type_shape, simple_type_signed, simple_type_width,
+    string_literal_word, AstMemoryType, AstPackedDimension, AstTypeShape, STRING_WIDTH,
 };
 
 impl SlangAstLowerer {
@@ -357,6 +357,9 @@ impl SlangAstLowerer {
     }
 
     pub(super) fn declared_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
+        if let Some(memory) = associative_memory_type(type_name) {
+            return Some(memory);
+        }
         if let Some(memory) = queue_memory_type(type_name) {
             return Some(memory);
         }
@@ -566,6 +569,9 @@ impl SlangAstLowerer {
             flat_length: memory.flat_length,
             dynamic: memory.dynamic,
             queue: memory.queue,
+            associative: memory.associative,
+            index_width: memory.index_width,
+            index_signed: memory.index_signed,
             storage: eda_core::ir::MemoryStorage::Ordinary,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,

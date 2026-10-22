@@ -35,10 +35,14 @@ pub(super) struct AstMemoryType {
     pub signed: bool,
     pub dynamic: bool,
     pub queue: bool,
+    pub associative: bool,
+    pub index_width: usize,
+    pub index_signed: bool,
 }
 
 pub(super) const DYNAMIC_ARRAY_CAPACITY: usize = 256;
 pub(super) const QUEUE_CAPACITY: usize = 256;
+pub(super) const ASSOCIATIVE_ARRAY_CAPACITY: usize = 256;
 
 pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
     simple_type_width(type_name).map(|_| {
@@ -127,6 +131,9 @@ pub(super) fn memory_type_with_element(
         signed,
         dynamic: false,
         queue: false,
+        associative: false,
+        index_width: 0,
+        index_signed: false,
     })
 }
 
@@ -150,6 +157,7 @@ pub(super) fn dynamic_memory_type(type_name: &str) -> Option<AstMemoryType> {
     )?;
     memory.dynamic = true;
     memory.queue = false;
+    memory.associative = false;
     Some(memory)
 }
 
@@ -188,6 +196,41 @@ pub(super) fn queue_memory_type(type_name: &str) -> Option<AstMemoryType> {
     )?;
     memory.dynamic = true;
     memory.queue = true;
+    memory.associative = false;
+    Some(memory)
+}
+
+pub(super) fn associative_memory_type(type_name: &str) -> Option<AstMemoryType> {
+    const MARKER: &str = "$assoc[";
+    let type_name = type_name.trim();
+    let separator = type_name.find(MARKER)?;
+    if !type_name.ends_with(']') {
+        return None;
+    }
+    let element_type = type_name[..separator].trim();
+    let shape = simple_type_shape(element_type)?;
+    let index_start = separator + MARKER.len();
+    let index_end = type_name.len().saturating_sub(1);
+    let index_type = type_name.get(index_start..index_end)?.trim();
+    let index_width = simple_type_width(index_type)?;
+    let index_signed = simple_type_signed(index_type)?;
+    if index_width == 0 || index_width > u64::BITS as usize {
+        return None;
+    }
+    let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
+    let capacity_msb = i64::try_from(ASSOCIATIVE_ARRAY_CAPACITY.saturating_sub(1)).ok()?;
+    let fixed_type_name = format!("{element_type}$[0:{capacity_msb}]");
+    let mut memory = memory_type_with_element(
+        &fixed_type_name,
+        shape.width,
+        shape.bounds.unwrap_or((element_msb, 0)),
+        simple_type_signed(element_type)?,
+    )?;
+    memory.dynamic = true;
+    memory.queue = false;
+    memory.associative = true;
+    memory.index_width = index_width;
+    memory.index_signed = index_signed;
     Some(memory)
 }
 

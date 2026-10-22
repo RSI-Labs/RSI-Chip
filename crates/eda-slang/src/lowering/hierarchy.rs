@@ -331,6 +331,9 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             remap_expression(start, offset);
         }
         Expr::MemorySize { .. } => {}
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
+            remap_expression(index, offset)
+        }
         Expr::Index { e, .. } => remap_expression(e, offset),
         Expr::StringLength { e } => remap_expression(e, offset),
         Expr::StringConcat { left, right } => {
@@ -384,6 +387,15 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => remap_expression(value, offset),
         Stmt::QueuePop { destination, .. } => destination.net += offset,
+        Stmt::AssocWrite { index, value, .. } => {
+            remap_expression(index, offset);
+            remap_expression(value, offset);
+        }
+        Stmt::AssocDelete { index, .. } => {
+            if let Some(index) = index {
+                remap_expression(index, offset);
+            }
+        }
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -543,6 +555,9 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
             rewrite_expression_nets(start, rewrites);
         }
         Expr::MemorySize { .. } => {}
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
+            rewrite_expression_nets(index, rewrites)
+        }
         Expr::Index { e, .. } => rewrite_expression_nets(e, rewrites),
         Expr::StringLength { e } => rewrite_expression_nets(e, rewrites),
         Expr::StringConcat { left, right } => {
@@ -596,6 +611,15 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
         Stmt::MemoryDelete { .. } => {}
         Stmt::QueuePush { value, .. } => rewrite_expression_nets(value, rewrites),
         Stmt::QueuePop { destination, .. } => rewrite_lvalue_nets(destination, rewrites),
+        Stmt::AssocWrite { index, value, .. } => {
+            rewrite_expression_nets(index, rewrites);
+            rewrite_expression_nets(value, rewrites);
+        }
+        Stmt::AssocDelete { index, .. } => {
+            if let Some(index) = index {
+                rewrite_expression_nets(index, rewrites);
+            }
+        }
         Stmt::MemoryBlPart {
             indexes, start, e, ..
         }
@@ -751,6 +775,10 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
             remap_expression_memory_ids(start, offset);
         }
         Expr::MemorySize { memory, .. } => *memory += offset,
+        Expr::AssocRead { memory, index, .. } | Expr::AssocExists { memory, index } => {
+            *memory += offset;
+            remap_expression_memory_ids(index, offset);
+        }
         Expr::Index { e, .. } => remap_expression_memory_ids(e, offset),
         Expr::StringLength { e } => remap_expression_memory_ids(e, offset),
         Expr::StringConcat { left, right } => {
@@ -845,6 +873,22 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             remap_expression_memory_ids(value, offset);
         }
         Stmt::QueuePop { memory, .. } => *memory += offset,
+        Stmt::AssocWrite {
+            memory,
+            index,
+            value,
+            ..
+        } => {
+            *memory += offset;
+            remap_expression_memory_ids(index, offset);
+            remap_expression_memory_ids(value, offset);
+        }
+        Stmt::AssocDelete { memory, index } => {
+            *memory += offset;
+            if let Some(index) = index {
+                remap_expression_memory_ids(index, offset);
+            }
+        }
         Stmt::If { c, t, f } => {
             remap_expression_memory_ids(c, offset);
             remap_statement_memory_ids(t, offset);

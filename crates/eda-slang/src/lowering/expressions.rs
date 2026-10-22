@@ -698,6 +698,16 @@ impl super::SlangAstLowerer {
                 }
                 if let Some((memory, indexes)) = self.memory_element_select(value)? {
                     let symbol = self.design.memories[memory].clone();
+                    if symbol.associative {
+                        let [index] = indexes.as_slice() else {
+                            return Err("associative array select requires one index".into());
+                        };
+                        return Ok(Expr::AssocRead {
+                            memory,
+                            index: Box::new(index.clone()),
+                            width: symbol.element_width,
+                        });
+                    }
                     let signed = self
                         .design
                         .net_decls
