@@ -1803,6 +1803,51 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower parameterized classes");
+    let parameterized_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("parameterized_class_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize parameterized-class AST");
+    let parameterized_summary = slang
+        .summarize_ast_json(&parameterized_json)
+        .expect("summarize parameterized-class AST");
+    parameterized_summary
+        .validate_against_design(&design)
+        .expect("exact parameterized class-property method fingerprints should match");
+    for (target, wrong_symbol) in [("observed8", "box8.wrong"), ("observed16", "box16.wrong")] {
+        let mut wrong_summary = parameterized_summary.clone();
+        if let Some(assignment) = wrong_summary
+            .procedural_blocks
+            .iter_mut()
+            .find_map(|block| {
+                block.assignments.iter_mut().find(|assignment| {
+                    assignment
+                        .target_names
+                        .first()
+                        .is_some_and(|name| name == target)
+                })
+            })
+        {
+            assignment.rhs.symbol = Some(wrong_symbol.into());
+        }
+        let error = wrong_summary
+            .validate_against_design(&design)
+            .expect_err("wrong parameterized class-property method must fail");
+        let expected_symbol = wrong_symbol.replace(".wrong", ".value");
+        assert!(
+            error.contains(&format!("Ref:8:u[{wrong_symbol}]"))
+                || error.contains(&format!("Ref:16:u[{wrong_symbol}]")),
+            "unexpected wrong parameterized symbol: {error}"
+        );
+        assert!(
+            error.contains(&format!("Ref:8:u[{expected_symbol}]"))
+                || error.contains(&format!("Ref:16:u[{expected_symbol}]")),
+            "unexpected parameterized symbol: {error}"
+        );
+    }
     let mut simulator = Simulator::new(&design).expect("create parameterized-class simulator");
     simulator
         .set_input("value8", &LogicWord::from_u64(8, 0xa5))

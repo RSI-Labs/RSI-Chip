@@ -236,6 +236,7 @@ fn collect_simple_function_definitions(
 
 #[derive(Default)]
 struct SimpleInstanceMethodIndex {
+    class_name: String,
     methods: std::collections::BTreeMap<String, Value>,
     composition_methods: std::collections::BTreeMap<String, Value>,
     properties: std::collections::BTreeMap<String, String>,
@@ -248,7 +249,10 @@ fn collect_simple_instance_methods(
 ) {
     if let Some(fields) = value.as_object() {
         if string_field(value, "kind").as_deref() == Some("ClassType") {
-            let mut index = SimpleInstanceMethodIndex::default();
+            let mut index = SimpleInstanceMethodIndex {
+                class_name: string_field(value, "name").unwrap_or_default(),
+                ..SimpleInstanceMethodIndex::default()
+            };
             let empty_members = Vec::new();
             let members = value
                 .get("members")
@@ -339,7 +343,17 @@ fn collect_simple_instance_methods(
                 || !index.composition_methods.is_empty()
                 || !index.property_definitions.is_empty()
             {
-                methods.insert(string_field(value, "name").unwrap_or_default(), index);
+                let address = value
+                    .get("addr")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|address| address.to_string())
+                    .unwrap_or_default();
+                let class_key = if address.is_empty() {
+                    string_field(value, "name").unwrap_or_default()
+                } else {
+                    address
+                };
+                methods.insert(class_key, index);
             }
         }
         for nested in fields.values() {
@@ -382,7 +396,7 @@ fn canonicalize_simple_instance_method_calls(
                     let property_name = index.properties.get(&property_symbol)?;
                     let property = index.property_definitions.get(&property_symbol)?;
                     let property_type = string_field(property, "type")?;
-                    let nested_class_name = class_type_name(&property_type);
+                    let nested_class_name = class_type_key(&property_type);
                     let nested_index = classes.get(&nested_class_name)?;
                     let nested_method = nested_index.methods.get(&nested_subroutine)?;
                     let nested_expression = nested_method.get("body")?.get("expr")?;
@@ -426,7 +440,7 @@ fn class_method_receiver_path(
     ) {
         let symbol = string_field(value, "symbol")?;
         let receiver_name = symbol.split_whitespace().next_back()?.to_string();
-        let class_name = class_type_name(&string_field(value, "type")?);
+        let class_name = class_type_key(&string_field(value, "type")?);
         return classes
             .contains_key(&class_name)
             .then_some((receiver_name, class_name));
@@ -449,7 +463,7 @@ fn class_method_receiver_path(
     }
     let receiver_symbol = string_field(receiver, "symbol")?;
     let mut symbol = receiver_symbol.split_whitespace().next_back()?.to_string();
-    let mut current_class = class_type_name(&string_field(receiver, "type")?);
+    let mut current_class = class_type_key(&string_field(receiver, "type")?);
     members.reverse();
     for member in members {
         let index = classes.get(&current_class)?;
@@ -460,7 +474,7 @@ fn class_method_receiver_path(
             return None;
         }
         let property_type = string_field(property, "type")?;
-        current_class = class_type_name(&property_type);
+        current_class = class_type_key(&property_type);
         if !classes.contains_key(&current_class) {
             return None;
         }
@@ -515,7 +529,7 @@ fn simple_class_property_path(
         return None;
     }
     let receiver_type = string_field(receiver, "type")?;
-    let mut current_class = class_type_name(&receiver_type);
+    let mut current_class = class_type_key(&receiver_type);
     let receiver_symbol = string_field(receiver, "symbol")?;
     let receiver_name = receiver_symbol
         .split_whitespace()
@@ -542,7 +556,7 @@ fn simple_class_property_path(
             }
             return Some((property_type, symbol));
         }
-        current_class = class_type_name(&property_type);
+        current_class = class_type_key(&property_type);
         if !classes.contains_key(&current_class) {
             return None;
         }
@@ -559,6 +573,15 @@ fn class_type_name(type_name: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+fn class_type_key(type_name: &str) -> String {
+    type_name
+        .split_whitespace()
+        .next()
+        .filter(|token| token.chars().all(|character| character.is_ascii_digit()))
+        .map(str::to_string)
+        .unwrap_or_else(|| class_type_name(type_name))
 }
 
 #[derive(Default)]
@@ -1403,11 +1426,13 @@ impl SlangAstSummary {
                         .is_some()
                 })
             })
-            .flat_map(|(name, _)| [name.clone(), class_type_name(name)])
+            .flat_map(|(name, index)| [name.clone(), index.class_name.clone()])
             .collect::<std::collections::BTreeSet<_>>();
+        let mut all_class_handle_types = class_types.clone();
+        all_class_handle_types.extend(simple_instance_methods.keys().cloned());
         let class_handle_types = ClassHandleTypes {
             field_bearing: &class_handle_source_types,
-            all: &class_types,
+            all: &all_class_handle_types,
         };
         let _ = canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
