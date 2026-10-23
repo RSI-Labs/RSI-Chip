@@ -323,20 +323,16 @@ impl SlangAstSummary {
                                 // structural equivalent yet.
                                 "?".to_string()
                             } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
-                                if !strict_generated_hierarchy {
-                                    "?".to_string()
-                                } else {
-                                    memory_member_lvalue_fingerprint(
-                                        target,
-                                        member,
-                                        &assignment.rhs,
-                                        &self.declarations,
-                                        &self.type_layouts,
-                                        &self.parameters,
-                                        fingerprint_mode,
-                                    )
-                                    .unwrap_or_else(|| "?".to_string())
-                                }
+                                memory_member_lvalue_fingerprint(
+                                    target,
+                                    member,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.type_layouts,
+                                    &self.parameters,
+                                    fingerprint_mode,
+                                )
+                                .unwrap_or_else(|| "?".to_string())
                             } else if let Some(selector) =
                                 assignment.dynamic_packed_lvalue_selector.as_ref()
                             {
