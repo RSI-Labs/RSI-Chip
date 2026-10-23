@@ -338,6 +338,56 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower a successful class cast");
+    let cast_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("class_cast_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize class-cast AST");
+    let mut cast_summary = slang
+        .summarize_ast_json(&cast_json)
+        .expect("summarize class-cast AST");
+    cast_summary
+        .validate_against_design(&design)
+        .expect("exact field-less class-handle copy fingerprint should match");
+    let expected_source_key = cast_summary
+        .procedural_blocks
+        .iter()
+        .find_map(|block| {
+            block.assignments.iter().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "source")
+            })
+        })
+        .and_then(|assignment| assignment.class_handle_source_key.clone())
+        .expect("field-less class-handle source key");
+    let expected_source_key = expected_source_key
+        .rsplit_once(' ')
+        .map(|(_, name)| name)
+        .expect("stable field-less class-handle source name");
+    assert_eq!(expected_source_key, "object");
+    if let Some(assignment) = cast_summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "source")
+        })
+    }) {
+        assignment.class_handle_source_key = Some("wrong_fieldless_source".into());
+    }
+    let fieldless_error = cast_summary
+        .validate_against_design(&design)
+        .expect_err("wrong field-less class-handle source must fail");
+    assert!(
+        fieldless_error.contains("ClassHandleCopy:wrong_fieldless_source")
+            && fieldless_error.contains(&format!("ClassHandleCopy:{expected_source_key}")),
+        "unexpected field-less class-handle error: {fieldless_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create class-cast simulator");
     simulator
         .run_until(0)

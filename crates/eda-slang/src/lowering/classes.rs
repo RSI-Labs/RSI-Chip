@@ -961,6 +961,7 @@ impl SlangAstLowerer {
             let synthetic_prefix = index
                 .map(|index| format!("{handle_address}_{index}"))
                 .unwrap_or_else(|| handle_address.to_string());
+            let metadata_prefix = element_name.clone();
             let mut fields: BTreeMap<String, super::AstLoweredSymbol> = BTreeMap::new();
             let mut property_initializers = Vec::new();
             let mut property_chains = vec![chain.clone()];
@@ -1075,19 +1076,19 @@ impl SlangAstLowerer {
             self.class_object_types
                 .insert(object_key.clone(), class_key.clone());
             let tag =
-                self.declare_class_internal_net(&format!("__class_tag_{synthetic_prefix}"), 32);
+                self.declare_class_internal_net(&format!("__class_tag_{metadata_prefix}"), 32);
             let id = self
-                .declare_class_internal_net(&format!("__class_object_id_{synthetic_prefix}"), 64);
+                .declare_class_internal_net(&format!("__class_object_id_{metadata_prefix}"), 64);
             let object_name = self.declare_class_internal_net(
-                &format!("__class_object_name_{synthetic_prefix}"),
+                &format!("__class_object_name_{metadata_prefix}"),
                 crate::types::STRING_WIDTH,
             );
             let object_full_name = self.declare_class_internal_net(
-                &format!("__class_object_full_name_{synthetic_prefix}"),
+                &format!("__class_object_full_name_{metadata_prefix}"),
                 crate::types::STRING_WIDTH,
             );
             let parent_id = self
-                .declare_class_internal_net(&format!("__class_parent_id_{synthetic_prefix}"), 64);
+                .declare_class_internal_net(&format!("__class_parent_id_{metadata_prefix}"), 64);
             self.design.initials.extend([
                 Stmt::Bl {
                     lv: class_lvalue(&tag),

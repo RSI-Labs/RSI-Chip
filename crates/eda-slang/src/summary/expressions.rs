@@ -232,7 +232,7 @@ fn memory_member_lvalue_summary(value: &Value) -> Option<SlangMemoryMemberLvalue
 pub(crate) fn procedural_assignments(
     value: &Value,
     class_handles: &std::collections::BTreeSet<String>,
-    class_types: &std::collections::BTreeSet<String>,
+    class_types: ClassHandleTypes<'_>,
 ) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
     if string_field(value, "kind").as_deref() == Some("ProceduralAssign")
@@ -254,8 +254,21 @@ pub(crate) fn procedural_assignments(
                 string_field(left, "kind").as_deref(),
                 Some("NamedValue" | "HierarchicalValue")
             ) && is_class_handle_target(left, class_handles);
+            let mut class_handle_target_key = None;
+            let mut class_handle_source_key = None;
             let class_handle_source = if target_is_named_handle {
-                class_handle_source_path(right, class_types)
+                if let Some(path) = class_handle_source_path(right, class_types.field_bearing) {
+                    Some(path)
+                } else if let Some((path, source_key)) =
+                    named_class_handle_identity(right, class_types.all)
+                {
+                    class_handle_target_key =
+                        string_field(left, "symbol").filter(|symbol| !symbol.trim().is_empty());
+                    class_handle_source_key = Some(source_key);
+                    Some(path)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -274,6 +287,8 @@ pub(crate) fn procedural_assignments(
                     memory_member_lvalue,
                     uses_class_static: expression_uses_class_symbol(right, class_handles),
                     class_handle_source,
+                    class_handle_target_key,
+                    class_handle_source_key,
                 });
             }
         }
@@ -298,6 +313,12 @@ pub(crate) fn procedural_assignments(
     assignments
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ClassHandleTypes<'a> {
+    pub field_bearing: &'a std::collections::BTreeSet<String>,
+    pub all: &'a std::collections::BTreeSet<String>,
+}
+
 fn class_handle_copy_block(
     design: &Design,
     statements: &[eda_core::ir::Stmt],
@@ -311,7 +332,7 @@ fn class_handle_copy_block(
         "__class_object_full_name_",
         "__class_parent_id_",
     ];
-    if statements.len() < METADATA_PREFIXES.len() + 1 {
+    if statements.len() < METADATA_PREFIXES.len() {
         return None;
     }
 
@@ -365,6 +386,12 @@ fn class_handle_copy_block(
             return None;
         }
     }
+    if target_object.is_empty() || source_object.is_empty() {
+        return Some((
+            target_metadata_key,
+            format!("ClassHandleCopy:{source_metadata_key}"),
+        ));
+    }
     Some((target_object, format!("ClassHandleCopy:{source_object}")))
 }
 
@@ -417,6 +444,25 @@ fn class_handle_source_path(
         path.push_str(&member);
     }
     Some(path)
+}
+
+fn named_class_handle_identity(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+) -> Option<(String, String)> {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        return named_class_handle_identity(value.get("operand")?, class_types);
+    }
+    if !matches!(
+        string_field(value, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let symbol = string_field(value, "symbol")?;
+    let name = symbol.split_whitespace().next_back()?.to_string();
+    let class_name = canonical_class_name(&string_field(value, "type")?)?;
+    class_types.contains(&class_name).then_some((name, symbol))
 }
 
 fn canonical_class_name(type_name: &str) -> Option<String> {
@@ -1489,7 +1535,7 @@ pub(crate) fn collect_generate_summary(
     continuous_targets: &mut Vec<SlangContinuousTarget>,
     procedural_blocks: &mut Vec<SlangProceduralBlockSummary>,
     class_handles: &std::collections::BTreeSet<String>,
-    class_types: &std::collections::BTreeSet<String>,
+    class_types: ClassHandleTypes<'_>,
 ) -> Result<(), String> {
     if string_field(value, "kind").as_deref() == Some("GenerateBlockArray") {
         let array_name = string_field(value, "name")

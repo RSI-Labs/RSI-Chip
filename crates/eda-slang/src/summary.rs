@@ -9,7 +9,7 @@ use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
 use expressions::{
     collect_generate_summary, collect_kinds, empty_expression_summary, expression_summary,
-    procedural_assignments,
+    procedural_assignments, ClassHandleTypes,
 };
 
 mod expressions;
@@ -1317,6 +1317,10 @@ pub struct SlangAssignmentSummary {
     pub uses_class_static: bool,
     /// Canonical source object path for a whole class-handle assignment.
     pub class_handle_source: Option<String>,
+    /// Authoritative slang symbol ID for a field-less whole-handle target.
+    pub class_handle_target_key: Option<String>,
+    /// Authoritative slang symbol ID for a field-less whole-handle source.
+    pub class_handle_source_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1388,6 +1392,8 @@ impl SlangAstSummary {
         canonicalize_simple_function_calls(&mut root, &simple_functions);
         let mut simple_instance_methods = std::collections::BTreeMap::new();
         collect_simple_instance_methods(&document, &mut simple_instance_methods);
+        let mut class_types = std::collections::BTreeSet::new();
+        collect_class_type_names(&document, &mut class_types);
         let class_handle_source_types = simple_instance_methods
             .iter()
             .filter(|(_, index)| {
@@ -1399,6 +1405,10 @@ impl SlangAstSummary {
             })
             .flat_map(|(name, _)| [name.clone(), class_type_name(name)])
             .collect::<std::collections::BTreeSet<_>>();
+        let class_handle_types = ClassHandleTypes {
+            field_bearing: &class_handle_source_types,
+            all: &class_types,
+        };
         let _ = canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
@@ -1425,8 +1435,6 @@ impl SlangAstSummary {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut class_types = std::collections::BTreeSet::new();
-        collect_class_type_names(&document, &mut class_types);
         let mut class_handles = std::collections::BTreeSet::new();
         collect_class_handle_names(root, &class_types, &mut class_handles);
         collect_class_static_property_symbols(&document, &mut class_handles);
@@ -1548,7 +1556,7 @@ impl SlangAstSummary {
                 "ProceduralBlock" => {
                     let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
                     let assignments =
-                        procedural_assignments(member, &class_handles, &class_handle_source_types);
+                        procedural_assignments(member, &class_handles, class_handle_types);
                     let assignment_targets = assignments
                         .iter()
                         .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -1599,7 +1607,7 @@ impl SlangAstSummary {
                         &mut continuous_targets,
                         &mut procedural_blocks,
                         &class_handles,
-                        &class_handle_source_types,
+                        class_handle_types,
                     )?;
                 }
                 _ => {}

@@ -7,6 +7,13 @@ use super::expressions::{
 use super::*;
 use crate::types::simple_type_shape;
 
+fn stable_class_metadata_key(symbol: &str) -> String {
+    symbol
+        .rsplit_once(' ')
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| symbol.to_string())
+}
+
 impl SlangAstSummary {
     pub fn validate_against_design(&self, design: &Design) -> Result<(), String> {
         self.validate(design, true)
@@ -256,6 +263,18 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
+                        if let (Some(target_key), Some(source_key)) = (
+                            assignment.class_handle_target_key.as_ref(),
+                            assignment.class_handle_source_key.as_ref(),
+                        ) {
+                            let target_key = stable_class_metadata_key(target_key);
+                            let source_key = stable_class_metadata_key(source_key);
+                            expected_procedural_targets
+                                .entry(target_key)
+                                .or_default()
+                                .push(format!("ClassHandleCopy:{source_key}"));
+                            continue;
+                        }
                         let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
                             format!("ClassHandleCopy:{source}")
                         } else {
