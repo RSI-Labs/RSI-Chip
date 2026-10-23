@@ -239,6 +239,7 @@ struct SimpleInstanceMethodIndex {
     class_name: String,
     methods: std::collections::BTreeMap<String, Value>,
     composition_methods: std::collections::BTreeMap<String, Value>,
+    binary_property_methods: std::collections::BTreeMap<String, Value>,
     properties: std::collections::BTreeMap<String, String>,
     property_definitions: std::collections::BTreeMap<String, Value>,
 }
@@ -246,6 +247,7 @@ struct SimpleInstanceMethodIndex {
 fn collect_simple_instance_methods(
     value: &Value,
     methods: &mut std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
+    global_properties: &std::collections::BTreeMap<String, (String, Value)>,
 ) {
     if let Some(fields) = value.as_object() {
         if string_field(value, "kind").as_deref() == Some("ClassType") {
@@ -270,6 +272,18 @@ fn collect_simple_instance_methods(
                         normalize_detailed_types(&mut definition);
                         index.property_definitions.insert(symbol, definition);
                     }
+                }
+            }
+            let mut referenced_symbols = Vec::new();
+            for member in members {
+                collect_referenced_property_symbols(member, &mut referenced_symbols);
+            }
+            for symbol in referenced_symbols {
+                if let Some((name, definition)) = global_properties.get(&symbol) {
+                    index.properties.insert(symbol.clone(), name.clone());
+                    index
+                        .property_definitions
+                        .insert(symbol, definition.clone());
                 }
             }
             for member in members {
@@ -335,12 +349,18 @@ fn collect_simple_instance_methods(
                                 index.composition_methods.insert(symbol, member.clone());
                             }
                         }
+                        Some("BinaryOp") => {
+                            if binary_method_properties(expression, &index.properties).is_some() {
+                                index.binary_property_methods.insert(symbol, member.clone());
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
             if !index.methods.is_empty()
                 || !index.composition_methods.is_empty()
+                || !index.binary_property_methods.is_empty()
                 || !index.property_definitions.is_empty()
             {
                 let address = value
@@ -357,13 +377,82 @@ fn collect_simple_instance_methods(
             }
         }
         for nested in fields.values() {
-            collect_simple_instance_methods(nested, methods);
+            collect_simple_instance_methods(nested, methods, global_properties);
         }
     } else if let Some(values) = value.as_array() {
         for nested in values {
-            collect_simple_instance_methods(nested, methods);
+            collect_simple_instance_methods(nested, methods, global_properties);
         }
     }
+}
+
+fn collect_global_class_properties(
+    value: &Value,
+    properties: &mut std::collections::BTreeMap<String, (String, Value)>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassProperty") {
+            if let (Some(address), Some(name)) = (
+                value.get("addr").and_then(serde_json::Value::as_u64),
+                string_field(value, "name"),
+            ) {
+                let mut definition = value.clone();
+                normalize_detailed_types(&mut definition);
+                properties.insert(format!("{address} {name}"), (name, definition));
+            }
+        }
+        for nested in fields.values() {
+            collect_global_class_properties(nested, properties);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_global_class_properties(nested, properties);
+        }
+    }
+}
+
+fn collect_referenced_property_symbols(value: &Value, symbols: &mut Vec<String>) {
+    if let Some(fields) = value.as_object() {
+        if let Some(symbol) = string_field(value, "symbol") {
+            symbols.push(symbol);
+        }
+        for nested in fields.values() {
+            collect_referenced_property_symbols(nested, symbols);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_referenced_property_symbols(nested, symbols);
+        }
+    }
+}
+
+fn binary_method_properties(
+    expression: &Value,
+    properties: &std::collections::BTreeMap<String, String>,
+) -> Option<(String, String)> {
+    if string_field(expression, "kind").as_deref() != Some("BinaryOp")
+        || string_field(expression, "op").as_deref() != Some("Add")
+    {
+        return None;
+    }
+    let left = conversion_property_symbol(expression.get("left")?)?;
+    let right = conversion_property_symbol(expression.get("right")?)?;
+    if properties.contains_key(&left) && properties.contains_key(&right) {
+        Some((left, right))
+    } else {
+        None
+    }
+}
+
+fn conversion_property_symbol(value: &Value) -> Option<String> {
+    if string_field(value, "kind").as_deref() != Some("Conversion") {
+        return None;
+    }
+    let operand = value.get("operand")?;
+    if string_field(operand, "kind").as_deref() != Some("NamedValue") {
+        return None;
+    }
+    string_field(operand, "symbol")
 }
 
 fn canonicalize_simple_instance_method_calls(
@@ -409,6 +498,41 @@ fn canonicalize_simple_instance_method_calls(
                         "symbol": format!(
                             "{receiver_path}.{property_name}.{nested_property_name}"
                         ),
+                    });
+                    return Some(());
+                }
+                if let Some(method) = index.binary_property_methods.get(&subroutine) {
+                    let expression = method.get("body")?.get("expr")?;
+                    let (left_symbol, right_symbol) =
+                        binary_method_properties(expression, &index.properties)?;
+                    let left_name = index.properties.get(&left_symbol)?;
+                    let right_name = index.properties.get(&right_symbol)?;
+                    let left_conversion = expression.get("left")?;
+                    let right_conversion = expression.get("right")?;
+                    let left_operand = left_conversion.get("operand")?;
+                    let right_operand = right_conversion.get("operand")?;
+                    *value = serde_json::json!({
+                        "kind": "BinaryOp",
+                        "type": expression.get("type"),
+                        "op": "Add",
+                        "left": {
+                            "kind": "Conversion",
+                            "type": left_conversion.get("type"),
+                            "operand": {
+                                "kind": "NamedValue",
+                                "type": left_operand.get("type"),
+                                "symbol": format!("{receiver_path}.{left_name}"),
+                            },
+                        },
+                        "right": {
+                            "kind": "Conversion",
+                            "type": right_conversion.get("type"),
+                            "operand": {
+                                "kind": "NamedValue",
+                                "type": right_operand.get("type"),
+                                "symbol": format!("{receiver_path}.{right_name}"),
+                            },
+                        },
                     });
                     return Some(());
                 }
@@ -1413,8 +1537,14 @@ impl SlangAstSummary {
         let mut simple_functions = std::collections::BTreeMap::new();
         collect_simple_function_definitions(&document, false, &mut simple_functions);
         canonicalize_simple_function_calls(&mut root, &simple_functions);
+        let mut global_class_properties = std::collections::BTreeMap::new();
+        collect_global_class_properties(&document, &mut global_class_properties);
         let mut simple_instance_methods = std::collections::BTreeMap::new();
-        collect_simple_instance_methods(&document, &mut simple_instance_methods);
+        collect_simple_instance_methods(
+            &document,
+            &mut simple_instance_methods,
+            &global_class_properties,
+        );
         let mut class_types = std::collections::BTreeSet::new();
         collect_class_type_names(&document, &mut class_types);
         let class_handle_source_types = simple_instance_methods

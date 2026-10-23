@@ -1848,6 +1848,31 @@ endmodule
             "unexpected parameterized symbol: {error}"
         );
     }
+    let mut wrong_binary_summary = parameterized_summary.clone();
+    if let Some(assignment) = wrong_binary_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "observed_sum")
+            })
+        })
+    {
+        assignment.rhs.operands[0].operands[0].symbol = Some("derived_box.wrong".into());
+    }
+    let binary_error = wrong_binary_summary
+        .validate_against_design(&design)
+        .expect_err("wrong parameterized binary-property method must fail");
+    assert!(
+        binary_error.contains("Ref:8:u[derived_box.wrong]")
+            && binary_error.contains("Ref:8:u[derived_box.value]")
+            && binary_error.contains("Ref:8:u[derived_box.extra]")
+            && binary_error.contains("Add:9:u["),
+        "unexpected parameterized binary-property error: {binary_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create parameterized-class simulator");
     simulator
         .set_input("value8", &LogicWord::from_u64(8, 0xa5))
