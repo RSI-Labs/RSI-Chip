@@ -256,6 +256,7 @@ pub(crate) fn procedural_assignments(
             ) && is_class_handle_target(left, class_handles);
             let mut class_handle_target_key = None;
             let mut class_handle_source_key = None;
+            let mut class_handle_dynamic_sources = Vec::new();
             let class_handle_source = if target_is_named_handle {
                 if let Some(path) = class_handle_source_path(right, class_types.field_bearing) {
                     Some(path)
@@ -267,12 +268,17 @@ pub(crate) fn procedural_assignments(
                     class_handle_source_key = Some(source_key);
                     Some(path)
                 } else {
+                    class_handle_dynamic_sources =
+                        dynamic_class_array_source_paths(right, class_types.field_bearing);
                     None
                 }
             } else {
                 None
             };
-            if class_handle_source.is_some() || !is_class_handle_target(left, class_handles) {
+            if class_handle_source.is_some()
+                || !class_handle_dynamic_sources.is_empty()
+                || !is_class_handle_target(left, class_handles)
+            {
                 let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
                 let dynamic_packed_lvalue_selector = dynamic_packed_lvalue
                     .then(|| left.get("selector").map(expression_summary))
@@ -289,6 +295,7 @@ pub(crate) fn procedural_assignments(
                     class_handle_source,
                     class_handle_target_key,
                     class_handle_source_key,
+                    class_handle_dynamic_sources,
                 });
             }
         }
@@ -444,6 +451,67 @@ fn class_handle_source_path(
         path.push_str(&member);
     }
     Some(path)
+}
+
+fn dynamic_class_array_source_paths(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let Some(result) = dynamic_class_array_source_path(value, class_types) else {
+        return Vec::new();
+    };
+    result
+}
+
+fn dynamic_class_array_source_path(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+) -> Option<Vec<String>> {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        return dynamic_class_array_source_path(value.get("operand")?, class_types);
+    }
+    if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+        return None;
+    }
+    let selected = value.get("value")?;
+    if !matches!(
+        string_field(selected, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let selector = value.get("selector")?;
+    if integer_literal_word(selector).is_some() || string_field(selector, "constant").is_some() {
+        return None;
+    }
+    let class_name = canonical_class_name(&string_field(value, "type")?)?;
+    if !class_types.contains(&class_name) {
+        return None;
+    }
+
+    let type_name = string_field(selected, "type")?;
+    let range_start = type_name.find("$[")? + 2;
+    let range_end = type_name.rfind(']')?;
+    if range_end <= range_start {
+        return None;
+    }
+    let range = &type_name[range_start..range_end];
+    let (left, right) = range.split_once(':')?;
+    let lower = left.trim().parse::<i64>().ok()?;
+    let upper = right.trim().parse::<i64>().ok()?;
+    let indexes = if lower <= upper {
+        (lower..=upper).collect::<Vec<_>>()
+    } else {
+        (upper..=lower).rev().collect::<Vec<_>>()
+    };
+    let symbol = string_field(selected, "symbol")?;
+    let name = symbol.split_whitespace().next_back()?.to_string();
+    Some(
+        indexes
+            .into_iter()
+            .map(|index| format!("{name}[{index}]"))
+            .collect(),
+    )
 }
 
 fn named_class_handle_identity(

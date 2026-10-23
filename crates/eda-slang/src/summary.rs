@@ -1996,6 +1996,8 @@ pub struct SlangAssignmentSummary {
     pub class_handle_target_key: Option<String>,
     /// Authoritative slang symbol ID for a field-less whole-handle source.
     pub class_handle_source_key: Option<String>,
+    /// All element sources selected by a dynamic class-array read.
+    pub class_handle_dynamic_sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

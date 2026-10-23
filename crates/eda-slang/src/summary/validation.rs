@@ -275,6 +275,18 @@ impl SlangAstSummary {
                                 .push(format!("ClassHandleCopy:{source_key}"));
                             continue;
                         }
+                        if !assignment.class_handle_dynamic_sources.is_empty() {
+                            let shapes = assignment
+                                .class_handle_dynamic_sources
+                                .iter()
+                                .map(|source| format!("ClassHandleCopy:{source}"))
+                                .collect::<Vec<_>>();
+                            expected_procedural_targets
+                                .entry(target.clone())
+                                .or_default()
+                                .extend(shapes);
+                            continue;
+                        }
                         let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
                             format!("ClassHandleCopy:{source}")
                         } else {

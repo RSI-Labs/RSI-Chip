@@ -835,6 +835,44 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower dynamic class-array handle assignment");
+    let dynamic_handle_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_handle_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize dynamic class-handle AST");
+    let mut dynamic_handle_summary = slang
+        .summarize_ast_json(&dynamic_handle_json)
+        .expect("summarize dynamic class-handle AST");
+    dynamic_handle_summary
+        .validate_against_design(&design)
+        .expect("exact dynamic class-array source fingerprints should match");
+    if let Some(assignment) = dynamic_handle_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "selected")
+                    && !assignment.class_handle_dynamic_sources.is_empty()
+            })
+        })
+    {
+        assignment.class_handle_dynamic_sources[0] = "wrong_source".into();
+    }
+    let dynamic_source_error = dynamic_handle_summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic class-array source must fail");
+    assert!(
+        dynamic_source_error.contains("ClassHandleCopy:wrong_source")
+            && dynamic_source_error.contains("ClassHandleCopy:source[0]")
+            && dynamic_source_error.contains("ClassHandleCopy:source[1]"),
+        "unexpected dynamic class-array source error: {dynamic_source_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create dynamic class-handle simulator");
     simulator
         .set_input("target_selector", &LogicWord::from_u64(32, 1))
