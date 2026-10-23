@@ -256,73 +256,77 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
-                        let legacy_array_shape =
-                            !strict_generated_hierarchy && legacy_array_targets.contains(target);
-                        let shape = if legacy_array_shape || assignment.uses_class_static {
-                            // Small arrays and class-static lowering expand or
-                            // rewrite source assignments without a canonical
-                            // structural equivalent yet.
-                            "?".to_string()
-                        } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
-                            if !strict_generated_hierarchy {
-                                "?".to_string()
-                            } else {
-                                memory_member_lvalue_fingerprint(
-                                    target,
-                                    member,
-                                    &assignment.rhs,
-                                    &self.declarations,
-                                    &self.type_layouts,
-                                    &self.parameters,
-                                    fingerprint_mode,
-                                )
-                                .unwrap_or_else(|| "?".to_string())
-                            }
-                        } else if let Some(selector) =
-                            assignment.dynamic_packed_lvalue_selector.as_ref()
-                        {
-                            if !strict_generated_hierarchy {
-                                "?".to_string()
-                            } else {
-                                dynamic_packed_lvalue_fingerprint(
-                                    target,
-                                    selector,
-                                    &assignment.rhs,
-                                    &self.declarations,
-                                    &self.parameters,
-                                    fingerprint_mode,
-                                )
-                                .ok_or_else(|| {
-                                    format!(
-                                        "direct lowering could not fingerprint dynamic packed lvalue '{target}'"
-                                    )
-                                })?
-                            }
+                        let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
+                            format!("ClassHandleCopy:{source}")
                         } else {
-                            match slang_expression_fingerprint_with_parameters(
-                                &assignment.rhs,
-                                &self.parameters,
-                                fingerprint_mode,
-                            ) {
-                                Some(fingerprint) => {
-                                    let fingerprint = canonicalize_memory_fingerprint(
-                                        &fingerprint,
-                                        &memory_names,
-                                    );
-                                    if strict_generated_hierarchy
-                                        || (!fingerprint.starts_with("MemoryRead")
-                                            && !fingerprint.contains("PackedSelect:"))
-                                        || memory_fingerprint_target_exists(
+                            let legacy_array_shape = !strict_generated_hierarchy
+                                && legacy_array_targets.contains(target);
+                            if legacy_array_shape || assignment.uses_class_static {
+                                // Small arrays and class-static lowering expand or
+                                // rewrite source assignments without a canonical
+                                // structural equivalent yet.
+                                "?".to_string()
+                            } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
+                                if !strict_generated_hierarchy {
+                                    "?".to_string()
+                                } else {
+                                    memory_member_lvalue_fingerprint(
+                                        target,
+                                        member,
+                                        &assignment.rhs,
+                                        &self.declarations,
+                                        &self.type_layouts,
+                                        &self.parameters,
+                                        fingerprint_mode,
+                                    )
+                                    .unwrap_or_else(|| "?".to_string())
+                                }
+                            } else if let Some(selector) =
+                                assignment.dynamic_packed_lvalue_selector.as_ref()
+                            {
+                                if !strict_generated_hierarchy {
+                                    "?".to_string()
+                                } else {
+                                    dynamic_packed_lvalue_fingerprint(
+                                        target,
+                                        selector,
+                                        &assignment.rhs,
+                                        &self.declarations,
+                                        &self.parameters,
+                                        fingerprint_mode,
+                                    )
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "direct lowering could not fingerprint dynamic packed lvalue '{target}'"
+                                        )
+                                    })?
+                                }
+                            } else {
+                                match slang_expression_fingerprint_with_parameters(
+                                    &assignment.rhs,
+                                    &self.parameters,
+                                    fingerprint_mode,
+                                ) {
+                                    Some(fingerprint) => {
+                                        let fingerprint = canonicalize_memory_fingerprint(
                                             &fingerprint,
                                             &memory_names,
-                                        )
-                                    {
-                                        fingerprint
-                                    } else {
-                                        "?".to_string()
+                                        );
+                                        if strict_generated_hierarchy
+                                            || (!fingerprint.starts_with("MemoryRead")
+                                                && !fingerprint.contains("PackedSelect:"))
+                                            || memory_fingerprint_target_exists(
+                                                &fingerprint,
+                                                &memory_names,
+                                            )
+                                        {
+                                            fingerprint
+                                        } else {
+                                            "?".to_string()
+                                        }
                                     }
+                                    None => "?".to_string(),
                                 }
-                                None => "?".to_string(),
                             }
                         };
                         expected_procedural_targets

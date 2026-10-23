@@ -935,6 +935,29 @@ endmodule
     composition_summary
         .validate_against_design(&design)
         .expect("exact nested class-property fingerprint should match");
+    let mut wrong_handle_source = composition_summary.clone();
+    if let Some(assignment) = wrong_handle_source
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "source")
+            })
+        })
+    {
+        assignment.class_handle_source = Some("wrong_source".into());
+    }
+    let handle_source_error = wrong_handle_source
+        .validate_against_design(&design)
+        .expect_err("wrong whole class-handle source must fail");
+    assert!(
+        handle_source_error.contains("ClassHandleCopy:wrong_source")
+            && handle_source_error.contains("ClassHandleCopy:outer.inner"),
+        "unexpected whole class-handle source error: {handle_source_error}"
+    );
     let mut wrong_composition_method = composition_summary.clone();
     if let Some(assignment) = wrong_composition_method
         .procedural_blocks

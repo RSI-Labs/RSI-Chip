@@ -1315,6 +1315,8 @@ pub struct SlangAssignmentSummary {
     /// Class static storage uses an internal IR name, so exact RHS symbol
     /// equivalence is deferred while assignment inventory remains checked.
     pub uses_class_static: bool,
+    /// Canonical source object path for a whole class-handle assignment.
+    pub class_handle_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1534,7 +1536,7 @@ impl SlangAstSummary {
                 }
                 "ProceduralBlock" => {
                     let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
-                    let assignments = procedural_assignments(member, &class_handles);
+                    let assignments = procedural_assignments(member, &class_handles, &class_types);
                     let assignment_targets = assignments
                         .iter()
                         .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -1585,6 +1587,7 @@ impl SlangAstSummary {
                         &mut continuous_targets,
                         &mut procedural_blocks,
                         &class_handles,
+                        &class_types,
                     )?;
                 }
                 _ => {}

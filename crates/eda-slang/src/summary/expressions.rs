@@ -232,6 +232,7 @@ fn memory_member_lvalue_summary(value: &Value) -> Option<SlangMemoryMemberLvalue
 pub(crate) fn procedural_assignments(
     value: &Value,
     class_handles: &std::collections::BTreeSet<String>,
+    class_types: &std::collections::BTreeSet<String>,
 ) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
     if string_field(value, "kind").as_deref() == Some("ProceduralAssign")
@@ -249,7 +250,12 @@ pub(crate) fn procedural_assignments(
     }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
-            if !is_class_handle_target(left, class_handles) {
+            let class_handle_source = if is_class_handle_target(left, class_handles) {
+                class_handle_source_path(right, class_types)
+            } else {
+                None
+            };
+            if class_handle_source.is_some() || !is_class_handle_target(left, class_handles) {
                 let dynamic_packed_lvalue = is_dynamic_packed_lvalue(left);
                 let dynamic_packed_lvalue_selector = dynamic_packed_lvalue
                     .then(|| left.get("selector").map(expression_summary))
@@ -263,14 +269,15 @@ pub(crate) fn procedural_assignments(
                     dynamic_packed_lvalue_selector,
                     memory_member_lvalue,
                     uses_class_static: expression_uses_class_symbol(right, class_handles),
+                    class_handle_source,
                 });
             }
         }
     }
     match value {
-        Value::Array(values) => values
-            .iter()
-            .for_each(|nested| assignments.extend(procedural_assignments(nested, class_handles))),
+        Value::Array(values) => values.iter().for_each(|nested| {
+            assignments.extend(procedural_assignments(nested, class_handles, class_types))
+        }),
         Value::Object(fields) => {
             let is_assignment = string_field(value, "kind").as_deref() == Some("Assignment");
             fields
@@ -279,12 +286,134 @@ pub(crate) fn procedural_assignments(
                     !(is_assignment && (field.as_str() == "left" || field.as_str() == "right"))
                 })
                 .for_each(|(_, nested)| {
-                    assignments.extend(procedural_assignments(nested, class_handles))
+                    assignments.extend(procedural_assignments(nested, class_handles, class_types))
                 });
         }
         _ => {}
     }
     assignments
+}
+
+fn class_handle_copy_block(
+    design: &Design,
+    statements: &[eda_core::ir::Stmt],
+) -> Option<(String, String)> {
+    use eda_core::ir::{Expr, Stmt};
+
+    const METADATA_PREFIXES: [&str; 5] = [
+        "__class_tag_",
+        "__class_object_id_",
+        "__class_object_name_",
+        "__class_object_full_name_",
+        "__class_parent_id_",
+    ];
+    if statements.len() < METADATA_PREFIXES.len() + 1 {
+        return None;
+    }
+
+    let mut target_metadata_key = String::new();
+    let mut source_metadata_key = String::new();
+    for (statement, prefix) in statements.iter().zip(METADATA_PREFIXES.iter()) {
+        let Stmt::Bl { lv, e } = statement else {
+            return None;
+        };
+        let Expr::Ref { .. } = e else {
+            return None;
+        };
+        let target = design_lvalue_name(design, lv)?;
+        let source = design_expr_symbol(design, e)?;
+        let statement_target_key = target.strip_prefix(prefix)?.to_string();
+        let statement_source_key = source.strip_prefix(prefix)?.to_string();
+        if target_metadata_key.is_empty() {
+            target_metadata_key = statement_target_key;
+        } else if target_metadata_key != statement_target_key {
+            return None;
+        }
+        if source_metadata_key.is_empty() {
+            source_metadata_key = statement_source_key;
+        } else if source_metadata_key != statement_source_key {
+            return None;
+        }
+    }
+
+    let fields = &statements[METADATA_PREFIXES.len()..];
+    let mut target_object = String::new();
+    let mut source_object = String::new();
+    for statement in fields {
+        let Stmt::Bl { lv, e } = statement else {
+            return None;
+        };
+        let Expr::Ref { .. } = e else {
+            return None;
+        };
+        let target_field = design_lvalue_name(design, lv)?;
+        let source_field = design_expr_symbol(design, e)?;
+        let (statement_target, _) = target_field.rsplit_once('.')?;
+        let (statement_source, _) = source_field.rsplit_once('.')?;
+        if target_object.is_empty() {
+            target_object = statement_target.to_string();
+        } else if target_object != statement_target {
+            return None;
+        }
+        if source_object.is_empty() {
+            source_object = statement_source.to_string();
+        } else if source_object != statement_source {
+            return None;
+        }
+    }
+    Some((target_object, format!("ClassHandleCopy:{source_object}")))
+}
+
+fn class_handle_source_path(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        return class_handle_source_path(value.get("operand")?, class_types);
+    }
+    if string_field(value, "kind").as_deref() != Some("MemberAccess") {
+        return None;
+    }
+
+    let mut members = Vec::new();
+    let mut selected = value;
+    while string_field(selected, "kind").as_deref() == Some("MemberAccess") {
+        members.push(
+            string_field(selected, "member")?
+                .split_whitespace()
+                .next_back()?
+                .to_string(),
+        );
+        selected = selected.get("value")?;
+    }
+    if !matches!(
+        string_field(selected, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let symbol = string_field(selected, "symbol")?;
+    let mut path = symbol.split_whitespace().next_back()?.to_string();
+    let class_name = canonical_class_name(&string_field(value, "type")?)?;
+    if !class_types.contains(&class_name) {
+        return None;
+    }
+    members.reverse();
+    for member in members {
+        path.push('.');
+        path.push_str(&member);
+    }
+    Some(path)
+}
+
+fn canonical_class_name(type_name: &str) -> Option<String> {
+    let class_name = type_name
+        .split_whitespace()
+        .next_back()?
+        .rsplit(['.', '#', ':'])
+        .next()?
+        .to_string();
+    (!class_name.is_empty()).then_some(class_name)
 }
 
 fn expression_uses_class_symbol(
@@ -1347,6 +1476,7 @@ pub(crate) fn collect_generate_summary(
     continuous_targets: &mut Vec<SlangContinuousTarget>,
     procedural_blocks: &mut Vec<SlangProceduralBlockSummary>,
     class_handles: &std::collections::BTreeSet<String>,
+    class_types: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     if string_field(value, "kind").as_deref() == Some("GenerateBlockArray") {
         let array_name = string_field(value, "name")
@@ -1377,6 +1507,7 @@ pub(crate) fn collect_generate_summary(
                 continuous_targets,
                 procedural_blocks,
                 class_handles,
+                class_types,
             )?;
         }
         return Ok(());
@@ -1454,7 +1585,7 @@ pub(crate) fn collect_generate_summary(
             }
             "ProceduralBlock" => {
                 let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
-                let assignments = procedural_assignments(member, class_handles);
+                let assignments = procedural_assignments(member, class_handles, class_types);
                 let assignment_targets = assignments
                     .iter()
                     .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -1473,6 +1604,7 @@ pub(crate) fn collect_generate_summary(
                     continuous_targets,
                     procedural_blocks,
                     class_handles,
+                    class_types,
                 )?;
             }
             _ => {}
@@ -1872,9 +2004,15 @@ pub(crate) fn design_stmt_assignments(
     use eda_core::ir::Stmt;
     let mut assignments = Vec::new();
     match statement {
-        Stmt::Block(statements) => statements
-            .iter()
-            .for_each(|nested| assignments.extend(design_stmt_assignments(design, nested))),
+        Stmt::Block(statements) => {
+            if let Some(copy) = class_handle_copy_block(design, statements) {
+                assignments.push(copy);
+            } else {
+                statements
+                    .iter()
+                    .for_each(|nested| assignments.extend(design_stmt_assignments(design, nested)));
+            }
+        }
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
