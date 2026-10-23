@@ -240,8 +240,10 @@ struct SimpleInstanceMethodIndex {
     methods: std::collections::BTreeMap<String, Value>,
     composition_methods: std::collections::BTreeMap<String, Value>,
     binary_property_methods: std::collections::BTreeMap<String, Value>,
+    constant_parameter_methods: std::collections::BTreeMap<String, Value>,
     properties: std::collections::BTreeMap<String, String>,
     property_definitions: std::collections::BTreeMap<String, Value>,
+    parameters: std::collections::BTreeMap<String, (String, String, String)>,
 }
 
 fn collect_simple_instance_methods(
@@ -274,6 +276,27 @@ fn collect_simple_instance_methods(
                     }
                 }
             }
+            for member in members {
+                if string_field(member, "kind").as_deref() != Some("Parameter") {
+                    continue;
+                }
+                if let (Some(address), Some(name), Some(value)) = (
+                    member.get("addr").and_then(serde_json::Value::as_u64),
+                    string_field(member, "name"),
+                    string_field(member, "value"),
+                ) {
+                    let mut parameter = member.clone();
+                    normalize_detailed_types(&mut parameter);
+                    index.parameters.insert(
+                        format!("{address} {name}"),
+                        (
+                            name,
+                            value,
+                            string_field(&parameter, "type").unwrap_or_default(),
+                        ),
+                    );
+                }
+            }
             let mut referenced_symbols = Vec::new();
             for member in members {
                 collect_referenced_property_symbols(member, &mut referenced_symbols);
@@ -287,12 +310,11 @@ fn collect_simple_instance_methods(
                 }
             }
             for member in members {
-                let static_or_virtual = string_field(member, "flags").is_some_and(|flags| {
-                    flags
-                        .split(',')
-                        .any(|flag| matches!(flag.trim(), "static" | "virtual"))
-                });
-                if static_or_virtual
+                let is_static = string_field(member, "flags")
+                    .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"));
+                let is_virtual = string_field(member, "flags")
+                    .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "virtual"));
+                if is_static
                     || string_field(member, "kind").as_deref() != Some("Subroutine")
                     || string_field(member, "subroutineKind").as_deref() != Some("Function")
                 {
@@ -318,6 +340,14 @@ fn collect_simple_instance_methods(
                     string_field(member, "name"),
                 ) {
                     let symbol = format!("{address} {name}");
+                    if is_virtual {
+                        if parameter_method_operands(expression, &index.parameters).is_some() {
+                            index
+                                .constant_parameter_methods
+                                .insert(symbol, member.clone());
+                        }
+                        continue;
+                    }
                     match string_field(expression, "kind").as_deref() {
                         Some("NamedValue") => {
                             let Some(property_symbol) = string_field(expression, "symbol") else {
@@ -361,6 +391,7 @@ fn collect_simple_instance_methods(
             if !index.methods.is_empty()
                 || !index.composition_methods.is_empty()
                 || !index.binary_property_methods.is_empty()
+                || !index.constant_parameter_methods.is_empty()
                 || !index.property_definitions.is_empty()
             {
                 let address = value
@@ -455,9 +486,38 @@ fn conversion_property_symbol(value: &Value) -> Option<String> {
     string_field(operand, "symbol")
 }
 
+fn parameter_method_operands(
+    expression: &Value,
+    parameters: &std::collections::BTreeMap<String, (String, String, String)>,
+) -> Option<(String, String)> {
+    if string_field(expression, "kind").as_deref() != Some("BinaryOp")
+        || string_field(expression, "op").as_deref() != Some("Add")
+    {
+        return None;
+    }
+    let left = parameter_symbol(expression.get("left")?)?;
+    let right = parameter_symbol(expression.get("right")?)?;
+    if parameters.contains_key(&left) && parameters.contains_key(&right) {
+        Some((left, right))
+    } else {
+        None
+    }
+}
+
+fn parameter_symbol(value: &Value) -> Option<String> {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        return parameter_symbol(value.get("operand")?);
+    }
+    if string_field(value, "kind").as_deref() != Some("NamedValue") {
+        return None;
+    }
+    string_field(value, "symbol")
+}
+
 fn canonicalize_simple_instance_method_calls(
     value: &mut Value,
     classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
+    dynamic_receivers: &std::collections::BTreeSet<String>,
 ) -> Option<()> {
     if string_field(value, "kind").as_deref() == Some("Call") {
         if let (Some(subroutine), Some(receiver)) =
@@ -466,6 +526,31 @@ fn canonicalize_simple_instance_method_calls(
             if let Some((receiver_path, class_name)) = class_method_receiver_path(receiver, classes)
             {
                 let index = classes.get(&class_name)?;
+                if let Some(method) = index.constant_parameter_methods.get(&subroutine) {
+                    if !dynamic_receivers.contains(receiver_path.as_str()) {
+                        let expression = method.get("body")?.get("expr")?;
+                        let (left_symbol, right_symbol) =
+                            parameter_method_operands(expression, &index.parameters)?;
+                        let (_, left_value, left_type) = index.parameters.get(&left_symbol)?;
+                        let (_, right_value, right_type) = index.parameters.get(&right_symbol)?;
+                        *value = serde_json::json!({
+                            "kind": "BinaryOp",
+                            "type": expression.get("type"),
+                            "op": "Add",
+                            "left": {
+                                "kind": "IntegerLiteral",
+                                "type": left_type,
+                                "value": left_value,
+                            },
+                            "right": {
+                                "kind": "IntegerLiteral",
+                                "type": right_type,
+                                "value": right_value,
+                            },
+                        });
+                        return Some(());
+                    }
+                }
                 if let Some(method) = index.methods.get(&subroutine) {
                     let expression = method.get("body")?.get("expr")?;
                     let property_symbol = string_field(expression, "symbol")?;
@@ -541,7 +626,7 @@ fn canonicalize_simple_instance_method_calls(
     }
     if let Value::Array(values) = value {
         for nested in values {
-            let _ = canonicalize_simple_instance_method_calls(nested, classes);
+            let _ = canonicalize_simple_instance_method_calls(nested, classes, dynamic_receivers);
         }
         return Some(());
     }
@@ -549,7 +634,7 @@ fn canonicalize_simple_instance_method_calls(
         return Some(());
     };
     for nested in fields.values_mut() {
-        let _ = canonicalize_simple_instance_method_calls(nested, classes);
+        let _ = canonicalize_simple_instance_method_calls(nested, classes, dynamic_receivers);
     }
     Some(())
 }
@@ -693,7 +778,7 @@ fn class_type_name(type_name: &str) -> String {
         .split_whitespace()
         .next_back()
         .unwrap_or_default()
-        .rsplit(['.', '#', ':'])
+        .split(['.', '#', ':'])
         .next()
         .unwrap_or_default()
         .to_string()
@@ -706,6 +791,62 @@ fn class_type_key(type_name: &str) -> String {
         .filter(|token| token.chars().all(|character| character.is_ascii_digit()))
         .map(str::to_string)
         .unwrap_or_else(|| class_type_name(type_name))
+}
+
+fn collect_dynamic_class_receivers(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+    receivers: &mut std::collections::BTreeSet<String>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Assignment") {
+            if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
+                let left = conversion_operand_json(left);
+                let right = conversion_operand_json(right);
+                if let (Some((left_name, left_class)), Some((_, right_class))) = (
+                    named_class_value(left, class_types),
+                    named_class_value(right, class_types),
+                ) {
+                    if left_class != right_class {
+                        receivers.insert(left_name);
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_dynamic_class_receivers(nested, class_types, receivers);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_dynamic_class_receivers(nested, class_types, receivers);
+        }
+    }
+}
+
+fn conversion_operand_json(value: &'_ Value) -> &'_ Value {
+    if string_field(value, "kind").as_deref() == Some("Conversion") {
+        value.get("operand").unwrap_or(value)
+    } else {
+        value
+    }
+}
+
+fn named_class_value(
+    value: &Value,
+    class_types: &std::collections::BTreeSet<String>,
+) -> Option<(String, String)> {
+    if !matches!(
+        string_field(value, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let symbol = string_field(value, "symbol")?;
+    let name = symbol.split_whitespace().next_back()?.to_string();
+    let class_name = class_type_name(&string_field(value, "type")?);
+    class_types
+        .contains(&class_name)
+        .then_some((name, class_name))
 }
 
 #[derive(Default)]
@@ -1547,6 +1688,8 @@ impl SlangAstSummary {
         );
         let mut class_types = std::collections::BTreeSet::new();
         collect_class_type_names(&document, &mut class_types);
+        let mut dynamic_class_receivers = std::collections::BTreeSet::new();
+        collect_dynamic_class_receivers(&root, &class_types, &mut dynamic_class_receivers);
         let class_handle_source_types = simple_instance_methods
             .iter()
             .filter(|(_, index)| {
@@ -1564,7 +1707,11 @@ impl SlangAstSummary {
             field_bearing: &class_handle_source_types,
             all: &all_class_handle_types,
         };
-        let _ = canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
+        let _ = canonicalize_simple_instance_method_calls(
+            &mut root,
+            &simple_instance_methods,
+            &dynamic_class_receivers,
+        );
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
         let root = &root;

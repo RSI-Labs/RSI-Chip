@@ -1848,6 +1848,31 @@ endmodule
             "unexpected parameterized symbol: {error}"
         );
     }
+    for (target, wrong_value, expected_value) in [
+        ("direct_kind8", 12_u64, 8_u64),
+        ("direct_kind16", 13_u64, 16_u64),
+    ] {
+        let mut wrong_kind = parameterized_summary.clone();
+        if let Some(assignment) = wrong_kind.procedural_blocks.iter_mut().find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == target)
+            })
+        }) {
+            assignment.rhs.operands[0].literal = Some(format!("32:{wrong_value:032b}"));
+        }
+        let error = wrong_kind
+            .validate_against_design(&design)
+            .expect_err("wrong parameterized constant method must fail");
+        assert!(
+            error.contains(&format!("Const:32:u[32:{wrong_value:032b}]"))
+                && error.contains(&format!("Const:32:u[32:{expected_value:032b}]"))
+                && error.contains("Add:32:s["),
+            "unexpected parameterized constant-method error: {error}"
+        );
+    }
     let mut wrong_binary_summary = parameterized_summary.clone();
     if let Some(assignment) = wrong_binary_summary
         .procedural_blocks
