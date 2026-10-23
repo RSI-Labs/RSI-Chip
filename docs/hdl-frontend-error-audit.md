@@ -64,7 +64,7 @@ to document their fixes; they are not current errors.
 
 ### 1.3 Exact remaining unresolved-fingerprint sites
 
-F-03 currently has eight production sites that can emit a wildcard `"?"`
+F-03 currently has seven production sites that can emit a wildcard `"?"`
 fingerprint plus one wildcard matcher in the current worktree. They must be
 removed class-by-class; a global hard-error conversion previously exposed about
 65 tests that still depended on these wildcards and was therefore reverted.
@@ -74,7 +74,6 @@ removed class-by-class; a global hard-error conversion previously exposed about
 | `summary/validation.rs`, continuous assignment unresolved memory target | A slang fingerprint begins with `MemoryRead` or contains `PackedSelect`, but no matching repository memory target exists outside strict generated-hierarchy mode. | Preserve an exact canonical memory/suffix mapping and reject unknown targets. |
 | `summary/validation.rs`, continuous assignment unsupported expression | `slang_expression_fingerprint_with_parameters` returns `None`. | Add the missing slang and repository fingerprints plus a wrong-shape negative test. |
 | `summary/validation.rs`, legacy procedural arrays and class-static assignments | Non-strict legacy per-element array expansion and class-static assignments intentionally use `"?"`. | Represent the source assignment once or add a legal explicit expansion fingerprint. |
-| `summary/validation.rs`, non-strict memory-member lvalues | A procedural memory-member lvalue is not fingerprinted outside strict mode. | Make the existing member-path fingerprint authoritative in both modes. |
 | `summary/validation.rs`, unresolved strict memory-member lvalue | The strict member-path helper itself returns `None`. | Extend layout/member-path coverage instead of downgrading to `"?"`. |
 | `summary/validation.rs`, non-strict dynamic packed lvalues | Dynamic packed lvalue selectors are wildcarded outside strict mode. | Use the existing strict selector fingerprint unconditionally. |
 | `summary/validation.rs`, procedural unresolved memory target | A generic procedural RHS references a memory/packed select whose repository target cannot be confirmed. | Resolve hierarchical memory identity and reject unconfirmed references. |
