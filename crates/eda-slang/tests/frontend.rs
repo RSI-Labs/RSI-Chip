@@ -921,6 +921,42 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower class composition");
+    let composition_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("class_composition_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize class-composition AST");
+    let mut composition_summary = slang
+        .summarize_ast_json(&composition_json)
+        .expect("summarize class-composition AST");
+    composition_summary
+        .validate_against_design(&design)
+        .expect("exact nested class-property fingerprint should match");
+    if let Some(assignment) = composition_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "property_result")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("outer.inner.wrong".into());
+    }
+    let composition_property_error = composition_summary
+        .validate_against_design(&design)
+        .expect_err("wrong nested class property must fail");
+    assert!(
+        composition_property_error.contains("Ref:32:s[outer.inner.wrong]")
+            && composition_property_error.contains("Ref:32:s[outer.inner.value]"),
+        "unexpected nested class-property error: {composition_property_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create class-composition simulator");
     simulator
         .set_input("v", &LogicWord::from_u64(32, 37))

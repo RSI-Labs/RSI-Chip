@@ -311,7 +311,7 @@ fn collect_simple_instance_methods(
                         .insert(format!("{address} {name}"), member.clone());
                 }
             }
-            if !index.methods.is_empty() {
+            if !index.methods.is_empty() || !index.property_definitions.is_empty() {
                 methods.insert(string_field(value, "name").unwrap_or_default(), index);
             }
         }
@@ -392,56 +392,13 @@ fn canonicalize_simple_class_property_reads(
     classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
 ) {
     if string_field(value, "kind").as_deref() == Some("MemberAccess") {
-        if let (Some(member), Some(receiver), Some(receiver_type)) = (
-            string_field(value, "member"),
-            value.get("value"),
-            value
-                .get("value")
-                .and_then(|receiver| string_field(receiver, "type")),
-        ) {
-            let class_name = receiver_type
-                .split_whitespace()
-                .next_back()
-                .unwrap_or_default()
-                .rsplit(['.', '#', ':'])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Some(index) = classes.get(&class_name) {
-                if let Some(property) = index.property_definitions.get(&member) {
-                    let is_static = string_field(property, "flags")
-                        .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"));
-                    let property_type = string_field(property, "type").unwrap_or_default();
-                    let simple_property = simple_type_width(&property_type).is_some();
-                    let receiver_is_named = matches!(
-                        string_field(receiver, "kind").as_deref(),
-                        Some("NamedValue" | "HierarchicalValue")
-                    );
-                    if !is_static
-                        && simple_property
-                        && receiver_is_named
-                        && matches!(
-                            string_field(receiver, "symbol"),
-                            Some(symbol) if !symbol.trim().is_empty()
-                        )
-                    {
-                        let receiver_symbol = string_field(receiver, "symbol").unwrap_or_default();
-                        let receiver_name = receiver_symbol
-                            .split_whitespace()
-                            .next_back()
-                            .unwrap_or_default();
-                        let property_name = index.properties.get(&member);
-                        if let Some(property_name) = property_name {
-                            *value = serde_json::json!({
-                                "kind": "NamedValue",
-                                "type": property_type,
-                                "symbol": format!("{receiver_name}.{property_name}"),
-                            });
-                            return;
-                        }
-                    }
-                }
-            }
+        if let Some((property_type, symbol)) = simple_class_property_path(value, classes) {
+            *value = serde_json::json!({
+                "kind": "NamedValue",
+                "type": property_type,
+                "symbol": symbol,
+            });
+            return;
         }
     }
     if let Value::Array(values) = value {
@@ -456,6 +413,69 @@ fn canonicalize_simple_class_property_reads(
     for nested in fields.values_mut() {
         canonicalize_simple_class_property_reads(nested, classes);
     }
+}
+
+fn simple_class_property_path(
+    value: &Value,
+    classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
+) -> Option<(String, String)> {
+    let mut members = Vec::new();
+    let mut receiver = value;
+    while string_field(receiver, "kind").as_deref() == Some("MemberAccess") {
+        members.push(string_field(receiver, "member")?);
+        receiver = receiver.get("value")?;
+    }
+    if !matches!(
+        string_field(receiver, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let receiver_type = string_field(receiver, "type")?;
+    let mut current_class = class_type_name(&receiver_type);
+    let receiver_symbol = string_field(receiver, "symbol")?;
+    let receiver_name = receiver_symbol
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
+        .to_string();
+    members.reverse();
+
+    for (level, member) in members.iter().enumerate() {
+        let index = classes.get(&current_class)?;
+        let property = index.property_definitions.get(member)?;
+        if string_field(property, "flags")
+            .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"))
+        {
+            return None;
+        }
+        let property_type = string_field(property, "type")?;
+        if level + 1 == members.len() {
+            simple_type_width(&property_type)?;
+            let mut symbol = receiver_name;
+            for member in members {
+                symbol.push('.');
+                symbol.push_str(member.split_whitespace().next_back()?);
+            }
+            return Some((property_type, symbol));
+        }
+        current_class = class_type_name(&property_type);
+        if !classes.contains_key(&current_class) {
+            return None;
+        }
+    }
+    None
+}
+
+fn class_type_name(type_name: &str) -> String {
+    type_name
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
+        .rsplit(['.', '#', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[derive(Default)]
