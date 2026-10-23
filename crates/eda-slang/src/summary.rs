@@ -341,7 +341,7 @@ fn collect_simple_instance_methods(
                 ) {
                     let symbol = format!("{address} {name}");
                     if is_virtual {
-                        if parameter_method_operands(expression, &index.parameters).is_some() {
+                        if parameter_only_expression(expression, &index.parameters) {
                             index
                                 .constant_parameter_methods
                                 .insert(symbol, member.clone());
@@ -529,6 +529,10 @@ fn canonicalize_simple_instance_method_calls(
                 if let Some(method) = index.constant_parameter_methods.get(&subroutine) {
                     if !dynamic_receivers.contains(receiver_path.as_str()) {
                         let expression = method.get("body")?.get("expr")?;
+                        if string_field(expression, "kind").as_deref() == Some("IntegerLiteral") {
+                            *value = expression.clone();
+                            return Some(());
+                        }
                         let (left_symbol, right_symbol) =
                             parameter_method_operands(expression, &index.parameters)?;
                         let (_, left_value, left_type) = index.parameters.get(&left_symbol)?;
@@ -769,7 +773,7 @@ fn virtual_parameter_method(
 
 fn parameter_only_expression(
     value: &Value,
-    parameters: &std::collections::BTreeMap<String, (String, String)>,
+    parameters: &std::collections::BTreeMap<String, (String, String, String)>,
 ) -> bool {
     match string_field(value, "kind").as_deref() {
         Some("IntegerLiteral") => true,
@@ -791,7 +795,7 @@ fn parameter_only_expression(
 
 fn substitute_class_parameters(
     value: &Value,
-    parameters: &std::collections::BTreeMap<String, (String, String)>,
+    parameters: &std::collections::BTreeMap<String, (String, String, String)>,
 ) -> Value {
     if let Some(symbol) = string_field(value, "symbol") {
         if let Some((parameter_value, parameter_type)) = class_parameter_value(&symbol, parameters)
@@ -823,10 +827,10 @@ fn substitute_class_parameters(
 
 fn class_parameter_value(
     symbol: &str,
-    parameters: &std::collections::BTreeMap<String, (String, String)>,
+    parameters: &std::collections::BTreeMap<String, (String, String, String)>,
 ) -> Option<(String, String)> {
     if let Some(value) = parameters.get(symbol) {
-        return Some(value.clone());
+        return Some((value.1.clone(), value.2.clone()));
     }
     let name = symbol.split_whitespace().next_back()?.to_string();
     parameters
@@ -837,7 +841,7 @@ fn class_parameter_value(
                 .next_back()
                 .is_some_and(|parameter_name| *parameter_name == name)
         })
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| (value.1.clone(), value.2.clone()))
 }
 
 fn class_method_receiver_path(
@@ -1091,7 +1095,7 @@ fn class_definition_chain(
 fn class_parameter_environment(
     class_key: &str,
     definitions: &std::collections::BTreeMap<String, Value>,
-) -> Option<std::collections::BTreeMap<String, (String, String)>> {
+) -> Option<std::collections::BTreeMap<String, (String, String, String)>> {
     let mut parameters = std::collections::BTreeMap::new();
     for (_, class) in class_definition_chain(class_key, definitions)? {
         let empty_members = Vec::new();
@@ -1112,7 +1116,11 @@ fn class_parameter_environment(
                 normalize_detailed_types(&mut normalized);
                 parameters.insert(
                     format!("{address} {name}"),
-                    (value, string_field(&normalized, "type").unwrap_or_default()),
+                    (
+                        name,
+                        value,
+                        string_field(&normalized, "type").unwrap_or_default(),
+                    ),
                 );
             }
         }
@@ -1152,6 +1160,34 @@ fn collect_dynamic_class_sources(
     sources: &mut std::collections::BTreeMap<String, String>,
 ) {
     if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine").as_deref() == Some("$cast")
+        {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() == 2 {
+                let target = arguments[0].get("left");
+                let source = &arguments[1];
+                if let (Some(target_name), Some(target_type), Some(source_type)) = (
+                    target.and_then(named_class_name),
+                    target.and_then(named_class_type),
+                    named_class_type(source),
+                ) {
+                    let target_key = definition_class_key(&target_type, definitions);
+                    let source_key = definition_class_key(&source_type, definitions);
+                    let related =
+                        class_definition_chain(&source_key, definitions).is_some_and(|chain| {
+                            chain.iter().any(|(class_key, _)| *class_key == target_key)
+                        });
+                    if target_key != source_key && related {
+                        sources.insert(target_name, source_key);
+                    }
+                }
+            }
+        }
         if string_field(value, "kind").as_deref() == Some("Assignment") {
             if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
                 let left = conversion_operand_json(left);

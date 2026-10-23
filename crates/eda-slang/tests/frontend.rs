@@ -449,6 +449,48 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower a class-cast condition");
+    let cast_condition_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("class_cast_condition_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize class-cast-condition AST");
+    let mut cast_condition_summary = slang
+        .summarize_ast_json(&cast_condition_json)
+        .expect("summarize class-cast-condition AST");
+    cast_condition_summary
+        .validate_against_design(&design)
+        .expect("exact guarded-cast method fingerprint should match");
+    let expected_cast_result = format!("32:{:032b}", 4_u64);
+    if let Some(assignment) = cast_condition_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "observed")
+                    && assignment
+                        .rhs
+                        .literal
+                        .as_deref()
+                        .is_some_and(|literal| literal == expected_cast_result)
+            })
+        })
+    {
+        assignment.rhs.literal = Some(format!("32:{:032b}", 5_u64));
+    }
+    let guarded_cast_error = cast_condition_summary
+        .validate_against_design(&design)
+        .expect_err("wrong guarded-cast method result must fail");
+    assert!(
+        guarded_cast_error.contains(&format!("Const:32:u[32:{:032b}]", 4_u64))
+            && guarded_cast_error.contains(&format!("Const:32:u[32:{:032b}]", 5_u64)),
+        "unexpected guarded-cast method error: {guarded_cast_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create class-cast condition simulator");
     simulator
         .run_until(0)
