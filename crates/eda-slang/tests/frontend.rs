@@ -843,13 +843,71 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("serialize dynamic class-handle AST");
-    let mut dynamic_handle_summary = slang
+    let dynamic_handle_summary = slang
         .summarize_ast_json(&dynamic_handle_json)
         .expect("summarize dynamic class-handle AST");
     dynamic_handle_summary
         .validate_against_design(&design)
         .expect("exact dynamic class-array source fingerprints should match");
-    if let Some(assignment) = dynamic_handle_summary
+
+    let mut wrong_dynamic_target = dynamic_handle_summary.clone();
+    if let Some(assignment) = wrong_dynamic_target
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "destination")
+                    && !assignment.class_handle_dynamic_targets.is_empty()
+                    && assignment.class_handle_dynamic_sources.is_empty()
+                    && assignment.class_handle_source.is_some()
+            })
+        })
+    {
+        assignment.class_handle_source = Some("wrong_scalar".into());
+    }
+    let dynamic_target_error = wrong_dynamic_target
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic class-array target source must fail");
+    assert!(
+        dynamic_target_error.contains("ClassHandleCopy:wrong_scalar")
+            && dynamic_target_error.contains("ClassHandleCopy:scalar")
+            && dynamic_target_error.contains("destination[0]")
+            && dynamic_target_error.contains("ClassHandleCopy:source[0]"),
+        "unexpected dynamic class-array target error: {dynamic_target_error}"
+    );
+
+    let mut wrong_array_to_array = dynamic_handle_summary.clone();
+    if let Some(assignment) = wrong_array_to_array
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "destination")
+                    && !assignment.class_handle_dynamic_targets.is_empty()
+                    && !assignment.class_handle_dynamic_sources.is_empty()
+            })
+        })
+    {
+        assignment.class_handle_dynamic_sources[0] = "wrong_source".into();
+    }
+    let dynamic_source_error = wrong_array_to_array
+        .validate_against_design(&design)
+        .expect_err("wrong array-to-array dynamic source must fail");
+    assert!(
+        dynamic_source_error.contains("ClassHandleCopy:wrong_source")
+            && dynamic_source_error.contains("ClassHandleCopy:source[0]")
+            && dynamic_source_error.contains("ClassHandleCopy:source[1]"),
+        "unexpected dynamic class-array source error: {dynamic_source_error}"
+    );
+
+    let mut wrong_selected = dynamic_handle_summary;
+    if let Some(assignment) = wrong_selected
         .procedural_blocks
         .iter_mut()
         .find_map(|block| {
@@ -862,16 +920,16 @@ endmodule
             })
         })
     {
-        assignment.class_handle_dynamic_sources[0] = "wrong_source".into();
+        assignment.class_handle_dynamic_sources[0] = "wrong_selected_source".into();
     }
-    let dynamic_source_error = dynamic_handle_summary
+    let selected_source_error = wrong_selected
         .validate_against_design(&design)
-        .expect_err("wrong dynamic class-array source must fail");
+        .expect_err("wrong selected dynamic class-array source must fail");
     assert!(
-        dynamic_source_error.contains("ClassHandleCopy:wrong_source")
-            && dynamic_source_error.contains("ClassHandleCopy:source[0]")
-            && dynamic_source_error.contains("ClassHandleCopy:source[1]"),
-        "unexpected dynamic class-array source error: {dynamic_source_error}"
+        selected_source_error.contains("ClassHandleCopy:wrong_selected_source")
+            && selected_source_error.contains("ClassHandleCopy:source[0]")
+            && selected_source_error.contains("ClassHandleCopy:source[1]"),
+        "unexpected selected dynamic class-array error: {selected_source_error}"
     );
     let mut simulator = Simulator::new(&design).expect("create dynamic class-handle simulator");
     simulator

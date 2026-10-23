@@ -1998,6 +1998,8 @@ pub struct SlangAssignmentSummary {
     pub class_handle_source_key: Option<String>,
     /// All element sources selected by a dynamic class-array read.
     pub class_handle_dynamic_sources: Vec<String>,
+    /// All element targets selected by a dynamic class-array write.
+    pub class_handle_dynamic_targets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

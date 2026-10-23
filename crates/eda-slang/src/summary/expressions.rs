@@ -257,6 +257,9 @@ pub(crate) fn procedural_assignments(
             let mut class_handle_target_key = None;
             let mut class_handle_source_key = None;
             let mut class_handle_dynamic_sources = Vec::new();
+            let class_handle_dynamic_targets =
+                dynamic_class_array_source_paths(left, class_types.field_bearing);
+            let target_is_dynamic_class_array = !class_handle_dynamic_targets.is_empty();
             let class_handle_source = if target_is_named_handle {
                 if let Some(path) = class_handle_source_path(right, class_types.field_bearing) {
                     Some(path)
@@ -275,6 +278,18 @@ pub(crate) fn procedural_assignments(
             } else {
                 None
             };
+            let dynamic_class_array_source = if target_is_dynamic_class_array {
+                if let Some(path) = class_handle_source_path(right, class_types.field_bearing) {
+                    Some(path)
+                } else {
+                    class_handle_dynamic_sources =
+                        dynamic_class_array_source_paths(right, class_types.field_bearing);
+                    None
+                }
+            } else {
+                None
+            };
+            let class_handle_source = dynamic_class_array_source.or(class_handle_source);
             if class_handle_source.is_some()
                 || !class_handle_dynamic_sources.is_empty()
                 || !is_class_handle_target(left, class_handles)
@@ -296,6 +311,7 @@ pub(crate) fn procedural_assignments(
                     class_handle_target_key,
                     class_handle_source_key,
                     class_handle_dynamic_sources,
+                    class_handle_dynamic_targets,
                 });
             }
         }

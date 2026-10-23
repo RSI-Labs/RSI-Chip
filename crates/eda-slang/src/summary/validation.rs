@@ -263,6 +263,31 @@ impl SlangAstSummary {
             for assignment in &block.assignments {
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
+                        if !assignment.class_handle_dynamic_targets.is_empty() {
+                            let source_shapes =
+                                if assignment.class_handle_dynamic_sources.is_empty() {
+                                    assignment
+                                        .class_handle_source
+                                        .iter()
+                                        .map(|source| format!("ClassHandleCopy:{source}"))
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    assignment
+                                        .class_handle_dynamic_sources
+                                        .iter()
+                                        .map(|source| format!("ClassHandleCopy:{source}"))
+                                        .collect::<Vec<_>>()
+                                };
+                            if !source_shapes.is_empty() {
+                                for target in &assignment.class_handle_dynamic_targets {
+                                    expected_procedural_targets
+                                        .entry(target.clone())
+                                        .or_default()
+                                        .extend(source_shapes.iter().cloned());
+                                }
+                                continue;
+                            }
+                        }
                         if let (Some(target_key), Some(source_key)) = (
                             assignment.class_handle_target_key.as_ref(),
                             assignment.class_handle_source_key.as_ref(),
