@@ -250,7 +250,11 @@ pub(crate) fn procedural_assignments(
     }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
-            let class_handle_source = if is_class_handle_target(left, class_handles) {
+            let target_is_named_handle = matches!(
+                string_field(left, "kind").as_deref(),
+                Some("NamedValue" | "HierarchicalValue")
+            ) && is_class_handle_target(left, class_handles);
+            let class_handle_source = if target_is_named_handle {
                 class_handle_source_path(right, class_types)
             } else {
                 None
@@ -370,6 +374,15 @@ fn class_handle_source_path(
 ) -> Option<String> {
     if string_field(value, "kind").as_deref() == Some("Conversion") {
         return class_handle_source_path(value.get("operand")?, class_types);
+    }
+    if matches!(
+        string_field(value, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        let symbol = string_field(value, "symbol")?;
+        let name = symbol.split_whitespace().next_back()?.to_string();
+        let class_name = canonical_class_name(&string_field(value, "type")?)?;
+        return class_types.contains(&class_name).then_some(name);
     }
     if string_field(value, "kind").as_deref() != Some("MemberAccess") {
         return None;

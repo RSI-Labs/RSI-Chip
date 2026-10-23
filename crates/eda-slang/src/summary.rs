@@ -1388,6 +1388,17 @@ impl SlangAstSummary {
         canonicalize_simple_function_calls(&mut root, &simple_functions);
         let mut simple_instance_methods = std::collections::BTreeMap::new();
         collect_simple_instance_methods(&document, &mut simple_instance_methods);
+        let class_handle_source_types = simple_instance_methods
+            .iter()
+            .filter(|(_, index)| {
+                index.property_definitions.values().any(|property| {
+                    string_field(property, "type")
+                        .and_then(|type_name| simple_type_width(&type_name))
+                        .is_some()
+                })
+            })
+            .flat_map(|(name, _)| [name.clone(), class_type_name(name)])
+            .collect::<std::collections::BTreeSet<_>>();
         let _ = canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
@@ -1536,7 +1547,8 @@ impl SlangAstSummary {
                 }
                 "ProceduralBlock" => {
                     let procedure_kind = string_field(member, "procedureKind").unwrap_or_default();
-                    let assignments = procedural_assignments(member, &class_handles, &class_types);
+                    let assignments =
+                        procedural_assignments(member, &class_handles, &class_handle_source_types);
                     let assignment_targets = assignments
                         .iter()
                         .flat_map(|assignment| assignment.target_names.iter().cloned())
@@ -1587,7 +1599,7 @@ impl SlangAstSummary {
                         &mut continuous_targets,
                         &mut procedural_blocks,
                         &class_handles,
-                        &class_types,
+                        &class_handle_source_types,
                     )?;
                 }
                 _ => {}

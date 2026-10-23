@@ -891,15 +891,20 @@ module class_composition_top(
   output int updated_result,
   output int method_set_result,
   output int source_after_write,
+  output int named_handle_result,
   output int identity_result
 );
   Outer outer;
   Inner source;
+  Inner direct;
+  Inner named_copy;
 
   initial begin
     #1;
     outer = new(v);
     source = outer.inner;
+    direct = new(51);
+    named_copy = direct;
     method_result = outer.get();
     property_result = outer.inner.value;
     outer.inner.value = v + 5;
@@ -907,6 +912,7 @@ module class_composition_top(
     outer.set(v + 6);
     method_set_result = outer.inner.get();
     source_after_write = source.get();
+    named_handle_result = named_copy.get();
     identity_result = (outer.inner == source);
   end
 endmodule
@@ -957,6 +963,29 @@ endmodule
         handle_source_error.contains("ClassHandleCopy:wrong_source")
             && handle_source_error.contains("ClassHandleCopy:outer.inner"),
         "unexpected whole class-handle source error: {handle_source_error}"
+    );
+    let mut wrong_named_handle_source = composition_summary.clone();
+    if let Some(assignment) = wrong_named_handle_source
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "named_copy")
+            })
+        })
+    {
+        assignment.class_handle_source = Some("wrong_named_source".into());
+    }
+    let named_handle_error = wrong_named_handle_source
+        .validate_against_design(&design)
+        .expect_err("wrong named class-handle source must fail");
+    assert!(
+        named_handle_error.contains("ClassHandleCopy:wrong_named_source")
+            && named_handle_error.contains("ClassHandleCopy:direct"),
+        "unexpected named class-handle source error: {named_handle_error}"
     );
     let mut wrong_composition_method = composition_summary.clone();
     if let Some(assignment) = wrong_composition_method
@@ -1023,6 +1052,10 @@ endmodule
     assert_eq!(
         simulator.read("source_after_write").unwrap().to_u64(),
         Some(43)
+    );
+    assert_eq!(
+        simulator.read("named_handle_result").unwrap().to_u64(),
+        Some(51)
     );
     assert_eq!(simulator.read("identity_result").unwrap().to_u64(), Some(1));
 
