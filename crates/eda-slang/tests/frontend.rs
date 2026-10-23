@@ -1873,6 +1873,31 @@ endmodule
             "unexpected parameterized constant-method error: {error}"
         );
     }
+    let mut wrong_dynamic_dispatch = parameterized_summary.clone();
+    if let Some(assignment) = wrong_dynamic_dispatch
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "dynamic_kind")
+            })
+        })
+    {
+        assignment.rhs.operands[1].operands[1].literal = Some(format!("32:{:032b}", 2_u64));
+    }
+    let dynamic_dispatch_error = wrong_dynamic_dispatch
+        .validate_against_design(&design)
+        .expect_err("wrong runtime virtual-dispatch branch must fail");
+    assert!(
+        dynamic_dispatch_error.contains("Cond:32:s[")
+            && dynamic_dispatch_error.contains("Ref:32:u[__class_tag_base_box]")
+            && dynamic_dispatch_error.contains(&format!("Const:32:u[32:{:032b}]", 1))
+            && dynamic_dispatch_error.contains(&format!("Const:32:u[32:{:032b}]", 2)),
+        "unexpected runtime virtual-dispatch error: {dynamic_dispatch_error}"
+    );
     let mut wrong_binary_summary = parameterized_summary.clone();
     if let Some(assignment) = wrong_binary_summary
         .procedural_blocks

@@ -639,6 +639,207 @@ fn canonicalize_simple_instance_method_calls(
     Some(())
 }
 
+fn canonicalize_dynamic_parameter_virtual_calls(
+    value: &mut Value,
+    definitions: &std::collections::BTreeMap<String, Value>,
+    dynamic_sources: &std::collections::BTreeMap<String, String>,
+) {
+    if string_field(value, "kind").as_deref() == Some("Call") {
+        if let (Some(subroutine), Some(receiver), Some(receiver_type)) = (
+            string_field(value, "subroutine"),
+            value.get("thisClass"),
+            value
+                .get("thisClass")
+                .and_then(|receiver| string_field(receiver, "type")),
+        ) {
+            let method_name = subroutine
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default();
+            let receiver_name = receiver
+                .get("symbol")
+                .and_then(Value::as_str)
+                .and_then(|symbol| symbol.split_whitespace().next_back())
+                .unwrap_or_default();
+            let receiver_key = definition_class_key(&receiver_type, definitions);
+            if let Some(source_key) = dynamic_sources.get(receiver_name) {
+                if let (Some(source_method), Some(fallback_method)) = (
+                    virtual_parameter_method(source_key, method_name, definitions),
+                    virtual_parameter_method(&receiver_key, method_name, definitions),
+                ) {
+                    let source_parameters =
+                        class_parameter_environment(source_key, definitions).unwrap_or_default();
+                    let fallback_parameters =
+                        class_parameter_environment(&receiver_key, definitions).unwrap_or_default();
+                    let source_expression = source_method
+                        .get("body")
+                        .and_then(|body| body.get("expr"))
+                        .cloned();
+                    let fallback_expression = fallback_method
+                        .get("body")
+                        .and_then(|body| body.get("expr"))
+                        .cloned();
+                    if let (Some(source_expression), Some(fallback_expression)) =
+                        (source_expression, fallback_expression)
+                    {
+                        let source_expression =
+                            substitute_class_parameters(&source_expression, &source_parameters);
+                        let fallback_expression =
+                            substitute_class_parameters(&fallback_expression, &fallback_parameters);
+                        let Some(source_id) = definitions
+                            .keys()
+                            .position(|class_key| class_key == source_key)
+                            .map(|index| index as u64 + 1)
+                        else {
+                            return;
+                        };
+                        let condition = serde_json::json!({
+                            "kind": "BinaryOp",
+                            "type": "bit",
+                            "op": "Equality",
+                            "left": {
+                                "kind": "NamedValue",
+                                "type": "bit[31:0]",
+                                "symbol": format!("__class_tag_{receiver_name}"),
+                            },
+                            "right": {
+                                "kind": "IntegerLiteral",
+                                "type": "int",
+                                "value": source_id.to_string(),
+                            },
+                        });
+                        *value = serde_json::json!({
+                            "kind": "ConditionalOp",
+                            "type": value.get("type"),
+                            "conditions": [{"expr": condition}],
+                            "left": source_expression,
+                            "right": fallback_expression,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if let Value::Array(values) = value {
+        for nested in values {
+            canonicalize_dynamic_parameter_virtual_calls(nested, definitions, dynamic_sources);
+        }
+        return;
+    }
+    let Value::Object(fields) = value else {
+        return;
+    };
+    for nested in fields.values_mut() {
+        canonicalize_dynamic_parameter_virtual_calls(nested, definitions, dynamic_sources);
+    }
+}
+
+fn virtual_parameter_method(
+    class_key: &str,
+    method_name: &str,
+    definitions: &std::collections::BTreeMap<String, Value>,
+) -> Option<Value> {
+    let parameters = class_parameter_environment(class_key, definitions)?;
+    for (_, class) in class_definition_chain(class_key, definitions)? {
+        let empty_members = Vec::new();
+        let members = class
+            .get("members")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_members);
+        let Some(method) = members.iter().find(|member| {
+            string_field(member, "kind").as_deref() == Some("Subroutine")
+                && string_field(member, "name").as_deref() == Some(method_name)
+        }) else {
+            continue;
+        };
+        let is_virtual = string_field(method, "flags")
+            .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "virtual"));
+        let has_parameter_expression = method
+            .get("body")
+            .and_then(|body| body.get("expr"))
+            .is_some_and(|expression| parameter_only_expression(expression, &parameters));
+        if has_parameter_expression && is_virtual {
+            return Some(method.clone());
+        }
+        return None;
+    }
+    None
+}
+
+fn parameter_only_expression(
+    value: &Value,
+    parameters: &std::collections::BTreeMap<String, (String, String)>,
+) -> bool {
+    match string_field(value, "kind").as_deref() {
+        Some("IntegerLiteral") => true,
+        Some("NamedValue") => string_field(value, "symbol")
+            .and_then(|symbol| class_parameter_value(&symbol, parameters))
+            .is_some(),
+        Some("BinaryOp") => {
+            string_field(value, "op").as_deref() == Some("Add")
+                && value
+                    .get("left")
+                    .is_some_and(|left| parameter_only_expression(left, parameters))
+                && value
+                    .get("right")
+                    .is_some_and(|right| parameter_only_expression(right, parameters))
+        }
+        _ => false,
+    }
+}
+
+fn substitute_class_parameters(
+    value: &Value,
+    parameters: &std::collections::BTreeMap<String, (String, String)>,
+) -> Value {
+    if let Some(symbol) = string_field(value, "symbol") {
+        if let Some((parameter_value, parameter_type)) = class_parameter_value(&symbol, parameters)
+        {
+            return serde_json::json!({
+                "kind": "IntegerLiteral",
+                "type": parameter_type,
+                "value": parameter_value,
+            });
+        }
+    }
+    match value {
+        Value::Object(fields) => {
+            let mut result = serde_json::Map::new();
+            for (key, nested) in fields {
+                result.insert(key.clone(), substitute_class_parameters(nested, parameters));
+            }
+            Value::Object(result)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|nested| substitute_class_parameters(nested, parameters))
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
+fn class_parameter_value(
+    symbol: &str,
+    parameters: &std::collections::BTreeMap<String, (String, String)>,
+) -> Option<(String, String)> {
+    if let Some(value) = parameters.get(symbol) {
+        return Some(value.clone());
+    }
+    let name = symbol.split_whitespace().next_back()?.to_string();
+    parameters
+        .iter()
+        .find(|(parameter_symbol, _)| {
+            parameter_symbol
+                .split_whitespace()
+                .next_back()
+                .is_some_and(|parameter_name| *parameter_name == name)
+        })
+        .map(|(_, value)| value.clone())
+}
+
 fn class_method_receiver_path(
     value: &Value,
     classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
@@ -823,6 +1024,102 @@ fn collect_dynamic_class_receivers(
     }
 }
 
+fn collect_class_definitions(
+    value: &Value,
+    definitions: &mut std::collections::BTreeMap<String, Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("ClassType") {
+            if let (Some(address), Some(name)) = (
+                value.get("addr").and_then(serde_json::Value::as_u64),
+                string_field(value, "name"),
+            ) {
+                definitions.insert(format!("{name}@{address}"), value.clone());
+                definitions.entry(name).or_insert_with(|| value.clone());
+            }
+        }
+        for nested in fields.values() {
+            collect_class_definitions(nested, definitions);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_class_definitions(nested, definitions);
+        }
+    }
+}
+
+fn definition_class_key(
+    type_name: &str,
+    definitions: &std::collections::BTreeMap<String, Value>,
+) -> String {
+    let base_name = class_type_name(type_name);
+    if let Some(address) = type_name
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.parse::<u64>().ok())
+    {
+        let specialized = format!("{base_name}@{address}");
+        if definitions.contains_key(&specialized) {
+            return specialized;
+        }
+    }
+    base_name
+}
+
+fn class_definition_chain(
+    class_key: &str,
+    definitions: &std::collections::BTreeMap<String, Value>,
+) -> Option<Vec<(String, Value)>> {
+    let mut chain = Vec::new();
+    let mut current = class_key.to_string();
+    loop {
+        if chain.iter().any(|(name, _)| name == &current) {
+            return None;
+        }
+        let class = definitions.get(&current)?.clone();
+        if let Some(base_type) = string_field(&class, "baseClass") {
+            let base = definition_class_key(&base_type, definitions);
+            chain.push((current, class));
+            current = base;
+        } else {
+            chain.push((current, class));
+            return Some(chain);
+        }
+    }
+}
+
+fn class_parameter_environment(
+    class_key: &str,
+    definitions: &std::collections::BTreeMap<String, Value>,
+) -> Option<std::collections::BTreeMap<String, (String, String)>> {
+    let mut parameters = std::collections::BTreeMap::new();
+    for (_, class) in class_definition_chain(class_key, definitions)? {
+        let empty_members = Vec::new();
+        let members = class
+            .get("members")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_members);
+        for member in members {
+            if string_field(member, "kind").as_deref() != Some("Parameter") {
+                continue;
+            }
+            if let (Some(address), Some(name), Some(value)) = (
+                member.get("addr").and_then(serde_json::Value::as_u64),
+                string_field(member, "name"),
+                string_field(member, "value"),
+            ) {
+                let mut normalized = member.clone();
+                normalize_detailed_types(&mut normalized);
+                parameters.insert(
+                    format!("{address} {name}"),
+                    (value, string_field(&normalized, "type").unwrap_or_default()),
+                );
+            }
+        }
+    }
+    Some(parameters)
+}
+
 fn conversion_operand_json(value: &'_ Value) -> &'_ Value {
     if string_field(value, "kind").as_deref() == Some("Conversion") {
         value.get("operand").unwrap_or(value)
@@ -847,6 +1144,60 @@ fn named_class_value(
     class_types
         .contains(&class_name)
         .then_some((name, class_name))
+}
+
+fn collect_dynamic_class_sources(
+    value: &Value,
+    definitions: &std::collections::BTreeMap<String, Value>,
+    sources: &mut std::collections::BTreeMap<String, String>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Assignment") {
+            if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
+                let left = conversion_operand_json(left);
+                let right = conversion_operand_json(right);
+                if let (Some(target_name), Some(target_type), Some(source_type)) = (
+                    named_class_name(left),
+                    named_class_type(left),
+                    named_class_type(right),
+                ) {
+                    let target_key = definition_class_key(&target_type, definitions);
+                    let source_key = definition_class_key(&source_type, definitions);
+                    if target_key != source_key
+                        && class_definition_chain(&source_key, definitions).is_some_and(|chain| {
+                            chain.iter().any(|(class_key, _)| *class_key == target_key)
+                        })
+                    {
+                        sources.insert(target_name, source_key);
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_dynamic_class_sources(nested, definitions, sources);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_dynamic_class_sources(nested, definitions, sources);
+        }
+    }
+}
+
+fn named_class_name(value: &Value) -> Option<String> {
+    string_field(value, "symbol")?
+        .split_whitespace()
+        .next_back()
+        .map(str::to_string)
+}
+
+fn named_class_type(value: &Value) -> Option<String> {
+    if !matches!(
+        string_field(value, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    string_field(value, "type")
 }
 
 #[derive(Default)]
@@ -1688,6 +2039,10 @@ impl SlangAstSummary {
         );
         let mut class_types = std::collections::BTreeSet::new();
         collect_class_type_names(&document, &mut class_types);
+        let mut class_definitions = std::collections::BTreeMap::new();
+        collect_class_definitions(&document, &mut class_definitions);
+        let mut dynamic_class_sources = std::collections::BTreeMap::new();
+        collect_dynamic_class_sources(&root, &class_definitions, &mut dynamic_class_sources);
         let mut dynamic_class_receivers = std::collections::BTreeSet::new();
         collect_dynamic_class_receivers(&root, &class_types, &mut dynamic_class_receivers);
         let class_handle_source_types = simple_instance_methods
@@ -1711,6 +2066,11 @@ impl SlangAstSummary {
             &mut root,
             &simple_instance_methods,
             &dynamic_class_receivers,
+        );
+        canonicalize_dynamic_parameter_virtual_calls(
+            &mut root,
+            &class_definitions,
+            &dynamic_class_sources,
         );
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
