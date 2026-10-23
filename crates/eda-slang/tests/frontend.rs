@@ -935,6 +935,29 @@ endmodule
     composition_summary
         .validate_against_design(&design)
         .expect("exact nested class-property fingerprint should match");
+    let mut wrong_composition_method = composition_summary.clone();
+    if let Some(assignment) = wrong_composition_method
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "method_result")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("outer.inner.wrong".into());
+    }
+    let composition_method_error = wrong_composition_method
+        .validate_against_design(&design)
+        .expect_err("wrong composed class-method property must fail");
+    assert!(
+        composition_method_error.contains("Ref:32:s[outer.inner.wrong]")
+            && composition_method_error.contains("Ref:32:s[outer.inner.value]"),
+        "unexpected composed class-method error: {composition_method_error}"
+    );
     if let Some(assignment) = composition_summary
         .procedural_blocks
         .iter_mut()

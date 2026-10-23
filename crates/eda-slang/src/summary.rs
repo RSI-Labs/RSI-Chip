@@ -237,6 +237,7 @@ fn collect_simple_function_definitions(
 #[derive(Default)]
 struct SimpleInstanceMethodIndex {
     methods: std::collections::BTreeMap<String, Value>,
+    composition_methods: std::collections::BTreeMap<String, Value>,
     properties: std::collections::BTreeMap<String, String>,
     property_definitions: std::collections::BTreeMap<String, Value>,
 }
@@ -290,28 +291,54 @@ fn collect_simple_instance_methods(
                 let Some(expression) = body.get("expr") else {
                     continue;
                 };
-                if !arguments.is_empty()
-                    || string_field(body, "kind").as_deref() != Some("Return")
-                    || string_field(expression, "kind").as_deref() != Some("NamedValue")
+                if !arguments.is_empty() || string_field(body, "kind").as_deref() != Some("Return")
                 {
-                    continue;
-                }
-                let Some(property_symbol) = string_field(expression, "symbol") else {
-                    continue;
-                };
-                if !index.properties.contains_key(&property_symbol) {
                     continue;
                 }
                 if let (Some(address), Some(name)) = (
                     member.get("addr").and_then(Value::as_u64),
                     string_field(member, "name"),
                 ) {
-                    index
-                        .methods
-                        .insert(format!("{address} {name}"), member.clone());
+                    let symbol = format!("{address} {name}");
+                    match string_field(expression, "kind").as_deref() {
+                        Some("NamedValue") => {
+                            let Some(property_symbol) = string_field(expression, "symbol") else {
+                                continue;
+                            };
+                            if index.properties.contains_key(&property_symbol) {
+                                index.methods.insert(symbol, member.clone());
+                            }
+                        }
+                        Some("Call") => {
+                            let empty_call_arguments = Vec::new();
+                            let call_arguments = expression
+                                .get("arguments")
+                                .and_then(Value::as_array)
+                                .unwrap_or(&empty_call_arguments);
+                            let nested_receiver_is_property =
+                                expression.get("thisClass").is_some_and(|nested_receiver| {
+                                    matches!(
+                                        string_field(nested_receiver, "kind").as_deref(),
+                                        Some("NamedValue")
+                                    ) && string_field(nested_receiver, "symbol").is_some_and(
+                                        |symbol| index.properties.contains_key(&symbol),
+                                    )
+                                });
+                            if call_arguments.is_empty()
+                                && nested_receiver_is_property
+                                && string_field(expression, "subroutine").is_some()
+                            {
+                                index.composition_methods.insert(symbol, member.clone());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
-            if !index.methods.is_empty() || !index.property_definitions.is_empty() {
+            if !index.methods.is_empty()
+                || !index.composition_methods.is_empty()
+                || !index.property_definitions.is_empty()
+            {
                 methods.insert(string_field(value, "name").unwrap_or_default(), index);
             }
         }
@@ -328,63 +355,119 @@ fn collect_simple_instance_methods(
 fn canonicalize_simple_instance_method_calls(
     value: &mut Value,
     classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
-) {
+) -> Option<()> {
     if string_field(value, "kind").as_deref() == Some("Call") {
-        if let (Some(subroutine), Some(receiver), Some(receiver_type)) = (
-            string_field(value, "subroutine"),
-            value.get("thisClass"),
-            value
-                .get("thisClass")
-                .and_then(|receiver| string_field(receiver, "type")),
-        ) {
-            let class_name = receiver_type
-                .split_whitespace()
-                .next_back()
-                .unwrap_or_default()
-                .rsplit(['.', '#', ':'])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Some(index) = classes.get(&class_name) {
+        if let (Some(subroutine), Some(receiver)) =
+            (string_field(value, "subroutine"), value.get("thisClass"))
+        {
+            if let Some((receiver_path, class_name)) = class_method_receiver_path(receiver, classes)
+            {
+                let index = classes.get(&class_name)?;
                 if let Some(method) = index.methods.get(&subroutine) {
-                    let body = method.get("body");
-                    let expression = body.and_then(|body| body.get("expr"));
-                    if let Some(expression) = expression {
-                        if let Some(property_symbol) = string_field(expression, "symbol") {
-                            if let Some(property_name) = index.properties.get(&property_symbol) {
-                                if let Some(receiver_name) =
-                                    receiver.get("symbol").and_then(Value::as_str)
-                                {
-                                    let receiver_name = receiver_name
-                                        .split_whitespace()
-                                        .next_back()
-                                        .unwrap_or_default();
-                                    *value = serde_json::json!({
-                                        "kind": "NamedValue",
-                                        "type": expression.get("type"),
-                                        "symbol": format!("{receiver_name}.{property_name}"),
-                                    });
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                    let expression = method.get("body")?.get("expr")?;
+                    let property_symbol = string_field(expression, "symbol")?;
+                    let property_name = index.properties.get(&property_symbol)?;
+                    *value = serde_json::json!({
+                        "kind": "NamedValue",
+                        "type": expression.get("type"),
+                        "symbol": format!("{receiver_path}.{property_name}"),
+                    });
+                    return Some(());
+                }
+                if let Some(method) = index.composition_methods.get(&subroutine) {
+                    let nested_call = method.get("body")?.get("expr")?;
+                    let nested_subroutine = string_field(nested_call, "subroutine")?;
+                    let nested_receiver = nested_call.get("thisClass")?;
+                    let property_symbol = string_field(nested_receiver, "symbol")?;
+                    let property_name = index.properties.get(&property_symbol)?;
+                    let property = index.property_definitions.get(&property_symbol)?;
+                    let property_type = string_field(property, "type")?;
+                    let nested_class_name = class_type_name(&property_type);
+                    let nested_index = classes.get(&nested_class_name)?;
+                    let nested_method = nested_index.methods.get(&nested_subroutine)?;
+                    let nested_expression = nested_method.get("body")?.get("expr")?;
+                    let nested_property_symbol = string_field(nested_expression, "symbol")?;
+                    let nested_property_name =
+                        nested_index.properties.get(&nested_property_symbol)?;
+                    *value = serde_json::json!({
+                        "kind": "NamedValue",
+                        "type": nested_expression.get("type"),
+                        "symbol": format!(
+                            "{receiver_path}.{property_name}.{nested_property_name}"
+                        ),
+                    });
+                    return Some(());
                 }
             }
         }
     }
     if let Value::Array(values) = value {
         for nested in values {
-            canonicalize_simple_instance_method_calls(nested, classes);
+            let _ = canonicalize_simple_instance_method_calls(nested, classes);
         }
-        return;
+        return Some(());
     }
     let Value::Object(fields) = value else {
-        return;
+        return Some(());
     };
     for nested in fields.values_mut() {
-        canonicalize_simple_instance_method_calls(nested, classes);
+        let _ = canonicalize_simple_instance_method_calls(nested, classes);
     }
+    Some(())
+}
+
+fn class_method_receiver_path(
+    value: &Value,
+    classes: &std::collections::BTreeMap<String, SimpleInstanceMethodIndex>,
+) -> Option<(String, String)> {
+    if matches!(
+        string_field(value, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        let symbol = string_field(value, "symbol")?;
+        let receiver_name = symbol.split_whitespace().next_back()?.to_string();
+        let class_name = class_type_name(&string_field(value, "type")?);
+        return classes
+            .contains_key(&class_name)
+            .then_some((receiver_name, class_name));
+    }
+    if string_field(value, "kind").as_deref() != Some("MemberAccess") {
+        return None;
+    }
+
+    let mut members = Vec::new();
+    let mut receiver = value;
+    while string_field(receiver, "kind").as_deref() == Some("MemberAccess") {
+        members.push(string_field(receiver, "member")?);
+        receiver = receiver.get("value")?;
+    }
+    if !matches!(
+        string_field(receiver, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return None;
+    }
+    let receiver_symbol = string_field(receiver, "symbol")?;
+    let mut symbol = receiver_symbol.split_whitespace().next_back()?.to_string();
+    let mut current_class = class_type_name(&string_field(receiver, "type")?);
+    members.reverse();
+    for member in members {
+        let index = classes.get(&current_class)?;
+        let property = index.property_definitions.get(&member)?;
+        if string_field(property, "flags")
+            .is_some_and(|flags| flags.split(',').any(|flag| flag.trim() == "static"))
+        {
+            return None;
+        }
+        let property_type = string_field(property, "type")?;
+        current_class = class_type_name(&property_type);
+        if !classes.contains_key(&current_class) {
+            return None;
+        }
+        symbol.push('.');
+        symbol.push_str(member.split_whitespace().next_back()?);
+    }
+    Some((symbol, current_class))
 }
 
 fn canonicalize_simple_class_property_reads(
@@ -1303,7 +1386,7 @@ impl SlangAstSummary {
         canonicalize_simple_function_calls(&mut root, &simple_functions);
         let mut simple_instance_methods = std::collections::BTreeMap::new();
         collect_simple_instance_methods(&document, &mut simple_instance_methods);
-        canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
+        let _ = canonicalize_simple_instance_method_calls(&mut root, &simple_instance_methods);
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
         let root = &root;
