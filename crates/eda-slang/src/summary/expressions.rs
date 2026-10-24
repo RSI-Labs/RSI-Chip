@@ -1949,6 +1949,35 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             expression.width()
         );
     }
+    if let Expr::Ref {
+        net: _,
+        decl_width,
+        range,
+        signed,
+    } = expression
+    {
+        let is_full_range = match range {
+            eda_core::ir::Range::Bit(bit) => *decl_width == 1 && *bit == 0,
+            eda_core::ir::Range::Span { msb, lsb } => {
+                *lsb == 0 && *msb == decl_width.saturating_sub(1)
+            }
+        };
+        if !is_full_range {
+            if let Some(name) = design_expr_symbol(design, expression) {
+                let signed_label = if *signed { "s" } else { "u" };
+                let base = format!("Ref:{decl_width}:{signed_label}[{name}]");
+                return match range {
+                    eda_core::ir::Range::Bit(bit) => {
+                        format!("PackedSelect:1:{signed_label}[{base},Range:{bit}:{bit}]")
+                    }
+                    eda_core::ir::Range::Span { msb, lsb } => format!(
+                        "PackedSelect:{}:{signed_label}[{base},Range:{msb}:{lsb}]",
+                        msb - lsb + 1
+                    ),
+                };
+            }
+        }
+    }
     let root = design_expr_shape(expression);
     if root == "Ref" {
         if let Some(name) = design_expr_symbol(design, expression) {

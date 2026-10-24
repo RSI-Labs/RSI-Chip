@@ -146,6 +146,22 @@ impl SlangAstSummary {
             std::collections::BTreeMap::new();
         for target in &self.continuous_targets {
             if !strict_generated_hierarchy {
+                if let Some(memory_name) = continuous_constant_memory_name(&target.rhs) {
+                    if !memory_names.contains(memory_name) {
+                        if let Some(fingerprint) = constant_array_read_fingerprint(
+                            memory_name,
+                            &target.rhs,
+                            design,
+                            &self.declarations,
+                        ) {
+                            expected_continuous_targets
+                                .entry(target.name.clone())
+                                .or_default()
+                                .push(fingerprint);
+                            continue;
+                        }
+                    }
+                }
                 if let Some(memory_name) = continuous_dynamic_memory_name(&target.rhs) {
                     if !memory_names.contains(memory_name) {
                         if let Some(fingerprint) = dynamic_array_read_fingerprint(
@@ -607,11 +623,31 @@ fn continuous_dynamic_memory_name(expression: &super::SlangExpressionSummary) ->
         .operands
         .get(1)
         .is_some_and(|selector| summary_literal_i64(selector).is_none());
-    if selected.type_name.contains('$') {
+    if matches!(selected.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && selected.type_name.contains('$')
+    {
         return selector_is_dynamic.then_some(selected.symbol.as_deref())?;
     }
     let memory_name = continuous_dynamic_memory_name(selected)?;
     (selector_is_dynamic || selected.kind == "ElementSelect").then_some(memory_name)
+}
+
+fn continuous_constant_memory_name(expression: &super::SlangExpressionSummary) -> Option<&str> {
+    if expression.kind != "ElementSelect" {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    let selector_is_constant = expression
+        .operands
+        .get(1)
+        .is_some_and(|selector| summary_literal_i64(selector).is_some());
+    if matches!(selected.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && selected.type_name.contains('$')
+    {
+        return selector_is_constant.then_some(selected.symbol.as_deref())?;
+    }
+    let memory_name = continuous_constant_memory_name(selected)?;
+    (selector_is_constant || selected.kind == "ElementSelect").then_some(memory_name)
 }
 
 fn dynamic_array_read_indexes(
@@ -621,7 +657,9 @@ fn dynamic_array_read_indexes(
         return None;
     }
     let selected = expression.operands.first()?;
-    let mut indexes = if selected.type_name.contains('$') {
+    let mut indexes = if matches!(selected.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && selected.type_name.contains('$')
+    {
         Vec::new()
     } else {
         dynamic_array_read_indexes(selected)?
@@ -703,6 +741,59 @@ fn dynamic_array_read_fingerprint(
     Some(format!(
         "Cond:{total_width}:u[{in_range},{selected},Const:{element_width}:u[{element_width}:{}]]",
         "x".repeat(element_width)
+    ))
+}
+
+fn constant_array_read_fingerprint(
+    target_name: &str,
+    expression: &super::SlangExpressionSummary,
+    design: &Design,
+    declarations: &[super::SlangDeclarationSummary],
+) -> Option<String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let memory = memory_type(&declaration.type_name)?;
+    if memory.dynamic
+        || memory.queue
+        || memory.associative
+        || memory.element_msb < memory.element_lsb
+    {
+        return None;
+    }
+    let indexes = dynamic_array_read_indexes(expression)?;
+    if indexes.len() != memory.dimensions.len() || expression.type_width? != memory.element_width {
+        return None;
+    }
+
+    let element_width = memory.element_width;
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    let net_width = design
+        .net_decls
+        .iter()
+        .find(|net| net.name == target_name)
+        .map(|net| net.width)?;
+    if total_width == 0 || net_width != total_width {
+        return None;
+    }
+
+    let mut element_index = 0_usize;
+    for (index, dimension) in indexes.into_iter().zip(&memory.dimensions) {
+        let index_value = summary_literal_i64(index)?;
+        let normalized_index = if dimension.step > 0 {
+            index_value - dimension.base
+        } else {
+            dimension.base - index_value
+        };
+        if normalized_index < 0 || normalized_index >= dimension.length as i64 {
+            return None;
+        }
+        element_index = element_index * dimension.length + normalized_index as usize;
+    }
+    let lsb = element_index * element_width;
+    let msb = lsb + element_width - 1;
+    Some(format!(
+        "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{msb}:{lsb}]"
     ))
 }
 

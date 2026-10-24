@@ -5302,6 +5302,30 @@ endmodule
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("exact multidimensional constant part fingerprint should match");
 
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "q")
+    {
+        target.rhs.operands[0].operands[1].literal =
+            Some("32:00000000000000000000000000000000".into());
+    }
+    let constant_read_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant multidimensional array read index must fail");
+    assert!(
+        constant_read_error.contains("Range:15:8") && constant_read_error.contains("Range:31:24"),
+        "unexpected constant read error: {constant_read_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "q")
+    {
+        target.rhs.operands[0].operands[1].literal =
+            Some("32:00000000000000000000000000000001".into());
+    }
+
     if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
         block
             .assignments
