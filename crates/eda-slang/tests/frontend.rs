@@ -4400,6 +4400,30 @@ endmodule
     summary
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("exact bounded reversed dynamic fingerprint should match");
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "q")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_addr".into());
+    }
+    let continuous_read_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong reversed continuous read selector must fail");
+    assert!(
+        continuous_read_error.contains("Ref:2:u[wrong_addr]")
+            && continuous_read_error.contains("Ref:2:u[addr]")
+            && continuous_read_error.contains("Cond:8:u[")
+            && continuous_read_error.contains("Concat:8:u["),
+        "unexpected reversed continuous read error: {continuous_read_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "q")
+    {
+        target.rhs.operands[1].symbol = Some("addr".into());
+    }
     if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
         block
             .assignments
@@ -4558,6 +4582,30 @@ endmodule
         .find(|target| target.name == "whole")
     {
         target.rhs.operands[1].symbol = Some("addr".into());
+    }
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "indexed_whole")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("wrong_addr".into());
+    }
+    let indexed_whole_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong canonical indexed whole-element selector must fail");
+    assert!(
+        indexed_whole_error.contains("Ref:3:u[wrong_addr]")
+            && indexed_whole_error.contains("Ref:3:u[addr]")
+            && indexed_whole_error.contains("Cond:40:u["),
+        "unexpected indexed whole-element error: {indexed_whole_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "indexed_whole")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("addr".into());
     }
 
     if let Some(target) = summary

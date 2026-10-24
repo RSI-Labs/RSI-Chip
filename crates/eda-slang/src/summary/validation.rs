@@ -210,22 +210,7 @@ impl SlangAstSummary {
                         fingerprint_mode,
                     ) {
                         Some(fingerprint) => {
-                            let fingerprint =
-                                canonicalize_memory_fingerprint(&fingerprint, &memory_names);
-                            if strict_generated_hierarchy
-                                || (!fingerprint.starts_with("MemoryRead")
-                                    && !fingerprint.contains("PackedSelect:"))
-                                || memory_fingerprint_target_exists(&fingerprint, &memory_names)
-                            {
-                                fingerprint
-                            } else {
-                                // The bounded elaborator can legally lower a
-                                // source-level memory read into flattened nets
-                                // without retaining the source memory symbol.
-                                // Preserve assignment-count checking until that
-                                // representation carries an exact fingerprint.
-                                "?".to_string()
-                            }
+                            canonicalize_memory_fingerprint(&fingerprint, &memory_names)
                         }
                         None => "?".to_string(),
                     },
@@ -705,16 +690,33 @@ fn dynamic_array_read_fingerprint(
     parameters: &[super::SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    let expression = if expression.kind == "RangeSelect" {
+        let (start, width, ascending) = array_part_selection(expression)?;
+        if width != expression.operands.first()?.type_width?
+            || !ascending
+            || summary_literal_i64(start)? != 0
+        {
+            return None;
+        }
+        expression.operands.first()?
+    } else {
+        expression
+    };
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
     let memory = memory_type(&declaration.type_name)?;
-    if memory.dynamic
-        || memory.queue
-        || memory.associative
-        || memory.element_msb < memory.element_lsb
-    {
+    if memory.dynamic || memory.queue || memory.associative {
         return None;
+    }
+    if memory.element_msb < memory.element_lsb {
+        return reversed_dynamic_array_read_fingerprint(
+            target_name,
+            expression,
+            &declaration.type_name,
+            parameters,
+            mode,
+        );
     }
     let indexes = dynamic_array_read_indexes(expression)?;
     if indexes.len() != memory.dimensions.len() || expression.type_width? != memory.element_width {
@@ -774,6 +776,90 @@ fn dynamic_array_read_fingerprint(
     ))
 }
 
+fn reversed_dynamic_array_read_fingerprint(
+    target_name: &str,
+    expression: &super::SlangExpressionSummary,
+    type_name: &str,
+    parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let memory = memory_type(type_name)?;
+    let indexes = dynamic_array_read_indexes(expression)?;
+    let element_width = memory.element_width;
+    if indexes.len() != memory.dimensions.len()
+        || expression.type_width? != element_width
+        || memory.element_msb < 0
+    {
+        return None;
+    }
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    if total_width == 0 {
+        return None;
+    }
+
+    let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
+    let selector_fingerprints = indexes
+        .iter()
+        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
+        .collect::<Option<Vec<_>>>()?;
+    let mut selected_element = format!(
+        "Const:{element_width}:u[{element_width}:{}]",
+        "x".repeat(element_width)
+    );
+    let mut any_index_valid = "Const:1:u[1:0]".to_string();
+    for physical_element in 0..memory.flat_length {
+        let mut physical_offset = physical_element;
+        let mut scale = memory.flat_length;
+        let mut candidate_valid = "Const:1:u[1:1]".to_string();
+        for (dimension, selector) in memory.dimensions.iter().zip(&selector_fingerprints) {
+            scale = scale.checked_div(dimension.length as u64)?;
+            let dimension_offset = physical_offset / scale;
+            physical_offset %= scale;
+            let logical_index = dimension
+                .base
+                .checked_add(dimension.step.checked_mul(dimension_offset as i64)?)?;
+            let equals = format!("Eq:1:u[{selector},{}]", const32(logical_index as u64));
+            candidate_valid = format!("And:1:u[{candidate_valid},{equals}]");
+        }
+        any_index_valid = format!("Or:1:u[{any_index_valid},{candidate_valid}]");
+
+        let physical_lsb = (physical_element as usize).checked_mul(element_width)?;
+        let bits = (physical_lsb..physical_lsb + element_width)
+            .map(|bit| {
+                format!("PackedSelect:1:u[Ref:{total_width}:u[{target_name}],Range:{bit}:{bit}]")
+            })
+            .collect::<Vec<_>>();
+        let candidate = format!("Concat:{element_width}:u[{}]", bits.join(","));
+        selected_element =
+            format!("Cond:{element_width}:u[{candidate_valid},{candidate},{selected_element}]");
+    }
+
+    let normalized_start = format!(
+        "Sub:32:u[{},{}]",
+        const32(0),
+        const32(memory.element_msb.unsigned_abs())
+    );
+    let in_range = format!(
+        "And:1:u[Ge:1:u[{normalized_start},{}],Le:1:u[{normalized_start},{}]]",
+        const32(0),
+        const32(0)
+    );
+    let shifted = format!("Shr:{element_width}:u[{selected_element},{normalized_start}]");
+    let mask = format!(
+        "Const:{element_width}:u[{element_width}:{}]",
+        "1".repeat(element_width)
+    );
+    let selected = format!("And:{element_width}:u[{shifted},{mask}]");
+    let packed_result = format!(
+        "Cond:{element_width}:u[{in_range},{selected},Const:{element_width}:u[{element_width}:{}]]",
+        "x".repeat(element_width)
+    );
+    Some(format!(
+        "Cond:{element_width}:u[{any_index_valid},{packed_result},Const:{element_width}:u[{element_width}:{}]]",
+        "x".repeat(element_width)
+    ))
+}
+
 fn array_part_selection(
     expression: &super::SlangExpressionSummary,
 ) -> Option<(&super::SlangExpressionSummary, usize, bool)> {
@@ -829,12 +915,7 @@ fn dynamic_array_part_read_fingerprint(
         .iter()
         .find(|declaration| declaration.name == target_name)?;
     let memory = memory_type(&declaration.type_name)?;
-    if memory.dynamic
-        || memory.queue
-        || memory.associative
-        || memory.element_msb < memory.element_lsb
-        || memory.element_lsb < 0
-    {
+    if memory.dynamic || memory.queue || memory.associative || memory.element_lsb < 0 {
         return None;
     }
 
@@ -892,7 +973,16 @@ fn dynamic_array_part_read_fingerprint(
 
         let physical_lsb = (physical_element as usize).checked_mul(element_width)?;
         let physical_msb = physical_lsb.checked_add(element_width)?.checked_sub(1)?;
-        let candidate = if total_width == element_width {
+        let candidate = if memory.element_msb < memory.element_lsb {
+            let bits = (physical_lsb..physical_lsb + element_width)
+                .map(|bit| {
+                    format!(
+                        "PackedSelect:1:u[Ref:{total_width}:u[{target_name}],Range:{bit}:{bit}]"
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("Concat:{element_width}:u[{}]", bits.join(","))
+        } else if total_width == element_width {
             format!("Ref:{total_width}:u[{target_name}]")
         } else {
             format!(
@@ -911,7 +1001,14 @@ fn dynamic_array_part_read_fingerprint(
     };
     let normalized_start = format!(
         "Sub:32:u[{logical_start},{}]",
-        const32(memory.element_lsb.unsigned_abs())
+        const32(
+            if memory.element_msb < memory.element_lsb {
+                memory.element_msb
+            } else {
+                memory.element_lsb
+            }
+            .unsigned_abs()
+        )
     );
     let max_offset = element_width - width;
     let packed_in_range = format!(
