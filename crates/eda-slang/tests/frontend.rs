@@ -13535,6 +13535,62 @@ endmodule
         .rev()
         .fold(0_u64, |acc, byte| (acc << 8) | byte);
     assert_eq!(packed_simulator.read("q").unwrap().to_u64(), Some(expected));
+
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_lvalue"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower dynamic packed lvalue through the bounded differential path");
+    let mut bounded_summary = slang
+        .summarize_ast_json(&json)
+        .expect("resummarize authoritative dynamic-lvalue AST");
+    bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact bounded dynamic packed-lvalue fingerprint should match");
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment
+            .dynamic_packed_lvalue_selector
+            .as_mut()
+            .expect("bounded dynamic packed-lvalue selector")
+            .symbol = Some("wrong_selector".into());
+    }
+    let bounded_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong bounded dynamic packed-lvalue selector must fail");
+    assert!(
+        bounded_error.contains("Eq:1:u[Ref:3:u[wrong_selector],"),
+        "unexpected bounded dynamic-lvalue error: {bounded_error}"
+    );
+
+    let mut bounded_simulator =
+        Simulator::new(&bounded).expect("create bounded dynamic-lvalue simulator");
+    let mut bounded_expected = 0_u64;
+    for selector in 0..8_u64 {
+        let value = selector % 2;
+        bounded_expected |= value << selector;
+        bounded_simulator
+            .set_input("clk", &LogicWord::from_u64(1, 0))
+            .unwrap();
+        bounded_simulator
+            .set_input("selector", &LogicWord::from_u64(3, selector))
+            .unwrap();
+        bounded_simulator
+            .set_input("value", &LogicWord::from_u64(1, value))
+            .unwrap();
+        bounded_simulator
+            .set_input("clk", &LogicWord::from_u64(1, 1))
+            .unwrap();
+    }
+    assert_eq!(
+        bounded_simulator.read("q").unwrap().to_u64(),
+        Some(bounded_expected)
+    );
 }
 
 #[test]

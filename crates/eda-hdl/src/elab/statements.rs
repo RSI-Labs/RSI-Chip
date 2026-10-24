@@ -576,6 +576,11 @@ impl<'a> Elaborator<'a> {
                 };
                 return self.elab_stmt(&transformed, env);
             }
+            if let Some(statement) =
+                self.dynamic_packed_select_assignment(name, index, e, false, env)?
+            {
+                return Ok(statement);
+            }
         }
         if let ast::Stmt::NBL {
             lv: ast::Expr::Select(name, index),
@@ -611,6 +616,11 @@ impl<'a> Elaborator<'a> {
                     e: e.clone(),
                 };
                 return self.elab_stmt(&transformed, env);
+            }
+            if let Some(statement) =
+                self.dynamic_packed_select_assignment(name, index, e, true, env)?
+            {
+                return Ok(statement);
             }
         }
         if let ast::Stmt::BL {
@@ -1049,6 +1059,84 @@ impl<'a> Elaborator<'a> {
             Some(file_name) => canonical_parent.join(file_name),
             None => resolved_path,
         }
+    }
+
+    fn dynamic_packed_select_assignment(
+        &self,
+        name: &str,
+        index: &ast::Expr,
+        value: &ast::Expr,
+        nonblocking: bool,
+        env: &Env<'_>,
+    ) -> Result<Option<StmtIR>, String> {
+        let Ok(entry) = env.net(name) else {
+            return Ok(None);
+        };
+        if entry.array.is_some() || entry.memory.is_some() {
+            return Ok(None);
+        }
+        if self.const_eval(index, env.params, env.module_name).is_ok() {
+            return Ok(None);
+        }
+        let value = self.elab_expr(value, env)?;
+        if value.width() != 1 {
+            return Err(format!(
+                "dynamic packed assignment width {} does not match selected bit width 1",
+                value.width()
+            ));
+        }
+        let selector = self.elab_expr(index, env)?;
+        let selector_width = selector.width().max(1);
+        let old_value = self.elab_expr(&ast::Expr::Ident(name.to_string()), env)?;
+        let mut physical_bits = vec![None; entry.width];
+        let (first_logical_index, last_logical_index) = if entry.msb >= entry.lsb {
+            (entry.lsb, entry.msb)
+        } else {
+            (entry.msb, entry.lsb)
+        };
+
+        for logical_index in first_logical_index..=last_logical_index {
+            let physical_bit = entry.offset(logical_index)?;
+            let condition = ExprIR::Bin {
+                op: BinOp::Eq,
+                a: Box::new(selector.clone()),
+                b: Box::new(ExprIR::Const(LogicWord::from_u64(
+                    selector_width,
+                    logical_index as u64,
+                ))),
+            };
+            physical_bits[physical_bit] = Some(ExprIR::Cond {
+                c: Box::new(condition),
+                t: Box::new(ExprIR::Index {
+                    e: Box::new(value.clone()),
+                    msb: 0,
+                    lsb: 0,
+                }),
+                f: Box::new(ExprIR::Index {
+                    e: Box::new(old_value.clone()),
+                    msb: physical_bit,
+                    lsb: physical_bit,
+                }),
+            });
+        }
+
+        let mut bits = Vec::with_capacity(entry.width);
+        for bit in physical_bits.into_iter().rev() {
+            bits.push(bit.ok_or_else(|| {
+                "dynamic packed assignment did not cover a physical bit".to_string()
+            })?);
+        }
+        let updated = ExprIR::Concat(bits);
+        let lv = LValue {
+            net: entry.base,
+            decl_width: entry.width,
+            range: full_range(entry.width),
+        };
+        Ok(Some(if nonblocking {
+            StmtIR::NBl { lv, e: updated }
+        } else {
+            StmtIR::Bl { lv, e: updated }
+        }))
     }
 
     pub(super) fn elab_lvalue(&self, e: &ast::Expr, env: &Env) -> Result<LValue, String> {

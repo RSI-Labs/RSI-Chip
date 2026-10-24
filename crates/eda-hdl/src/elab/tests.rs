@@ -78,6 +78,70 @@ fn reversed_range_decl() {
 }
 
 #[test]
+fn dynamic_packed_select_assignment_builds_conditional_concat() {
+    let d = compile_ok(
+        "module m(input clk, input [2:0] selector, input value, output logic [7:0] q); \
+         always_ff @(posedge clk) q[selector] <= value; endmodule",
+    );
+    assert_eq!(d.processes.len(), 1);
+    let Stmt::NBl { lv, e } = &d.processes[0].body else {
+        panic!(
+            "expected nonblocking assignment, got {:?}",
+            d.processes[0].body
+        );
+    };
+    assert_eq!(lv.decl_width, 8);
+    assert_eq!(lv.range, Range::Span { msb: 7, lsb: 0 });
+    let Expr::Concat(bits) = e else {
+        panic!("expected conditional bit concatenation, got {e:?}");
+    };
+    assert_eq!(bits.len(), 8);
+    assert!(bits.iter().all(|bit| matches!(bit, Expr::Cond { .. })));
+
+    let blocking = compile_ok(
+        "module m(input [1:0] selector, input value, output logic [3:0] q); \
+         initial q[selector] = value; endmodule",
+    );
+    assert_eq!(blocking.initials.len(), 1);
+    let Stmt::Bl { lv, e } = &blocking.initials[0] else {
+        panic!(
+            "expected blocking assignment, got {:?}",
+            blocking.initials[0]
+        );
+    };
+    assert_eq!(lv.decl_width, 4);
+    assert_eq!(lv.range, Range::Span { msb: 3, lsb: 0 });
+    let Expr::Concat(blocking_bits) = e else {
+        panic!("expected blocking conditional concatenation, got {e:?}");
+    };
+    assert_eq!(blocking_bits.len(), 4);
+    assert!(blocking_bits
+        .iter()
+        .all(|bit| matches!(bit, Expr::Cond { .. })));
+
+    let reversed = compile_ok(
+        "module m(input clk, input [2:0] selector, input value, output logic [0:7] q); \
+         always_ff @(posedge clk) q[selector] <= value; endmodule",
+    );
+    assert_eq!(reversed.processes.len(), 1);
+    let Stmt::NBl { lv, e } = &reversed.processes[0].body else {
+        panic!(
+            "expected reversed nonblocking assignment, got {:?}",
+            reversed.processes[0].body
+        );
+    };
+    assert_eq!(lv.decl_width, 8);
+    assert_eq!(lv.range, Range::Span { msb: 7, lsb: 0 });
+    let Expr::Concat(reversed_bits) = e else {
+        panic!("expected reversed conditional concatenation, got {e:?}");
+    };
+    assert_eq!(reversed_bits.len(), 8);
+    assert!(reversed_bits
+        .iter()
+        .all(|bit| matches!(bit, Expr::Cond { .. })));
+}
+
+#[test]
 fn out_of_range_index_is_error() {
     assert!(compile(
         "module m(input [3:0] a, output y); assign y = a[7]; endmodule",

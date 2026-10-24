@@ -336,23 +336,19 @@ impl SlangAstSummary {
                             } else if let Some(selector) =
                                 assignment.dynamic_packed_lvalue_selector.as_ref()
                             {
-                                if !strict_generated_hierarchy {
-                                    "?".to_string()
-                                } else {
-                                    dynamic_packed_lvalue_fingerprint(
-                                        target,
-                                        selector,
-                                        &assignment.rhs,
-                                        &self.declarations,
-                                        &self.parameters,
-                                        fingerprint_mode,
+                                dynamic_packed_lvalue_fingerprint(
+                                    target,
+                                    selector,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.parameters,
+                                    fingerprint_mode,
+                                )
+                                .ok_or_else(|| {
+                                    format!(
+                                        "lowering could not fingerprint dynamic packed lvalue '{target}'"
                                     )
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "direct lowering could not fingerprint dynamic packed lvalue '{target}'"
-                                        )
-                                    })?
-                                }
+                                })?
                             } else {
                                 match slang_expression_fingerprint_with_parameters(
                                     &assignment.rhs,
