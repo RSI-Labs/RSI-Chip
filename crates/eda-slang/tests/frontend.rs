@@ -4822,6 +4822,47 @@ endmodule
     bounded_summary
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("exact constant-index array fingerprints should match");
+    if let Some(target) = bounded_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "y")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("wrong_addr".into());
+    }
+    let simple_range_index_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong dynamic array simple-range selector must fail");
+    assert!(
+        simple_range_index_error.contains("Ref:2:u[wrong_addr]")
+            && simple_range_index_error.contains("Ref:2:u[addr]")
+            && simple_range_index_error.contains("Cond:8:u["),
+        "unexpected simple-range selector error: {simple_range_index_error}"
+    );
+    if let Some(target) = bounded_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "y")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("addr".into());
+        target.rhs.type_width = Some(3);
+        target.rhs.operands[1].literal = Some("32:010".into());
+    }
+    let simple_range_width_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong dynamic array simple-range width must fail");
+    assert!(
+        simple_range_width_error.contains("Const:3:u[3:111]")
+            && simple_range_width_error.contains("Const:4:u[4:1111]"),
+        "unexpected simple-range width error: {simple_range_width_error}"
+    );
+    if let Some(target) = bounded_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "y")
+    {
+        target.rhs.type_width = Some(4);
+        target.rhs.operands[1].literal = Some("32:011".into());
+    }
     if let Some(assignment) = bounded_summary
         .procedural_blocks
         .iter_mut()
@@ -5336,7 +5377,8 @@ module memory2d_constant_parts(
   input logic [2:0] start,
   input logic [7:0] wdata,
   output logic [7:0] q,
-  output logic [3:0] p
+  output logic [3:0] p,
+  output logic [3:0] r
 );
   logic [7:0] mem [0:1][2:3];
   initial begin
@@ -5345,6 +5387,7 @@ module memory2d_constant_parts(
   always @(posedge clk) mem[1][3][start +: 4] <= wdata[3:0];
   assign q = mem[1][3];
   assign p = mem[1][3][start +: 4];
+  assign r = mem[1][3][5:2];
 endmodule
 "#,
     )
@@ -5463,6 +5506,31 @@ endmodule
         target.rhs.operands[2].literal = Some("32:00000000000000000000000000000100".into());
     }
 
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "r")
+    {
+        target.rhs.type_width = Some(3);
+        target.rhs.operands[1].literal = Some("32:100".into());
+    }
+    let constant_simple_range_width_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant multidimensional array simple-range width must fail");
+    assert!(
+        constant_simple_range_width_error.contains("Const:3:u[3:111]")
+            && constant_simple_range_width_error.contains("Const:4:u[4:1111]"),
+        "unexpected constant simple-range width error: {constant_simple_range_width_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "r")
+    {
+        target.rhs.type_width = Some(4);
+        target.rhs.operands[1].literal = Some("32:101".into());
+    }
+
     if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
         block
             .assignments
@@ -5561,11 +5629,13 @@ endmodule
         .expect("set direct part data");
     assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
     assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    assert_eq!(direct_simulator.read("r").unwrap().to_u64(), Some(0xd));
     direct_simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .expect("create direct posedge");
     assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0xa4));
     assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0xa));
+    assert_eq!(direct_simulator.read("r").unwrap().to_u64(), Some(0x9));
 
     let mut bounded_simulator =
         Simulator::new(&bounded).expect("create bounded multidimensional part simulator");
@@ -5580,11 +5650,13 @@ endmodule
         .expect("set bounded part data");
     assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0x34));
     assert_eq!(bounded_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    assert_eq!(bounded_simulator.read("r").unwrap().to_u64(), Some(0xd));
     bounded_simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .expect("create bounded posedge");
     assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0xa4));
     assert_eq!(bounded_simulator.read("p").unwrap().to_u64(), Some(0xa));
+    assert_eq!(bounded_simulator.read("r").unwrap().to_u64(), Some(0x9));
 }
 
 #[test]

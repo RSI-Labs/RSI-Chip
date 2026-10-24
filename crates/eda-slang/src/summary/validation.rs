@@ -774,6 +774,43 @@ fn dynamic_array_read_fingerprint(
     ))
 }
 
+fn array_part_selection(
+    expression: &super::SlangExpressionSummary,
+) -> Option<(&super::SlangExpressionSummary, usize, bool)> {
+    let width = expression.type_width?;
+    if width == 0 {
+        return None;
+    }
+    match expression.selection_kind.as_str() {
+        "IndexedUp" | "IndexedDown" => {
+            let declared_width = summary_literal_i64(expression.operands.get(2)?)?;
+            if declared_width != i64::try_from(width).ok()? {
+                return None;
+            }
+            let start = expression.operands.get(1)?;
+            let ascending = expression.selection_kind == "IndexedUp";
+            Some((start, width, ascending))
+        }
+        "Simple" => {
+            let left = summary_literal_i64(expression.operands.get(1)?)?;
+            let right = summary_literal_i64(expression.operands.get(2)?)?;
+            let range_width = left.abs_diff(right).checked_add(1)?;
+            let range_width = usize::try_from(range_width).ok()?;
+            if range_width != width {
+                return None;
+            }
+            let ascending = left >= right;
+            let start = if ascending {
+                expression.operands.get(2)?
+            } else {
+                expression.operands.get(1)?
+            };
+            Some((start, width, ascending))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dynamic_array_part_read_fingerprint(
     target_name: &str,
@@ -783,15 +820,11 @@ fn dynamic_array_part_read_fingerprint(
     parameters: &[super::SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
-    if expression.kind != "RangeSelect"
-        || !matches!(
-            expression.selection_kind.as_str(),
-            "IndexedUp" | "IndexedDown"
-        )
-    {
+    if expression.kind != "RangeSelect" {
         return None;
     }
     let selected = expression.operands.first()?;
+    let (start_expression, width, ascending) = array_part_selection(expression)?;
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
@@ -806,22 +839,17 @@ fn dynamic_array_part_read_fingerprint(
     }
 
     let indexes = dynamic_array_read_indexes(selected)?;
-    let width = expression.type_width?;
     let element_width = memory.element_width;
     if indexes.len() != memory.dimensions.len()
         || selected.type_width? != element_width
         || width == 0
         || width > element_width
-        || summary_literal_i64(expression.operands.get(2)?)? != i64::try_from(width).ok()?
     {
         return None;
     }
     // The bounded elaborator canonicalizes a full-width ascending select from
     // bit zero to its arithmetic whole-element read form.
-    if width == element_width
-        && expression.selection_kind == "IndexedUp"
-        && summary_literal_i64(expression.operands.get(1)?)? == 0
-    {
+    if width == element_width && ascending && summary_literal_i64(start_expression)? == 0 {
         return None;
     }
 
@@ -864,19 +892,19 @@ fn dynamic_array_part_read_fingerprint(
 
         let physical_lsb = (physical_element as usize).checked_mul(element_width)?;
         let physical_msb = physical_lsb.checked_add(element_width)?.checked_sub(1)?;
-        let candidate = format!(
-            "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
-        );
+        let candidate = if total_width == element_width {
+            format!("Ref:{total_width}:u[{target_name}]")
+        } else {
+            format!(
+                "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
+            )
+        };
         selected_element =
             format!("Cond:{element_width}:u[{candidate_valid},{candidate},{selected_element}]");
     }
 
-    let start = slang_expression_fingerprint_with_parameters(
-        expression.operands.get(1)?,
-        parameters,
-        mode,
-    )?;
-    let logical_start = if expression.selection_kind == "IndexedUp" {
+    let start = slang_expression_fingerprint_with_parameters(start_expression, parameters, mode)?;
+    let logical_start = if ascending {
         start
     } else {
         format!("Sub:32:u[{start},{}]", const32(width as u64 - 1))
@@ -912,15 +940,11 @@ fn constant_array_part_read_fingerprint(
     parameters: &[super::SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
-    if expression.kind != "RangeSelect"
-        || !matches!(
-            expression.selection_kind.as_str(),
-            "IndexedUp" | "IndexedDown"
-        )
-    {
+    if expression.kind != "RangeSelect" {
         return None;
     }
     let selected = expression.operands.first()?;
+    let (start_expression, width, ascending) = array_part_selection(expression)?;
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
@@ -935,13 +959,11 @@ fn constant_array_part_read_fingerprint(
     }
 
     let indexes = dynamic_array_read_indexes(selected)?;
-    let width = expression.type_width?;
     let element_width = memory.element_width;
     if indexes.len() != memory.dimensions.len()
         || selected.type_width? != element_width
         || width == 0
         || width > element_width
-        || summary_literal_i64(expression.operands.get(2)?)? != i64::try_from(width).ok()?
     {
         return None;
     }
@@ -973,17 +995,17 @@ fn constant_array_part_read_fingerprint(
     }
     let physical_lsb = element_index.checked_mul(element_width)?;
     let physical_msb = physical_lsb.checked_add(element_width)?.checked_sub(1)?;
-    let selected_element = format!(
-        "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
-    );
+    let selected_element = if total_width == element_width {
+        format!("Ref:{total_width}:u[{target_name}]")
+    } else {
+        format!(
+            "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
+        )
+    };
 
     let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
-    let start = slang_expression_fingerprint_with_parameters(
-        expression.operands.get(1)?,
-        parameters,
-        mode,
-    )?;
-    let logical_start = if expression.selection_kind == "IndexedUp" {
+    let start = slang_expression_fingerprint_with_parameters(start_expression, parameters, mode)?;
+    let logical_start = if ascending {
         start
     } else {
         format!("Sub:32:u[{start},{}]", const32(width as u64 - 1))
