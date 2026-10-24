@@ -499,23 +499,14 @@ fn dynamic_array_lvalue_indexes(value: &Value) -> Vec<SlangExpressionSummary> {
     if string_field(value, "kind").as_deref() != Some("ElementSelect") {
         return Vec::new();
     }
-    let Some(selected) = value.get("value") else {
+    let Some(indexes) = array_indexes(value) else {
         return Vec::new();
     };
-    if !matches!(
-        string_field(selected, "kind").as_deref(),
-        Some("NamedValue" | "HierarchicalValue")
-    ) {
-        return Vec::new();
-    }
-    if !string_field(selected, "type").is_some_and(|type_name| type_name.contains('$')) {
-        return Vec::new();
-    }
-    let Some(selector) = value.get("selector") else {
-        return Vec::new();
-    };
-    if slang_constant_u64(selector).is_err() {
-        vec![expression_summary(selector)]
+    if indexes
+        .iter()
+        .any(|index| summary_literal_i64(index).is_none())
+    {
+        indexes
     } else {
         Vec::new()
     }

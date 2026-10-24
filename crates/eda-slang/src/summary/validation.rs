@@ -651,12 +651,9 @@ fn dynamic_array_element_lvalue_fingerprint(
     if memory.dynamic || memory.queue || memory.associative {
         return None;
     }
-    let [selector] = indexes else {
+    if indexes.len() != memory.dimensions.len() {
         return None;
-    };
-    let [dimension] = &memory.dimensions[..] else {
-        return None;
-    };
+    }
     if memory.element_msb < memory.element_lsb {
         return None;
     }
@@ -671,48 +668,55 @@ fn dynamic_array_element_lvalue_fingerprint(
         return None;
     }
 
-    let base = dimension.base;
-    let last = base + dimension.step * (dimension.length as i64 - 1);
-    let lower = base.min(last);
-    let upper = base.max(last);
-    if lower < 0 || upper < 0 || lower > i64::from(u32::MAX) || upper > i64::from(u32::MAX) {
-        return None;
-    }
-
-    let selector_fingerprint =
-        slang_expression_fingerprint_with_parameters(selector, parameters, mode)?;
+    let selector_fingerprints = indexes
+        .iter()
+        .map(|selector| slang_expression_fingerprint_with_parameters(selector, parameters, mode))
+        .collect::<Option<Vec<_>>>()?;
     let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
     let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
     let const_total =
         |value: u64| format!("Const:{total_width}:u[{total_width}:{value:0total_width$b}]");
 
-    let lower_bound = format!(
-        "Ge:1:u[{selector_fingerprint},{}]",
-        const32(lower.unsigned_abs())
-    );
-    let upper_bound = format!(
-        "Le:1:u[{selector_fingerprint},{}]",
-        const32(upper.unsigned_abs())
-    );
-    let in_range = format!("LogAnd:1:u[Const:1:u[1:1],LogAnd:1:u[{lower_bound},{upper_bound}]]");
-    let normalized = if base <= last {
-        format!(
-            "Sub:32:u[{selector_fingerprint},{}]",
-            const32(base.unsigned_abs())
-        )
-    } else {
-        format!(
-            "Sub:32:u[{},{}]",
-            const32(base.unsigned_abs()),
-            selector_fingerprint
-        )
-    };
-    let stride = memory.flat_length / u64::try_from(dimension.length).ok()?;
-    let physical_index = format!(
-        "Add:32:u[{},Mul:32:u[{normalized},{}]]",
-        const32(0),
-        const32(stride)
-    );
+    let mut in_range = "Const:1:u[1:1]".to_string();
+    let mut physical_index = const32(0);
+    let mut stride = memory.flat_length;
+    for (selector_fingerprint, dimension) in selector_fingerprints.iter().zip(&memory.dimensions) {
+        let base = dimension.base;
+        let last = base + dimension.step * (dimension.length as i64 - 1);
+        let lower = base.min(last);
+        let upper = base.max(last);
+        if lower < 0 || upper < 0 || lower > i64::from(u32::MAX) || upper > i64::from(u32::MAX) {
+            return None;
+        }
+
+        let lower_bound = format!(
+            "Ge:1:u[{selector_fingerprint},{}]",
+            const32(lower.unsigned_abs())
+        );
+        let upper_bound = format!(
+            "Le:1:u[{selector_fingerprint},{}]",
+            const32(upper.unsigned_abs())
+        );
+        in_range = format!("LogAnd:1:u[{in_range},LogAnd:1:u[{lower_bound},{upper_bound}]]");
+        let normalized = if base <= last {
+            format!(
+                "Sub:32:u[{selector_fingerprint},{}]",
+                const32(base.unsigned_abs())
+            )
+        } else {
+            format!(
+                "Sub:32:u[{},{}]",
+                const32(base.unsigned_abs()),
+                selector_fingerprint
+            )
+        };
+        let dimension_length = u64::try_from(dimension.length).ok()?;
+        stride = stride.checked_div(dimension_length)?;
+        physical_index = format!(
+            "Add:32:u[{physical_index},Mul:32:u[{normalized},{}]]",
+            const32(stride)
+        );
+    }
     let bit_offset = format!(
         "Mul:32:u[{physical_index},{}]",
         const32(element_width as u64)

@@ -4496,6 +4496,75 @@ endmodule
     direct_summary
         .validate_against_design(&direct)
         .expect("exact multidimensional memory fingerprints should match");
+    let mut bounded_summary = direct_summary.clone();
+    bounded_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect("exact dynamic multidimensional whole-element fingerprint should match");
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.dynamic_array_lvalue_indexes.len() == 2)
+        })
+    {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("wrong_x".into());
+    }
+    let bounded_first_index_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong bounded first multidimensional index must fail");
+    assert!(
+        bounded_first_index_error.contains("Ref:2:u[wrong_x]")
+            && bounded_first_index_error.contains("Ref:2:u[x]")
+            && bounded_first_index_error.contains("Cond:32:u["),
+        "unexpected bounded first index error: {bounded_first_index_error}"
+    );
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.dynamic_array_lvalue_indexes.len() == 2)
+        })
+    {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("x".into());
+        assignment.dynamic_array_lvalue_indexes[1].symbol = Some("wrong_y".into());
+    }
+    let bounded_second_index_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong bounded second multidimensional index must fail");
+    assert!(
+        bounded_second_index_error.contains("Ref:3:u[wrong_y]")
+            && bounded_second_index_error.contains("Ref:3:u[y]")
+            && bounded_second_index_error.contains("Cond:32:u["),
+        "unexpected bounded second index error: {bounded_second_index_error}"
+    );
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.dynamic_array_lvalue_indexes.len() == 2)
+        })
+    {
+        assignment.dynamic_array_lvalue_indexes[1].symbol = Some("y".into());
+        assignment.rhs.symbol = Some("wrong_data".into());
+    }
+    let bounded_value_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong bounded multidimensional value must fail");
+    assert!(
+        bounded_value_error.contains("Ref:8:u[wrong_data]")
+            && bounded_value_error.contains("Ref:8:u[wdata]")
+            && bounded_value_error.contains("Cond:32:u["),
+        "unexpected bounded value error: {bounded_value_error}"
+    );
 
     let mut wrong_first_index = direct_summary.clone();
     if let Some(assignment) = wrong_first_index
