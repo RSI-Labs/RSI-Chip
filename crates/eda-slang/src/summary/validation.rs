@@ -5,7 +5,7 @@ use super::expressions::{
     slang_expression_fingerprint_with_parameters, ExpressionFingerprintMode,
 };
 use super::*;
-use crate::types::simple_type_shape;
+use crate::types::{memory_type, simple_type_shape};
 
 fn stable_class_metadata_key(symbol: &str) -> String {
     symbol
@@ -317,7 +317,25 @@ impl SlangAstSummary {
                         } else {
                             let legacy_array_shape = !strict_generated_hierarchy
                                 && legacy_array_targets.contains(target);
-                            if legacy_array_shape {
+                            if legacy_array_shape
+                                && !assignment.dynamic_array_lvalue_indexes.is_empty()
+                            {
+                                dynamic_array_element_lvalue_fingerprint(
+                                    target,
+                                    &assignment.dynamic_array_lvalue_indexes,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.parameters,
+                                    fingerprint_mode,
+                                )
+                                .ok_or_else(|| {
+                                    format!(
+                                        "lowering could not fingerprint dynamic array lvalue '{target}'"
+                                    )
+                                })?
+                            } else if legacy_array_shape
+                                && !assignment.constant_array_element_lvalue
+                            {
                                 // Small arrays still use the legacy bounded
                                 // per-element expansion, whose expression tree is
                                 // intentionally not structurally equivalent to the
@@ -591,6 +609,111 @@ fn memory_member_lvalue_fingerprint(
         parts.push(format!("PackedSelect:{}:u[{old},Range:{msb}:0]", msb + 1));
     }
     Some(format!("Concat:{element_width}:u[{}]", parts.join(",")))
+}
+
+fn dynamic_array_element_lvalue_fingerprint(
+    target_name: &str,
+    indexes: &[super::SlangExpressionSummary],
+    value: &super::SlangExpressionSummary,
+    declarations: &[super::SlangDeclarationSummary],
+    parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let memory = memory_type(&declaration.type_name)?;
+    if memory.dynamic || memory.queue || memory.associative {
+        return None;
+    }
+    let [selector] = indexes else {
+        return None;
+    };
+    let [dimension] = &memory.dimensions[..] else {
+        return None;
+    };
+    if memory.element_msb < memory.element_lsb {
+        return None;
+    }
+
+    let element_width = memory.element_width;
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    if total_width == 0 || total_width > u32::BITS as usize {
+        return None;
+    }
+    let value_width = value.type_width?;
+    if value_width != element_width {
+        return None;
+    }
+
+    let base = dimension.base;
+    let last = base + dimension.step * (dimension.length as i64 - 1);
+    let lower = base.min(last);
+    let upper = base.max(last);
+    if lower < 0 || upper < 0 || lower > i64::from(u32::MAX) || upper > i64::from(u32::MAX) {
+        return None;
+    }
+
+    let selector_fingerprint =
+        slang_expression_fingerprint_with_parameters(selector, parameters, mode)?;
+    let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
+    let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
+    let const_total =
+        |value: u64| format!("Const:{total_width}:u[{total_width}:{value:0total_width$b}]");
+
+    let lower_bound = format!(
+        "Ge:1:u[{selector_fingerprint},{}]",
+        const32(lower.unsigned_abs())
+    );
+    let upper_bound = format!(
+        "Le:1:u[{selector_fingerprint},{}]",
+        const32(upper.unsigned_abs())
+    );
+    let in_range = format!("LogAnd:1:u[Const:1:u[1:1],LogAnd:1:u[{lower_bound},{upper_bound}]]");
+    let normalized = if base <= last {
+        format!(
+            "Sub:32:u[{selector_fingerprint},{}]",
+            const32(base.unsigned_abs())
+        )
+    } else {
+        format!(
+            "Sub:32:u[{},{}]",
+            const32(base.unsigned_abs()),
+            selector_fingerprint
+        )
+    };
+    let stride = memory.flat_length / u64::try_from(dimension.length).ok()?;
+    let physical_index = format!(
+        "Add:32:u[{},Mul:32:u[{normalized},{}]]",
+        const32(0),
+        const32(stride)
+    );
+    let bit_offset = format!(
+        "Mul:32:u[{physical_index},{}]",
+        const32(element_width as u64)
+    );
+
+    let old = format!("Ref:{total_width}:u[{target_name}]");
+    let wide_value = if value_width < total_width {
+        let padding = total_width - value_width;
+        let padding_zero = format!("Const:{padding}:u[{padding}:{:0padding$b}]", 0);
+        format!(
+            "Concat:{total_width}:u[{},{}]",
+            padding_zero, value_fingerprint
+        )
+    } else {
+        value_fingerprint
+    };
+    let shifted_value = format!(
+        "Or:{total_width}:u[Shl:{total_width}:u[{wide_value},{bit_offset}],{}]",
+        const_total(0)
+    );
+    let mask = (1_u64 << element_width) - 1;
+    let selected_mask = format!("Shl:{total_width}:u[{},{}]", const_total(mask), bit_offset);
+    let merged = format!(
+        "Or:{total_width}:u[And:{total_width}:u[{old},Not:{total_width}:u[{selected_mask}]],{shifted_value}]"
+    );
+    Some(format!("Cond:{total_width}:u[{in_range},{merged},{old}]"))
 }
 
 fn dynamic_packed_lvalue_fingerprint(

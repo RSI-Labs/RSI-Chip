@@ -299,6 +299,7 @@ pub(crate) fn procedural_assignments(
                     .then(|| left.get("selector").map(expression_summary))
                     .flatten();
                 let memory_member_lvalue = memory_member_lvalue_summary(left);
+                let dynamic_array_lvalue_indexes = dynamic_array_lvalue_indexes(left);
                 assignments.push(SlangAssignmentSummary {
                     target_names: expression_target_names(left),
                     rhs: expression_summary(right),
@@ -306,6 +307,8 @@ pub(crate) fn procedural_assignments(
                     dynamic_packed_lvalue,
                     dynamic_packed_lvalue_selector,
                     memory_member_lvalue,
+                    constant_array_element_lvalue: constant_array_element_lvalue(left),
+                    dynamic_array_lvalue_indexes,
                     class_handle_source,
                     class_handle_target_key,
                     class_handle_source_key,
@@ -415,6 +418,64 @@ fn class_handle_copy_block(
         ));
     }
     Some((target_object, format!("ClassHandleCopy:{source_object}")))
+}
+
+fn constant_array_element_lvalue(value: &Value) -> bool {
+    match string_field(value, "kind").as_deref() {
+        Some("ElementSelect") => {
+            let Some(selected) = value.get("value") else {
+                return false;
+            };
+            let Some(selector) = value.get("selector") else {
+                return false;
+            };
+            let selected_is_array = matches!(
+                string_field(selected, "kind").as_deref(),
+                Some("NamedValue" | "HierarchicalValue")
+            ) && string_field(selected, "type")
+                .is_some_and(|type_name| type_name.contains('$'));
+            slang_constant_u64(selector).is_ok()
+                && (selected_is_array || constant_array_element_lvalue(selected))
+        }
+        Some("RangeSelect") => {
+            let Some(selected) = value.get("value") else {
+                return false;
+            };
+            let (Some(left), Some(right)) = (value.get("left"), value.get("right")) else {
+                return false;
+            };
+            constant_array_element_lvalue(selected)
+                && slang_constant_u64(left).is_ok()
+                && slang_constant_u64(right).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn dynamic_array_lvalue_indexes(value: &Value) -> Vec<SlangExpressionSummary> {
+    if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+        return Vec::new();
+    }
+    let Some(selected) = value.get("value") else {
+        return Vec::new();
+    };
+    if !matches!(
+        string_field(selected, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return Vec::new();
+    }
+    if !string_field(selected, "type").is_some_and(|type_name| type_name.contains('$')) {
+        return Vec::new();
+    }
+    let Some(selector) = value.get("selector") else {
+        return Vec::new();
+    };
+    if slang_constant_u64(selector).is_err() {
+        vec![expression_summary(selector)]
+    } else {
+        Vec::new()
+    }
 }
 
 fn class_handle_source_path(

@@ -2113,6 +2113,11 @@ pub struct SlangAssignmentSummary {
     /// Member writes through a sparse-memory element are canonicalized into a
     /// whole-memory-element concat.
     pub memory_member_lvalue: Option<SlangMemoryMemberLvalueSummary>,
+    /// Constant-index unpacked-array lvalues can be compared by their RHS
+    /// fingerprint even when the bounded path flattens the array storage.
+    pub constant_array_element_lvalue: bool,
+    /// Selectors of a one-dimensional dynamic unpacked-array element lvalue.
+    pub dynamic_array_lvalue_indexes: Vec<SlangExpressionSummary>,
     /// Canonical source object path for a whole class-handle assignment.
     pub class_handle_source: Option<String>,
     /// Authoritative slang symbol ID for a field-less whole-handle target.

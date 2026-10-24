@@ -3708,6 +3708,63 @@ endmodule
         format!("{:?}", reference.ports),
         format!("{:?}", design.ports)
     );
+    let reference_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize legacy-array AST");
+    let mut reference_summary = slang
+        .summarize_ast_json(&reference_json)
+        .expect("summarize legacy-array AST");
+    reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect("exact dynamic array lvalue fingerprint should match");
+    if let Some(assignment) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .dynamic_array_lvalue_indexes
+                    .first()
+                    .is_some_and(|selector| selector.symbol.as_deref() == Some("addr"))
+            })
+        })
+    {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("wrong_addr".into());
+    }
+    let selector_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic array selector must fail");
+    assert!(
+        selector_error.contains("Ref:2:u[wrong_addr]") && selector_error.contains("Ref:2:u[addr]"),
+        "unexpected dynamic array selector error: {selector_error}"
+    );
+    if let Some(assignment) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .dynamic_array_lvalue_indexes
+                    .first()
+                    .is_some_and(|selector| selector.symbol.as_deref() == Some("wrong_addr"))
+            })
+        })
+    {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("addr".into());
+        assignment.rhs.symbol = Some("wrong_data".into());
+    }
+    let value_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic array value must fail");
+    assert!(
+        value_error.contains("Ref:8:u[wrong_data]") && value_error.contains("Ref:8:u[wdata]"),
+        "unexpected dynamic array value error: {value_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create sparse-memory simulator");
     simulator
@@ -4213,6 +4270,56 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower array-element simple range through bounded path");
+    let bounded_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("simple_range"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize bounded array-element AST");
+    let mut bounded_summary = slang
+        .summarize_ast_json(&bounded_json)
+        .expect("summarize bounded array-element AST");
+    bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact constant-index array fingerprints should match");
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment.rhs.operands[0].literal = Some("8:10100100".into());
+    }
+    let whole_element_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant-index whole-element RHS must fail");
+    assert!(
+        whole_element_error.contains("Const:8:u[8:10100100]")
+            && whole_element_error.contains("Const:8:u[8:10011100]"),
+        "unexpected whole-element error: {whole_element_error}"
+    );
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.first_mut())
+    {
+        assignment.rhs.operands[0].literal = Some("8:10011100".into());
+    }
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| block.assignments.get_mut(1))
+    {
+        assignment.rhs.operands[0].literal = Some("2:10".into());
+    }
+    let range_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant-index array range RHS must fail");
+    assert!(
+        range_error.contains("Const:2:u[2:10]") && range_error.contains("Const:2:u[2:01]"),
+        "unexpected array-range error: {range_error}"
+    );
     assert_eq!(direct.memories.len(), 1);
 
     let mut direct_simulator = Simulator::new(&direct).expect("create direct simulator");
