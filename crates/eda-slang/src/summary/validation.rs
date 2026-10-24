@@ -660,7 +660,7 @@ fn dynamic_array_element_lvalue_fingerprint(
 
     let element_width = memory.element_width;
     let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
-    if total_width == 0 || total_width > u32::BITS as usize {
+    if total_width == 0 {
         return None;
     }
     let value_width = value.type_width?;
@@ -674,8 +674,7 @@ fn dynamic_array_element_lvalue_fingerprint(
         .collect::<Option<Vec<_>>>()?;
     let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
     let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
-    let const_total =
-        |value: u64| format!("Const:{total_width}:u[{total_width}:{value:0total_width$b}]");
+    let const_total_bits = |bits: &str| format!("Const:{total_width}:u[{total_width}:{bits}]");
 
     let mut in_range = "Const:1:u[1:1]".to_string();
     let mut physical_index = const32(0);
@@ -735,10 +734,18 @@ fn dynamic_array_element_lvalue_fingerprint(
     };
     let shifted_value = format!(
         "Or:{total_width}:u[Shl:{total_width}:u[{wide_value},{bit_offset}],{}]",
-        const_total(0)
+        const_total_bits(&"0".repeat(total_width))
     );
-    let mask = (1_u64 << element_width) - 1;
-    let selected_mask = format!("Shl:{total_width}:u[{},{}]", const_total(mask), bit_offset);
+    let selected_mask_bits = format!(
+        "{}{}",
+        "0".repeat(total_width - element_width),
+        "1".repeat(element_width)
+    );
+    let selected_mask = format!(
+        "Shl:{total_width}:u[{},{}]",
+        const_total_bits(&selected_mask_bits),
+        bit_offset
+    );
     let merged = format!(
         "Or:{total_width}:u[And:{total_width}:u[{old},Not:{total_width}:u[{selected_mask}]],{shifted_value}]"
     );
@@ -769,7 +776,7 @@ fn array_part_lvalue_fingerprints(
     let element_width = memory.element_width;
     let flat_length = usize::try_from(memory.flat_length).ok()?;
     let total_width = element_width.checked_mul(flat_length)?;
-    if total_width == 0 || total_width > u32::BITS as usize {
+    if total_width == 0 {
         return None;
     }
     if part.width == 0 || part.width > element_width {

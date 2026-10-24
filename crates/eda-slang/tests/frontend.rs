@@ -4329,6 +4329,208 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_uses_wide_dynamic_array_fingerprints() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("wide-dynamic-array-parts");
+    let source_path = root.join("wide_dynamic_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module wide_dynamic_array(
+  input logic clk,
+  input logic [2:0] addr,
+  input logic [2:0] start,
+  input logic [7:0] wdata,
+  output logic [7:0] whole,
+  output logic [3:0] part
+);
+  logic [7:0] mem [0:4];
+  initial begin
+    mem[0] = 8'h12;
+    mem[4] = 8'h34;
+  end
+  always @(posedge clk) begin
+    mem[addr] <= wdata;
+    mem[addr][start +: 4] <= wdata[3:0];
+  end
+  assign whole = mem[addr];
+  assign part = mem[addr][start +: 4];
+endmodule
+"#,
+    )
+    .expect("write wide dynamic array source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("wide_dynamic_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower wide dynamic array");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("wide_dynamic_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower wide dynamic array through bounded path");
+    assert_eq!(direct.memories.len(), 1);
+    assert!(bounded.memories.is_empty());
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("wide_dynamic_array"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize wide dynamic array AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize wide dynamic array AST");
+    summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact wide dynamic array fingerprints should match");
+
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.dynamic_array_lvalue_indexes.len() == 1)
+    }) {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("wrong_addr".into());
+    }
+    let whole_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong wide whole-element selector must fail");
+    assert!(
+        whole_error.contains("Ref:3:u[wrong_addr]")
+            && whole_error.contains("Ref:3:u[addr]")
+            && whole_error.contains("Cond:40:u["),
+        "unexpected wide whole-element error: {whole_error}"
+    );
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.dynamic_array_lvalue_indexes.len() == 1)
+    }) {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("addr".into());
+        assignment.rhs.symbol = Some("wrong_data".into());
+    }
+    let whole_value_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong wide whole-element value must fail");
+    assert!(
+        whole_value_error.contains("Ref:8:u[wrong_data]")
+            && whole_value_error.contains("Ref:8:u[wdata]")
+            && whole_value_error.contains("Cond:40:u["),
+        "unexpected wide whole-value error: {whole_value_error}"
+    );
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.array_part_lvalue.is_some())
+    }) {
+        assignment.rhs.symbol = Some("wdata".into());
+        assignment.array_part_lvalue.as_mut().unwrap().start.symbol = Some("wrong_start".into());
+    }
+    let part_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong wide part start must fail");
+    assert!(
+        part_error.contains("Ref:3:u[wrong_start]")
+            && part_error.contains("Ref:3:u[start]")
+            && part_error.contains("GuardedArrayPartWrite:4:u["),
+        "unexpected wide part error: {part_error}"
+    );
+    if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+    }) {
+        part.start.symbol = Some("start".into());
+        part.width = 3;
+    }
+    let width_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong wide part width must fail closed");
+    assert!(
+        width_error.contains("could not fingerprint array part lvalue 'mem'"),
+        "unexpected wide part width error: {width_error}"
+    );
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.array_part_lvalue.is_some())
+    }) {
+        assignment.array_part_lvalue.as_mut().unwrap().width = 4;
+        assignment.rhs.operands[0].symbol = Some("wrong_data".into());
+    }
+    let part_value_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong wide part value must fail");
+    assert!(
+        part_value_error.contains("PackedSelect:4:u[Ref:8:u[wrong_data]")
+            && part_value_error.contains("PackedSelect:4:u[Ref:8:u[wdata]"),
+        "unexpected wide part value error: {part_value_error}"
+    );
+
+    let mut direct_simulator = Simulator::new(&direct).expect("create direct wide-array simulator");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize direct clock");
+    direct_simulator
+        .set_input("addr", &LogicWord::from_u64(3, 4))
+        .expect("select direct element");
+    direct_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set direct part start");
+    direct_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .expect("set direct data");
+    assert_eq!(direct_simulator.read("whole").unwrap().to_u64(), Some(0x34));
+    assert_eq!(direct_simulator.read("part").unwrap().to_u64(), Some(0x3));
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create direct posedge");
+    assert_eq!(direct_simulator.read("whole").unwrap().to_u64(), Some(0xaa));
+    assert_eq!(direct_simulator.read("part").unwrap().to_u64(), Some(0xa));
+
+    let mut bounded_simulator =
+        Simulator::new(&bounded).expect("create bounded wide-array simulator");
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize bounded clock");
+    bounded_simulator
+        .set_input("addr", &LogicWord::from_u64(3, 4))
+        .expect("select bounded element");
+    bounded_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set bounded part start");
+    bounded_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .expect("set bounded data");
+    assert_eq!(
+        bounded_simulator.read("whole").unwrap().to_u64(),
+        Some(0x34)
+    );
+    assert_eq!(bounded_simulator.read("part").unwrap().to_u64(), Some(0x3));
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create bounded posedge");
+    assert_eq!(
+        bounded_simulator.read("whole").unwrap().to_u64(),
+        Some(0xaa)
+    );
+    assert_eq!(bounded_simulator.read("part").unwrap().to_u64(), Some(0xa));
+}
+
+#[test]
 fn slang_and_bounded_paths_lower_array_element_simple_ranges() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
