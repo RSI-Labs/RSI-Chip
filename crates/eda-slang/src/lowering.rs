@@ -35,7 +35,16 @@ fn collect_compilation_unit_definitions(
             string_field(member, "kind").as_deref(),
             Some("Parameter" | "Subroutine" | "TypeAlias" | "EnumType")
         ) {
-            definitions.push(member.clone());
+            let mut definition = member.clone();
+            if string_field(member, "kind").as_deref() == Some("TypeAlias") {
+                if let Some(fields) = definition.as_object_mut() {
+                    fields.insert(
+                        "eda_package_scope".into(),
+                        serde_json::Value::String(string_field(value, "name").unwrap_or_default()),
+                    );
+                }
+            }
+            definitions.push(definition);
         }
     }
 }

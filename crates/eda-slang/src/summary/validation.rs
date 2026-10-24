@@ -544,14 +544,7 @@ fn memory_member_lvalue_fingerprint(
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
-    let alias = declaration
-        .type_name
-        .split('$')
-        .next()?
-        .trim()
-        .rsplit(['.', ':'])
-        .next()?
-        .trim();
+    let alias = super::type_layout_alias_key(&declaration.type_name)?;
     let mut current_alias = alias.to_string();
     let mut offset = 0_usize;
     let mut field_width = None;
@@ -563,15 +556,7 @@ fn memory_member_lvalue_fingerprint(
             .find(|field| field.name == *member_name)?;
         offset += field.offset;
         field_width = Some(field.width);
-        current_alias = field
-            .type_name
-            .split_whitespace()
-            .next_back()
-            .unwrap_or_default()
-            .rsplit(['.', '#'])
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        current_alias = super::type_layout_alias_key(&field.type_name)?.to_string();
     }
     let field_width = field_width?;
     let root_layout = type_layouts.get(alias)?;

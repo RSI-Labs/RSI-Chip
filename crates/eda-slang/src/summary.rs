@@ -1318,6 +1318,135 @@ fn collect_visible_package_imports(value: &Value, imports: &mut SlangPackageImpo
     }
 }
 
+fn collect_imported_package_type_aliases_from_document(
+    document: &Value,
+    imported_packages: &std::collections::BTreeSet<String>,
+    aliases: &mut std::collections::BTreeMap<String, Value>,
+    unqualified_owners: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let design = document.get("design").unwrap_or(document);
+    let empty_members = Vec::new();
+    let members = design
+        .get("members")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_members);
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let empty_packages = Vec::new();
+        let packages = member
+            .get("members")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_packages);
+        for package in packages {
+            if string_field(package, "kind").as_deref() != Some("Package") {
+                continue;
+            }
+            let (Some(address), Some(name)) = (
+                package.get("addr").and_then(Value::as_u64),
+                string_field(package, "name"),
+            ) else {
+                return Err("slang AST Package has no address or name".into());
+            };
+            if imported_packages.contains(&format!("{address} {name}")) {
+                collect_imported_package_type_aliases(
+                    package,
+                    None,
+                    imported_packages,
+                    aliases,
+                    unqualified_owners,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_imported_package_type_aliases(
+    value: &Value,
+    current_package: Option<(&str, &str)>,
+    imported_packages: &std::collections::BTreeSet<String>,
+    aliases: &mut std::collections::BTreeMap<String, Value>,
+    unqualified_owners: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Value::Object(fields) = value else {
+        if let Value::Array(values) = value {
+            for nested in values {
+                collect_imported_package_type_aliases(
+                    nested,
+                    current_package,
+                    imported_packages,
+                    aliases,
+                    unqualified_owners,
+                )?;
+            }
+        }
+        return Ok(());
+    };
+
+    let mut current_package =
+        current_package.map(|(name, key)| (name.to_string(), key.to_string()));
+    if string_field(value, "kind").as_deref() == Some("Package") {
+        let (Some(address), Some(name)) = (
+            value.get("addr").and_then(Value::as_u64),
+            string_field(value, "name"),
+        ) else {
+            return Err("slang AST Package has no address or name".into());
+        };
+        current_package = Some((name.clone(), format!("{address} {name}")));
+    }
+
+    if let Some((package_name, package_key)) = current_package
+        .as_ref()
+        .map(|(name, key)| (name.as_str(), key.as_str()))
+    {
+        if imported_packages.contains(package_key)
+            && string_field(value, "kind").as_deref() == Some("TypeAlias")
+        {
+            let Some(alias_name) = string_field(value, "name") else {
+                return Err("slang AST TypeAlias has no name".into());
+            };
+            let qualified_name = format!("{package_name}::{alias_name}");
+            match unqualified_owners.get(&alias_name) {
+                Some(existing) if existing != &qualified_name => {
+                    return Err(format!(
+                        "imported package type alias collision for '{alias_name}'"
+                    ));
+                }
+                None => {
+                    unqualified_owners.insert(alias_name, qualified_name.clone());
+                }
+                _ => {}
+            }
+            if aliases.contains_key(&qualified_name) {
+                return Ok(());
+            }
+
+            let mut alias = value.clone();
+            normalize_detailed_types(&mut alias);
+            if let Some(alias_fields) = alias.as_object_mut() {
+                alias_fields.insert("name".into(), Value::String(qualified_name.clone()));
+            }
+            aliases.insert(qualified_name, alias);
+        }
+    }
+
+    let current_package = current_package
+        .as_ref()
+        .map(|(name, key)| (name.as_str(), key.as_str()));
+    for nested in fields.values() {
+        collect_imported_package_type_aliases(
+            nested,
+            current_package,
+            imported_packages,
+            aliases,
+            unqualified_owners,
+        )?;
+    }
+    Ok(())
+}
+
 fn canonicalize_simple_function_calls(
     value: &mut Value,
     functions: &std::collections::BTreeMap<String, Value>,
@@ -1608,6 +1737,11 @@ fn type_layout_summary(
     let name = string_field(member, "name")
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "slang TypeAlias has no name".to_string())?;
+    let key = member
+        .get("addr")
+        .and_then(Value::as_u64)
+        .map(|address| format!("{address} {name}"))
+        .unwrap_or_else(|| name.clone());
     let mut target = member
         .get("target")
         .cloned()
@@ -1633,13 +1767,7 @@ fn type_layout_summary(
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no bit offset"))?;
         let type_name = string_field(field, "type").unwrap_or_default();
-        let alias = type_name
-            .split_whitespace()
-            .next_back()
-            .unwrap_or_default()
-            .rsplit(['.', '#'])
-            .next()
-            .unwrap_or_default();
+        let alias = type_layout_alias_key(&type_name).unwrap_or_default();
         let Some(width) = crate::types::simple_type_width(&type_name)
             .or_else(|| existing.get(alias).map(|layout| layout.element_width))
         else {
@@ -1656,12 +1784,17 @@ fn type_layout_summary(
         return Ok(None);
     };
     Ok(Some((
-        name,
+        key,
         SlangTypeLayoutSummary {
             element_width,
             fields,
         },
     )))
+}
+
+fn type_layout_alias_key(type_name: &str) -> Option<&str> {
+    let alias = type_name.split('$').next()?.trim();
+    (!alias.is_empty()).then_some(alias)
 }
 
 #[derive(Default)]
@@ -1843,14 +1976,7 @@ fn annotate_memory_element_shapes(
         }
         if let Some(memory) = selected {
             if memory.type_name.contains('$') {
-                let element_type = memory.type_name.split('$').next().unwrap_or_default();
-                let alias = element_type
-                    .split_whitespace()
-                    .next_back()
-                    .unwrap_or_default()
-                    .rsplit(['.', '#', ':'])
-                    .next()
-                    .unwrap_or_default();
+                let alias = type_layout_alias_key(&memory.type_name).unwrap_or_default();
                 if let Some(layout) = type_layouts.get(alias) {
                     expression.type_width.get_or_insert(layout.element_width);
                     expression.type_signed.get_or_insert(false);
@@ -2151,11 +2277,31 @@ impl SlangAstSummary {
         let mut procedural_blocks = Vec::new();
         let mut instances = Vec::new();
         let mut type_layouts = std::collections::BTreeMap::new();
-        let type_alias_members = members
+        let mut package_imports = SlangPackageImports::default();
+        collect_visible_package_imports(root, &mut package_imports);
+        let mut imported_packages = package_imports.wildcard.clone();
+        imported_packages.extend(package_imports.explicit.keys().cloned());
+        let mut imported_type_aliases = std::collections::BTreeMap::new();
+        let mut imported_type_alias_owners = std::collections::BTreeMap::new();
+        collect_imported_package_type_aliases_from_document(
+            &document,
+            &imported_packages,
+            &mut imported_type_aliases,
+            &mut imported_type_alias_owners,
+        )?;
+        let mut type_alias_members = members
             .iter()
             .filter(|member| string_field(member, "kind").as_deref() == Some("TypeAlias"))
-            .cloned()
+            .map(|member| {
+                let mut scoped = member.clone();
+                let name = string_field(&scoped, "name").unwrap_or_default();
+                if let Some(fields) = scoped.as_object_mut() {
+                    fields.insert("name".into(), Value::String(format!("{top_name}.{name}")));
+                }
+                scoped
+            })
             .collect::<Vec<_>>();
+        type_alias_members.extend(imported_type_aliases.into_values());
         loop {
             let mut changed = false;
             for member in &type_alias_members {
@@ -2326,8 +2472,6 @@ impl SlangAstSummary {
             }
         }
         let mut package_parameters = Vec::new();
-        let mut package_imports = SlangPackageImports::default();
-        collect_visible_package_imports(root, &mut package_imports);
         collect_package_parameters(&document, None, &package_imports, &mut package_parameters);
         let visible_parameter_names = parameters
             .iter()

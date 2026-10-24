@@ -1100,14 +1100,7 @@ impl super::SlangAstLowerer {
         use eda_core::ir::Expr;
 
         let type_name = string_field(value, "type").unwrap_or_default();
-        let alias_name = type_name
-            .split_whitespace()
-            .next_back()
-            .unwrap_or_default()
-            .rsplit(['.', '#'])
-            .next()
-            .unwrap_or_default();
-        let definition = self.type_aliases.get(alias_name).ok_or_else(|| {
+        let definition = self.type_alias_definition(&type_name).ok_or_else(|| {
             format!("assignment pattern requires a packed struct type, found '{type_name}'")
         })?;
         if definition.is_union {
@@ -1242,19 +1235,7 @@ impl super::SlangAstLowerer {
         member: &str,
     ) -> Result<super::AstStructField, String> {
         let type_name = string_field(value, "type").unwrap_or_default();
-        let qualified_alias_name = type_name.split_whitespace().next_back().unwrap_or_default();
-        if let Some(definition) = self.type_aliases.get(qualified_alias_name) {
-            return definition
-                .fields
-                .get(member)
-                .copied()
-                .ok_or_else(|| format!("struct type has no member '{member}'"));
-        }
-        let alias_name = qualified_alias_name
-            .rsplit(['.', '#'])
-            .next()
-            .unwrap_or_default();
-        if let Some(definition) = self.type_aliases.get(alias_name) {
+        if let Some(definition) = self.type_alias_definition(&type_name) {
             return definition
                 .fields
                 .get(member)

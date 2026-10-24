@@ -10563,6 +10563,108 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_uses_package_memory_member_layouts() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-package-memory-member");
+    let source_path = root.join("package_memory_member.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package shapes_pkg;
+  typedef struct packed {
+    logic [1:0] a;
+    logic [1:0] b;
+  } inner_t;
+
+  typedef struct packed {
+    inner_t left;
+    logic [3:0] right;
+  } outer_t;
+endpackage
+
+module package_memory_member(
+  input logic [1:0] address,
+  input logic [1:0] value,
+  output logic [7:0] observed
+);
+  import shapes_pkg::*;
+  typedef struct packed {
+    logic [7:0] byte_value;
+  } outer_t;
+
+  shapes_pkg::outer_t rows [0:3];
+  always_comb begin
+    rows[address].right = 4'b0;
+    rows[address].left.b = 2'b0;
+    rows[address].left.a = value;
+  end
+  assign observed = rows[address];
+endmodule
+"#,
+    )
+    .expect("write package sparse-memory member source");
+
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("package_memory_member"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize package sparse-memory member AST");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("package_memory_member"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower package sparse-memory member");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize package sparse-memory member AST");
+    summary
+        .validate_against_design(&design)
+        .expect("package sparse-memory member fingerprint should match");
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .memory_member_lvalue
+                .as_ref()
+                .is_some_and(|member| member.members.last().is_some_and(|name| name == "a"))
+        })
+    }) {
+        assignment
+            .memory_member_lvalue
+            .as_mut()
+            .expect("package sparse-memory member lvalue")
+            .members[1] = "b".into();
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong package sparse-memory member field must fail");
+    assert!(
+        error.contains("Range:5:0") && error.contains("Range:7:6") && error.contains("Range:3:0"),
+        "unexpected structural error: {error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create package sparse-memory simulator");
+    simulator
+        .set_input("address", &LogicWord::from_u64(2, 1))
+        .unwrap();
+    simulator
+        .set_input("value", &LogicWord::from_u64(2, 3))
+        .unwrap();
+    simulator.run_until(0).unwrap();
+    assert_eq!(
+        simulator.read("observed").unwrap().to_u64(),
+        Some(0b1100_0000),
+        "package nested sparse-memory member write should preserve physical field offsets"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_packed_union_arrays() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;

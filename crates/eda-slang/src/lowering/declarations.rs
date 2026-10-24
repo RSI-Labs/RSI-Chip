@@ -13,6 +13,45 @@ use crate::types::{
 };
 
 impl SlangAstLowerer {
+    fn insert_type_alias(
+        &mut self,
+        name: String,
+        member: &serde_json::Value,
+        definition: AstStructType,
+    ) {
+        let address = member.get("addr").and_then(serde_json::Value::as_u64);
+        let scoped_name = if let Some(package) =
+            string_field(member, "eda_package_scope").filter(|package| !package.is_empty())
+        {
+            address.map_or_else(
+                || format!("{package}::{name}"),
+                |address| format!("{address} {package}::{name}"),
+            )
+        } else {
+            address.map_or_else(
+                || format!("{}.{name}", self.design.name),
+                |address| format!("{address} {}.{}", self.design.name, name),
+            )
+        };
+        self.type_aliases.insert(scoped_name, definition.clone());
+        self.type_aliases.insert(name, definition);
+    }
+
+    pub(super) fn type_alias_definition(&self, type_name: &str) -> Option<&AstStructType> {
+        let type_reference = type_name.split('$').next()?.trim();
+        if !type_reference.is_empty() {
+            if let Some(definition) = self.type_aliases.get(type_reference) {
+                return Some(definition);
+            }
+        }
+        let scoped_alias_name = type_name.split_whitespace().next_back()?;
+        if let Some(definition) = self.type_aliases.get(scoped_alias_name) {
+            return Some(definition);
+        }
+        let alias_name = scoped_alias_name.rsplit(['.', '#', ':']).next()?;
+        self.type_aliases.get(alias_name)
+    }
+
     pub(super) fn collect_procedure_locals(
         &mut self,
         member: &serde_json::Value,
@@ -108,8 +147,9 @@ impl SlangAstLowerer {
                 let signed = simple_type_signed(target_type).ok_or_else(|| {
                     format!("direct lowering cannot resolve signedness of type alias '{name}'")
                 })?;
-                self.type_aliases.insert(
+                self.insert_type_alias(
                     name,
+                    member,
                     AstStructType {
                         width: shape.width,
                         signed,
@@ -153,8 +193,9 @@ impl SlangAstLowerer {
                 ),
                 None => (detailed_type_width(target)?, detailed_type_signed(target)),
             };
-            self.type_aliases.insert(
+            self.insert_type_alias(
                 name,
+                member,
                 AstStructType {
                     width,
                     signed,
@@ -243,7 +284,7 @@ impl SlangAstLowerer {
             is_union,
             is_unpacked,
         };
-        self.type_aliases.insert(name, definition);
+        self.insert_type_alias(name, member, definition);
         Ok(())
     }
 
@@ -314,8 +355,7 @@ impl SlangAstLowerer {
             })?;
             return Ok((shape, signed, std::collections::BTreeMap::new()));
         }
-        let qualified_alias_name = type_name.split_whitespace().next_back().unwrap_or_default();
-        if let Some(definition) = self.type_aliases.get(qualified_alias_name) {
+        if let Some(definition) = self.type_alias_definition(type_name) {
             return Ok((
                 AstTypeShape {
                     width: definition.width,
@@ -326,7 +366,10 @@ impl SlangAstLowerer {
                 definition.fields.clone(),
             ));
         }
-        let alias_name = qualified_alias_name
+        let alias_name = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
             .rsplit(['.', '#', ':'])
             .next()
             .unwrap_or_default();
@@ -341,19 +384,7 @@ impl SlangAstLowerer {
                 std::collections::BTreeMap::new(),
             ));
         }
-        let definition = self
-            .type_aliases
-            .get(alias_name)
-            .ok_or_else(|| format!("direct lowering cannot resolve type '{type_name}'"))?;
-        Ok((
-            AstTypeShape {
-                width: definition.width,
-                bounds: None,
-                dimensions: Vec::<AstPackedDimension>::new(),
-            },
-            definition.signed,
-            definition.fields.clone(),
-        ))
+        Err(format!("direct lowering cannot resolve type '{type_name}'"))
     }
 
     pub(super) fn declared_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
