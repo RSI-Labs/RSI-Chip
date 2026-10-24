@@ -748,12 +748,9 @@ fn array_part_lvalue_fingerprint(
     if memory.dynamic || memory.queue || memory.associative {
         return None;
     }
-    let [index] = &part.indexes[..] else {
+    if part.indexes.len() != memory.dimensions.len() {
         return None;
-    };
-    let [dimension] = &memory.dimensions[..] else {
-        return None;
-    };
+    }
     if memory.element_msb < memory.element_lsb {
         return None;
     }
@@ -769,16 +766,20 @@ fn array_part_lvalue_fingerprint(
         return None;
     }
 
-    let index_value = summary_literal_i64(index)?;
-    let normalized_index = if dimension.step > 0 {
-        index_value - dimension.base
-    } else {
-        dimension.base - index_value
-    };
-    if normalized_index < 0 || normalized_index >= dimension.length as i64 {
-        return None;
+    let mut element_index = 0_usize;
+    for (index, dimension) in part.indexes.iter().zip(&memory.dimensions) {
+        let index_value = summary_literal_i64(index)?;
+        let normalized_index = if dimension.step > 0 {
+            index_value - dimension.base
+        } else {
+            dimension.base - index_value
+        };
+        if normalized_index < 0 || normalized_index >= dimension.length as i64 {
+            return None;
+        }
+        element_index = element_index * dimension.length + normalized_index as usize;
     }
-    let base_offset = normalized_index as usize * element_width;
+    let base_offset = element_index * element_width;
 
     let start_fingerprint =
         slang_expression_fingerprint_with_parameters(&part.start, parameters, mode)?;

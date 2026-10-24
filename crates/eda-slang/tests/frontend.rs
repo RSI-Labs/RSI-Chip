@@ -4691,6 +4691,188 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_uses_multidimensional_array_part_layouts() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory2d-constant-parts");
+    let source_path = root.join("memory2d_constant_parts.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module memory2d_constant_parts(
+  input logic clk,
+  input logic [2:0] start,
+  input logic [7:0] wdata,
+  output logic [7:0] q,
+  output logic [3:0] p
+);
+  logic [7:0] mem [0:1][2:3];
+  initial begin
+    mem[1][3] = 8'h34;
+  end
+  always @(posedge clk) mem[1][3][start +: 4] <= wdata[3:0];
+  assign q = mem[1][3];
+  assign p = mem[1][3][start +: 4];
+endmodule
+"#,
+    )
+    .expect("write multidimensional constant part-write source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_constant_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower multidimensional constant part write");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_constant_parts"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower multidimensional constant part write through bounded path");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_constant_parts"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize multidimensional constant part AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize multidimensional constant part AST");
+    summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact multidimensional constant part fingerprint should match");
+
+    if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+    }) {
+        part.indexes[0].literal = Some("32:00000000000000000000000000000000".into());
+    }
+    let first_index_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong first multidimensional part index must fail");
+    assert!(
+        first_index_error.contains("Offset:8") && first_index_error.contains("Offset:24"),
+        "unexpected first index error: {first_index_error}"
+    );
+
+    if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+    }) {
+        part.indexes[0].literal = Some("32:00000000000000000000000000000001".into());
+        part.indexes[1].literal = Some("32:00000000000000000000000000000010".into());
+    }
+    let second_index_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong second multidimensional part index must fail");
+    assert!(
+        second_index_error.contains("Offset:16") && second_index_error.contains("Offset:24"),
+        "unexpected second index error: {second_index_error}"
+    );
+
+    if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+    }) {
+        part.indexes[1].literal = Some("32:00000000000000000000000000000011".into());
+        part.start.symbol = Some("wrong_start".into());
+    }
+    let start_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong multidimensional part start must fail");
+    assert!(
+        start_error.contains("Ref:3:u[wrong_start]") && start_error.contains("Ref:3:u[start]"),
+        "unexpected multidimensional part start error: {start_error}"
+    );
+
+    if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+    }) {
+        part.start.symbol = Some("start".into());
+        part.width = 3;
+    }
+    let width_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong multidimensional part width must fail closed");
+    assert!(
+        width_error.contains("could not fingerprint array part lvalue 'mem'"),
+        "unexpected multidimensional part width error: {width_error}"
+    );
+
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| assignment.array_part_lvalue.is_some())
+    }) {
+        assignment.array_part_lvalue.as_mut().unwrap().width = 4;
+        assignment.rhs.operands[0].symbol = Some("wrong_data".into());
+    }
+    let value_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong multidimensional part value must fail");
+    assert!(
+        value_error.contains("PackedSelect:4:u[Ref:8:u[wrong_data]")
+            && value_error.contains("PackedSelect:4:u[Ref:8:u[wdata]"),
+        "unexpected multidimensional part value error: {value_error}"
+    );
+
+    let mut direct_simulator =
+        Simulator::new(&direct).expect("create direct multidimensional part simulator");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize direct clock");
+    direct_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set direct part start");
+    direct_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x0a))
+        .expect("set direct part data");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create direct posedge");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0xa4));
+    assert_eq!(direct_simulator.read("p").unwrap().to_u64(), Some(0xa));
+
+    let mut bounded_simulator =
+        Simulator::new(&bounded).expect("create bounded multidimensional part simulator");
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize bounded clock");
+    bounded_simulator
+        .set_input("start", &LogicWord::from_u64(3, 4))
+        .expect("set bounded part start");
+    bounded_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x0a))
+        .expect("set bounded part data");
+    assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    assert_eq!(bounded_simulator.read("p").unwrap().to_u64(), Some(0x3));
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create bounded posedge");
+    assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0xa4));
+    assert_eq!(bounded_simulator.read("p").unwrap().to_u64(), Some(0xa));
+}
+
+#[test]
 fn slang_ast_direct_lowering_shares_child_sparse_memory_ports() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
