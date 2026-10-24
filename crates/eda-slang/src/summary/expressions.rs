@@ -2416,6 +2416,7 @@ fn design_stmt_assignments_guarded(
             element_width,
             start,
             width,
+            reversed,
             e,
             ..
         }
@@ -2425,6 +2426,7 @@ fn design_stmt_assignments_guarded(
             element_width,
             start,
             width,
+            reversed,
             e,
             ..
         } => {
@@ -2432,7 +2434,7 @@ fn design_stmt_assignments_guarded(
                 *net >= declaration.base && *net < declaration.base + declaration.width
             }) {
                 let body = format!(
-                    "{},Element:{element_width},Offset:{base_offset},{},{}",
+                    "{},Element:{element_width},Offset:{base_offset},Reversed:{reversed},{},{}",
                     canonical_ref_symbol_name(&declaration.name),
                     design_expr_fingerprint(design, start),
                     design_indexed_value_fingerprint(design, e)

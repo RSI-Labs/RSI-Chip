@@ -314,6 +314,27 @@ impl SlangAstSummary {
                         }
                         let legacy_array_shape =
                             !strict_generated_hierarchy && legacy_array_targets.contains(target);
+                        if legacy_array_shape && !assignment.dynamic_array_lvalue_indexes.is_empty()
+                        {
+                            let shapes = dynamic_array_element_lvalue_fingerprints(
+                                target,
+                                &assignment.dynamic_array_lvalue_indexes,
+                                &assignment.rhs,
+                                &self.declarations,
+                                &self.parameters,
+                                fingerprint_mode,
+                            )
+                            .ok_or_else(|| {
+                                format!(
+                                    "lowering could not fingerprint dynamic array lvalue '{target}'"
+                                )
+                            })?;
+                            expected_procedural_targets
+                                .entry(target.clone())
+                                .or_default()
+                                .extend(shapes);
+                            continue;
+                        }
                         if legacy_array_shape && assignment.array_part_lvalue.is_some() {
                             let shapes = assignment
                                 .array_part_lvalue
@@ -342,25 +363,7 @@ impl SlangAstSummary {
                         let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
                             format!("ClassHandleCopy:{source}")
                         } else {
-                            if legacy_array_shape
-                                && !assignment.dynamic_array_lvalue_indexes.is_empty()
-                            {
-                                dynamic_array_element_lvalue_fingerprint(
-                                    target,
-                                    &assignment.dynamic_array_lvalue_indexes,
-                                    &assignment.rhs,
-                                    &self.declarations,
-                                    &self.parameters,
-                                    fingerprint_mode,
-                                )
-                                .ok_or_else(|| {
-                                    format!(
-                                        "lowering could not fingerprint dynamic array lvalue '{target}'"
-                                    )
-                                })?
-                            } else if legacy_array_shape
-                                && !assignment.constant_array_element_lvalue
-                            {
+                            if legacy_array_shape && !assignment.constant_array_element_lvalue {
                                 // Small arrays still use the legacy bounded
                                 // per-element expansion, whose expression tree is
                                 // intentionally not structurally equivalent to the
@@ -636,14 +639,14 @@ fn memory_member_lvalue_fingerprint(
     Some(format!("Concat:{element_width}:u[{}]", parts.join(",")))
 }
 
-fn dynamic_array_element_lvalue_fingerprint(
+fn dynamic_array_element_lvalue_fingerprints(
     target_name: &str,
     indexes: &[super::SlangExpressionSummary],
     value: &super::SlangExpressionSummary,
     declarations: &[super::SlangDeclarationSummary],
     parameters: &[super::SlangParameterSummary],
     mode: ExpressionFingerprintMode,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
@@ -654,10 +657,6 @@ fn dynamic_array_element_lvalue_fingerprint(
     if indexes.len() != memory.dimensions.len() {
         return None;
     }
-    if memory.element_msb < memory.element_lsb {
-        return None;
-    }
-
     let element_width = memory.element_width;
     let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
     if total_width == 0 {
@@ -666,6 +665,23 @@ fn dynamic_array_element_lvalue_fingerprint(
     let value_width = value.type_width?;
     if value_width != element_width {
         return None;
+    }
+
+    if memory.element_msb < memory.element_lsb {
+        let whole_element_part = super::SlangArrayPartLvalueSummary {
+            indexes: indexes.to_vec(),
+            start: constant_zero_summary(),
+            width: element_width,
+            selection_kind: "IndexedUp".to_string(),
+        };
+        return array_part_lvalue_fingerprints(
+            target_name,
+            &whole_element_part,
+            value,
+            declarations,
+            parameters,
+            mode,
+        );
     }
 
     let selector_fingerprints = indexes
@@ -749,7 +765,26 @@ fn dynamic_array_element_lvalue_fingerprint(
     let merged = format!(
         "Or:{total_width}:u[And:{total_width}:u[{old},Not:{total_width}:u[{selected_mask}]],{shifted_value}]"
     );
-    Some(format!("Cond:{total_width}:u[{in_range},{merged},{old}]"))
+    Some(vec![format!(
+        "Cond:{total_width}:u[{in_range},{merged},{old}]"
+    )])
+}
+
+fn constant_zero_summary() -> super::SlangExpressionSummary {
+    super::SlangExpressionSummary {
+        kind: "IntegerLiteral".to_string(),
+        type_name: "int".to_string(),
+        operator: String::new(),
+        selection_kind: String::new(),
+        type_width: Some(32),
+        type_signed: Some(true),
+        symbol: None,
+        literal: Some(format!("32:{}", "0".repeat(32))),
+        repeat_count: None,
+        simulation_time_unit: None,
+        enum_definition: None,
+        operands: Vec::new(),
+    }
 }
 
 fn array_part_lvalue_fingerprints(
@@ -768,9 +803,6 @@ fn array_part_lvalue_fingerprints(
         return None;
     }
     if part.indexes.len() != memory.dimensions.len() {
-        return None;
-    }
-    if memory.element_msb < memory.element_lsb {
         return None;
     }
     let element_width = memory.element_width;
@@ -805,7 +837,11 @@ fn array_part_lvalue_fingerprints(
     };
     let normalized_start = format!(
         "Sub:32:u[{logical_start},{}]",
-        const32(memory.element_lsb as u64)
+        const32(if memory.element_msb < memory.element_lsb {
+            memory.element_msb
+        } else {
+            memory.element_lsb
+        } as u64)
     );
 
     let physical_layout = |physical_element: usize| -> Option<(usize, Vec<i64>)> {
@@ -829,7 +865,8 @@ fn array_part_lvalue_fingerprints(
 
     let array_part_body = |base_offset: usize| {
         format!(
-            "{target_name},Element:{element_width},Offset:{base_offset},{normalized_start},{value_fingerprint}"
+            "{target_name},Element:{element_width},Offset:{base_offset},Reversed:{},{normalized_start},{value_fingerprint}",
+            memory.element_msb < memory.element_lsb,
         )
     };
 

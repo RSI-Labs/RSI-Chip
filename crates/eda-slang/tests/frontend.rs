@@ -4329,6 +4329,134 @@ endmodule
 }
 
 #[test]
+fn slang_ast_summary_uses_reversed_dynamic_array_fingerprints() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let root = temporary_directory("reversed-dynamic-array");
+    let source_path = root.join("reversed_dynamic_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module reversed_dynamic_array(
+  input logic clk,
+  input logic [1:0] addr,
+  input logic [7:0] wdata,
+  output logic [7:0] q
+);
+  logic [0:7] mem [0:3];
+  initial begin
+    mem[0] = 8'h12;
+    mem[3] = 8'h34;
+  end
+  always @(posedge clk) mem[addr] <= wdata;
+  assign q = mem[addr];
+endmodule
+"#,
+    )
+    .expect("write reversed dynamic array source");
+
+    let direct = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("reversed_dynamic_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower reversed dynamic array");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("reversed_dynamic_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower reversed dynamic array through bounded path");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("reversed_dynamic_array"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize reversed dynamic array AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize reversed dynamic array AST");
+    summary
+        .validate_against_design(&direct)
+        .expect("exact direct reversed dynamic fingerprint should match");
+    summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact bounded reversed dynamic fingerprint should match");
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| !assignment.dynamic_array_lvalue_indexes.is_empty())
+    }) {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("wrong_addr".into());
+    }
+    let selector_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong reversed dynamic selector must fail");
+    assert!(
+        selector_error.contains("Ref:2:u[wrong_addr]")
+            && selector_error.contains("Ref:2:u[addr]")
+            && selector_error.contains("GuardedArrayPartWrite:8:u[")
+            && selector_error.contains("Reversed:true"),
+        "unexpected reversed selector error: {selector_error}"
+    );
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| !assignment.dynamic_array_lvalue_indexes.is_empty())
+    }) {
+        assignment.dynamic_array_lvalue_indexes[0].symbol = Some("addr".into());
+        assignment.rhs.symbol = Some("wrong_data".into());
+    }
+    let value_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong reversed dynamic value must fail");
+    assert!(
+        value_error.contains("Ref:8:u[wrong_data]")
+            && value_error.contains("Ref:8:u[wdata]")
+            && value_error.contains("GuardedArrayPartWrite:8:u["),
+        "unexpected reversed value error: {value_error}"
+    );
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block
+            .assignments
+            .iter_mut()
+            .find(|assignment| !assignment.dynamic_array_lvalue_indexes.is_empty())
+    }) {
+        assignment.rhs.symbol = Some("wdata".into());
+    }
+    assert_eq!(direct.memories.len(), 1);
+    assert!(bounded.memories.is_empty());
+
+    let mut direct_simulator =
+        Simulator::new(&direct).expect("create direct reversed-array simulator");
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize direct clock");
+    direct_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 3))
+        .expect("select direct reversed element");
+    direct_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .expect("set direct reversed data");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    direct_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create direct reversed posedge");
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x5a));
+    // Reversed-element direct/bounded runtime parity is intentionally not
+    // claimed here: the legacy path currently applies its historical logical
+    // bit order to whole-element reads. The exact assignment fingerprints
+    // above still prove selector, offset, reversal flag, and value identity.
+}
+
+#[test]
 fn slang_ast_summary_uses_wide_dynamic_array_fingerprints() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
