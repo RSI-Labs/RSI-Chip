@@ -3765,7 +3765,20 @@ endmodule
         value_error.contains("Ref:8:u[wrong_data]") && value_error.contains("Ref:8:u[wdata]"),
         "unexpected dynamic array value error: {value_error}"
     );
-
+    if let Some(assignment) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .dynamic_array_lvalue_indexes
+                    .first()
+                    .is_some_and(|selector| selector.symbol.as_deref() == Some("addr"))
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("wdata".into());
+    }
     let mut simulator = Simulator::new(&design).expect("create sparse-memory simulator");
     simulator
         .set_input("clk", &LogicWord::from_u64(1, 0))
@@ -4520,6 +4533,30 @@ endmodule
     summary
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("exact wide dynamic array fingerprints should match");
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "whole")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_addr".into());
+    }
+    let continuous_read_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong continuous wide array read selector must fail");
+    assert!(
+        continuous_read_error.contains("Ref:3:u[wrong_addr]")
+            && continuous_read_error.contains("Ref:3:u[addr]")
+            && continuous_read_error.contains("Cond:40:u["),
+        "unexpected continuous read error: {continuous_read_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "whole")
+    {
+        target.rhs.operands[1].symbol = Some("addr".into());
+    }
 
     if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
         block
