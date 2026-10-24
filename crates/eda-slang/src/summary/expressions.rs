@@ -306,7 +306,6 @@ pub(crate) fn procedural_assignments(
                     dynamic_packed_lvalue,
                     dynamic_packed_lvalue_selector,
                     memory_member_lvalue,
-                    uses_class_static: expression_uses_class_symbol(right, class_handles),
                     class_handle_source,
                     class_handle_target_key,
                     class_handle_source_key,
@@ -557,32 +556,6 @@ fn canonical_class_name(type_name: &str) -> Option<String> {
         .next()?
         .to_string();
     (!class_name.is_empty()).then_some(class_name)
-}
-
-fn expression_uses_class_symbol(
-    value: &Value,
-    class_symbols: &std::collections::BTreeSet<String>,
-) -> bool {
-    if let Some(symbol) = string_field(value, "symbol") {
-        if class_symbols.contains(&symbol) {
-            return true;
-        }
-    }
-    value
-        .as_object()
-        .map(|fields| {
-            fields
-                .values()
-                .any(|nested| expression_uses_class_symbol(nested, class_symbols))
-        })
-        .or_else(|| {
-            value.as_array().map(|values| {
-                values
-                    .iter()
-                    .any(|nested| expression_uses_class_symbol(nested, class_symbols))
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn is_class_handle_target(
@@ -1763,7 +1736,7 @@ pub(crate) fn design_lvalue_name(design: &Design, lvalue: &eda_core::ir::LValue)
         .find(|declaration| {
             lvalue.net >= declaration.base && lvalue.net < declaration.base + declaration.width
         })
-        .map(|declaration| declaration.name.clone())
+        .map(|declaration| canonical_ref_symbol_name(&declaration.name))
 }
 
 pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str {

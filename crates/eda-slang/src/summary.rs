@@ -2113,9 +2113,6 @@ pub struct SlangAssignmentSummary {
     /// Member writes through a sparse-memory element are canonicalized into a
     /// whole-memory-element concat.
     pub memory_member_lvalue: Option<SlangMemoryMemberLvalueSummary>,
-    /// Class static storage uses an internal IR name, so exact RHS symbol
-    /// equivalence is deferred while assignment inventory remains checked.
-    pub uses_class_static: bool,
     /// Canonical source object path for a whole class-handle assignment.
     pub class_handle_source: Option<String>,
     /// Authoritative slang symbol ID for a field-less whole-handle target.

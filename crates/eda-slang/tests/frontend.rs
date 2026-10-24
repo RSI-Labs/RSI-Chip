@@ -2156,6 +2156,38 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower hierarchy-global class statics");
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("static_class_hierarchy_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize hierarchy-global class-static AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize hierarchy-global class-static AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact hierarchy-global class-static fingerprint should match");
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "initial_result")
+        })
+    }) {
+        assignment.rhs.symbol = Some("Registry_wrong_static".into());
+    }
+    let error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong hierarchy-global class-static source must fail");
+    assert!(
+        error.contains("Ref:32:s[Registry_wrong_static]")
+            && error.contains("Ref:32:s[Registry_shared]"),
+        "unexpected class-static structural error: {error}"
+    );
     assert_eq!(
         design
             .net_decls

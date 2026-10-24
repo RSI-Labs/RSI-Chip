@@ -317,10 +317,11 @@ impl SlangAstSummary {
                         } else {
                             let legacy_array_shape = !strict_generated_hierarchy
                                 && legacy_array_targets.contains(target);
-                            if legacy_array_shape || assignment.uses_class_static {
-                                // Small arrays and class-static lowering expand or
-                                // rewrite source assignments without a canonical
-                                // structural equivalent yet.
+                            if legacy_array_shape {
+                                // Small arrays still use the legacy bounded
+                                // per-element expansion, whose expression tree is
+                                // intentionally not structurally equivalent to the
+                                // slang source.
                                 "?".to_string()
                             } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
                                 memory_member_lvalue_fingerprint(
