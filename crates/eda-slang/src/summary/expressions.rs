@@ -300,6 +300,7 @@ pub(crate) fn procedural_assignments(
                     .flatten();
                 let memory_member_lvalue = memory_member_lvalue_summary(left);
                 let dynamic_array_lvalue_indexes = dynamic_array_lvalue_indexes(left);
+                let array_part_lvalue = array_part_lvalue_summary(left);
                 assignments.push(SlangAssignmentSummary {
                     target_names: expression_target_names(left),
                     rhs: expression_summary(right),
@@ -309,6 +310,7 @@ pub(crate) fn procedural_assignments(
                     memory_member_lvalue,
                     constant_array_element_lvalue: constant_array_element_lvalue(left),
                     dynamic_array_lvalue_indexes,
+                    array_part_lvalue,
                     class_handle_source,
                     class_handle_target_key,
                     class_handle_source_key,
@@ -422,34 +424,68 @@ fn class_handle_copy_block(
 
 fn constant_array_element_lvalue(value: &Value) -> bool {
     match string_field(value, "kind").as_deref() {
-        Some("ElementSelect") => {
-            let Some(selected) = value.get("value") else {
-                return false;
-            };
-            let Some(selector) = value.get("selector") else {
-                return false;
-            };
-            let selected_is_array = matches!(
-                string_field(selected, "kind").as_deref(),
-                Some("NamedValue" | "HierarchicalValue")
-            ) && string_field(selected, "type")
-                .is_some_and(|type_name| type_name.contains('$'));
-            slang_constant_u64(selector).is_ok()
-                && (selected_is_array || constant_array_element_lvalue(selected))
-        }
+        Some("ElementSelect") => constant_array_indexes(value).is_some(),
         Some("RangeSelect") => {
             let Some(selected) = value.get("value") else {
                 return false;
             };
-            let (Some(left), Some(right)) = (value.get("left"), value.get("right")) else {
-                return false;
-            };
-            constant_array_element_lvalue(selected)
-                && slang_constant_u64(left).is_ok()
-                && slang_constant_u64(right).is_ok()
+            constant_array_indexes(selected).is_some()
         }
         _ => false,
     }
+}
+
+fn constant_array_indexes(value: &Value) -> Option<Vec<SlangExpressionSummary>> {
+    if string_field(value, "kind").as_deref() != Some("ElementSelect") {
+        return None;
+    }
+    let selected = value.get("value")?;
+    let mut indexes = constant_array_indexes(selected).or_else(|| {
+        let selected_is_array = matches!(
+            string_field(selected, "kind").as_deref(),
+            Some("NamedValue" | "HierarchicalValue")
+        ) && string_field(selected, "type")
+            .is_some_and(|type_name| type_name.contains('$'));
+        selected_is_array.then_some(Vec::new())
+    })?;
+    let selector = value.get("selector")?;
+    slang_constant_u64(selector).ok()?;
+    indexes.push(expression_summary(selector));
+    Some(indexes)
+}
+
+fn array_part_lvalue_summary(value: &Value) -> Option<super::SlangArrayPartLvalueSummary> {
+    if string_field(value, "kind").as_deref() != Some("RangeSelect") {
+        return None;
+    }
+    let selected = value.get("value")?;
+    let indexes = constant_array_indexes(selected)?;
+    let selection_kind = string_field(value, "selectionKind")?;
+    let left = value.get("left")?;
+    let right = value.get("right")?;
+    let (start, width, normalized_selection_kind) = match selection_kind.as_str() {
+        "IndexedUp" | "IndexedDown" => {
+            let width = usize::try_from(slang_constant_u64(right).ok()?).ok()?;
+            (left.clone(), width, selection_kind.clone())
+        }
+        "Simple" => {
+            let left_value = slang_constant_u64(left).ok()?;
+            let right_value = slang_constant_u64(right).ok()?;
+            let width = usize::try_from(left_value.abs_diff(right_value) + 1).ok()?;
+            if left_value >= right_value {
+                (right.clone(), width, "IndexedUp".to_string())
+            } else {
+                (left.clone(), width, "IndexedDown".to_string())
+            }
+        }
+        _ => return None,
+    };
+    Some(super::SlangArrayPartLvalueSummary {
+        indexes,
+        start: expression_summary(&start),
+        width,
+        selection_kind: normalized_selection_kind,
+    })
 }
 
 fn dynamic_array_lvalue_indexes(value: &Value) -> Vec<SlangExpressionSummary> {
@@ -728,7 +764,7 @@ pub(crate) fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) 
     ))
 }
 
-fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option<i64> {
+pub(crate) fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option<i64> {
     let (_, bits) = expression.literal.as_deref()?.split_once(':')?;
     let mut value = 0_i64;
     for bit in bits.chars() {
@@ -2190,6 +2226,7 @@ pub(crate) fn design_stmt_assignments(
                     .for_each(|nested| assignments.extend(design_stmt_assignments(design, nested)));
             }
         }
+
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
             assignments.extend(design_stmt_assignments(design, body));
         }
@@ -2360,11 +2397,37 @@ pub(crate) fn design_stmt_assignments(
                     .map(|memory| (memory.name.clone(), design_expr_fingerprint(design, value))),
             );
         }
-        Stmt::BlIndexed { net, e, .. } | Stmt::NBlIndexed { net, e, .. } => {
-            assignments.extend(design.net_decls.iter().find_map(|declaration| {
-                (*net >= declaration.base && *net < declaration.base + declaration.width)
-                    .then(|| (declaration.name.clone(), design_expr_fingerprint(design, e)))
-            }));
+        Stmt::BlIndexed {
+            net,
+            base_offset,
+            element_width,
+            start,
+            width,
+            e,
+            ..
+        }
+        | Stmt::NBlIndexed {
+            net,
+            base_offset,
+            element_width,
+            start,
+            width,
+            e,
+            ..
+        } => {
+            if let Some(declaration) = design.net_decls.iter().find(|declaration| {
+                *net >= declaration.base && *net < declaration.base + declaration.width
+            }) {
+                assignments.push((
+                    canonical_ref_symbol_name(&declaration.name),
+                    format!(
+                        "ArrayPartWrite:{width}:u[{},Element:{element_width},Offset:{base_offset},{},{}]",
+                        canonical_ref_symbol_name(&declaration.name),
+                        design_expr_fingerprint(design, start),
+                        design_indexed_value_fingerprint(design, e)
+                    ),
+                ));
+            }
         }
         Stmt::If { t, f, .. } => {
             assignments.extend(design_stmt_assignments(design, t));
@@ -2389,4 +2452,37 @@ pub(crate) fn design_stmt_assignments(
         | Stmt::Finish => {}
     }
     assignments
+}
+
+fn design_indexed_value_fingerprint(design: &Design, expression: &eda_core::ir::Expr) -> String {
+    use eda_core::ir::{Expr, Range};
+
+    let Expr::Ref {
+        decl_width, range, ..
+    } = expression
+    else {
+        return design_expr_fingerprint(design, expression);
+    };
+    let is_full_range = match range {
+        Range::Bit(bit) => *decl_width == 1 && *bit == 0,
+        Range::Span { msb, lsb } => *lsb == 0 && *msb == decl_width.saturating_sub(1),
+    };
+    if is_full_range {
+        return design_expr_fingerprint(design, expression);
+    }
+    let Some(name) = design_expr_symbol(design, expression) else {
+        return design_expr_fingerprint(design, expression);
+    };
+    let signed_label = if expression.is_signed() { "s" } else { "u" };
+    match range {
+        Range::Bit(bit) => {
+            format!("PackedSelect:1:u[Ref:{decl_width}:{signed_label}[{name}],Range:{bit}:{bit}]")
+        }
+        Range::Span { msb, lsb } => {
+            let width = msb - lsb + 1;
+            format!(
+                "PackedSelect:{width}:u[Ref:{decl_width}:{signed_label}[{name}],Range:{msb}:{lsb}]"
+            )
+        }
+    }
 }

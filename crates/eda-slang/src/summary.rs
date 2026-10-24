@@ -2067,6 +2067,14 @@ pub struct SlangMemoryMemberLvalueSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangArrayPartLvalueSummary {
+    pub indexes: Vec<SlangExpressionSummary>,
+    pub start: SlangExpressionSummary,
+    pub width: usize,
+    pub selection_kind: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangInstanceSummary {
     pub instance_name: String,
     pub definition_name: String,
@@ -2118,6 +2126,8 @@ pub struct SlangAssignmentSummary {
     pub constant_array_element_lvalue: bool,
     /// Selectors of a one-dimensional dynamic unpacked-array element lvalue.
     pub dynamic_array_lvalue_indexes: Vec<SlangExpressionSummary>,
+    /// Constant-index array element with a part-select lvalue.
+    pub array_part_lvalue: Option<SlangArrayPartLvalueSummary>,
     /// Canonical source object path for a whole class-handle assignment.
     pub class_handle_source: Option<String>,
     /// Authoritative slang symbol ID for a field-less whole-handle target.

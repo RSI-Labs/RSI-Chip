@@ -4134,6 +4134,100 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower sparse-memory part selects through the preprocessed path");
+    let reference_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory_parts"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize bounded part-select AST");
+    let mut reference_summary = slang
+        .summarize_ast_json(&reference_json)
+        .expect("summarize bounded part-select AST");
+    reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect("exact bounded array part-write fingerprint should match");
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.indexes[0].literal = Some("32:00000000000000000000000000000000".into());
+    }
+    let index_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong array part element index must fail");
+    assert!(
+        index_error.contains("Offset:0") && index_error.contains("Offset:8"),
+        "unexpected array part index error: {index_error}"
+    );
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.indexes[0].literal = Some("32:00000000000000000000000000000001".into());
+        part.start.symbol = Some("wrong_start".into());
+    }
+    let start_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong array part start must fail");
+    assert!(
+        start_error.contains("Ref:3:u[wrong_start]") && start_error.contains("Ref:3:u[start]"),
+        "unexpected array part start error: {start_error}"
+    );
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.start.symbol = Some("start".into());
+        part.width = 3;
+    }
+    let width_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong array part width must fail closed");
+    assert!(
+        width_error.contains("could not fingerprint array part lvalue 'mem'"),
+        "unexpected array part width error: {width_error}"
+    );
+    if let Some(assignment) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.array_part_lvalue.is_some())
+        })
+    {
+        assignment.array_part_lvalue.as_mut().unwrap().width = 4;
+        assignment.rhs.operands[0].symbol = Some("wrong_data".into());
+    }
+    let value_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong array part value must fail");
+    assert!(
+        value_error.contains("PackedSelect:4:u[Ref:8:u[wrong_data]")
+            && value_error.contains("PackedSelect:4:u[Ref:8:u[data]"),
+        "unexpected array part value error: {value_error}"
+    );
     assert_eq!(design.memories.len(), 1);
     assert_eq!(design.assigns.len(), 4);
     assert_eq!(design.initials.len(), 1);

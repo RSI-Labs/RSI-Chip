@@ -2,7 +2,7 @@
 
 use super::expressions::{
     contains_expected_shapes, design_expr_fingerprint, design_lvalue_name, design_stmt_assignments,
-    slang_expression_fingerprint_with_parameters, ExpressionFingerprintMode,
+    slang_expression_fingerprint_with_parameters, summary_literal_i64, ExpressionFingerprintMode,
 };
 use super::*;
 use crate::types::{memory_type, simple_type_shape};
@@ -331,6 +331,23 @@ impl SlangAstSummary {
                                 .ok_or_else(|| {
                                     format!(
                                         "lowering could not fingerprint dynamic array lvalue '{target}'"
+                                    )
+                                })?
+                            } else if legacy_array_shape && assignment.array_part_lvalue.is_some() {
+                                assignment
+                                .array_part_lvalue
+                                .as_ref()
+                                .and_then(|part| array_part_lvalue_fingerprint(
+                                    target,
+                                    part,
+                                    &assignment.rhs,
+                                    &self.declarations,
+                                    &self.parameters,
+                                    fingerprint_mode,
+                                ))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "lowering could not fingerprint array part lvalue '{target}'"
                                     )
                                 })?
                             } else if legacy_array_shape
@@ -714,6 +731,75 @@ fn dynamic_array_element_lvalue_fingerprint(
         "Or:{total_width}:u[And:{total_width}:u[{old},Not:{total_width}:u[{selected_mask}]],{shifted_value}]"
     );
     Some(format!("Cond:{total_width}:u[{in_range},{merged},{old}]"))
+}
+
+fn array_part_lvalue_fingerprint(
+    target_name: &str,
+    part: &super::SlangArrayPartLvalueSummary,
+    value: &super::SlangExpressionSummary,
+    declarations: &[super::SlangDeclarationSummary],
+    parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let memory = memory_type(&declaration.type_name)?;
+    if memory.dynamic || memory.queue || memory.associative {
+        return None;
+    }
+    let [index] = &part.indexes[..] else {
+        return None;
+    };
+    let [dimension] = &memory.dimensions[..] else {
+        return None;
+    };
+    if memory.element_msb < memory.element_lsb {
+        return None;
+    }
+    let element_width = memory.element_width;
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    if total_width == 0 || total_width > u32::BITS as usize {
+        return None;
+    }
+    if part.width == 0 || part.width > element_width {
+        return None;
+    }
+    if value.type_width? != part.width {
+        return None;
+    }
+
+    let index_value = summary_literal_i64(index)?;
+    let normalized_index = if dimension.step > 0 {
+        index_value - dimension.base
+    } else {
+        dimension.base - index_value
+    };
+    if normalized_index < 0 || normalized_index >= dimension.length as i64 {
+        return None;
+    }
+    let base_offset = normalized_index as usize * element_width;
+
+    let start_fingerprint =
+        slang_expression_fingerprint_with_parameters(&part.start, parameters, mode)?;
+    let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
+    let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
+    let logical_start = if part.selection_kind == "IndexedDown" {
+        format!(
+            "Sub:32:u[{start_fingerprint},{}]",
+            const32(part.width as u64 - 1)
+        )
+    } else {
+        start_fingerprint
+    };
+    let normalized_start = format!(
+        "Sub:32:u[{logical_start},{}]",
+        const32(memory.element_lsb.unsigned_abs())
+    );
+    Some(format!(
+        "ArrayPartWrite:{}:u[{target_name},Element:{element_width},Offset:{base_offset},{normalized_start},{value_fingerprint}]",
+        part.width
+    ))
 }
 
 fn dynamic_packed_lvalue_fingerprint(
