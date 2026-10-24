@@ -5403,6 +5403,66 @@ endmodule
             Some("32:00000000000000000000000000000001".into());
     }
 
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_start".into());
+    }
+    let constant_part_start_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant multidimensional array part-read start must fail");
+    assert!(
+        constant_part_start_error.contains("Ref:3:u[wrong_start]")
+            && constant_part_start_error.contains("Ref:3:u[start]")
+            && constant_part_start_error.contains("Cond:8:u["),
+        "unexpected constant part-read start error: {constant_part_start_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        target.rhs.operands[1].symbol = Some("start".into());
+        target.rhs.operands[0].operands[1].literal =
+            Some("32:00000000000000000000000000000010".into());
+    }
+    let constant_part_index_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant multidimensional array part-read index must fail");
+    assert!(
+        constant_part_index_error.contains("Range:23:16")
+            && constant_part_index_error.contains("Range:31:24"),
+        "unexpected constant part-read index error: {constant_part_index_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        target.rhs.operands[0].operands[1].literal =
+            Some("32:00000000000000000000000000000011".into());
+        target.rhs.type_width = Some(3);
+        target.rhs.operands[2].literal = Some("32:011".into());
+    }
+    let constant_part_width_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong constant multidimensional array part-read width must fail");
+    assert!(
+        constant_part_width_error.contains("Const:3:u[3:111]")
+            && constant_part_width_error.contains("Const:4:u[4:1111]"),
+        "unexpected constant part-read width error: {constant_part_width_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "p")
+    {
+        target.rhs.type_width = Some(4);
+        target.rhs.operands[2].literal = Some("32:00000000000000000000000000000100".into());
+    }
+
     if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
         block
             .assignments

@@ -148,12 +148,22 @@ impl SlangAstSummary {
             if !strict_generated_hierarchy {
                 if let Some(memory_name) = continuous_constant_memory_name(&target.rhs) {
                     if !memory_names.contains(memory_name) {
-                        if let Some(fingerprint) = constant_array_read_fingerprint(
+                        if let Some(fingerprint) = constant_array_part_read_fingerprint(
                             memory_name,
                             &target.rhs,
                             design,
                             &self.declarations,
-                        ) {
+                            &self.parameters,
+                            fingerprint_mode,
+                        )
+                        .or_else(|| {
+                            constant_array_read_fingerprint(
+                                memory_name,
+                                &target.rhs,
+                                design,
+                                &self.declarations,
+                            )
+                        }) {
                             expected_continuous_targets
                                 .entry(target.name.clone())
                                 .or_default()
@@ -648,6 +658,11 @@ fn continuous_dynamic_memory_name(expression: &super::SlangExpressionSummary) ->
 }
 
 fn continuous_constant_memory_name(expression: &super::SlangExpressionSummary) -> Option<&str> {
+    let expression = if expression.kind == "RangeSelect" {
+        expression.operands.first()?
+    } else {
+        expression
+    };
     if expression.kind != "ElementSelect" {
         return None;
     }
@@ -885,6 +900,109 @@ fn dynamic_array_part_read_fingerprint(
     );
     Some(format!(
         "Cond:{element_width}:u[{any_index_valid},{packed_result},Const:{width}:u[{width}:{}]]",
+        "x".repeat(width)
+    ))
+}
+
+fn constant_array_part_read_fingerprint(
+    target_name: &str,
+    expression: &super::SlangExpressionSummary,
+    design: &Design,
+    declarations: &[super::SlangDeclarationSummary],
+    parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if expression.kind != "RangeSelect"
+        || !matches!(
+            expression.selection_kind.as_str(),
+            "IndexedUp" | "IndexedDown"
+        )
+    {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let memory = memory_type(&declaration.type_name)?;
+    if memory.dynamic
+        || memory.queue
+        || memory.associative
+        || memory.element_msb < memory.element_lsb
+        || memory.element_lsb < 0
+    {
+        return None;
+    }
+
+    let indexes = dynamic_array_read_indexes(selected)?;
+    let width = expression.type_width?;
+    let element_width = memory.element_width;
+    if indexes.len() != memory.dimensions.len()
+        || selected.type_width? != element_width
+        || width == 0
+        || width > element_width
+        || summary_literal_i64(expression.operands.get(2)?)? != i64::try_from(width).ok()?
+    {
+        return None;
+    }
+
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    let net_width = design
+        .net_decls
+        .iter()
+        .find(|net| net.name == target_name)
+        .map(|net| net.width)?;
+    if total_width == 0 || net_width != total_width {
+        return None;
+    }
+
+    let mut element_index = 0_usize;
+    for (index, dimension) in indexes.iter().zip(&memory.dimensions) {
+        let index_value = summary_literal_i64(index)?;
+        let normalized_index = if dimension.step > 0 {
+            index_value.checked_sub(dimension.base)?
+        } else {
+            dimension.base.checked_sub(index_value)?
+        };
+        if normalized_index < 0 || normalized_index >= dimension.length as i64 {
+            return None;
+        }
+        element_index = element_index
+            .checked_mul(dimension.length)?
+            .checked_add(usize::try_from(normalized_index).ok()?)?;
+    }
+    let physical_lsb = element_index.checked_mul(element_width)?;
+    let physical_msb = physical_lsb.checked_add(element_width)?.checked_sub(1)?;
+    let selected_element = format!(
+        "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
+    );
+
+    let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
+    let start = slang_expression_fingerprint_with_parameters(
+        expression.operands.get(1)?,
+        parameters,
+        mode,
+    )?;
+    let logical_start = if expression.selection_kind == "IndexedUp" {
+        start
+    } else {
+        format!("Sub:32:u[{start},{}]", const32(width as u64 - 1))
+    };
+    let normalized_start = format!(
+        "Sub:32:u[{logical_start},{}]",
+        const32(memory.element_lsb.unsigned_abs())
+    );
+    let max_offset = element_width - width;
+    let in_range = format!(
+        "And:1:u[Ge:1:u[{normalized_start},{}],Le:1:u[{normalized_start},{}]]",
+        const32(0),
+        const32(max_offset as u64)
+    );
+    let shifted = format!("Shr:{element_width}:u[{selected_element},{normalized_start}]");
+    let mask = format!("Const:{width}:u[{width}:{}]", "1".repeat(width));
+    let selected_value = format!("And:{element_width}:u[{shifted},{mask}]");
+    Some(format!(
+        "Cond:{element_width}:u[{in_range},{selected_value},Const:{width}:u[{width}:{}]]",
         "x".repeat(width)
     ))
 }
