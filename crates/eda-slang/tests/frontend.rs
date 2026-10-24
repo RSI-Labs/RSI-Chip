@@ -12795,6 +12795,35 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower strings through the bounded compatibility path");
+    let bounded_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&bounded_source_path),
+            Some("strings_bounded"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize bounded string AST");
+    let mut bounded_summary = slang
+        .summarize_ast_json(&bounded_json)
+        .expect("summarize bounded string AST");
+    bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect("exact bounded string literal fingerprints should match");
+    if let Some(target) = bounded_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "literal_source")
+    {
+        target.rhs.operands[0].literal = Some(format!("32:{}", "1".repeat(32)));
+    }
+    let bounded_literal_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong bounded string literal must fail");
+    assert!(
+        bounded_literal_error.contains("Const:512:u[512:")
+            && bounded_literal_error.contains(&"1".repeat(32)),
+        "unexpected bounded string literal error: {bounded_literal_error}"
+    );
     let mut bounded_simulator = Simulator::new(&bounded).expect("create bounded string simulator");
     bounded_simulator.run_until(0).expect("run bounded strings");
     assert_eq!(

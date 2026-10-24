@@ -941,6 +941,19 @@ fn conversion_fingerprint(
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let operand = expression.operands.first()?;
+    if expression.type_name == "string"
+        && mode == ExpressionFingerprintMode::BoundedCompatibility
+        && operand.kind == "StringLiteral"
+    {
+        let (_, bits) = operand.literal.as_deref()?.split_once(':')?;
+        if bits.len() > STRING_WIDTH {
+            return None;
+        }
+        let padded_bits = format!("{bits:0>width$}", width = STRING_WIDTH);
+        return Some(format!(
+            "Const:{STRING_WIDTH}:u[{STRING_WIDTH}:{padded_bits}]"
+        ));
+    }
     if expression.type_name == "string" && mode == ExpressionFingerprintMode::Direct {
         return direct_string_conversion_fingerprint(operand, parameters, mode);
     }
@@ -1352,6 +1365,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    if expression.kind == "StringLiteral" {
+        let literal = expression.literal.as_deref()?;
+        let width = expression.type_width.unwrap_or(STRING_WIDTH);
+        return canonical_literal_fingerprint(width, false, literal);
+    }
     if expression.kind == "Concatenation"
         && expression.type_name == "string"
         && mode == ExpressionFingerprintMode::Direct
