@@ -164,13 +164,23 @@ impl SlangAstSummary {
                 }
                 if let Some(memory_name) = continuous_dynamic_memory_name(&target.rhs) {
                     if !memory_names.contains(memory_name) {
-                        if let Some(fingerprint) = dynamic_array_read_fingerprint(
+                        if let Some(fingerprint) = dynamic_array_part_read_fingerprint(
                             memory_name,
                             &target.rhs,
+                            design,
                             &self.declarations,
                             &self.parameters,
                             fingerprint_mode,
-                        ) {
+                        )
+                        .or_else(|| {
+                            dynamic_array_read_fingerprint(
+                                memory_name,
+                                &target.rhs,
+                                &self.declarations,
+                                &self.parameters,
+                                fingerprint_mode,
+                            )
+                        }) {
                             expected_continuous_targets
                                 .entry(target.name.clone())
                                 .or_default()
@@ -615,6 +625,11 @@ fn memory_fingerprint_target_exists(
 }
 
 fn continuous_dynamic_memory_name(expression: &super::SlangExpressionSummary) -> Option<&str> {
+    let expression = if expression.kind == "RangeSelect" {
+        expression.operands.first()?
+    } else {
+        expression
+    };
     if expression.kind != "ElementSelect" {
         return None;
     }
@@ -741,6 +756,136 @@ fn dynamic_array_read_fingerprint(
     Some(format!(
         "Cond:{total_width}:u[{in_range},{selected},Const:{element_width}:u[{element_width}:{}]]",
         "x".repeat(element_width)
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dynamic_array_part_read_fingerprint(
+    target_name: &str,
+    expression: &super::SlangExpressionSummary,
+    design: &Design,
+    declarations: &[super::SlangDeclarationSummary],
+    parameters: &[super::SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if expression.kind != "RangeSelect"
+        || !matches!(
+            expression.selection_kind.as_str(),
+            "IndexedUp" | "IndexedDown"
+        )
+    {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.name == target_name)?;
+    let memory = memory_type(&declaration.type_name)?;
+    if memory.dynamic
+        || memory.queue
+        || memory.associative
+        || memory.element_msb < memory.element_lsb
+        || memory.element_lsb < 0
+    {
+        return None;
+    }
+
+    let indexes = dynamic_array_read_indexes(selected)?;
+    let width = expression.type_width?;
+    let element_width = memory.element_width;
+    if indexes.len() != memory.dimensions.len()
+        || selected.type_width? != element_width
+        || width == 0
+        || width > element_width
+        || summary_literal_i64(expression.operands.get(2)?)? != i64::try_from(width).ok()?
+    {
+        return None;
+    }
+    // The bounded elaborator canonicalizes a full-width ascending select from
+    // bit zero to its arithmetic whole-element read form.
+    if width == element_width
+        && expression.selection_kind == "IndexedUp"
+        && summary_literal_i64(expression.operands.get(1)?)? == 0
+    {
+        return None;
+    }
+
+    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    let net_width = design
+        .net_decls
+        .iter()
+        .find(|net| net.name == target_name)
+        .map(|net| net.width)?;
+    if total_width == 0 || net_width != total_width || memory.flat_length > usize::MAX as u64 {
+        return None;
+    }
+
+    let const32 = |value: u64| format!("Const:32:u[32:{value:032b}]");
+    let selector_fingerprints = indexes
+        .iter()
+        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut selected_element = format!(
+        "Const:{element_width}:u[{element_width}:{}]",
+        "x".repeat(element_width)
+    );
+    let mut any_index_valid = "Const:1:u[1:0]".to_string();
+    for physical_element in 0..memory.flat_length {
+        let mut physical_offset = physical_element;
+        let mut scale = memory.flat_length;
+        let mut candidate_valid = "Const:1:u[1:1]".to_string();
+        for (dimension, selector) in memory.dimensions.iter().zip(&selector_fingerprints) {
+            scale = scale.checked_div(dimension.length as u64)?;
+            let dimension_offset = physical_offset / scale;
+            physical_offset %= scale;
+            let logical_index = dimension
+                .base
+                .checked_add(dimension.step.checked_mul(dimension_offset as i64)?)?;
+            let equals = format!("Eq:1:u[{selector},{}]", const32(logical_index as u64));
+            candidate_valid = format!("And:1:u[{candidate_valid},{equals}]");
+        }
+        any_index_valid = format!("Or:1:u[{any_index_valid},{candidate_valid}]");
+
+        let physical_lsb = (physical_element as usize).checked_mul(element_width)?;
+        let physical_msb = physical_lsb.checked_add(element_width)?.checked_sub(1)?;
+        let candidate = format!(
+            "PackedSelect:{element_width}:u[Ref:{total_width}:u[{target_name}],Range:{physical_msb}:{physical_lsb}]"
+        );
+        selected_element =
+            format!("Cond:{element_width}:u[{candidate_valid},{candidate},{selected_element}]");
+    }
+
+    let start = slang_expression_fingerprint_with_parameters(
+        expression.operands.get(1)?,
+        parameters,
+        mode,
+    )?;
+    let logical_start = if expression.selection_kind == "IndexedUp" {
+        start
+    } else {
+        format!("Sub:32:u[{start},{}]", const32(width as u64 - 1))
+    };
+    let normalized_start = format!(
+        "Sub:32:u[{logical_start},{}]",
+        const32(memory.element_lsb.unsigned_abs())
+    );
+    let max_offset = element_width - width;
+    let packed_in_range = format!(
+        "And:1:u[Ge:1:u[{normalized_start},{}],Le:1:u[{normalized_start},{}]]",
+        const32(0),
+        const32(max_offset as u64)
+    );
+    let shifted = format!("Shr:{element_width}:u[{selected_element},{normalized_start}]");
+    let mask = format!("Const:{width}:u[{width}:{}]", "1".repeat(width));
+    let packed_selected = format!("And:{element_width}:u[{shifted},{mask}]");
+    let packed_result = format!(
+        "Cond:{element_width}:u[{packed_in_range},{packed_selected},Const:{width}:u[{width}:{}]]",
+        "x".repeat(width)
+    );
+    Some(format!(
+        "Cond:{element_width}:u[{any_index_valid},{packed_result},Const:{width}:u[{width}:{}]]",
+        "x".repeat(width)
     ))
 }
 

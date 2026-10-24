@@ -4485,6 +4485,7 @@ module wide_dynamic_array(
   input logic [2:0] start,
   input logic [7:0] wdata,
   output logic [7:0] whole,
+  output logic [7:0] indexed_whole,
   output logic [3:0] part
 );
   logic [7:0] mem [0:4];
@@ -4497,6 +4498,7 @@ module wide_dynamic_array(
     mem[addr][start +: 4] <= wdata[3:0];
   end
   assign whole = mem[addr];
+  assign indexed_whole = mem[addr][0 +: 8];
   assign part = mem[addr][start +: 4];
 endmodule
 "#,
@@ -4556,6 +4558,65 @@ endmodule
         .find(|target| target.name == "whole")
     {
         target.rhs.operands[1].symbol = Some("addr".into());
+    }
+
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "part")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("wrong_addr".into());
+    }
+    let part_read_index_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong continuous wide array part-read selector must fail");
+    assert!(
+        part_read_index_error.contains("Ref:3:u[wrong_addr]")
+            && part_read_index_error.contains("Ref:3:u[addr]")
+            && part_read_index_error.contains("Cond:8:u["),
+        "unexpected continuous part-read index error: {part_read_index_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "part")
+    {
+        target.rhs.operands[0].operands[1].symbol = Some("addr".into());
+        target.rhs.operands[1].symbol = Some("wrong_start".into());
+    }
+    let part_read_start_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong continuous wide array part-read start must fail");
+    assert!(
+        part_read_start_error.contains("Ref:3:u[wrong_start]")
+            && part_read_start_error.contains("Ref:3:u[start]")
+            && part_read_start_error.contains("Cond:8:u["),
+        "unexpected continuous part-read start error: {part_read_start_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "part")
+    {
+        target.rhs.operands[1].symbol = Some("start".into());
+        target.rhs.type_width = Some(3);
+        target.rhs.operands[2].literal = Some("32:011".into());
+    }
+    let part_read_width_error = summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong continuous wide array part-read width must fail");
+    assert!(
+        part_read_width_error.contains("Const:3:u[3:111]")
+            && part_read_width_error.contains("Const:4:u[4:1111]"),
+        "unexpected continuous part-read width error: {part_read_width_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "part")
+    {
+        target.rhs.type_width = Some(4);
+        target.rhs.operands[2].literal = Some("32:00000000000000000000000000000100".into());
     }
 
     if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
@@ -4659,11 +4720,19 @@ endmodule
         .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
         .expect("set direct data");
     assert_eq!(direct_simulator.read("whole").unwrap().to_u64(), Some(0x34));
+    assert_eq!(
+        direct_simulator.read("indexed_whole").unwrap().to_u64(),
+        Some(0x34)
+    );
     assert_eq!(direct_simulator.read("part").unwrap().to_u64(), Some(0x3));
     direct_simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .expect("create direct posedge");
     assert_eq!(direct_simulator.read("whole").unwrap().to_u64(), Some(0xaa));
+    assert_eq!(
+        direct_simulator.read("indexed_whole").unwrap().to_u64(),
+        Some(0xaa)
+    );
     assert_eq!(direct_simulator.read("part").unwrap().to_u64(), Some(0xa));
 
     let mut bounded_simulator =
@@ -4684,12 +4753,20 @@ endmodule
         bounded_simulator.read("whole").unwrap().to_u64(),
         Some(0x34)
     );
+    assert_eq!(
+        bounded_simulator.read("indexed_whole").unwrap().to_u64(),
+        Some(0x34)
+    );
     assert_eq!(bounded_simulator.read("part").unwrap().to_u64(), Some(0x3));
     bounded_simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .expect("create bounded posedge");
     assert_eq!(
         bounded_simulator.read("whole").unwrap().to_u64(),
+        Some(0xaa)
+    );
+    assert_eq!(
+        bounded_simulator.read("indexed_whole").unwrap().to_u64(),
         Some(0xaa)
     );
     assert_eq!(bounded_simulator.read("part").unwrap().to_u64(), Some(0xa));
