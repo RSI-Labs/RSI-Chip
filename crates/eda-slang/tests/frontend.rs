@@ -4637,6 +4637,124 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower multidimensional indexed part write through bounded path");
+    let reference_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("memory2d_parts"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize multidimensional indexed part AST");
+    let mut reference_summary = slang
+        .summarize_ast_json(&reference_json)
+        .expect("summarize multidimensional indexed part AST");
+    reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect("exact dynamic multidimensional part fingerprint should match");
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.indexes[0].symbol = Some("wrong_x".into());
+    }
+    let first_index_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic first multidimensional index must fail");
+    assert!(
+        first_index_error.contains("Ref:2:u[wrong_x]")
+            && first_index_error.contains("Ref:2:u[x]")
+            && first_index_error.contains("GuardedArrayPartWrite:4:u["),
+        "unexpected dynamic first index error: {first_index_error}"
+    );
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.indexes[0].symbol = Some("x".into());
+        part.indexes[1].symbol = Some("wrong_y".into());
+    }
+    let second_index_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic second multidimensional index must fail");
+    assert!(
+        second_index_error.contains("Ref:3:u[wrong_y]")
+            && second_index_error.contains("Ref:3:u[y]")
+            && second_index_error.contains("GuardedArrayPartWrite:4:u["),
+        "unexpected dynamic second index error: {second_index_error}"
+    );
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.indexes[1].symbol = Some("y".into());
+        part.start.symbol = Some("wrong_start".into());
+    }
+    let start_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic multidimensional part start must fail");
+    assert!(
+        start_error.contains("Ref:3:u[wrong_start]") && start_error.contains("Ref:3:u[start]"),
+        "unexpected dynamic part start error: {start_error}"
+    );
+    if let Some(part) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find_map(|assignment| assignment.array_part_lvalue.as_mut())
+        })
+    {
+        part.start.symbol = Some("start".into());
+        part.width = 3;
+    }
+    let width_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic multidimensional part width must fail closed");
+    assert!(
+        width_error.contains("could not fingerprint array part lvalue 'mem'"),
+        "unexpected dynamic part width error: {width_error}"
+    );
+    if let Some(assignment) = reference_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block
+                .assignments
+                .iter_mut()
+                .find(|assignment| assignment.array_part_lvalue.is_some())
+        })
+    {
+        assignment.array_part_lvalue.as_mut().unwrap().width = 4;
+        assignment.rhs.operands[0].symbol = Some("wrong_data".into());
+    }
+    let value_error = reference_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong dynamic multidimensional part value must fail");
+    assert!(
+        value_error.contains("PackedSelect:4:u[Ref:8:u[wrong_data]")
+            && value_error.contains("PackedSelect:4:u[Ref:8:u[wdata]"),
+        "unexpected dynamic part value error: {value_error}"
+    );
     assert_eq!(direct.memories.len(), 1);
     assert_eq!(direct.memories[0].dimensions.len(), 2);
 

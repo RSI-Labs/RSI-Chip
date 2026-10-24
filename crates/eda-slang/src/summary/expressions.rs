@@ -436,11 +436,19 @@ fn constant_array_element_lvalue(value: &Value) -> bool {
 }
 
 fn constant_array_indexes(value: &Value) -> Option<Vec<SlangExpressionSummary>> {
+    let indexes = array_indexes(value)?;
+    indexes
+        .iter()
+        .all(|index| summary_literal_i64(index).is_some())
+        .then_some(indexes)
+}
+
+fn array_indexes(value: &Value) -> Option<Vec<SlangExpressionSummary>> {
     if string_field(value, "kind").as_deref() != Some("ElementSelect") {
         return None;
     }
     let selected = value.get("value")?;
-    let mut indexes = constant_array_indexes(selected).or_else(|| {
+    let mut indexes = array_indexes(selected).or_else(|| {
         let selected_is_array = matches!(
             string_field(selected, "kind").as_deref(),
             Some("NamedValue" | "HierarchicalValue")
@@ -449,7 +457,6 @@ fn constant_array_indexes(value: &Value) -> Option<Vec<SlangExpressionSummary>> 
         selected_is_array.then_some(Vec::new())
     })?;
     let selector = value.get("selector")?;
-    slang_constant_u64(selector).ok()?;
     indexes.push(expression_summary(selector));
     Some(indexes)
 }
@@ -459,7 +466,7 @@ fn array_part_lvalue_summary(value: &Value) -> Option<super::SlangArrayPartLvalu
         return None;
     }
     let selected = value.get("value")?;
-    let indexes = constant_array_indexes(selected)?;
+    let indexes = array_indexes(selected)?;
     let selection_kind = string_field(value, "selectionKind")?;
     let left = value.get("left")?;
     let right = value.get("right")?;
@@ -2214,6 +2221,21 @@ pub(crate) fn design_stmt_assignments(
     design: &Design,
     statement: &eda_core::ir::Stmt,
 ) -> Vec<(String, String)> {
+    design_stmt_assignments_guarded(design, statement, None)
+}
+
+fn combine_assignment_guards(existing: Option<&str>, condition: &str) -> String {
+    match existing {
+        Some(existing) => format!("And:1:u[{existing},{condition}]"),
+        None => condition.to_string(),
+    }
+}
+
+fn design_stmt_assignments_guarded(
+    design: &Design,
+    statement: &eda_core::ir::Stmt,
+    guard: Option<&str>,
+) -> Vec<(String, String)> {
     use eda_core::ir::Stmt;
     let mut assignments = Vec::new();
     match statement {
@@ -2221,47 +2243,47 @@ pub(crate) fn design_stmt_assignments(
             if let Some(copy) = class_handle_copy_block(design, statements) {
                 assignments.push(copy);
             } else {
-                statements
-                    .iter()
-                    .for_each(|nested| assignments.extend(design_stmt_assignments(design, nested)));
+                statements.iter().for_each(|nested| {
+                    assignments.extend(design_stmt_assignments_guarded(design, nested, guard))
+                });
             }
         }
 
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
-            assignments.extend(design_stmt_assignments(design, body));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
         Stmt::Wait { body, .. } => {
-            assignments.extend(design_stmt_assignments(design, body));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
         Stmt::EventWait { body, .. } => {
-            assignments.extend(design_stmt_assignments(design, body));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
         Stmt::WaitOrder {
             success, failure, ..
         } => {
             if let Some(statement) = success {
-                assignments.extend(design_stmt_assignments(design, statement));
+                assignments.extend(design_stmt_assignments_guarded(design, statement, guard));
             }
             if let Some(statement) = failure {
-                assignments.extend(design_stmt_assignments(design, statement));
+                assignments.extend(design_stmt_assignments_guarded(design, statement, guard));
             }
         }
-        Stmt::Fork { branches, .. } => branches
-            .iter()
-            .for_each(|branch| assignments.extend(design_stmt_assignments(design, branch))),
+        Stmt::Fork { branches, .. } => branches.iter().for_each(|branch| {
+            assignments.extend(design_stmt_assignments_guarded(design, branch, guard))
+        }),
         Stmt::While { body, steps, .. } => {
-            assignments.extend(design_stmt_assignments(design, body));
-            steps
-                .iter()
-                .for_each(|step| assignments.extend(design_stmt_assignments(design, step)));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
+            steps.iter().for_each(|step| {
+                assignments.extend(design_stmt_assignments_guarded(design, step, guard))
+            });
         }
         Stmt::Repeat { body, .. } => {
-            assignments.extend(design_stmt_assignments(design, body));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
         Stmt::Force { .. } | Stmt::Release { .. } => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => {
-            assignments.extend(design_stmt_assignments(design, body));
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             if let Some(name) = design_lvalue_name(design, lv) {
@@ -2418,29 +2440,44 @@ pub(crate) fn design_stmt_assignments(
             if let Some(declaration) = design.net_decls.iter().find(|declaration| {
                 *net >= declaration.base && *net < declaration.base + declaration.width
             }) {
-                assignments.push((
+                let body = format!(
+                    "{},Element:{element_width},Offset:{base_offset},{},{}",
                     canonical_ref_symbol_name(&declaration.name),
-                    format!(
-                        "ArrayPartWrite:{width}:u[{},Element:{element_width},Offset:{base_offset},{},{}]",
-                        canonical_ref_symbol_name(&declaration.name),
-                        design_expr_fingerprint(design, start),
-                        design_indexed_value_fingerprint(design, e)
-                    ),
-                ));
+                    design_expr_fingerprint(design, start),
+                    design_indexed_value_fingerprint(design, e)
+                );
+                let shape = if let Some(guard) = guard {
+                    format!("GuardedArrayPartWrite:{width}:u[{guard},{body}]")
+                } else {
+                    format!("ArrayPartWrite:{width}:u[{body}]")
+                };
+                assignments.push((canonical_ref_symbol_name(&declaration.name), shape));
             }
         }
-        Stmt::If { t, f, .. } => {
-            assignments.extend(design_stmt_assignments(design, t));
+        Stmt::If { c, t, f } => {
+            let condition = design_expr_fingerprint(design, c);
+            let true_guard = combine_assignment_guards(guard, &condition);
+            let false_condition = format!("Not:1:u[{condition}]");
+            let false_guard = combine_assignment_guards(guard, &false_condition);
+            assignments.extend(design_stmt_assignments_guarded(
+                design,
+                t,
+                Some(&true_guard),
+            ));
             if let Some(f) = f {
-                assignments.extend(design_stmt_assignments(design, f));
+                assignments.extend(design_stmt_assignments_guarded(
+                    design,
+                    f,
+                    Some(&false_guard),
+                ));
             }
         }
         Stmt::Case { arms, dflt, .. } => {
             for (_, body) in arms {
-                assignments.extend(design_stmt_assignments(design, body));
+                assignments.extend(design_stmt_assignments_guarded(design, body, guard));
             }
             if let Some(body) = dflt {
-                assignments.extend(design_stmt_assignments(design, body));
+                assignments.extend(design_stmt_assignments_guarded(design, body, guard));
             }
         }
         Stmt::Display { .. }

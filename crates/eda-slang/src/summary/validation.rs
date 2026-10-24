@@ -312,11 +312,36 @@ impl SlangAstSummary {
                                 .extend(shapes);
                             continue;
                         }
+                        let legacy_array_shape =
+                            !strict_generated_hierarchy && legacy_array_targets.contains(target);
+                        if legacy_array_shape && assignment.array_part_lvalue.is_some() {
+                            let shapes = assignment
+                                .array_part_lvalue
+                                .as_ref()
+                                .and_then(|part| {
+                                    array_part_lvalue_fingerprints(
+                                        target,
+                                        part,
+                                        &assignment.rhs,
+                                        &self.declarations,
+                                        &self.parameters,
+                                        fingerprint_mode,
+                                    )
+                                })
+                                .ok_or_else(|| {
+                                    format!(
+                                        "lowering could not fingerprint array part lvalue '{target}'"
+                                    )
+                                })?;
+                            expected_procedural_targets
+                                .entry(target.clone())
+                                .or_default()
+                                .extend(shapes);
+                            continue;
+                        }
                         let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
                             format!("ClassHandleCopy:{source}")
                         } else {
-                            let legacy_array_shape = !strict_generated_hierarchy
-                                && legacy_array_targets.contains(target);
                             if legacy_array_shape
                                 && !assignment.dynamic_array_lvalue_indexes.is_empty()
                             {
@@ -331,23 +356,6 @@ impl SlangAstSummary {
                                 .ok_or_else(|| {
                                     format!(
                                         "lowering could not fingerprint dynamic array lvalue '{target}'"
-                                    )
-                                })?
-                            } else if legacy_array_shape && assignment.array_part_lvalue.is_some() {
-                                assignment
-                                .array_part_lvalue
-                                .as_ref()
-                                .and_then(|part| array_part_lvalue_fingerprint(
-                                    target,
-                                    part,
-                                    &assignment.rhs,
-                                    &self.declarations,
-                                    &self.parameters,
-                                    fingerprint_mode,
-                                ))
-                                .ok_or_else(|| {
-                                    format!(
-                                        "lowering could not fingerprint array part lvalue '{target}'"
                                     )
                                 })?
                             } else if legacy_array_shape
@@ -733,14 +741,14 @@ fn dynamic_array_element_lvalue_fingerprint(
     Some(format!("Cond:{total_width}:u[{in_range},{merged},{old}]"))
 }
 
-fn array_part_lvalue_fingerprint(
+fn array_part_lvalue_fingerprints(
     target_name: &str,
     part: &super::SlangArrayPartLvalueSummary,
     value: &super::SlangExpressionSummary,
     declarations: &[super::SlangDeclarationSummary],
     parameters: &[super::SlangParameterSummary],
     mode: ExpressionFingerprintMode,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
@@ -755,7 +763,8 @@ fn array_part_lvalue_fingerprint(
         return None;
     }
     let element_width = memory.element_width;
-    let total_width = element_width.checked_mul(usize::try_from(memory.flat_length).ok()?)?;
+    let flat_length = usize::try_from(memory.flat_length).ok()?;
+    let total_width = element_width.checked_mul(flat_length)?;
     if total_width == 0 || total_width > u32::BITS as usize {
         return None;
     }
@@ -766,21 +775,11 @@ fn array_part_lvalue_fingerprint(
         return None;
     }
 
-    let mut element_index = 0_usize;
-    for (index, dimension) in part.indexes.iter().zip(&memory.dimensions) {
-        let index_value = summary_literal_i64(index)?;
-        let normalized_index = if dimension.step > 0 {
-            index_value - dimension.base
-        } else {
-            dimension.base - index_value
-        };
-        if normalized_index < 0 || normalized_index >= dimension.length as i64 {
-            return None;
-        }
-        element_index = element_index * dimension.length + normalized_index as usize;
-    }
-    let base_offset = element_index * element_width;
-
+    let index_fingerprints = part
+        .indexes
+        .iter()
+        .map(|index| slang_expression_fingerprint_with_parameters(index, parameters, mode))
+        .collect::<Option<Vec<_>>>()?;
     let start_fingerprint =
         slang_expression_fingerprint_with_parameters(&part.start, parameters, mode)?;
     let value_fingerprint = slang_expression_fingerprint_with_parameters(value, parameters, mode)?;
@@ -795,12 +794,95 @@ fn array_part_lvalue_fingerprint(
     };
     let normalized_start = format!(
         "Sub:32:u[{logical_start},{}]",
-        const32(memory.element_lsb.unsigned_abs())
+        const32(memory.element_lsb as u64)
     );
-    Some(format!(
-        "ArrayPartWrite:{}:u[{target_name},Element:{element_width},Offset:{base_offset},{normalized_start},{value_fingerprint}]",
-        part.width
-    ))
+
+    let physical_layout = |physical_element: usize| -> Option<(usize, Vec<i64>)> {
+        let mut physical_offset = physical_element;
+        let mut element_index = 0_usize;
+        let mut logical_indexes = Vec::with_capacity(memory.dimensions.len());
+        let mut stride = flat_length;
+        for dimension in &memory.dimensions {
+            stride /= dimension.length;
+            let dimension_offset = physical_offset / stride;
+            physical_offset %= stride;
+            if dimension_offset >= dimension.length {
+                return None;
+            }
+            let logical_index = dimension.base + dimension.step * dimension_offset as i64;
+            element_index = element_index * dimension.length + dimension_offset;
+            logical_indexes.push(logical_index);
+        }
+        Some((element_index, logical_indexes))
+    };
+
+    let array_part_body = |base_offset: usize| {
+        format!(
+            "{target_name},Element:{element_width},Offset:{base_offset},{normalized_start},{value_fingerprint}"
+        )
+    };
+
+    if part
+        .indexes
+        .iter()
+        .all(|index| summary_literal_i64(index).is_some())
+    {
+        let index_values = part
+            .indexes
+            .iter()
+            .map(summary_literal_i64)
+            .collect::<Option<Vec<_>>>()?;
+        let mut element_index = 0_usize;
+        for (index_value, dimension) in index_values.iter().zip(&memory.dimensions) {
+            let normalized_index = if dimension.step > 0 {
+                index_value - dimension.base
+            } else {
+                dimension.base - index_value
+            };
+            if normalized_index < 0 || normalized_index >= dimension.length as i64 {
+                return None;
+            }
+            element_index = element_index * dimension.length + normalized_index as usize;
+        }
+        let base_offset = element_index * element_width;
+        return Some(vec![format!(
+            "ArrayPartWrite:{}:u[{}]",
+            part.width,
+            array_part_body(base_offset)
+        )]);
+    }
+
+    let mut shapes = Vec::with_capacity(flat_length);
+    let mut excluded_conditions = None::<String>;
+    for physical_element in (0..flat_length).rev() {
+        let (element_index, logical_indexes) = physical_layout(physical_element)?;
+        let mut candidate_condition = "Const:1:u[1:1]".to_string();
+        for (index_fingerprint, logical_index) in index_fingerprints.iter().zip(logical_indexes) {
+            candidate_condition = format!(
+                "And:1:u[{candidate_condition},Eq:1:u[{index_fingerprint},{}]]",
+                const32(logical_index as u64)
+            );
+        }
+
+        let guard = match &excluded_conditions {
+            Some(excluded) => format!("And:1:u[{excluded},{candidate_condition}]"),
+            None => candidate_condition.clone(),
+        };
+        let base_offset = element_index * element_width;
+        shapes.push(format!(
+            "GuardedArrayPartWrite:{}:u[{guard},{}]",
+            part.width,
+            array_part_body(base_offset)
+        ));
+
+        excluded_conditions = match excluded_conditions {
+            Some(excluded) => Some(format!(
+                "And:1:u[{excluded},Not:1:u[{candidate_condition}]]"
+            )),
+            None => Some(format!("Not:1:u[{candidate_condition}]")),
+        };
+    }
+    Some(shapes)
 }
 
 fn dynamic_packed_lvalue_fingerprint(
