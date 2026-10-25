@@ -2,11 +2,12 @@
 
 use crate::ast_util::{
     bool_field, expression_symbol, expression_target_names, instance_parameters,
-    integer_literal_word, literal_word, named_constant_word, slang_constant_u64, string_field,
+    integer_literal_word, literal_word, named_constant_word, parameter_summary, slang_constant_u64,
+    string_field,
 };
 use crate::types::{
     memory_type, simple_type_shape, simple_type_signed, simple_type_width, string_literal_word,
-    STRING_WIDTH,
+    AstPackedDimension, STRING_WIDTH,
 };
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
@@ -792,7 +793,13 @@ fn constant_packed_select_fingerprint(
         return None;
     }
     let shape = simple_type_shape(&selected.type_name)?;
-    let dimension = shape.dimensions.first()?;
+    let implicit_dimension = AstPackedDimension {
+        msb: i64::try_from(shape.width.checked_sub(1)?).ok()?,
+        lsb: 0,
+        length: shape.width,
+        element_width: 1,
+    };
+    let dimension = shape.dimensions.first().unwrap_or(&implicit_dimension);
     let width = expression.type_width?;
     if width == 0 || width > shape.width {
         return None;
@@ -1698,9 +1705,11 @@ pub(crate) fn collect_kinds(value: &Value, kinds: &mut std::collections::BTreeSe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_generate_summary(
     value: &Value,
     prefix: &[String],
+    parameters: &[SlangParameterSummary],
     instances: &mut Vec<SlangInstanceSummary>,
     continuous_targets: &mut Vec<SlangContinuousTarget>,
     procedural_blocks: &mut Vec<SlangProceduralBlockSummary>,
@@ -1732,6 +1741,7 @@ pub(crate) fn collect_generate_summary(
             collect_generate_summary(
                 member,
                 &nested_prefix,
+                parameters,
                 instances,
                 continuous_targets,
                 procedural_blocks,
@@ -1746,9 +1756,23 @@ pub(crate) fn collect_generate_summary(
         return Ok(());
     };
     let mut working_prefix = prefix.to_vec();
+    let mut scoped_parameters = parameters.to_vec();
     if string_field(value, "kind").as_deref() == Some("GenerateBlock") {
         if let Some(name) = string_field(value, "name").filter(|name| !name.is_empty()) {
             working_prefix.push(name);
+        }
+        for member in members {
+            if string_field(member, "kind").as_deref() == Some("Parameter") {
+                let parameter = parameter_summary(member)?;
+                if let Some(existing) = scoped_parameters
+                    .iter_mut()
+                    .find(|existing| existing.name == parameter.name)
+                {
+                    *existing = parameter;
+                } else {
+                    scoped_parameters.push(parameter);
+                }
+            }
         }
     }
     for member in members {
@@ -1800,8 +1824,11 @@ pub(crate) fn collect_generate_summary(
                 let Some(left) = assignment.get("left") else {
                     continue;
                 };
-                let rhs = assignment
+                let rhs_value = assignment
                     .get("right")
+                    .map(|rhs| materialize_generate_constants(rhs, &scoped_parameters));
+                let rhs = rhs_value
+                    .as_ref()
                     .map(expression_summary)
                     .unwrap_or_else(empty_expression_summary);
                 for name in expression_target_names(left) {
@@ -1829,6 +1856,7 @@ pub(crate) fn collect_generate_summary(
                 collect_generate_summary(
                     member,
                     &working_prefix,
+                    &scoped_parameters,
                     instances,
                     continuous_targets,
                     procedural_blocks,
@@ -1840,6 +1868,32 @@ pub(crate) fn collect_generate_summary(
         }
     }
     Ok(())
+}
+
+fn materialize_generate_constants(value: &Value, parameters: &[SlangParameterSummary]) -> Value {
+    let mut materialized = value.clone();
+    if let Some(fields) = materialized.as_object_mut() {
+        if fields.get("kind").and_then(Value::as_str) == Some("NamedValue") {
+            let symbol = fields
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = symbol.split_whitespace().next_back().unwrap_or_default();
+            if let Some(parameter) = parameters.iter().find(|parameter| parameter.name == name) {
+                fields
+                    .entry("constant")
+                    .or_insert_with(|| Value::String(parameter.value.clone()));
+            }
+        }
+        for nested in fields.values_mut() {
+            *nested = materialize_generate_constants(nested, parameters);
+        }
+    } else if let Some(values) = materialized.as_array_mut() {
+        for nested in values {
+            *nested = materialize_generate_constants(nested, parameters);
+        }
+    }
+    materialized
 }
 
 pub(crate) fn design_lvalue_name(design: &Design, lvalue: &eda_core::ir::LValue) -> Option<String> {

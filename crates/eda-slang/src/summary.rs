@@ -2463,6 +2463,7 @@ impl SlangAstSummary {
                     collect_generate_summary(
                         member,
                         &[],
+                        &[],
                         &mut instances,
                         &mut continuous_targets,
                         &mut procedural_blocks,

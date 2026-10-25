@@ -8933,6 +8933,61 @@ endmodule
         )
         .expect("lower generated assignments");
     assert_eq!(design.assigns.len(), 8);
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("generate_for"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize generated assignment AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize generated assignment AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact generated constant bit-select fingerprints should match");
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "forward")
+    {
+        target.rhs.operands[1].operands[0].literal =
+            Some("32:00000000000000000000000000000001".into());
+    }
+    let wrong_constant_error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong generated genvar constant must fail");
+    assert!(
+        wrong_constant_error.contains("Const:32:u[32:00000000000000000000000000000000]")
+            && wrong_constant_error.contains("Const:32:u[32:00000000000000000000000000000001]"),
+        "unexpected generated genvar constant error: {wrong_constant_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "forward")
+    {
+        target.rhs.operands[1].operands[0].literal =
+            Some("32:00000000000000000000000000000000".into());
+        target.rhs.operands[1].operands[1].literal =
+            Some("32:00000000000000000000000000000001".into());
+    }
+    let wrong_selector_error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong generated constant bit selector must fail");
+    assert!(
+        wrong_selector_error.contains("Range:0:0") && wrong_selector_error.contains("Range:1:1"),
+        "unexpected generated bit selector error: {wrong_selector_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "forward")
+    {
+        target.rhs.operands[1].operands[1].literal =
+            Some("32:00000000000000000000000000000000".into());
+    }
     let mut simulator = Simulator::new(&design).expect("create generate simulator");
     simulator
         .set_input("a", &LogicWord::from_u64(1, 1))
