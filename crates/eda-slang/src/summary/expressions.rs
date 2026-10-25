@@ -189,6 +189,21 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
                 }
             }
         }
+        "ValueRange" => {
+            for field in ["left", "right"] {
+                if let Some(bound) = value.get(field) {
+                    operands.push(expression_summary(bound));
+                }
+            }
+        }
+        "Inside" => {
+            if let Some(left) = value.get("left") {
+                operands.push(expression_summary(left));
+            }
+            if let Some(ranges) = value.get("rangeList").and_then(Value::as_array) {
+                operands.extend(ranges.iter().map(expression_summary));
+            }
+        }
         "MemberAccess" => {
             if let Some(selected) = value.get("value") {
                 operands.push(expression_summary(selected));
@@ -737,6 +752,7 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         // AST lowering rather than guessing here.
         ("ElementSelect" | "RangeSelect", _) => None,
         ("Concat" | "Concatenation", _) => Some("Concat"),
+        ("Inside", _) => Some("Inside"),
         ("Replication", _) => Some("Repeat"),
         ("ConditionalOp", _) => Some("Cond"),
         ("UnaryOp", "BitwiseNot") => Some("Not"),
@@ -1132,6 +1148,12 @@ fn conversion_fingerprint(
     if operand.kind == "IntegerLiteral" && expression.type_name == "time" {
         return Some(operand_fingerprint);
     }
+    if simple_type_shape(&expression.type_name).is_none()
+        && target_width == operand.type_width?
+        && expression.type_signed.unwrap_or(false) == operand.type_signed.unwrap_or(false)
+    {
+        return Some(operand_fingerprint);
+    }
 
     let target_shape = simple_type_shape(&expression.type_name)?;
     let source_shape = simple_type_shape(&operand.type_name)?;
@@ -1368,6 +1390,48 @@ fn wildcard_equality_fingerprint(
     Some(equality)
 }
 
+fn inside_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let left = slang_expression_fingerprint_with_parameters(
+        expression.operands.first()?,
+        parameters,
+        mode,
+    )?;
+    let mut result = Some("Const:1:u[1:0]".to_string());
+    for range in expression.operands.iter().skip(1) {
+        let comparison = match range.kind.as_str() {
+            "Conversion" => {
+                let value = slang_expression_fingerprint_with_parameters(
+                    range.operands.first()?,
+                    parameters,
+                    mode,
+                )?;
+                format!("Eq:1:u[{left},{value}]")
+            }
+            "ValueRange" => {
+                let lower = slang_expression_fingerprint_with_parameters(
+                    range.operands.first()?,
+                    parameters,
+                    mode,
+                )?;
+                let upper = slang_expression_fingerprint_with_parameters(
+                    range.operands.get(1)?,
+                    parameters,
+                    mode,
+                )?;
+                format!("LogAnd:1:u[Ge:1:u[{left},{lower}],Le:1:u[{left},{upper}]]")
+            }
+            _ => return None,
+        };
+        let previous = result?;
+        result = Some(format!("LogOr:1:u[{previous},{comparison}]"));
+    }
+    result
+}
+
 fn direct_lowered_signed(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1376,8 +1440,8 @@ fn direct_lowered_signed(
         "IntegerLiteral" => expression.type_signed,
         "NamedValue" | "HierarchicalValue" => {
             let symbol = expression.symbol.as_deref()?;
-            if parameters.iter().any(|parameter| parameter.name == symbol) {
-                return Some(false);
+            if let Some(parameter) = parameters.iter().find(|parameter| parameter.name == symbol) {
+                return simple_type_signed(&parameter.type_name);
             }
             expression.type_signed
         }
@@ -1406,8 +1470,8 @@ fn direct_lowered_signed(
             _ => None,
         },
         "BinaryOp" => {
-            let left = direct_lowered_signed(expression.operands.first()?, parameters)?;
-            let right = direct_lowered_signed(expression.operands.get(1)?, parameters)?;
+            let left = direct_binary_operand_signed(expression.operands.first()?, parameters)?;
+            let right = direct_binary_operand_signed(expression.operands.get(1)?, parameters)?;
             match expression.operator.as_str() {
                 "LogicalShiftLeft"
                 | "ArithmeticShiftLeft"
@@ -1434,6 +1498,20 @@ fn direct_lowered_signed(
         "Replication" => direct_lowered_signed(expression.operands.first()?, parameters),
         _ => None,
     }
+}
+
+fn direct_binary_operand_signed(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+) -> Option<bool> {
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue") {
+        if let Some(symbol) = expression.symbol.as_deref() {
+            if parameters.iter().any(|parameter| parameter.name == symbol) {
+                return Some(false);
+            }
+        }
+    }
+    direct_lowered_signed(expression, parameters)
 }
 
 fn memory_selection(
@@ -1955,6 +2033,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             return Some(fingerprint);
         }
         if let Some(fingerprint) = wildcard_equality_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
+        }
+    }
+    if expression.kind == "Inside" {
+        if let Some(fingerprint) = inside_fingerprint(expression, parameters, mode) {
             return Some(fingerprint);
         }
     }

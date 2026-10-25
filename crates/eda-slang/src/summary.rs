@@ -1,9 +1,9 @@
 //! Typed summaries and structural validation for slang's elaborated AST.
 
 use super::ast_util::{
-    canonical_detailed_type, expression_symbol_id, expression_target_names, instance_parameters,
-    literal_word, normalize_detailed_types, normalize_instance_bodies, parameter_summary,
-    source_span, string_field,
+    canonical_detailed_type, constant_json_word, expression_symbol_id, expression_target_names,
+    instance_parameters, integer_literal_word, literal_word, normalize_detailed_types,
+    normalize_instance_bodies, parameter_summary, source_span, string_field,
 };
 use crate::types::{simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
@@ -1528,6 +1528,48 @@ fn simple_function_return_expression(
     environment: &std::collections::BTreeMap<String, Value>,
 ) -> Option<Value> {
     let body = definition.get("body")?;
+    if string_field(body, "kind").as_deref() == Some("Return") {
+        let mut environment = environment.clone();
+        initialize_simple_function_locals(definition, &mut environment)?;
+        let expression = simple_function_statement_expression(
+            body,
+            &mut environment,
+            &string_field(definition, "returnType").unwrap_or_default(),
+        )?;
+        return Some(serde_json::json!({
+            "kind": "Conversion",
+            "type": string_field(definition, "returnType")?,
+            "operand": expression,
+        }));
+    }
+    if string_field(body, "kind").as_deref() == Some("List") {
+        let mut environment = environment.clone();
+        initialize_simple_function_locals(definition, &mut environment)?;
+        if let Some(expression) = simple_function_statement_expression(
+            body,
+            &mut environment,
+            &string_field(definition, "returnType").unwrap_or_default(),
+        ) {
+            return Some(serde_json::json!({
+                "kind": "Conversion",
+                "type": string_field(definition, "returnType")?,
+                "operand": expression,
+            }));
+        }
+    }
+    let mut environment = environment.clone();
+    initialize_simple_function_locals(definition, &mut environment)?;
+    if let Some(expression) = simple_function_statement_expression(
+        body,
+        &mut environment,
+        &string_field(definition, "returnType").unwrap_or_default(),
+    ) {
+        return Some(serde_json::json!({
+            "kind": "Conversion",
+            "type": string_field(definition, "returnType")?,
+            "operand": expression,
+        }));
+    }
     if string_field(body, "kind").as_deref() != Some("ExpressionStatement") {
         return None;
     }
@@ -1546,13 +1588,282 @@ fn simple_function_return_expression(
         return None;
     }
     let expression = assignment.get("right")?.clone();
-    let expression = substitute_simple_function_values(&expression, environment)?;
+    let expression = substitute_simple_function_values(&expression, &environment)?;
     let return_type = string_field(definition, "returnType")?;
     Some(serde_json::json!({
         "kind": "Conversion",
         "type": return_type,
         "operand": expression,
     }))
+}
+
+fn initialize_simple_function_locals(
+    definition: &Value,
+    environment: &mut std::collections::BTreeMap<String, Value>,
+) -> Option<()> {
+    fn collect(value: &Value, environment: &mut std::collections::BTreeMap<String, Value>) {
+        if let Some(fields) = value.as_object() {
+            if let Some(initializer) = value.get("initializer") {
+                if let (Some(address), Some(name)) = (
+                    value.get("addr").and_then(Value::as_u64),
+                    string_field(value, "name"),
+                ) {
+                    if let Some(initializer) =
+                        substitute_simple_function_values(initializer, environment)
+                    {
+                        environment.insert(format!("{address} {name}"), initializer);
+                    }
+                }
+            }
+            for nested in fields.values() {
+                collect(nested, environment);
+            }
+        } else if let Some(values) = value.as_array() {
+            for nested in values {
+                collect(nested, environment);
+            }
+        }
+    }
+    collect(definition, environment);
+    Some(())
+}
+
+fn simple_function_statement_expression(
+    statement: &Value,
+    environment: &mut std::collections::BTreeMap<String, Value>,
+    return_type: &str,
+) -> Option<Value> {
+    match string_field(statement, "kind")?.as_str() {
+        "List" | "Block" => {
+            if let Some(body) = statement.get("body") {
+                return simple_function_statement_expression(body, environment, return_type);
+            }
+            if let Some(statements) = statement.get("list").and_then(Value::as_array) {
+                for nested in statements {
+                    if let Some(expression) =
+                        simple_function_statement_expression(nested, environment, return_type)
+                    {
+                        return Some(expression);
+                    }
+                }
+            }
+            None
+        }
+        "Return" => substitute_simple_function_values(statement.get("expr")?, environment),
+        "ExpressionStatement" => {
+            apply_simple_function_assignment(statement.get("expr")?, environment);
+            None
+        }
+        "Assignment" => {
+            apply_simple_function_assignment(statement, environment);
+            None
+        }
+        "ForLoop" => {
+            if let Some(initializers) = statement.get("initializers").and_then(Value::as_array) {
+                for initializer in initializers {
+                    if let Some(expression) =
+                        simple_function_statement_expression(initializer, environment, return_type)
+                    {
+                        return Some(expression);
+                    }
+                }
+            }
+            let stop = statement.get("stopExpr")?;
+            let body = statement.get("body")?;
+            let steps = statement.get("steps")?.as_array()?;
+            for _ in 0..=256 {
+                let stop = substitute_simple_function_values(stop, environment)?;
+                if simple_function_constant_i64(&stop)? == 0 {
+                    return None;
+                }
+                if let Some(expression) =
+                    simple_function_statement_expression(body, environment, return_type)
+                {
+                    return Some(expression);
+                }
+                for step in steps {
+                    if let Some(expression) =
+                        simple_function_statement_expression(step, environment, return_type)
+                    {
+                        return Some(expression);
+                    }
+                }
+            }
+            None
+        }
+        "WhileLoop" => {
+            let condition = statement.get("cond")?;
+            let body = statement.get("body")?;
+            for _ in 0..=256 {
+                let condition = substitute_simple_function_values(condition, environment)?;
+                if simple_function_constant_i64(&condition)? == 0 {
+                    return None;
+                }
+                if let Some(expression) =
+                    simple_function_statement_expression(body, environment, return_type)
+                {
+                    return Some(expression);
+                }
+            }
+            None
+        }
+        "RepeatLoop" => {
+            let count = substitute_simple_function_values(statement.get("count")?, environment)?;
+            let count = usize::try_from(simple_function_constant_i64(&count)?).ok()?;
+            let body = statement.get("body")?;
+            for _ in 0..count {
+                if let Some(expression) =
+                    simple_function_statement_expression(body, environment, return_type)
+                {
+                    return Some(expression);
+                }
+            }
+            None
+        }
+        "Conditional" => {
+            let condition = statement
+                .get("conditions")?
+                .as_array()?
+                .first()?
+                .get("expr")?;
+            let condition = substitute_simple_function_values(condition, environment)?;
+            let if_true = statement.get("ifTrue")?;
+            let if_false = statement.get("ifFalse");
+            let mut true_environment = environment.clone();
+            let true_return =
+                simple_function_statement_expression(if_true, &mut true_environment, return_type);
+            let mut false_environment = environment.clone();
+            let false_return = if_false.and_then(|statement| {
+                simple_function_statement_expression(statement, &mut false_environment, return_type)
+            });
+            if let (Some(left), Some(right)) = (true_return, false_return) {
+                return Some(serde_json::json!({
+                    "kind": "ConditionalOp",
+                    "type": return_type,
+                    "conditions": [{"expr": condition}],
+                    "left": left,
+                    "right": right,
+                }));
+            }
+
+            let true_target = conditional_assignment_target(if_true)?;
+            let true_value = true_environment.get(&true_target)?.clone();
+            let false_value = if let Some(if_false) = if_false {
+                let false_target = conditional_assignment_target(if_false)?;
+                false_environment.get(&false_target)?.clone()
+            } else {
+                environment.get(&true_target)?.clone()
+            };
+            let value = serde_json::json!({
+                "kind": "ConditionalOp",
+                "type": return_type,
+                "conditions": [{"expr": condition}],
+                "left": true_value,
+                "right": false_value,
+            });
+            environment.insert(true_target, value);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn apply_simple_function_assignment(
+    assignment: &Value,
+    environment: &mut std::collections::BTreeMap<String, Value>,
+) -> Option<()> {
+    if string_field(assignment, "kind").as_deref() != Some("Assignment") {
+        return None;
+    }
+    let target = string_field(assignment.get("left")?, "symbol")?;
+    let value = substitute_simple_function_values(assignment.get("right")?, environment)?;
+    environment.insert(target, value);
+    Some(())
+}
+
+fn simple_function_constant_i64(value: &Value) -> Option<i64> {
+    if let Some(word) = integer_literal_word(value).or_else(|| constant_json_word(value)) {
+        return simple_function_word_i64(&word, &string_field(value, "type").unwrap_or_default());
+    }
+    match string_field(value, "kind").as_deref() {
+        Some("Conversion") => simple_function_constant_i64(value.get("operand")?),
+        Some("UnaryOp") => {
+            let operand = simple_function_constant_i64(value.get("operand")?)?;
+            match string_field(value, "op").as_deref() {
+                Some("Plus") => Some(operand),
+                Some("Minus") => operand.checked_neg(),
+                _ => None,
+            }
+        }
+        Some("BinaryOp") => {
+            let left = simple_function_constant_i64(value.get("left")?)?;
+            let right = simple_function_constant_i64(value.get("right")?)?;
+            match string_field(value, "op").as_deref() {
+                Some("Add") => left.checked_add(right),
+                Some("Subtract") => left.checked_sub(right),
+                Some("Multiply") => left.checked_mul(right),
+                Some("LessThan") => Some((left < right) as i64),
+                Some("LessThanEqual") => Some((left <= right) as i64),
+                Some("GreaterThan") => Some((left > right) as i64),
+                Some("GreaterThanEqual") => Some((left >= right) as i64),
+                Some("Equality") => Some((left == right) as i64),
+                Some("Inequality") => Some((left != right) as i64),
+                _ => None,
+            }
+        }
+        Some("ConditionalOp") => {
+            let condition = value.get("conditions")?.as_array()?.first()?.get("expr")?;
+            let selected = if simple_function_constant_i64(condition)? != 0 {
+                "left"
+            } else {
+                "right"
+            };
+            simple_function_constant_i64(value.get(selected)?)
+        }
+        _ => None,
+    }
+}
+
+fn simple_function_word_i64(word: &eda_core::logic::LogicWord, type_name: &str) -> Option<i64> {
+    if word.width() == 0 || word.width() > u64::BITS as usize || !word.is_fully_known() {
+        return None;
+    }
+    let mut magnitude = 0_i128;
+    for (bit, value) in word.bits.iter().enumerate() {
+        if value.as_bool() == Some(true) {
+            magnitude |= 1_i128 << bit;
+        }
+    }
+    let signed = simple_type_signed(type_name).unwrap_or(false);
+    let sign_bit = 1_i128 << (word.width() - 1);
+    let signed_value = if signed && magnitude & sign_bit != 0 {
+        magnitude - (1_i128 << word.width())
+    } else {
+        magnitude
+    };
+    i64::try_from(signed_value).ok()
+}
+
+fn conditional_assignment_target(statement: &Value) -> Option<String> {
+    if matches!(
+        string_field(statement, "kind").as_deref(),
+        Some("List" | "Block")
+    ) {
+        if let Some(body) = statement.get("body") {
+            return conditional_assignment_target(body);
+        }
+        let statements = statement
+            .get("list")
+            .or_else(|| statement.get("body"))
+            .and_then(Value::as_array)?;
+        let assignment = statements
+            .iter()
+            .find(|nested| string_field(nested, "kind").as_deref() == Some("ExpressionStatement"))?
+            .get("expr")?;
+        return string_field(assignment.get("left")?, "symbol");
+    }
+    let assignment = statement.get("expr")?;
+    string_field(assignment.get("left")?, "symbol")
 }
 
 fn substitute_simple_function_values(
@@ -1812,6 +2123,81 @@ fn collect_type_alias_members(value: &Value, aliases: &mut Vec<Value>) {
 }
 
 #[derive(Default)]
+struct SimpleTypeAliasWidths {
+    by_address: std::collections::BTreeMap<u64, usize>,
+    by_name: std::collections::BTreeMap<String, Vec<usize>>,
+}
+
+fn collect_simple_type_alias_widths(aliases: &[Value], widths: &mut SimpleTypeAliasWidths) {
+    let mut pending = aliases.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        pending.retain(|alias| {
+            let Some(name) = string_field(alias, "name") else {
+                return false;
+            };
+            let Some(address) = alias.get("addr").and_then(Value::as_u64) else {
+                return false;
+            };
+            let Some(target) = alias.get("target") else {
+                return false;
+            };
+            let target_name = if target.is_string() {
+                target.as_str().unwrap_or_default().to_string()
+            } else {
+                match canonical_detailed_type(target) {
+                    Some(target_name) => target_name,
+                    None => return true,
+                }
+            };
+            let width = simple_type_width(&target_name)
+                .or_else(|| lookup_simple_type_alias_width(&target_name, widths));
+            let Some(width) = width else {
+                return true;
+            };
+            if widths.by_address.insert(address, width).is_none() {
+                widths.by_name.entry(name).or_default().push(width);
+                changed = true;
+            }
+            false
+        });
+    }
+}
+
+fn lookup_simple_type_alias_width(
+    type_name: &str,
+    widths: &SimpleTypeAliasWidths,
+) -> Option<usize> {
+    let (address, name) = type_name.split_once(' ')?;
+    if let Some(width) = address
+        .parse::<u64>()
+        .ok()
+        .and_then(|address| widths.by_address.get(&address))
+    {
+        return Some(*width);
+    }
+    let name = name.rsplit(['.', '#', ':']).next()?;
+    let matches = widths.by_name.get(name)?;
+    (matches.len() == 1).then(|| matches[0])
+}
+
+fn annotate_simple_type_alias_widths(
+    expression: &mut SlangExpressionSummary,
+    widths: &SimpleTypeAliasWidths,
+) {
+    if expression.type_width.is_none() {
+        let base_type = expression.type_name.split('$').next().unwrap_or_default();
+        if let Some(width) = lookup_simple_type_alias_width(base_type, widths) {
+            expression.type_width = Some(width);
+        }
+    }
+    for operand in &mut expression.operands {
+        annotate_simple_type_alias_widths(operand, widths);
+    }
+}
+
+#[derive(Default)]
 struct SlangTypeAliasIndex {
     exact: std::collections::BTreeMap<String, Value>,
     by_name: std::collections::BTreeMap<String, Vec<Value>>,
@@ -2052,8 +2438,7 @@ fn annotate_memory_element_shapes(
         }
         if let Some(memory) = selected {
             if memory.type_name.contains('$') {
-                let alias = type_layout_alias_key(&memory.type_name).unwrap_or_default();
-                if let Some(layout) = type_layouts.get(alias) {
+                if let Some(layout) = lookup_type_layout(&memory.type_name, type_layouts) {
                     expression.type_width.get_or_insert(layout.element_width);
                     expression.type_signed.get_or_insert(false);
                 }
@@ -2072,6 +2457,19 @@ fn lookup_type_layout<'a>(
     let alias = type_layout_alias_key(type_name)?;
     if let Some(layout) = type_layouts.get(alias) {
         return Some(layout);
+    }
+    let alias_address = alias.split_whitespace().next()?.parse::<u64>().ok()?;
+    let address_matches = type_layouts
+        .keys()
+        .filter(|key| {
+            key.split_whitespace()
+                .next()
+                .and_then(|address| address.parse::<u64>().ok())
+                .is_some_and(|address| address == alias_address)
+        })
+        .collect::<Vec<_>>();
+    if address_matches.len() == 1 {
+        return Some(&type_layouts[address_matches[0]]);
     }
     let alias_name = alias
         .split_whitespace()
@@ -2705,6 +3103,8 @@ impl SlangAstSummary {
             .collect::<Vec<_>>();
         type_alias_members.extend(imported_type_aliases.into_values());
         collect_type_alias_members(root, &mut type_alias_members);
+        let mut simple_type_alias_widths = SimpleTypeAliasWidths::default();
+        collect_simple_type_alias_widths(&type_alias_members, &mut simple_type_alias_widths);
         loop {
             let mut changed = false;
             for member in &type_alias_members {
@@ -2891,6 +3291,7 @@ impl SlangAstSummary {
         let mut interface_members = std::collections::BTreeMap::new();
         collect_instance_member_paths(root, root, &mut interface_members);
         for target in &mut continuous_targets {
+            annotate_simple_type_alias_widths(&mut target.rhs, &simple_type_alias_widths);
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
             annotate_enum_name_calls(&mut target.rhs, &enum_types);
             annotate_memory_element_shapes(&mut target.rhs, &type_layouts);
@@ -2900,6 +3301,7 @@ impl SlangAstSummary {
         }
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
+                annotate_simple_type_alias_widths(&mut assignment.rhs, &simple_type_alias_widths);
                 annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
                 annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
                 annotate_memory_element_shapes(&mut assignment.rhs, &type_layouts);

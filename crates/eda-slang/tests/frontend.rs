@@ -3298,6 +3298,35 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower simple type aliases");
+    let simple_alias_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("type_alias_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize simple-type-alias AST");
+    let mut simple_alias_summary = slang
+        .summarize_ast_json(&simple_alias_json)
+        .expect("summarize simple-type-alias AST");
+    simple_alias_summary
+        .validate_against_design(&design)
+        .expect("exact simple-type-alias fingerprints should match");
+    if let Some(target) = simple_alias_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "wide")
+    {
+        target.rhs.operands[0].literal = Some("16:0001001000110101".into());
+    }
+    let simple_alias_error = simple_alias_summary
+        .validate_against_design(&design)
+        .expect_err("wrong simple-type-alias literal must fail");
+    assert!(
+        simple_alias_error.contains("Const:16:u[16:0001001000110100]")
+            && simple_alias_error.contains("Const:16:u[16:0001001000110101]"),
+        "unexpected simple-type-alias error: {simple_alias_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create type-alias simulator");
     simulator.run_until(0).expect("run type-alias assignments");
     assert_eq!(simulator.read("wide").unwrap().to_u64(), Some(0x1234));
@@ -8672,7 +8701,7 @@ endmodule
     assert!(dropped_continuous
         .validate_against_design_legacy_compatibility(&design)
         .unwrap_err()
-        .contains("continuous assignment shape for 'wide' does not match slang"));
+        .contains("unsupported continuous expression for 'wide'"));
 
     let mut changed_operand_shape = summary.clone();
     let sum_rhs = changed_operand_shape
@@ -16172,6 +16201,45 @@ endmodule
         .expect("lower function calls");
     assert_eq!(design.assigns.len(), 8);
     assert_eq!(design.initials.len(), 1);
+    let function_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("functions"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize function-call AST");
+    let mut function_summary = slang
+        .summarize_ast_json(&function_json)
+        .expect("summarize function-call AST");
+    function_summary
+        .validate_against_design(&design)
+        .expect("exact inlined function fingerprints should match");
+    fn replace_first_a(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("a") {
+            expression.symbol = Some("wrong_a".into());
+            return true;
+        }
+        expression.operands.iter_mut().any(replace_first_a)
+    }
+    if let Some(target) = function_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "assigned")
+    {
+        assert!(
+            replace_first_a(&mut target.rhs),
+            "inlined function argument was not found"
+        );
+    }
+    let function_argument_error = function_summary
+        .validate_against_design(&design)
+        .expect_err("wrong inlined function argument must fail");
+    assert!(
+        function_argument_error.contains("Ref:8:s[wrong_a]")
+            && function_argument_error.contains("Ref:8:s[a]"),
+        "unexpected inlined-function argument error: {function_argument_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create function simulator");
     simulator
@@ -17612,6 +17680,36 @@ endmodule
         )
         .expect("lower inside expression");
     assert_eq!(design.assigns.len(), 1);
+    let inside_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("inside_expr"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize inside AST");
+    let mut inside_summary = slang
+        .summarize_ast_json(&inside_json)
+        .expect("summarize inside AST");
+    inside_summary
+        .validate_against_design(&design)
+        .expect("exact inside fingerprints should match");
+    if let Some(target) = inside_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "y")
+    {
+        target.rhs.operands[0].symbol = Some("wrong_a".into());
+    }
+    let inside_error = inside_summary
+        .validate_against_design(&design)
+        .expect_err("wrong inside receiver must fail");
+    assert!(
+        inside_error.contains("Ref:8:u[wrong_a]")
+            && inside_error.contains("Ref:8:u[a]")
+            && inside_error.contains("LogOr:1:u["),
+        "unexpected inside error: {inside_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create inside simulator");
     for (value, expected) in [

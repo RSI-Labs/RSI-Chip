@@ -145,6 +145,16 @@ impl SlangAstSummary {
         let mut expected_continuous_targets: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         for target in &self.continuous_targets {
+            if target.source == "Initializer"
+                && target.rhs.kind.ends_with("AssignmentPattern")
+                && memory_names.contains(&target.name)
+            {
+                // Array initializers lower into design.initials rather than
+                // continuous assignments. Their executable behavior is checked
+                // by initialization/runtime tests and their presence by the
+                // initial-block count below.
+                continue;
+            }
             if !strict_generated_hierarchy {
                 if let Some(memory_name) = continuous_constant_memory_name(&target.rhs) {
                     if !memory_names.contains(memory_name) {
@@ -200,21 +210,21 @@ impl SlangAstSummary {
                     }
                 }
             }
+            let Some(fingerprint) = slang_expression_fingerprint_with_parameters(
+                &target.rhs,
+                &self.parameters,
+                fingerprint_mode,
+            ) else {
+                return Err(format!(
+                    "unsupported continuous expression for '{}': slang expression kind '{}' has no exact fingerprint",
+                    target.name, target.rhs.kind
+                ) + &self
+                    .span_note(&format!("continuous:{}:", target.name)));
+            };
             expected_continuous_targets
                 .entry(target.name.clone())
                 .or_default()
-                .push(
-                    match slang_expression_fingerprint_with_parameters(
-                        &target.rhs,
-                        &self.parameters,
-                        fingerprint_mode,
-                    ) {
-                        Some(fingerprint) => {
-                            canonicalize_memory_fingerprint(&fingerprint, &memory_names)
-                        }
-                        None => "?".to_string(),
-                    },
-                );
+                .push(canonicalize_memory_fingerprint(&fingerprint, &memory_names));
         }
         let mut actual_continuous_targets: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
