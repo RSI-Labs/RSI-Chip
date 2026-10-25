@@ -1749,7 +1749,7 @@ fn type_layout_summary(
     normalize_detailed_types(&mut target);
     if !matches!(
         string_field(&target, "kind").as_deref(),
-        Some("PackedStructType" | "PackedUnionType")
+        Some("PackedStructType" | "PackedUnionType" | "UnpackedStructType" | "UnpackedUnionType")
     ) {
         return Ok(None);
     }
@@ -2291,7 +2291,10 @@ fn collect_direct_hierarchical_symbols(
         if let Some(symbol) = string_field(value, "symbol") {
             let name = symbol.split_whitespace().next_back().unwrap_or_default();
             if !name.is_empty() {
-                symbols.entry(name.to_string()).or_default().push(symbol);
+                let entries = symbols.entry(name.to_string()).or_default();
+                if !entries.contains(&symbol) {
+                    entries.push(symbol);
+                }
             }
         }
         return;

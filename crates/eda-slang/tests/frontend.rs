@@ -9782,6 +9782,36 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower interface unpacked struct members");
+    let unpacked_interface_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_unpacked_struct_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface unpacked-struct AST");
+    let mut unpacked_interface_summary = slang
+        .summarize_ast_json(&unpacked_interface_json)
+        .expect("summarize interface unpacked-struct AST");
+    unpacked_interface_summary
+        .validate_against_design(&design)
+        .expect("exact interface unpacked-struct fingerprints should match");
+    if let Some(target) = unpacked_interface_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed_tag")
+    {
+        target.rhs.operands[0].member_path = vec!["payload".into()];
+        target.rhs.operands[0].member_range = Some((7, 0));
+    }
+    let unpacked_interface_error = unpacked_interface_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface unpacked-struct member must fail");
+    assert!(
+        unpacked_interface_error.contains("Range:12:8")
+            && unpacked_interface_error.contains("Range:7:0"),
+        "unexpected interface unpacked-struct error: {unpacked_interface_error}"
+    );
     assert!(design
         .net_decls
         .iter()
@@ -10050,6 +10080,36 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower interface unpacked union members");
+    let unpacked_union_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_unpacked_union_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface unpacked-union AST");
+    let mut unpacked_union_summary = slang
+        .summarize_ast_json(&unpacked_union_json)
+        .expect("summarize interface unpacked-union AST");
+    unpacked_union_summary
+        .validate_against_design(&design)
+        .expect("exact interface unpacked-union fingerprints should match");
+    if let Some(target) = unpacked_union_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed")
+    {
+        target.rhs.member_path = vec!["wide".into()];
+        target.rhs.member_range = Some((7, 0));
+        target.rhs.type_width = Some(8);
+    }
+    let unpacked_union_error = unpacked_union_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface unpacked-union member must fail");
+    assert!(
+        unpacked_union_error.contains("Range:7:0") && unpacked_union_error.contains("Range:3:0"),
+        "unexpected interface unpacked-union error: {unpacked_union_error}"
+    );
     assert!(design
         .net_decls
         .iter()
@@ -10229,6 +10289,42 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower interface array port struct members");
+    let array_struct_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_struct_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface-array struct AST");
+    let mut array_struct_summary = slang
+        .summarize_ast_json(&array_struct_json)
+        .expect("summarize interface-array struct AST");
+    array_struct_summary
+        .validate_against_design(&design)
+        .expect("exact interface-array struct fingerprints should match");
+    if let Some(target) = array_struct_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| {
+            target
+                .rhs
+                .operands
+                .first()
+                .and_then(|base| base.interface_path.as_deref())
+                == Some("buses[1].packet")
+        })
+    {
+        target.rhs.operands[0].interface_path = Some("buses[9].packet".into());
+    }
+    let array_struct_error = array_struct_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface-array aggregate member must fail");
+    assert!(
+        array_struct_error.contains("Ref:6:u[buses[9].packet]")
+            && array_struct_error.contains("Ref:6:u[buses[1].packet]"),
+        "unexpected interface-array aggregate error: {array_struct_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create interface-array struct simulator");
     simulator
         .set_input("value", &LogicWord::from_u64(8, 0b1100_1011))
