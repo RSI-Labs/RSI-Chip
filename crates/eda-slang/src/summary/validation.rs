@@ -1383,6 +1383,8 @@ fn constant_zero_summary() -> super::SlangExpressionSummary {
         repeat_count: None,
         simulation_time_unit: None,
         enum_definition: None,
+        member_path: Vec::new(),
+        member_range: None,
         operands: Vec::new(),
     }
 }

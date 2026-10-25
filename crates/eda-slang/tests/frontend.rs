@@ -8661,6 +8661,8 @@ endmodule
                 repeat_count: None,
                 simulation_time_unit: None,
                 enum_definition: None,
+                member_path: Vec::new(),
+                member_range: None,
                 operands: Vec::new(),
             },
         });
@@ -11340,6 +11342,35 @@ endmodule
         )
         .expect("lower packed struct");
     assert_eq!(design.assigns.len(), 4);
+    let packed_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("packed_struct"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize packed-struct AST");
+    let mut packed_summary = slang
+        .summarize_ast_json(&packed_json)
+        .expect("summarize packed-struct AST");
+    packed_summary
+        .validate_against_design(&design)
+        .expect("exact packed-struct fingerprints should match");
+    if let Some(target) = packed_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "selected_low")
+    {
+        target.rhs.member_path = vec!["high".into()];
+        target.rhs.member_range = Some((7, 4));
+    }
+    let packed_member_error = packed_summary
+        .validate_against_design(&design)
+        .expect_err("wrong packed-struct member must fail");
+    assert!(
+        packed_member_error.contains("Range:7:4") && packed_member_error.contains("Range:3:0"),
+        "unexpected packed-struct member error: {packed_member_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create packed-struct simulator");
     simulator
@@ -11395,6 +11426,36 @@ endmodule
         )
         .expect("lower nested packed struct");
     assert_eq!(design.assigns.len(), 5);
+
+    let nested_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("nested_packed_struct"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize nested packed-struct AST");
+    let mut nested_summary = slang
+        .summarize_ast_json(&nested_json)
+        .expect("summarize nested packed-struct AST");
+    nested_summary
+        .validate_against_design(&design)
+        .expect("exact nested packed-struct fingerprints should match");
+    if let Some(target) = nested_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "selected")
+    {
+        target.rhs.member_path = vec!["b".into()];
+        target.rhs.member_range = Some((1, 0));
+    }
+    let nested_member_error = nested_summary
+        .validate_against_design(&design)
+        .expect_err("wrong nested packed-struct member must fail");
+    assert!(
+        nested_member_error.contains("Range:3:2") && nested_member_error.contains("Range:1:0"),
+        "unexpected nested packed-struct member error: {nested_member_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create nested packed-struct simulator");
     simulator.run_until(0).expect("settle nested packed struct");

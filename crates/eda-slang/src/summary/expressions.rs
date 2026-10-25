@@ -27,6 +27,22 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
             .flatten()
     });
     let literal = expression_literal(value);
+    let member_path = if kind == "MemberAccess" {
+        value
+            .get("member")
+            .and_then(|member| member.as_str())
+            .map(|member| {
+                member
+                    .split_whitespace()
+                    .next_back()
+                    .map(ToString::to_string)
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     // The bounded IR folds parameter constants to unsigned 32-bit Const nodes.
     // Keep those leaves comparable without inventing a signed Constant type.
     let type_signed = if kind == "NamedValue" && literal.is_some() {
@@ -46,6 +62,8 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         repeat_count: repeat_count(value),
         simulation_time_unit: None,
         enum_definition: None,
+        member_path,
+        member_range: None,
         operands: expression_operands(value),
     }
 }
@@ -63,6 +81,8 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         repeat_count: None,
         simulation_time_unit: None,
         enum_definition: None,
+        member_path: Vec::new(),
+        member_range: None,
         operands: Vec::new(),
     }
 }
@@ -153,6 +173,11 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
                 if let Some(bound) = value.get(field) {
                     operands.push(expression_summary(bound));
                 }
+            }
+        }
+        "MemberAccess" => {
+            if let Some(selected) = value.get("value") {
+                operands.push(expression_summary(selected));
             }
         }
         "Call" => {
@@ -1852,6 +1877,17 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     {
         let definition = expression.enum_definition.as_ref()?;
         return enum_name_receiver_fingerprint(expression, definition, parameters, mode);
+    }
+    if expression.kind == "MemberAccess" {
+        if let Some((msb, lsb)) = expression.member_range {
+            let width = expression.type_width?;
+            let base = slang_expression_fingerprint_with_parameters(
+                expression.operands.first()?,
+                parameters,
+                mode,
+            )?;
+            return Some(format!("PackedSelect:{width}:u[{base},Range:{msb}:{lsb}]"));
+        }
     }
     let root = slang_expression_shape(expression)?;
     let enum_definition = expression.enum_definition.as_ref();

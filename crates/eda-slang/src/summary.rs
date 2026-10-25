@@ -2051,6 +2051,44 @@ fn annotate_memory_element_shapes(
     }
 }
 
+fn annotate_packed_member_shapes(
+    expression: &mut SlangExpressionSummary,
+    type_layouts: &std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
+) -> Option<()> {
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue") {
+        let alias = type_layout_alias_key(&expression.type_name)?;
+        let layout = type_layouts.get(alias)?;
+        expression.type_width = Some(layout.element_width);
+        expression.type_signed.get_or_insert(
+            crate::types::simple_type_signed(&expression.type_name).unwrap_or(false),
+        );
+    }
+    if expression.kind == "MemberAccess" {
+        let selected = expression.operands.first_mut()?;
+        let member = expression.member_path.first()?.clone();
+        let alias = type_layout_alias_key(&selected.type_name)?;
+        let layout = type_layouts.get(alias)?;
+        let field = layout
+            .fields
+            .iter()
+            .find(|candidate| candidate.name == member)?;
+        let msb = field.offset.checked_add(field.width)?.checked_sub(1)?;
+        expression.member_range = Some((msb, field.offset));
+        expression.type_width = Some(field.width);
+        expression
+            .type_signed
+            .get_or_insert(crate::types::simple_type_signed(&field.type_name).unwrap_or(false));
+        selected.type_width = Some(layout.element_width);
+        selected
+            .type_signed
+            .get_or_insert(crate::types::simple_type_signed(&selected.type_name).unwrap_or(false));
+    }
+    for operand in &mut expression.operands {
+        let _ = annotate_packed_member_shapes(operand, type_layouts);
+    }
+    Some(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangAstSummary {
     pub top_name: String,
@@ -2227,6 +2265,10 @@ pub struct SlangExpressionSummary {
     /// Definition used to construct the conditional tree emitted by direct
     /// lowering for an enum `.name()` call.
     pub enum_definition: Option<SlangEnumTypeSummary>,
+    /// Source member path for a packed struct/union field access.
+    pub member_path: Vec<String>,
+    /// Physical inclusive bit range selected by a packed member path.
+    pub member_range: Option<(usize, usize)>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 
@@ -2563,12 +2605,14 @@ impl SlangAstSummary {
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
             annotate_enum_name_calls(&mut target.rhs, &enum_types);
             annotate_memory_element_shapes(&mut target.rhs, &type_layouts);
+            let _ = annotate_packed_member_shapes(&mut target.rhs, &type_layouts);
         }
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
                 annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
                 annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
                 annotate_memory_element_shapes(&mut assignment.rhs, &type_layouts);
+                let _ = annotate_packed_member_shapes(&mut assignment.rhs, &type_layouts);
                 if let Some(selector) = assignment.dynamic_packed_lvalue_selector.as_mut() {
                     annotate_memory_element_shapes(selector, &type_layouts);
                 }
