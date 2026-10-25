@@ -15372,6 +15372,60 @@ endmodule
         )
         .expect("lower ascending indexed selects");
     assert_eq!(design.assigns.len(), 2);
+    let json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("ascending_indexed"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize ascending indexed-select AST");
+    let mut summary = slang
+        .summarize_ast_json(&json)
+        .expect("summarize ascending indexed-select AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact ascending indexed-select fingerprints should match");
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "down")
+    {
+        target.rhs.operands[1].symbol = Some("wrong_start".into());
+    }
+    let selector_error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong indexed packed-select start must fail");
+    assert!(
+        selector_error.contains("Ref:3:u[wrong_start]")
+            && selector_error.contains("Ref:3:u[start]")
+            && selector_error.contains("Cond:4:u["),
+        "unexpected indexed selector error: {selector_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "down")
+    {
+        target.rhs.operands[1].symbol = Some("start".into());
+        target.rhs.type_width = Some(3);
+        target.rhs.operands[2].literal = Some("32:011".into());
+    }
+    let width_error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong indexed packed-select width must fail");
+    assert!(
+        width_error.contains("Cond:3:u[") && width_error.contains("Cond:4:u["),
+        "unexpected indexed width error: {width_error}"
+    );
+    if let Some(target) = summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "down")
+    {
+        target.rhs.type_width = Some(4);
+        target.rhs.operands[2].literal = Some("32:00000000000000000000000000000100".into());
+    }
 
     let mut simulator = Simulator::new(&design).expect("create ascending simulator");
     simulator

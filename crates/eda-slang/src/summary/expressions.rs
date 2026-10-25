@@ -932,6 +932,97 @@ fn dynamic_packed_element_select_fingerprint(
     Some(selected_fingerprint)
 }
 
+fn dynamic_indexed_packed_range_select_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if expression.kind != "RangeSelect"
+        || !matches!(
+            expression.selection_kind.as_str(),
+            "IndexedUp" | "IndexedDown"
+        )
+    {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    if selected.type_name.contains('$') {
+        return None;
+    }
+    let selector = expression.operands.get(1)?;
+    if selector.literal.is_some() {
+        return None;
+    }
+    let width = expression.type_width?;
+    let declared_width = summary_literal_i64(expression.operands.get(2)?)?;
+    if declared_width != i64::try_from(width).ok()? {
+        return None;
+    }
+
+    let shape = simple_type_shape(&selected.type_name)?;
+    let implicit_dimension = AstPackedDimension {
+        msb: i64::try_from(shape.width.checked_sub(1)?).ok()?,
+        lsb: 0,
+        length: shape.width,
+        element_width: 1,
+    };
+    let dimension = shape.dimensions.first().unwrap_or(&implicit_dimension);
+    if width == 0 || width > dimension.length {
+        return None;
+    }
+    let width_i64 = i64::try_from(width).ok()?;
+    let lower = dimension.msb.min(dimension.lsb);
+    let upper = dimension.msb.max(dimension.lsb);
+    let starts = if expression.selection_kind == "IndexedUp" {
+        lower..=upper.checked_add(1)?.checked_sub(width_i64)?
+    } else {
+        lower.checked_add(width_i64)?.checked_sub(1)?..=upper
+    };
+
+    let selector_width = selector.type_width?.max(1);
+    let selector_fingerprint =
+        slang_expression_fingerprint_with_parameters(selector, parameters, mode)?;
+    let base = slang_expression_fingerprint_with_parameters(selected, parameters, mode)?;
+    let physical_bit = |logical: i64| -> Option<i64> {
+        if logical < lower || logical > upper {
+            return None;
+        }
+        if dimension.msb >= dimension.lsb {
+            logical.checked_sub(dimension.lsb)
+        } else {
+            dimension.lsb.checked_sub(logical)
+        }
+    };
+    let mut selected_fingerprint = format!("Const:{width}:u[{width}:{}]", "x".repeat(width));
+    for logical_start in starts {
+        let (low_logical, high_logical) = if expression.selection_kind == "IndexedUp" {
+            (logical_start, logical_start.checked_add(width_i64 - 1)?)
+        } else {
+            (logical_start.checked_sub(width_i64 - 1)?, logical_start)
+        };
+        let first = physical_bit(low_logical)?;
+        let second = physical_bit(high_logical)?;
+        let msb = first.max(second);
+        let lsb = first.min(second);
+
+        let mut constant_bits = String::with_capacity(selector_width);
+        for bit in (0..selector_width).rev() {
+            constant_bits.push(if ((logical_start as u64) >> bit) & 1 == 0 {
+                '0'
+            } else {
+                '1'
+            });
+        }
+        let condition = format!(
+            "Eq:1:u[{selector_fingerprint},Const:{selector_width}:u[{selector_width}:{constant_bits}]]"
+        );
+        let candidate = format!("PackedSelect:{width}:u[{base},Range:{msb}:{lsb}]");
+        selected_fingerprint =
+            format!("Cond:{width}:u[{condition},{candidate},{selected_fingerprint}]");
+    }
+    Some(selected_fingerprint)
+}
+
 fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> Option<String> {
     let (_, bits) = literal.split_once(':')?;
     let signed_label = if signed && bits.starts_with('1') {
@@ -1596,6 +1687,11 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
         }
         if let Some(fingerprint) =
             dynamic_packed_element_select_fingerprint(expression, parameters, mode)
+        {
+            return Some(fingerprint);
+        }
+        if let Some(fingerprint) =
+            dynamic_indexed_packed_range_select_fingerprint(expression, parameters, mode)
         {
             return Some(fingerprint);
         }
