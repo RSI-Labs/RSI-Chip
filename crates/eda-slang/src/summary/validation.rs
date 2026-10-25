@@ -410,6 +410,65 @@ impl SlangAstSummary {
                                 .extend(shapes);
                             continue;
                         }
+                        if !strict_generated_hierarchy {
+                            if let Some(memory_name) =
+                                continuous_constant_memory_name(&assignment.rhs)
+                            {
+                                if !memory_names.contains(memory_name) {
+                                    if let Some(fingerprint) = constant_array_part_read_fingerprint(
+                                        memory_name,
+                                        &assignment.rhs,
+                                        design,
+                                        &self.declarations,
+                                        &self.parameters,
+                                        fingerprint_mode,
+                                    )
+                                    .or_else(|| {
+                                        constant_array_read_fingerprint(
+                                            memory_name,
+                                            &assignment.rhs,
+                                            design,
+                                            &self.declarations,
+                                        )
+                                    }) {
+                                        expected_procedural_targets
+                                            .entry(target.clone())
+                                            .or_default()
+                                            .push(fingerprint);
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Some(memory_name) =
+                                continuous_dynamic_memory_name(&assignment.rhs)
+                            {
+                                if !memory_names.contains(memory_name) {
+                                    if let Some(fingerprint) = dynamic_array_part_read_fingerprint(
+                                        memory_name,
+                                        &assignment.rhs,
+                                        design,
+                                        &self.declarations,
+                                        &self.parameters,
+                                        fingerprint_mode,
+                                    )
+                                    .or_else(|| {
+                                        dynamic_array_read_fingerprint(
+                                            memory_name,
+                                            &assignment.rhs,
+                                            &self.declarations,
+                                            &self.parameters,
+                                            fingerprint_mode,
+                                        )
+                                    }) {
+                                        expected_procedural_targets
+                                            .entry(target.clone())
+                                            .or_default()
+                                            .push(fingerprint);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         let legacy_whole_array_copy = legacy_array_shape
                             && !assignment.constant_array_element_lvalue
                             && assignment.dynamic_array_lvalue_indexes.is_empty()
@@ -505,8 +564,7 @@ impl SlangAstSummary {
                                             &memory_names,
                                         );
                                         if strict_generated_hierarchy
-                                            || (!fingerprint.starts_with("MemoryRead")
-                                                && !fingerprint.contains("PackedSelect:"))
+                                            || !fingerprint.starts_with("MemoryRead")
                                             || memory_fingerprint_target_exists(
                                                 &fingerprint,
                                                 &memory_names,
@@ -514,7 +572,10 @@ impl SlangAstSummary {
                                         {
                                             fingerprint
                                         } else {
-                                            "?".to_string()
+                                            let error = format!(
+                                                "procedural memory target for '{target}' cannot be confirmed"
+                                            );
+                                            return Err(error + &self.span_note("procedural:"));
                                         }
                                     }
                                     None => "?".to_string(),

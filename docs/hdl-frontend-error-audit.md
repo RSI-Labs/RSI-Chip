@@ -64,7 +64,7 @@ to document their fixes; they are not current errors.
 
 ### 1.3 Exact remaining unresolved-fingerprint sites
 
-F-03 currently has two production sites that can emit a wildcard `"?"`
+F-03 currently has one production site that can emit a wildcard `"?"`
 fingerprint plus one wildcard matcher in the current worktree. They must be
 removed class-by-class; a global hard-error conversion previously exposed about
 65 tests that still depended on these wildcards and was therefore reverted.
@@ -72,7 +72,6 @@ removed class-by-class; a global hard-error conversion previously exposed about
 | Location | Construct class | Cleanup requirement |
 | --- | --- | --- |
 | Reversed-element runtime semantics | Exact structural fingerprints now distinguish `Reversed:true`, but direct/bounded whole-element runtime parity remains unclaimed for reversed packed element declarations. | Resolve the historical logical-bit-order convention and add a direct/bounded differential before claiming runtime completion. |
-| `summary/validation.rs`, procedural unresolved memory target | A generic procedural RHS references a memory/packed select whose repository target cannot be confirmed. | Resolve hierarchical memory identity and reject unconfirmed references. |
 | `summary/validation.rs`, procedural unsupported expression | A generic procedural RHS has no slang expression fingerprint. | Add exact expression fingerprints and runtime differentials. |
 | `summary/expressions.rs`, wildcard matcher | `contains_expected_shapes` accepts any remaining actual shape when expected is `"?"`. | Remove this branch only after the corresponding production class is exact. |
 
@@ -88,11 +87,11 @@ and official UVM commit `78c06547a2a0a29b3dc9dcafae62b75b2ff61544`.
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 90 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 235 passed, 3097.03 s with the pinned official UVM checkout |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 235 passed, 1816.93 s with the pinned official UVM checkout |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 29 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 85 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 218.00 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 154.21 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe

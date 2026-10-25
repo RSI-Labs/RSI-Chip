@@ -5066,6 +5066,43 @@ endmodule
         .procedural_blocks
         .iter_mut()
         .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "q")
+            })
+        })
+    {
+        assignment.rhs.operands[0].operands[1].symbol = Some("wrong_x".into());
+    }
+    let bounded_read_index_error = bounded_summary
+        .validate_against_design_legacy_compatibility(&reference)
+        .expect_err("wrong bounded multidimensional read index must fail");
+    assert!(
+        bounded_read_index_error.contains("Ref:2:u[wrong_x]")
+            && bounded_read_index_error.contains("Ref:2:u[x]")
+            && bounded_read_index_error.contains("Cond:32:u["),
+        "unexpected bounded multidimensional read error: {bounded_read_index_error}"
+    );
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "q")
+            })
+        })
+    {
+        assignment.rhs.operands[0].operands[1].symbol = Some("x".into());
+    }
+    if let Some(assignment) = bounded_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
             block
                 .assignments
                 .iter_mut()
