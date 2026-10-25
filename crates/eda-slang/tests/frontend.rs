@@ -6763,6 +6763,42 @@ endmodule
         .expect("directly lower array dimension/bit queries");
     assert_eq!(design.memories.len(), 1);
 
+    let array_query_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("array_dimension_bits"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize array dimension/bit-query AST");
+    let mut array_query_summary = slang
+        .summarize_ast_json(&array_query_json)
+        .expect("summarize array dimension/bit-query AST");
+    array_query_summary
+        .validate_against_design(&design)
+        .expect("exact array dimension/bit-query fingerprints should match");
+    let array_bits_assignment = array_query_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "array_bits")
+            })
+        })
+        .expect("array_bits assignment was not summarized");
+    array_bits_assignment.rhs.operands[0].operands[0].type_name = "logic[15:0]$[2:0][1:4]".into();
+    let wrong_bits_error = array_query_summary
+        .validate_against_design(&design)
+        .expect_err("wrong array bit-query shape must fail");
+    assert!(
+        wrong_bits_error.contains(&format!("Const:32:u[32:{:032b}]", 192))
+            && wrong_bits_error.contains(&format!("Const:32:u[32:{:032b}]", 384)),
+        "unexpected array bit-query shape error: {wrong_bits_error}"
+    );
+
     let mut simulator = Simulator::new(&design).expect("create dimension/bit-query simulator");
     simulator
         .run_until(0)

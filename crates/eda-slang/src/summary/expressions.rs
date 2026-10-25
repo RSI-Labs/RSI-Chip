@@ -6,8 +6,9 @@ use crate::ast_util::{
     parameter_summary, slang_constant_u64, string_field,
 };
 use crate::types::{
-    memory_type, simple_type_shape, simple_type_signed, simple_type_width, string_literal_word,
-    AstPackedDimension, STRING_WIDTH,
+    associative_memory_type, dynamic_memory_type, memory_type, memory_type_with_element,
+    queue_memory_type, simple_type_shape, simple_type_signed, simple_type_width,
+    string_literal_word, AstPackedDimension, STRING_WIDTH,
 };
 use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
@@ -1742,6 +1743,134 @@ fn enum_method_fingerprint(
     Some(result)
 }
 
+fn array_system_query_fingerprint(expression: &SlangExpressionSummary) -> Option<String> {
+    const QUERY_METHODS: [&str; 8] = [
+        "$dimensions",
+        "$unpacked_dimensions",
+        "$bits",
+        "$left",
+        "$right",
+        "$low",
+        "$high",
+        "$increment",
+    ];
+    let method = expression
+        .operator
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default();
+    if !QUERY_METHODS.contains(&method) {
+        return None;
+    }
+    let selected = expression.operands.first()?;
+    let packed_type = selected
+        .type_name
+        .split('$')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let packed_shape = simple_type_shape(packed_type)?;
+    let memory_shape = if selected.type_name.contains('$') {
+        if selected.type_name.ends_with("$[]") {
+            dynamic_memory_type(&selected.type_name)
+        } else if selected.type_name.contains("$queue") {
+            queue_memory_type(&selected.type_name)
+        } else if selected.type_name.contains("$assoc[") {
+            associative_memory_type(&selected.type_name)
+        } else {
+            let element_msb = i64::try_from(packed_shape.width.checked_sub(1)?).ok()?;
+            memory_type_with_element(
+                &selected.type_name,
+                packed_shape.width,
+                packed_shape.bounds.unwrap_or((element_msb, 0)),
+                simple_type_signed(packed_type)?,
+            )
+        }
+    } else {
+        None
+    };
+    let dimensions = memory_shape
+        .as_ref()
+        .map(|memory| memory.dimensions.clone())
+        .unwrap_or_default();
+    let unpacked_count = dimensions.len();
+    let total_dimensions = unpacked_count + packed_shape.dimensions.len();
+
+    let const32 = |value: i64| {
+        let (signed_label, bits) = if value < 0 {
+            ("s", format!("{:032b}", value as u32))
+        } else {
+            ("u", format!("{value:032b}"))
+        };
+        Some(format!("Const:32:{signed_label}[32:{bits}]"))
+    };
+    match method {
+        "$dimensions" => const32(i64::try_from(total_dimensions).ok()?),
+        "$unpacked_dimensions" => const32(i64::try_from(unpacked_count).ok()?),
+        "$bits" => {
+            if selected.type_name.contains("$[]")
+                || selected.type_name.contains("$queue")
+                || selected.type_name.contains("$assoc[")
+            {
+                let memory = selected.symbol.as_deref()?;
+                let memory = memory
+                    .rsplit_once(' ')
+                    .map(|(_, memory)| memory)
+                    .unwrap_or(memory);
+                let memory_shape = memory_shape?;
+                return Some(format!(
+                    "Mul:32:s[MemorySize:32:s[{memory}],{}]",
+                    const32(i64::try_from(memory_shape.element_width).ok()?)?
+                ));
+            }
+            let bits = if let Some(memory) = memory_shape.as_ref() {
+                usize::try_from(memory.flat_length)
+                    .ok()?
+                    .checked_mul(memory.element_width)?
+            } else {
+                packed_shape.width
+            };
+            const32(i64::try_from(bits).ok()?)
+        }
+        "$left" | "$right" | "$low" | "$high" | "$increment" => {
+            let index = expression
+                .operands
+                .get(1)
+                .and_then(summary_literal_i64)
+                .unwrap_or(1);
+            let index = usize::try_from(index).ok()?;
+            let physical_index = index.checked_sub(1)?;
+            let (base, step, length) = if let Some(dimension) = dimensions.get(physical_index) {
+                (
+                    dimension.base,
+                    dimension.step,
+                    i64::try_from(dimension.length).ok()?,
+                )
+            } else {
+                let dimension = packed_shape.dimensions.get(physical_index)?;
+                (
+                    dimension.msb,
+                    if dimension.msb >= dimension.lsb {
+                        1
+                    } else {
+                        -1
+                    },
+                    i64::try_from(dimension.length).ok()?,
+                )
+            };
+            let value = match method {
+                "$left" => base,
+                "$right" => base + step * (length - 1),
+                "$low" => base.min(base + step * (length - 1)),
+                "$high" => base.max(base + step * (length - 1)),
+                _ => step,
+            };
+            const32(value)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1781,6 +1910,9 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             "prev" => "Prev",
             _ => "",
         };
+        if let Some(fingerprint) = array_system_query_fingerprint(expression) {
+            return Some(fingerprint);
+        }
         if !operation.is_empty() {
             let selected = expression.operands.first()?;
             if selected.type_name.contains("$assoc[") {
