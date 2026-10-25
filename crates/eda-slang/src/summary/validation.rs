@@ -468,11 +468,15 @@ impl SlangAstSummary {
                                     member,
                                     &assignment.rhs,
                                     &self.declarations,
-                                    &self.type_layouts,
-                                    &self.parameters,
-                                    fingerprint_mode,
-                                )
-                                .unwrap_or_else(|| "?".to_string())
+                                &self.type_layouts,
+                                &self.parameters,
+                                fingerprint_mode,
+                            )
+                                .ok_or_else(|| {
+                                    format!(
+                                        "lowering could not fingerprint memory-member lvalue '{target}'"
+                                    )
+                                })?
                             } else if let Some(selector) =
                                 assignment.dynamic_packed_lvalue_selector.as_ref()
                             {
@@ -1244,22 +1248,21 @@ fn memory_member_lvalue_fingerprint(
     let declaration = declarations
         .iter()
         .find(|declaration| declaration.name == target_name)?;
-    let alias = super::type_layout_alias_key(&declaration.type_name)?;
-    let mut current_alias = alias.to_string();
+    let mut current_type = declaration.type_name.clone();
     let mut offset = 0_usize;
     let mut field_width = None;
     for member_name in &member.members {
-        let layout = type_layouts.get(&current_alias)?;
+        let layout = lookup_type_layout(&current_type, type_layouts)?;
         let field = layout
             .fields
             .iter()
             .find(|field| field.name == *member_name)?;
         offset += field.offset;
         field_width = Some(field.width);
-        current_alias = super::type_layout_alias_key(&field.type_name)?.to_string();
+        current_type = field.type_name.clone();
     }
     let field_width = field_width?;
-    let root_layout = type_layouts.get(alias)?;
+    let root_layout = lookup_type_layout(&declaration.type_name, type_layouts)?;
     let element_width = root_layout.element_width;
     if offset + field_width > element_width {
         return None;
