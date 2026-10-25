@@ -12187,6 +12187,34 @@ endmodule
             .width,
         2
     );
+    let enum_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("enum_module"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize enum AST");
+    let mut enum_summary = slang
+        .summarize_ast_json(&enum_json)
+        .expect("summarize enum AST");
+    enum_summary
+        .validate_against_design(&design)
+        .expect("exact enum cast fingerprint should match");
+    if let Some(target) = enum_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "cast_raw")
+    {
+        target.rhs.operands[0].operands[0].literal = Some("2:10".into());
+    }
+    let enum_cast_error = enum_summary
+        .validate_against_design(&design)
+        .expect_err("wrong enum cast literal must fail");
+    assert!(
+        enum_cast_error.contains("Const:2:u[2:10]") && enum_cast_error.contains("Const:2:u[2:11]"),
+        "unexpected enum cast error: {enum_cast_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create enum simulator");
     for (selector, expected_raw, expected_is_b) in
@@ -12257,6 +12285,36 @@ endmodule
         .expect("lower enum next/prev");
     assert_eq!(design.processes.len(), 1);
     assert_eq!(design.assigns.len(), 9);
+    let enum_method_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("enum_next_prev"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize enum-method AST");
+    let mut enum_method_summary = slang
+        .summarize_ast_json(&enum_method_json)
+        .expect("summarize enum-method AST");
+    enum_method_summary
+        .validate_against_design(&design)
+        .expect("exact enum-method fingerprints should match");
+    if let Some(target) = enum_method_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "next_state")
+    {
+        target.rhs.operands[0].operands[0].symbol = Some("wrong_state".into());
+    }
+    let enum_method_error = enum_method_summary
+        .validate_against_design(&design)
+        .expect_err("wrong enum-method receiver must fail");
+    assert!(
+        enum_method_error.contains("Ref:2:u[wrong_state]")
+            && enum_method_error.contains("Ref:2:u[state]")
+            && enum_method_error.contains("Cond:2:u["),
+        "unexpected enum-method error: {enum_method_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create enum next/prev simulator");
     for (selector, expected_next, expected_prev, expected_by_two) in [

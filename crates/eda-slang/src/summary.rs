@@ -1937,7 +1937,7 @@ fn annotate_enum_name_calls(
             .split_whitespace()
             .next_back()
             .unwrap_or_default();
-        if method == "name" {
+        if matches!(method, "name" | "next" | "prev" | "first" | "last" | "num") {
             if let Some(receiver) = expression.operands.first() {
                 let enum_name = receiver
                     .type_name
@@ -1953,6 +1953,68 @@ fn annotate_enum_name_calls(
                         expression.enum_definition = Some(definitions[0].clone());
                     }
                 }
+            }
+        }
+    }
+    if expression.kind == "Conversion" {
+        let mut enum_name = expression
+            .type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !enums.contains_key(&enum_name) {
+            enum_name = expression
+                .operands
+                .first()
+                .map(|operand| operand.type_name.as_str())
+                .unwrap_or_default()
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .rsplit(['.', '#', ':'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+        }
+        if let Some(definitions) = enums.get(&enum_name) {
+            if definitions.len() == 1 {
+                expression.enum_definition = Some(definitions[0].clone());
+            }
+        }
+    }
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue") {
+        let enum_name = expression
+            .type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(definitions) = enums.get(&enum_name) {
+            if definitions.len() == 1 {
+                expression.enum_definition = Some(definitions[0].clone());
+            }
+        }
+    }
+    if expression.enum_definition.is_none() {
+        let enum_name = expression
+            .type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(definitions) = enums.get(&enum_name) {
+            if definitions.len() == 1 {
+                expression.enum_definition = Some(definitions[0].clone());
             }
         }
     }

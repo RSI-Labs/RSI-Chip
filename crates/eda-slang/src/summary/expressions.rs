@@ -1058,6 +1058,20 @@ fn conversion_fingerprint(
     if expression.type_name == "string" || operand.type_name == "string" {
         return None;
     }
+    let target_width = expression.type_width.or_else(|| {
+        expression
+            .enum_definition
+            .as_ref()
+            .map(|definition| definition.width)
+    })?;
+    if expression.kind == "Conversion"
+        && expression
+            .enum_definition
+            .as_ref()
+            .is_some_and(|definition| definition.width == target_width)
+    {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
     let operand_fingerprint =
         slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
     if mode == ExpressionFingerprintMode::BoundedCompatibility {
@@ -1413,6 +1427,7 @@ fn enum_name_receiver_fingerprint(
     normalized.type_name = definition.base_type_name.clone();
     normalized.type_width = Some(definition.width);
     normalized.type_signed = Some(definition.signed);
+    normalized.enum_definition = None;
     if normalized.literal.is_none() && matches!(normalized.kind.as_str(), "NamedValue") {
         let symbol = normalized.symbol.as_deref()?;
         let constant_name = symbol
@@ -1426,7 +1441,21 @@ fn enum_name_receiver_fingerprint(
             .members
             .iter()
             .find(|member| member.name == constant_name)
-            .map(|member| member.literal.clone());
+            .map(|member| member.literal.clone())
+            .or_else(|| {
+                let parameter = parameters
+                    .iter()
+                    .find(|parameter| parameter.name == constant_name)?;
+                literal_word(&definition.base_type_name, &parameter.value)
+                    .map(|word| format!("{}:{}", word.width(), word.to_bin_str()))
+                    .or_else(|| {
+                        definition
+                            .members
+                            .iter()
+                            .find(|member| member.name == parameter.value.trim())
+                            .map(|member| member.literal.clone())
+                    })
+            });
     }
     slang_expression_fingerprint_with_parameters(&normalized, parameters, mode)
 }
@@ -1454,6 +1483,72 @@ fn enum_name_fingerprint(
         );
         let condition = format!("Eq:1:u[{receiver},{enum_value}]");
         result = format!("Cond:{STRING_WIDTH}:u[{condition},{rendered},{result}]");
+    }
+    Some(result)
+}
+
+fn enum_method_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if mode != ExpressionFingerprintMode::Direct {
+        return None;
+    }
+    let definition = expression.enum_definition.as_ref()?;
+    let method = expression
+        .operator
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default();
+    if matches!(method, "first" | "last") {
+        let member = if method == "first" {
+            definition.members.first()?
+        } else {
+            definition.members.last()?
+        };
+        return Some(format!("Const:{}:u[{}]", definition.width, member.literal));
+    }
+    if method == "num" {
+        let count = definition.members.len();
+        return Some(format!("Const:32:u[32:{count:032b}]"));
+    }
+    if !matches!(method, "next" | "prev") {
+        return None;
+    }
+
+    let receiver =
+        enum_name_receiver_fingerprint(expression.operands.first()?, definition, parameters, mode)?;
+    let mut count = match expression.operands.get(1) {
+        Some(count) => summary_literal_i64(count)
+            .or_else(|| count.operands.first().and_then(summary_literal_i64))?,
+        None => 1,
+    };
+    if method == "prev" {
+        count = -count;
+    }
+    let length = i64::try_from(definition.members.len()).ok()?;
+    let offset = count.rem_euclid(length);
+
+    let mut result = format!(
+        "Const:{}:u[{}:{}]",
+        definition.width,
+        definition.width,
+        "x".repeat(definition.width)
+    );
+    for (index, current) in definition.members.iter().enumerate() {
+        let target_index = (index as i64 + offset) % length;
+        let target = definition
+            .members
+            .get(usize::try_from(target_index).ok()?)?;
+        let condition = format!(
+            "Eq:1:u[{receiver},Const:{}:u[{}]]",
+            definition.width, current.literal
+        );
+        result = format!(
+            "Cond:{}:u[{condition},Const:{}:u[{}],{result}]",
+            definition.width, definition.width, target.literal
+        );
     }
     Some(result)
 }
@@ -1517,6 +1612,9 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             if let Some(fingerprint) = enum_name_fingerprint(expression, parameters, mode) {
                 return Some(fingerprint);
             }
+        }
+        if let Some(fingerprint) = enum_method_fingerprint(expression, parameters, mode) {
+            return Some(fingerprint);
         }
         if let Some(fingerprint) = string_method_fingerprint(expression, parameters, mode) {
             return Some(fingerprint);
@@ -1749,16 +1847,29 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             return Some(fingerprint);
         }
     }
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue")
+        && expression.enum_definition.is_some()
+    {
+        let definition = expression.enum_definition.as_ref()?;
+        return enum_name_receiver_fingerprint(expression, definition, parameters, mode);
+    }
     let root = slang_expression_shape(expression)?;
-    let width = expression.type_width?;
+    let enum_definition = expression.enum_definition.as_ref();
+    let width = expression
+        .type_width
+        .or_else(|| enum_definition.map(|definition| definition.width))?;
     let signed = if mode == ExpressionFingerprintMode::Direct
         && matches!(
             expression.kind.as_str(),
             "BinaryOp" | "ConditionalOp" | "Replication"
         ) {
-        direct_lowered_signed(expression, parameters).or(expression.type_signed)?
+        direct_lowered_signed(expression, parameters)
+            .or(expression.type_signed)
+            .or_else(|| enum_definition.map(|definition| definition.signed))?
     } else {
-        expression.type_signed?
+        expression
+            .type_signed
+            .or_else(|| enum_definition.map(|definition| definition.signed))?
     };
     let signed_label = if signed { "s" } else { "u" };
     if root == "Ref" {
