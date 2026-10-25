@@ -13,6 +13,7 @@ use expressions::{
 };
 
 mod expressions;
+mod tasks;
 mod validation;
 use serde_json::Value;
 
@@ -2995,6 +2996,7 @@ impl SlangAstSummary {
         let mut simple_functions = std::collections::BTreeMap::new();
         collect_simple_function_definitions(&document, false, &mut simple_functions);
         canonicalize_simple_function_calls(&mut root, &simple_functions);
+        tasks::canonicalize_simple_task_calls(&document, &mut root);
         let mut global_class_properties = std::collections::BTreeMap::new();
         collect_global_class_properties(&document, &mut global_class_properties);
         let mut simple_instance_methods = std::collections::BTreeMap::new();

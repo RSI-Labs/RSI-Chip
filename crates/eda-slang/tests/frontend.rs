@@ -16666,6 +16666,55 @@ endmodule
         )
         .expect("lower task with local variables");
     assert_eq!(design.processes.len(), 1);
+    let task_locals_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("task_locals"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize task-local AST");
+    let mut task_locals_summary = slang
+        .summarize_ast_json(&task_locals_json)
+        .expect("summarize task-local AST");
+    task_locals_summary
+        .validate_against_design(&design)
+        .expect("exact inlined task-local fingerprints should match");
+    fn replace_first_task_argument(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("a") {
+            expression.symbol = Some("wrong_a".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_first_task_argument)
+    }
+    if let Some(assignment) = task_locals_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "y")
+            })
+        })
+    {
+        assert!(
+            replace_first_task_argument(&mut assignment.rhs),
+            "inlined task argument was not found"
+        );
+    }
+    let wrong_task_argument_error = task_locals_summary
+        .validate_against_design(&design)
+        .expect_err("wrong inlined task argument must fail");
+    assert!(
+        wrong_task_argument_error.contains("Ref:32:s[wrong_a]")
+            && wrong_task_argument_error.contains("Ref:32:s[a]"),
+        "unexpected inlined task-argument error: {wrong_task_argument_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create task-local simulator");
     simulator
