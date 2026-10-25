@@ -43,6 +43,14 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     } else {
         Vec::new()
     };
+    let streaming_slice_size = if kind == "Streaming" {
+        value
+            .get("sliceSize")
+            .and_then(Value::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+    } else {
+        None
+    };
     // The bounded IR folds parameter constants to unsigned 32-bit Const nodes.
     // Keep those leaves comparable without inventing a signed Constant type.
     let type_signed = if kind == "NamedValue" && literal.is_some() {
@@ -66,6 +74,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         member_path,
         member_range: None,
         interface_path: None,
+        streaming_slice_size,
         operands: expression_operands(value),
     }
 }
@@ -87,6 +96,7 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         member_path: Vec::new(),
         member_range: None,
         interface_path: None,
+        streaming_slice_size: None,
         operands: Vec::new(),
     }
 }
@@ -187,6 +197,16 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
         "Call" => {
             if let Some(arguments) = value.get("arguments").and_then(Value::as_array) {
                 operands.extend(arguments.iter().map(expression_summary));
+            }
+        }
+        "Streaming" => {
+            if let Some(streams) = value.get("streams").and_then(Value::as_array) {
+                operands.extend(
+                    streams
+                        .iter()
+                        .filter_map(|stream| stream.get("operand"))
+                        .map(expression_summary),
+                );
             }
         }
         _ => {}
@@ -1084,6 +1104,9 @@ fn conversion_fingerprint(
     if expression.type_name == "string" && mode == ExpressionFingerprintMode::Direct {
         return direct_string_conversion_fingerprint(operand, parameters, mode);
     }
+    if expression.kind == "Conversion" && operand.kind == "Streaming" {
+        return streaming_conversion_fingerprint(expression, operand, parameters, mode);
+    }
     if expression.type_name == "string" || operand.type_name == "string" {
         return None;
     }
@@ -1140,6 +1163,65 @@ fn conversion_fingerprint(
     };
     let signed_label = if target_signed { "s" } else { "u" };
     Some(format!("Signed:{target_width}:{signed_label}[{resized}]"))
+}
+
+fn streaming_conversion_fingerprint(
+    conversion: &SlangExpressionSummary,
+    streaming: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    let target_width = conversion.type_width?;
+    let parts = streaming
+        .operands
+        .iter()
+        .map(|operand| {
+            Some((
+                operand.type_width?,
+                slang_expression_fingerprint_with_parameters(operand, parameters, mode)?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if parts.is_empty() {
+        return None;
+    }
+    let source_width = parts.iter().map(|(width, _)| *width).sum::<usize>();
+    if source_width != target_width {
+        return None;
+    }
+    let source = if let [(_, only)] = parts.as_slice() {
+        only.clone()
+    } else {
+        format!(
+            "Concat:{source_width}:u[{}]",
+            parts
+                .iter()
+                .map(|(_, fingerprint)| fingerprint.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+
+    let slice_size = streaming.streaming_slice_size?;
+    if slice_size == 0 {
+        return Some(source);
+    }
+    if slice_size > source_width || source_width % slice_size != 0 {
+        return None;
+    }
+    let blocks = source_width / slice_size;
+    let mut reversed_blocks = Vec::with_capacity(blocks);
+    for block in 0..blocks {
+        let lsb = block * slice_size;
+        let msb = lsb + slice_size - 1;
+        reversed_blocks.push(format!(
+            "PackedSelect:{slice_size}:u[{source},Range:{msb}:{lsb}]"
+        ));
+    }
+    Some(format!(
+        "Concat:{target_width}:u[{}]",
+        reversed_blocks.join(",")
+    ))
 }
 
 fn direct_string_conversion_fingerprint(

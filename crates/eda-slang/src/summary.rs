@@ -2553,6 +2553,8 @@ pub struct SlangExpressionSummary {
     pub member_range: Option<(usize, usize)>,
     /// Canonical hierarchical path for a direct interface member reference.
     pub interface_path: Option<String>,
+    /// Slice size for a SystemVerilog streaming concatenation.
+    pub streaming_slice_size: Option<usize>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 

@@ -8665,6 +8665,7 @@ endmodule
                 member_path: Vec::new(),
                 member_range: None,
                 interface_path: None,
+                streaming_slice_size: None,
                 operands: Vec::new(),
             },
         });
@@ -15733,6 +15734,57 @@ endmodule
         )
         .expect("lower streaming concatenation");
     assert_eq!(design.assigns.len(), 6);
+    let streaming_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("streaming"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize streaming-concatenation AST");
+    let mut streaming_summary = slang
+        .summarize_ast_json(&streaming_json)
+        .expect("summarize streaming-concatenation AST");
+    streaming_summary
+        .validate_against_design(&design)
+        .expect("exact streaming-concatenation fingerprints should match");
+    if let Some(target) = streaming_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "reverse_bits")
+    {
+        target.rhs.operands[0].operands[0].symbol = Some("wrong_a".into());
+    }
+    let streaming_operand_error = streaming_summary
+        .validate_against_design(&design)
+        .expect_err("wrong streaming operand must fail");
+    assert!(
+        streaming_operand_error.contains("Ref:8:u[wrong_a]")
+            && streaming_operand_error.contains("Ref:8:u[a]")
+            && streaming_operand_error.contains("Concat:8:u["),
+        "unexpected streaming operand error: {streaming_operand_error}"
+    );
+    if let Some(target) = streaming_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "reverse_bits")
+    {
+        target.rhs.operands[0].operands[0].symbol = Some("a".into());
+    }
+    if let Some(target) = streaming_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "reverse_nibbles")
+    {
+        target.rhs.operands[0].streaming_slice_size = Some(2);
+    }
+    let streaming_slice_error = streaming_summary
+        .validate_against_design(&design)
+        .expect_err("wrong streaming slice size must fail");
+    assert!(
+        streaming_slice_error.contains("Range:3:0") && streaming_slice_error.contains("Range:1:0"),
+        "unexpected streaming slice error: {streaming_slice_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create streaming simulator");
     simulator

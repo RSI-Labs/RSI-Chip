@@ -1387,6 +1387,7 @@ fn constant_zero_summary() -> super::SlangExpressionSummary {
         member_path: Vec::new(),
         member_range: None,
         interface_path: None,
+        streaming_slice_size: None,
         operands: Vec::new(),
     }
 }
