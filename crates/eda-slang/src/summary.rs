@@ -1767,10 +1767,9 @@ fn type_layout_summary(
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no bit offset"))?;
         let type_name = string_field(field, "type").unwrap_or_default();
-        let alias = type_layout_alias_key(&type_name).unwrap_or_default();
-        let Some(width) = crate::types::simple_type_width(&type_name)
-            .or_else(|| existing.get(alias).map(|layout| layout.element_width))
-        else {
+        let Some(width) = crate::types::simple_type_width(&type_name).or_else(|| {
+            lookup_type_layout(&type_name, existing).map(|layout| layout.element_width)
+        }) else {
             return Ok(None);
         };
         fields.push(SlangFieldLayoutSummary {

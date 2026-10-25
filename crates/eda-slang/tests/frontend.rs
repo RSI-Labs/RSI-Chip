@@ -10126,6 +10126,36 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower interface nested struct members");
+    let nested_interface_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_nested_struct_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface nested-struct AST");
+    let mut nested_interface_summary = slang
+        .summarize_ast_json(&nested_interface_json)
+        .expect("summarize interface nested-struct AST");
+    nested_interface_summary
+        .validate_against_design(&design)
+        .expect("exact interface nested-struct fingerprints should match");
+    if let Some(target) = nested_interface_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed_high")
+    {
+        target.rhs.operands[0].member_path = vec!["tag".into()];
+        target.rhs.operands[0].member_range = Some((1, 0));
+    }
+    let nested_interface_error = nested_interface_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface nested-struct member must fail");
+    assert!(
+        nested_interface_error.contains("Range:7:2")
+            && nested_interface_error.contains("Range:1:0"),
+        "unexpected interface nested-struct error: {nested_interface_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create interface nested-struct simulator");
     simulator
         .set_input("low", &LogicWord::from_u64(2, 0b10))
