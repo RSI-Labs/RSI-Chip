@@ -13,6 +13,7 @@ use expressions::{
 };
 
 mod expressions;
+mod patterns;
 mod tasks;
 mod validation;
 use serde_json::Value;
@@ -3042,22 +3043,22 @@ impl SlangAstSummary {
         );
         canonicalize_simple_class_property_reads(&mut root, &simple_instance_methods);
         normalize_detailed_types(&mut root);
-        let root = &root;
-        if string_field(root, "kind").as_deref() != Some("Instance") {
+        let root_ref = &root;
+        if string_field(root_ref, "kind").as_deref() != Some("Instance") {
             return Err("slang AST root is not an elaborated Instance".into());
         }
-        let body = root
+        let body = root_ref
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
         if string_field(body, "kind").as_deref() != Some("InstanceBody") {
             return Err("slang AST Instance body has unexpected kind".into());
         }
-        let top_name = string_field(root, "name")
+        let top_name = string_field(root_ref, "name")
             .or_else(|| string_field(body, "name"))
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
         let time_unit_exponent = summary_time_unit_exponent(&document, body);
         let mut source_spans = std::collections::BTreeMap::new();
-        if let Some(span) = source_span(root) {
+        if let Some(span) = source_span(root_ref) {
             source_spans.insert("top".to_string(), span);
         }
         let members = body
@@ -3066,12 +3067,12 @@ impl SlangAstSummary {
             .cloned()
             .unwrap_or_default();
         let mut class_handles = std::collections::BTreeSet::new();
-        collect_class_handle_names(root, &class_types, &mut class_handles);
+        collect_class_handle_names(root_ref, &class_types, &mut class_handles);
         collect_class_static_property_symbols(&document, &mut class_handles);
         let mut type_aliases = SlangTypeAliasIndex::default();
-        collect_type_alias_targets(root, &mut type_aliases);
+        collect_type_alias_targets(root_ref, &mut type_aliases);
         let mut enum_types = std::collections::BTreeMap::<String, Vec<SlangEnumTypeSummary>>::new();
-        collect_enum_type_summaries(root, &type_aliases, &mut enum_types)?;
+        collect_enum_type_summaries(root_ref, &type_aliases, &mut enum_types)?;
         let mut ports = Vec::new();
         let mut declarations = Vec::new();
         let mut parameters = Vec::new();
@@ -3080,7 +3081,7 @@ impl SlangAstSummary {
         let mut instances = Vec::new();
         let mut type_layouts = std::collections::BTreeMap::new();
         let mut package_imports = SlangPackageImports::default();
-        collect_visible_package_imports(root, &mut package_imports);
+        collect_visible_package_imports(root_ref, &mut package_imports);
         let mut imported_packages = package_imports.wildcard.clone();
         imported_packages.extend(package_imports.explicit.keys().cloned());
         let mut imported_type_aliases = std::collections::BTreeMap::new();
@@ -3104,7 +3105,7 @@ impl SlangAstSummary {
             })
             .collect::<Vec<_>>();
         type_alias_members.extend(imported_type_aliases.into_values());
-        collect_type_alias_members(root, &mut type_alias_members);
+        collect_type_alias_members(root_ref, &mut type_alias_members);
         let mut simple_type_alias_widths = SimpleTypeAliasWidths::default();
         collect_simple_type_alias_widths(&type_alias_members, &mut simple_type_alias_widths);
         loop {
@@ -3121,6 +3122,16 @@ impl SlangAstSummary {
                 break;
             }
         }
+        patterns::canonicalize_packed_struct_assignment_patterns(&mut root, &type_layouts);
+        let root = &root;
+        let body = root
+            .get("body")
+            .ok_or_else(|| "slang AST Instance has no body".to_string())?;
+        let members = body
+            .get("members")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         for member in &members {
             let Some(kind) = string_field(member, "kind") else {
                 continue;

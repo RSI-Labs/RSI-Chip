@@ -12625,6 +12625,56 @@ endmodule
         .expect("lower packed struct assignment patterns");
     assert_eq!(design.processes.len(), 1);
     assert_eq!(design.assigns.len(), 2);
+    let struct_pattern_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("struct_patterns"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize packed struct assignment-pattern AST");
+    let mut struct_pattern_summary = slang
+        .summarize_ast_json(&struct_pattern_json)
+        .expect("summarize packed struct assignment-pattern AST");
+    struct_pattern_summary
+        .validate_against_design(&design)
+        .expect("exact packed struct assignment-pattern fingerprints should match");
+    fn replace_first_pattern_operand(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("a") {
+            expression.symbol = Some("wrong_a".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_first_pattern_operand)
+    }
+    if let Some(assignment) = struct_pattern_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "positional_value")
+            })
+        })
+    {
+        assert!(
+            replace_first_pattern_operand(&mut assignment.rhs),
+            "packed struct assignment-pattern operand was not found"
+        );
+    }
+    let wrong_pattern_operand_error = struct_pattern_summary
+        .validate_against_design(&design)
+        .expect_err("wrong packed struct assignment-pattern operand must fail");
+    assert!(
+        wrong_pattern_operand_error.contains("Ref:4:u[wrong_a]")
+            && wrong_pattern_operand_error.contains("Ref:4:u[a]")
+            && wrong_pattern_operand_error.contains("Concat:8:u["),
+        "unexpected packed struct assignment-pattern error: {wrong_pattern_operand_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create assignment-pattern simulator");
     simulator
