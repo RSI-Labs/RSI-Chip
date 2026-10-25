@@ -11338,6 +11338,34 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower unpacked aggregates");
+    let unpacked_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("unpacked_aggregate"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize unpacked-aggregate AST");
+    let mut unpacked_summary = slang
+        .summarize_ast_json(&unpacked_json)
+        .expect("summarize unpacked-aggregate AST");
+    unpacked_summary
+        .validate_against_design(&design)
+        .expect("exact unpacked-aggregate fingerprints should match");
+    if let Some(target) = unpacked_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed_tag")
+    {
+        target.rhs.member_range = Some((7, 4));
+    }
+    let unpacked_error = unpacked_summary
+        .validate_against_design(&design)
+        .expect_err("wrong unpacked-struct member range must fail");
+    assert!(
+        unpacked_error.contains("Range:11:8") && unpacked_error.contains("Range:7:4"),
+        "unexpected unpacked-struct member error: {unpacked_error}"
+    );
     assert_eq!(
         design
             .net_decls
@@ -11442,6 +11470,34 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower nested unpacked aggregates");
+    let nested_unpacked_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("nested_unpacked"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize nested-unpacked AST");
+    let mut nested_unpacked_summary = slang
+        .summarize_ast_json(&nested_unpacked_json)
+        .expect("summarize nested-unpacked AST");
+    nested_unpacked_summary
+        .validate_against_design(&design)
+        .expect("exact nested-unpacked fingerprints should match");
+    if let Some(target) = nested_unpacked_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed_tag")
+    {
+        target.rhs.member_range = Some((1, 0));
+    }
+    let nested_unpacked_error = nested_unpacked_summary
+        .validate_against_design(&design)
+        .expect_err("wrong nested unpacked-struct member must fail");
+    assert!(
+        nested_unpacked_error.contains("Range:11:8") && nested_unpacked_error.contains("Range:1:0"),
+        "unexpected nested unpacked-struct error: {nested_unpacked_error}"
+    );
     assert_eq!(
         design
             .net_decls
