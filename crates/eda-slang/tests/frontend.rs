@@ -13528,6 +13528,44 @@ endmodule
     bounded_summary
         .validate_against_design_legacy_compatibility(&bounded)
         .expect("exact bounded string literal fingerprints should match");
+    fn replace_bounded_substrate_receiver(
+        expression: &mut eda_slang::SlangExpressionSummary,
+    ) -> bool {
+        if expression.kind == "Call" && expression.operator == "substr" {
+            expression.operands[0].symbol = Some("wrong_source".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_bounded_substrate_receiver)
+    }
+    let mut bounded_substr_summary = bounded_summary.clone();
+    if let Some(assignment) = bounded_substr_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "substr_value")
+            })
+        })
+    {
+        assert!(
+            replace_bounded_substrate_receiver(&mut assignment.rhs),
+            "bounded string substr receiver was not found"
+        );
+    }
+    let wrong_substrate_error = bounded_substr_summary
+        .validate_against_design_legacy_compatibility(&bounded)
+        .expect_err("wrong bounded string substr receiver must fail");
+    assert!(
+        wrong_substrate_error.contains("Ref:512:u[wrong_source]")
+            && wrong_substrate_error.contains("Ref:512:u[literal_source]"),
+        "unexpected bounded string substr error: {wrong_substrate_error}"
+    );
     if let Some(target) = bounded_summary
         .continuous_targets
         .iter_mut()

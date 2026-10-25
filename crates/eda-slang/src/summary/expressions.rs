@@ -1550,7 +1550,7 @@ fn string_method_fingerprint(
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     if mode == ExpressionFingerprintMode::BoundedCompatibility {
-        return None;
+        return bounded_string_substr_fingerprint(expression, parameters, mode);
     }
     let receiver = expression.operands.first()?;
     if receiver.type_name != "string" {
@@ -1605,6 +1605,87 @@ fn string_method_fingerprint(
         "atobin" => Some(format!("StringToRadix:32:s[Radix2:{receiver}]")),
         _ => None,
     }
+}
+
+fn bounded_string_substr_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if expression.operator != "substr" {
+        return None;
+    }
+    const BYTE_COUNT: usize = STRING_WIDTH / 8;
+    let receiver = expression.operands.first()?;
+    if receiver.type_name != "string" {
+        return None;
+    }
+    let receiver = slang_expression_fingerprint_with_parameters(receiver, parameters, mode)?;
+    let left = slang_expression_fingerprint_with_parameters(
+        expression.operands.get(1)?,
+        parameters,
+        mode,
+    )?;
+    let right = slang_expression_fingerprint_with_parameters(
+        expression.operands.get(2)?,
+        parameters,
+        mode,
+    )?;
+    let const32 = |value: u32| format!("Const:32:u[32:{value:032b}]");
+    let zero_byte = "Const:8:u[8:00000000]".to_string();
+    let byte = |index: usize| {
+        format!(
+            "PackedSelect:8:u[{receiver},Range:{}:{}]",
+            index * 8 + 7,
+            index * 8
+        )
+    };
+
+    let mut length = const32(BYTE_COUNT as u32);
+    for index in (0..BYTE_COUNT).rev() {
+        length = format!(
+            "Cond:32:u[Eq:1:u[{},{}],{},{}]",
+            byte(index),
+            zero_byte,
+            const32(index as u32),
+            length
+        );
+    }
+    let indexed_byte = |index: String| {
+        let mut selected = zero_byte.clone();
+        for source in (0..BYTE_COUNT).rev() {
+            selected = format!(
+                "Cond:8:u[Eq:1:u[{},{}],{},{}]",
+                index,
+                const32(source as u32),
+                byte(source),
+                selected
+            );
+        }
+        selected
+    };
+
+    let mut bytes = Vec::with_capacity(BYTE_COUNT);
+    for output in 0..BYTE_COUNT {
+        let source_index = format!("Add:32:u[{},{}]", left, const32(output as u32));
+        let in_range = format!(
+            "LogAnd:1:u[LogAnd:1:u[Ge:1:u[{},{}],Le:1:u[{},{}]],Lt:1:u[{},{}]]",
+            left,
+            const32(0),
+            source_index,
+            right,
+            right,
+            length
+        );
+        bytes.push(format!(
+            "Cond:8:u[{},{},{}]",
+            in_range,
+            indexed_byte(source_index),
+            zero_byte
+        ));
+    }
+    bytes.reverse();
+    Some(format!("Concat:512:u[{}]", bytes.join(",")))
 }
 
 fn enum_name_receiver_fingerprint(
