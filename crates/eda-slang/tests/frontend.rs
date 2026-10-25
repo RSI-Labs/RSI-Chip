@@ -6978,6 +6978,56 @@ endmodule
         .memories
         .iter()
         .all(|memory| memory.storage == eda_core::ir::MemoryStorage::Ordinary));
+    let unpacked_pattern_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("unpacked_assignment_pattern"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize unpacked assignment-pattern AST");
+    let mut unpacked_pattern_summary = slang
+        .summarize_ast_json(&unpacked_pattern_json)
+        .expect("summarize unpacked assignment-pattern AST");
+    unpacked_pattern_summary
+        .validate_against_design(&design)
+        .expect("exact unpacked assignment-pattern fingerprints should match");
+    fn replace_first_unpacked_operand(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("a") {
+            expression.symbol = Some("wrong_a".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_first_unpacked_operand)
+    }
+    let mut replaced_unpacked_operand = false;
+    'pattern_assignments: for block in unpacked_pattern_summary.procedural_blocks.iter_mut() {
+        for assignment in block.assignments.iter_mut() {
+            if assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "blocking_values")
+                && replace_first_unpacked_operand(&mut assignment.rhs)
+            {
+                replaced_unpacked_operand = true;
+                break 'pattern_assignments;
+            }
+        }
+    }
+    assert!(
+        replaced_unpacked_operand,
+        "unpacked assignment-pattern operand was not found"
+    );
+    let wrong_unpacked_operand_error = unpacked_pattern_summary
+        .validate_against_design(&design)
+        .expect_err("wrong unpacked assignment-pattern operand must fail");
+    assert!(
+        wrong_unpacked_operand_error.contains("Ref:8:u[wrong_a]")
+            && wrong_unpacked_operand_error.contains("Ref:8:u[a]"),
+        "unexpected unpacked assignment-pattern error: {wrong_unpacked_operand_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create assignment-pattern simulator");
     simulator

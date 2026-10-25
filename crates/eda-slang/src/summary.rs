@@ -3123,6 +3123,7 @@ impl SlangAstSummary {
             }
         }
         patterns::canonicalize_packed_struct_assignment_patterns(&mut root, &type_layouts);
+        patterns::canonicalize_unpacked_assignment_patterns(&mut root);
         let root = &root;
         let body = root
             .get("body")
