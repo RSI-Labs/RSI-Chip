@@ -13785,6 +13785,58 @@ endmodule
             .width,
         2
     );
+    let event_array_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("event_array"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize event-array AST");
+    let mut event_array_summary = slang
+        .summarize_ast_json(&event_array_json)
+        .expect("summarize event-array AST");
+    event_array_summary
+        .validate_against_design(&design)
+        .expect("exact event-array fingerprints should match");
+    fn replace_first_event_selector(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.kind == "ElementSelect" && expression.type_name == "event" {
+            expression.operands[1].symbol = Some("wrong_selector".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_first_event_selector)
+    }
+    let mut replaced_event_selector = false;
+    'assignments: for block in event_array_summary.procedural_blocks.iter_mut() {
+        for assignment in block.assignments.iter_mut() {
+            if assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "triggered_later")
+                && replace_first_event_selector(&mut assignment.rhs)
+            {
+                replaced_event_selector = true;
+                break 'assignments;
+            }
+        }
+    }
+    assert!(
+        replaced_event_selector,
+        "event-array selector was not found"
+    );
+    let wrong_event_selector_error = event_array_summary
+        .validate_against_design(&design)
+        .expect_err("wrong event-array selector must fail");
+    assert!(
+        wrong_event_selector_error.contains("Ref:32:s[wrong_selector]")
+            && wrong_event_selector_error.contains("Ref:32:s[index]")
+            && wrong_event_selector_error.contains("EventTriggered:1:u[events["),
+        "unexpected event-array selector error: {wrong_event_selector_error}"
+    );
+
     let mut simulator = Simulator::new(&design).expect("create event-array simulator");
     simulator
         .set_input("index", &LogicWord::from_u64(32, 0))

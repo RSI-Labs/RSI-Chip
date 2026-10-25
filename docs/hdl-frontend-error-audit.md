@@ -1,7 +1,7 @@
 # HDL frontend error and gap audit
 
 Date: 2026-10-25 (local time)
-Repository state audited: `fix-digital` including bounded scalar dynamic packed-lvalue lowering, package-qualified sparse-memory member fingerprints, exact hierarchy-global class-static property fingerprints, exact fixed-array/dynamic-container dimension/bound/bit-count query fingerprints, exact bounded constant/dynamic-index one/multidimensional array element/range/part-write fingerprints, exact dynamic whole-element reads (including reversed elements and full-width indexed selects), exact constant/dynamic indexed and simple-range part reads from flattened bounded arrays, exact dynamic indexed packed-range reads, exact enum constants/casts/next/prev/first/last/num/name fingerprints, exact packed/unpacked struct/union whole-object and nested member fingerprints, exact scalar/vector interface members, packed/unpacked direct interface aggregate members including nested structs/unions, scalar/vector interface instance-array/array-port members through multiple dimensions, and packed aggregate interface array-port members, exact bounded string-literal initialization/conversion fingerprints, exact streaming concatenation source/slice/reorder fingerprints, exact `inside` value/range expressions, simple integral type-alias literal conversions, straight-line/control-flow/looping function inlining, package-qualified aggregate memory reads, exact bounded legacy whole-array copies, and exact generated genvar constant bit-select fingerprints.
+Repository state audited: `fix-digital` including bounded scalar dynamic packed-lvalue lowering, package-qualified sparse-memory member fingerprints, exact hierarchy-global class-static property fingerprints, exact fixed-array/dynamic-container dimension/bound/bit-count query fingerprints, exact scalar and dynamically selected event `.triggered` fingerprints, exact bounded constant/dynamic-index one/multidimensional array element/range/part-write fingerprints, exact dynamic whole-element reads (including reversed elements and full-width indexed selects), exact constant/dynamic indexed and simple-range part reads from flattened bounded arrays, exact dynamic indexed packed-range reads, exact enum constants/casts/next/prev/first/last/num/name fingerprints, exact packed/unpacked struct/union whole-object and nested member fingerprints, exact scalar/vector interface members, packed/unpacked direct interface aggregate members including nested structs/unions, scalar/vector interface instance-array/array-port members through multiple dimensions, and packed aggregate interface array-port members, exact bounded string-literal initialization/conversion fingerprints, exact streaming concatenation source/slice/reorder fingerprints, exact `inside` value/range expressions, simple integral type-alias literal conversions, straight-line/control-flow/looping function inlining, package-qualified aggregate memory reads, exact bounded legacy whole-array copies, and exact generated genvar constant bit-select fingerprints.
 
 This is an engineering audit, not a marketing maturity claim. “All errors”
 below means **all currently known, code-visible, or probe-reproduced frontend
@@ -59,7 +59,7 @@ direct-AST coverage gaps (`D-*`), 12 bounded-path limitations (`B-*`), and 17
 additional confirmed bounded-path defects/blind spots (`O-*`). It also records
 19 explicit resource limits (`L-*`). These categories overlap intentionally:
 `F-*` rows are architectural rollups, while `D-*`, `B-*`, and `O-*` expose their
-specific known consequences. The 25 `R-*` rows are former defects retained only
+specific known consequences. The 26 `R-*` rows are former defects retained only
 to document their fixes; they are not current errors.
 
 ### 1.3 Exact remaining unresolved-fingerprint sites
@@ -69,11 +69,12 @@ fingerprint plus one wildcard matcher in the current worktree. They must be
 removed class-by-class; a global hard-error conversion previously exposed about
 65 tests that still depended on these wildcards and was therefore reverted.
 The current hard-marker probe (excluding the separate direct official-UVM
-bootstrap lane) leaves 25 dependencies: memory-file initialization, class
-properties/inheritance/composition/handles/arrays/package classes, event arrays
-and `.triggered`, packed/unpacked assignment patterns, string/enum methods, and
-task locals/control flow/loops/returns/arguments. Fixed, dynamic, queue, and
-associative array bound/dimension/bit queries no longer depend on the wildcard.
+bootstrap lane) leaves 23 dependencies: memory-file initialization, class
+properties/inheritance/composition/handles/arrays/package classes,
+packed/unpacked assignment patterns, string/enum methods, and task
+locals/control flow/loops/returns/arguments. Fixed, dynamic, queue, and
+associative array bound/dimension/bit queries plus scalar and dynamically
+selected event `.triggered` checks no longer depend on the wildcard.
 
 | Location | Construct class | Cleanup requirement |
 | --- | --- | --- |
@@ -93,11 +94,11 @@ and official UVM commit `78c06547a2a0a29b3dc9dcafae62b75b2ff61544`.
 | `cargo fmt --all -- --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 90 passed |
-| `cargo test -p eda-slang --all-targets -- --nocapture` | 235 passed, 1760.60 s with the pinned official UVM checkout |
+| `cargo test -p eda-slang --all-targets -- --nocapture` | 235 passed, 1602.80 s with the pinned official UVM checkout |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 29 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 85 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
-| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 159.59 s |
+| `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | Pass in 151.62 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
 the bounded/preprocessed path on representative valid constructs. The probe
@@ -105,9 +106,9 @@ was removed after collecting results; permanent conformance tests are a
 required remediation in P0-7.
 
 The current temporary procedural-expression hard-marker run serially executed
-the non-direct-UVM frontend lane and produced the expected 156 passes plus 25
-unresolved-fingerprint failures in 147.89 s. It was reverted before the normal
-green gates above; the 25 remaining dependencies are classified in section 1.3.
+the non-direct-UVM frontend lane and produced the expected 158 passes plus 23
+unresolved-fingerprint failures in 140.43 s. It was reverted before the normal
+green gates above; the 23 remaining dependencies are classified in section 1.3.
 
 These results prove that the currently named regressions pass. They do **not**
 prove commercial SystemVerilog correctness or exhaustive LRM coverage.
@@ -150,6 +151,7 @@ information from re-entering the roadmap.
 | R-23 | Dynamic-container whole-object copies were absent | Fixed. `MemoryCopy` now carries fixed-array, dynamic-array, queue, and associative kinds. Same-shape one-dimensional integral copies execute with blocking/nonblocking sampling, dynamic size propagation, queue ordering, bounded-queue tail discard, associative key/value preservation, destination clearing, capacity checks, and shape/index mismatch diagnostics. |
 | R-24 | Associative traversal methods were unsupported | Fixed. Integral associative arrays now execute `first`, `last`, `next`, and `prev` as blocking status assignments. They preserve declared signed/unsigned ordering, update the ref key immediately on success, leave it unchanged on failure/empty traversal, and reject nonblocking calls and key-width mismatches; an exact structural fingerprint rejects wrong traversal directions. |
 | R-25 | Nested multi-packed array-query fingerprints collapsed to element width | Fixed. Array query fingerprinting reconstructs memory storage for multi-packed elements and fails closed when an unpacked receiver cannot be represented. `$bits(logic [7:0][3:0] values [2:0][1:4])` is exactly 384; a wrong-shape probe changing the element to 16 bits rejects 192 versus 384. |
+| R-26 | Event `.triggered` checks depended on wildcard fingerprints | Fixed. Scalar and dynamically selected event-array `.triggered` expressions now fingerprint named event nets and exact index-condition trees. A wrong-selector probe rejects `wrong_selector` versus the authoritative `index` reference. |
 
 ## 4. Current P0 and P1 findings
 

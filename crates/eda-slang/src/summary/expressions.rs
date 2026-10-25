@@ -1871,6 +1871,109 @@ fn array_system_query_fingerprint(expression: &SlangExpressionSummary) -> Option
     }
 }
 
+fn event_triggered_fingerprint(
+    expression: &SlangExpressionSummary,
+    parameters: &[SlangParameterSummary],
+    mode: ExpressionFingerprintMode,
+) -> Option<String> {
+    if expression.kind != "Call" || expression.operator != "triggered" {
+        return None;
+    }
+    let receiver = expression.operands.first()?;
+    if receiver.kind != "ElementSelect" {
+        if receiver.type_name != "event" {
+            return None;
+        }
+        let symbol = receiver.symbol.as_deref()?;
+        let event = symbol
+            .rsplit_once(' ')
+            .map(|(_, event)| event)
+            .unwrap_or(symbol);
+        return Some(format!("EventTriggered:1:u[{event}]"));
+    }
+
+    let array = receiver.operands.first()?;
+    let symbol = array.symbol.as_deref()?;
+    let event = symbol
+        .rsplit_once(' ')
+        .map(|(_, event)| event)
+        .unwrap_or(symbol);
+    let shape = simple_type_shape(&array.type_name)?;
+    let selectors = receiver
+        .operands
+        .iter()
+        .skip(1)
+        .map(|selector| {
+            Some((
+                slang_expression_fingerprint_with_parameters(selector, parameters, mode)?,
+                selector.type_width?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if selectors.len() != shape.dimensions.len() {
+        return None;
+    }
+
+    fn append_candidates(
+        dimensions: &[AstPackedDimension],
+        selectors: &[(String, usize)],
+        level: usize,
+        offset: usize,
+        conditions: Vec<String>,
+        candidates: &mut Vec<(usize, Vec<String>)>,
+    ) -> Option<()> {
+        let Some(dimension) = dimensions.get(level) else {
+            candidates.push((offset, conditions));
+            return Some(());
+        };
+        let (selector, comparison_width) = selectors.get(level)?;
+        let lower = dimension.msb.min(dimension.lsb);
+        let upper = dimension.msb.max(dimension.lsb);
+        for logical_index in lower..=upper {
+            let coordinate = if dimension.msb >= dimension.lsb {
+                logical_index - dimension.lsb
+            } else {
+                dimension.lsb - logical_index
+            };
+            let coordinate = usize::try_from(coordinate).ok()?;
+            let bits = format!("{logical_index:0comparison_width$b}");
+            let condition =
+                format!("Eq:1:u[{selector},Const:{comparison_width}:u[{comparison_width}:{bits}]]");
+            let mut conditions = conditions.clone();
+            conditions.push(condition);
+            append_candidates(
+                dimensions,
+                selectors,
+                level + 1,
+                offset + coordinate * dimension.element_width,
+                conditions,
+                candidates,
+            )?;
+        }
+        Some(())
+    }
+
+    let mut candidates = Vec::new();
+    append_candidates(
+        &shape.dimensions,
+        &selectors,
+        0,
+        0,
+        Vec::new(),
+        &mut candidates,
+    )?;
+    let mut result = "Const:1:u[1:x]".to_string();
+    for (offset, conditions) in candidates {
+        let condition = conditions
+            .iter()
+            .cloned()
+            .reduce(|left, right| format!("LogAnd:1:u[{left},{right}]"))?;
+        let triggered = format!("EventTriggered:1:u[{event}[{offset}]]");
+        result = format!("Cond:1:u[{condition},{triggered},{result}]");
+    }
+    Some(result)
+}
+
 pub(crate) fn slang_expression_fingerprint_with_parameters(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1911,6 +2014,9 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             _ => "",
         };
         if let Some(fingerprint) = array_system_query_fingerprint(expression) {
+            return Some(fingerprint);
+        }
+        if let Some(fingerprint) = event_triggered_fingerprint(expression, parameters, mode) {
             return Some(fingerprint);
         }
         if !operation.is_empty() {
@@ -2728,6 +2834,9 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             "AssocExists:1:u[{memory_name},{}]",
             design_expr_fingerprint(design, index)
         );
+    }
+    if let Expr::EventTriggered { net } = expression {
+        return format!("EventTriggered:1:u[{}]", design.net_name(*net));
     }
     let operands: Vec<String> = match expression {
         Expr::Const(_)
