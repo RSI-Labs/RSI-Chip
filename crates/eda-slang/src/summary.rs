@@ -2129,42 +2129,215 @@ fn annotate_packed_member_shapes(
 
 fn collect_instance_member_paths(
     value: &Value,
+    root: &Value,
     paths: &mut std::collections::BTreeMap<String, String>,
 ) {
     if let Some(fields) = value.as_object() {
-        if fields.get("kind").and_then(Value::as_str) == Some("Instance") {
-            let instance_name = fields
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !instance_name.is_empty() {
-                if let Some(members) = fields
-                    .get("body")
-                    .and_then(|body| body.get("members"))
-                    .and_then(Value::as_array)
-                {
-                    for member in members {
-                        if let (Some(address), Some(member_name)) = (
-                            member.get("addr").and_then(Value::as_u64),
-                            member.get("name").and_then(Value::as_str),
-                        ) {
-                            if !member_name.is_empty() {
-                                paths.insert(
-                                    format!("{address} {member_name}"),
-                                    format!("{instance_name}.{member_name}"),
-                                );
-                            }
-                        }
+        let mut recurse = true;
+        match fields.get("kind").and_then(Value::as_str) {
+            Some("Instance") => {
+                let instance_name = fields
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !instance_name.is_empty() {
+                    if let Some(members) = fields
+                        .get("body")
+                        .and_then(|body| body.get("members"))
+                        .and_then(Value::as_array)
+                    {
+                        insert_instance_member_paths(
+                            members,
+                            0,
+                            &format!("{instance_name}."),
+                            paths,
+                        );
                     }
                 }
             }
+            Some("InstanceArray") => {
+                if let Some(array_name) = fields.get("name").and_then(Value::as_str) {
+                    collect_instance_array_member_paths(value, array_name, root, paths);
+                }
+                recurse = false;
+            }
+            _ => {}
         }
-        for nested in fields.values() {
-            collect_instance_member_paths(nested, paths);
+        if recurse {
+            for nested in fields.values() {
+                collect_instance_member_paths(nested, root, paths);
+            }
         }
     } else if let Some(values) = value.as_array() {
         for nested in values {
-            collect_instance_member_paths(nested, paths);
+            collect_instance_member_paths(nested, root, paths);
+        }
+    }
+}
+
+fn instance_array_indexes(member: &Value) -> Option<Vec<i64>> {
+    let range = string_field(member, "range")?;
+    let range = range.trim().trim_start_matches('[').trim_end_matches(']');
+    let (left, right) = range.split_once(':')?;
+    let left = left.trim().parse::<i64>().ok()?;
+    let right = right.trim().parse::<i64>().ok()?;
+    Some(if left <= right {
+        (left..=right).collect()
+    } else {
+        (right..=left).rev().collect()
+    })
+}
+
+fn collect_instance_array_leaves<'value>(
+    member: &'value Value,
+    indexes: &mut Vec<i64>,
+    leaves: &mut Vec<(&'value Value, Vec<i64>)>,
+) -> Option<()> {
+    let element_indexes = instance_array_indexes(member)?;
+    let elements = member.get("members")?.as_array()?;
+    if element_indexes.len() != elements.len() {
+        return None;
+    }
+    for (index, element) in element_indexes.into_iter().zip(elements) {
+        indexes.push(index);
+        match element.get("kind").and_then(Value::as_str) {
+            Some("Instance") => leaves.push((element, indexes.clone())),
+            Some("InstanceArray") => {
+                collect_instance_array_leaves(element, indexes, leaves)?;
+            }
+            _ => return None,
+        }
+        indexes.pop();
+    }
+    Some(())
+}
+
+fn collect_instance_array_member_paths(
+    member: &Value,
+    array_name: &str,
+    root: &Value,
+    paths: &mut std::collections::BTreeMap<String, String>,
+) -> Option<()> {
+    let mut leaves = Vec::new();
+    let mut indexes = Vec::new();
+    collect_instance_array_leaves(member, &mut indexes, &mut leaves)?;
+    let first = leaves.first()?.0;
+    let first_address = first.get("addr")?.as_u64()?;
+    let first_body = first.get("body")?;
+    let first_members = first_body.get("members")?.as_array()?;
+
+    let mut direct_symbols = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let top_members = root
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(Value::as_array)?;
+    for member in top_members {
+        if string_field(member, "kind").as_deref() == Some("ContinuousAssign") {
+            if let Some(right) = member
+                .get("assignment")
+                .and_then(|assignment| assignment.get("right"))
+            {
+                collect_direct_hierarchical_symbols(right, &mut direct_symbols);
+            }
+        }
+    }
+
+    for (element, element_indexes) in &leaves {
+        let element_address = element.get("addr")?.as_u64()?;
+        let delta = i128::from(element_address) - i128::from(first_address);
+        let mut path = array_name.to_string();
+        for index in element_indexes {
+            path.push_str(&format!("[{index}]"));
+        }
+        path.push('.');
+        insert_instance_member_paths(first_members, delta, &path, paths);
+    }
+
+    for first_member in first_members {
+        let member_name = first_member.get("name").and_then(Value::as_str)?;
+        if member_name.is_empty() {
+            continue;
+        }
+        let expected = leaves
+            .iter()
+            .map(|(_, indexes)| {
+                let mut path = array_name.to_string();
+                for index in indexes {
+                    path.push_str(&format!("[{index}]"));
+                }
+                path.push('.');
+                path.push_str(member_name);
+                path
+            })
+            .collect::<Vec<_>>();
+        if let Some(symbols) = direct_symbols.get(member_name) {
+            if symbols.len() == expected.len() {
+                for (symbol, path) in symbols.iter().zip(expected) {
+                    paths.insert(symbol.clone(), path);
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn collect_direct_hierarchical_symbols(
+    value: &Value,
+    symbols: &mut std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let Some(kind) = string_field(value, "kind") else {
+        return;
+    };
+    if kind == "HierarchicalValue" {
+        if let Some(symbol) = string_field(value, "symbol") {
+            let name = symbol.split_whitespace().next_back().unwrap_or_default();
+            if !name.is_empty() {
+                symbols.entry(name.to_string()).or_default().push(symbol);
+            }
+        }
+        return;
+    }
+    if kind == "Instance" || kind == "InstanceArray" {
+        return;
+    }
+    match value {
+        Value::Object(fields) => {
+            for nested in fields.values() {
+                collect_direct_hierarchical_symbols(nested, symbols);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                collect_direct_hierarchical_symbols(nested, symbols);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_instance_member_paths(
+    members: &[Value],
+    address_delta: i128,
+    path_prefix: &str,
+    paths: &mut std::collections::BTreeMap<String, String>,
+) {
+    for member in members {
+        if let (Some(address), Some(member_name)) = (
+            member.get("addr").and_then(Value::as_u64),
+            member.get("name").and_then(Value::as_str),
+        ) {
+            if member_name.is_empty() {
+                continue;
+            }
+            if let Some(address) = i128::from(address)
+                .checked_add(address_delta)
+                .and_then(|address| u64::try_from(address).ok())
+            {
+                paths.insert(
+                    format!("{address} {member_name}"),
+                    format!("{path_prefix}{member_name}"),
+                );
+            }
         }
     }
 }
@@ -2712,7 +2885,7 @@ impl SlangAstSummary {
         let mut kinds = std::collections::BTreeSet::new();
         collect_kinds(root, &mut kinds);
         let mut interface_members = std::collections::BTreeMap::new();
-        collect_instance_member_paths(root, &mut interface_members);
+        collect_instance_member_paths(root, root, &mut interface_members);
         for target in &mut continuous_targets {
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
             annotate_enum_name_calls(&mut target.rhs, &enum_types);

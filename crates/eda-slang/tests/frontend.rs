@@ -10555,6 +10555,35 @@ endmodule
         .net_decls
         .iter()
         .any(|declaration| declaration.name == "buses[1].valid"));
+    let instance_array_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_instance_array_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface-instance-array AST");
+    let mut instance_array_summary = slang
+        .summarize_ast_json(&instance_array_json)
+        .expect("summarize interface-instance-array AST");
+    instance_array_summary
+        .validate_against_design(&design)
+        .expect("exact interface-instance-array fingerprints should match");
+    if let Some(target) = instance_array_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed")
+    {
+        target.rhs.interface_path = Some("buses[99].valid".into());
+    }
+    let instance_array_error = instance_array_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface-instance-array member must fail");
+    assert!(
+        instance_array_error.contains("Ref:1:u[buses[99].valid]")
+            && instance_array_error.contains("Ref:1:u[buses[0].valid]"),
+        "unexpected interface-instance-array error: {instance_array_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create interface-instance-array simulator");
     simulator
@@ -10773,6 +10802,35 @@ endmodule
         )
         .expect("directly lower multidimensional interface array ports");
     assert_eq!(design.hierarchy.len(), 6);
+    let array_port_2d_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_array_port_2d_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize multidimensional interface-array-port AST");
+    let mut array_port_2d_summary = slang
+        .summarize_ast_json(&array_port_2d_json)
+        .expect("summarize multidimensional interface-array-port AST");
+    array_port_2d_summary
+        .validate_against_design(&design)
+        .expect("exact multidimensional interface-array-port fingerprints should match");
+    if let Some(target) = array_port_2d_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.rhs.interface_path.as_deref() == Some("buses[1][0].valid"))
+    {
+        target.rhs.interface_path = Some("buses[9][9].valid".into());
+    }
+    let array_port_2d_error = array_port_2d_summary
+        .validate_against_design(&design)
+        .expect_err("wrong multidimensional interface-array member must fail");
+    assert!(
+        array_port_2d_error.contains("Ref:1:u[buses[9][9].valid]")
+            && array_port_2d_error.contains("Ref:1:u[buses[1][0].valid]"),
+        "unexpected multidimensional interface-array error: {array_port_2d_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create 2D interface-array-port simulator");
     simulator
         .set_input("value", &LogicWord::from_u64(4, 0b1010))
