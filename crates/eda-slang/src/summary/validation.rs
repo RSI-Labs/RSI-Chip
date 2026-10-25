@@ -410,15 +410,58 @@ impl SlangAstSummary {
                                 .extend(shapes);
                             continue;
                         }
+                        let legacy_whole_array_copy = legacy_array_shape
+                            && !assignment.constant_array_element_lvalue
+                            && assignment.dynamic_array_lvalue_indexes.is_empty()
+                            && assignment.array_part_lvalue.is_none()
+                            && assignment.memory_member_lvalue.is_none()
+                            && assignment.rhs.type_name.contains('$');
+                        if legacy_array_shape
+                            && !legacy_whole_array_copy
+                            && !assignment.constant_array_element_lvalue
+                        {
+                            let error = format!(
+                                "legacy procedural array assignment for '{target}' has no exact fingerprint"
+                            );
+                            return Err(error + &self.span_note("procedural:"));
+                        }
                         let shape = if let Some(source) = assignment.class_handle_source.as_ref() {
                             format!("ClassHandleCopy:{source}")
                         } else {
-                            if legacy_array_shape && !assignment.constant_array_element_lvalue {
-                                // Small arrays still use the legacy bounded
-                                // per-element expansion, whose expression tree is
-                                // intentionally not structurally equivalent to the
-                                // slang source.
-                                "?".to_string()
+                            if legacy_whole_array_copy {
+                                let source = assignment.rhs.symbol.as_deref().ok_or_else(|| {
+                                    format!("whole-array copy source '{target}' has no symbol")
+                                })?;
+                                let source_name =
+                                    source.split_whitespace().next_back().unwrap_or_default();
+                                let source_declaration = self
+                                    .declarations
+                                    .iter()
+                                    .find(|declaration| declaration.name == source_name)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "whole-array copy source '{source_name}' is undeclared"
+                                        )
+                                    })?;
+                                let source_memory = memory_type(&source_declaration.type_name)
+                                    .ok_or_else(|| {
+                                        format!("whole-array copy source '{source_name}' is not an array")
+                                    })?;
+                                let flat_length = usize::try_from(source_memory.flat_length)
+                                    .map_err(|_| {
+                                        format!(
+                                            "whole-array copy source '{source_name}' is too wide"
+                                        )
+                                    })?;
+                                let width = source_memory
+                                    .element_width
+                                    .checked_mul(flat_length)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "whole-array copy source '{source_name}' is too wide"
+                                        )
+                                    })?;
+                                format!("Ref:{width}:u[{source}]")
                             } else if let Some(member) = assignment.memory_member_lvalue.as_ref() {
                                 memory_member_lvalue_fingerprint(
                                     target,

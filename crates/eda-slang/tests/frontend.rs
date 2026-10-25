@@ -6508,6 +6508,48 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("lower array-copy differential through bounded path");
+    let differential_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&differential_path),
+            Some("array_copy_differential"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize array-copy differential AST");
+    let mut differential_summary = slang
+        .summarize_ast_json(&differential_json)
+        .expect("summarize array-copy differential AST");
+    differential_summary
+        .validate_against_design_legacy_compatibility(&reference_copy)
+        .expect("exact bounded whole-array copy fingerprints should match");
+    let source_declaration = differential_summary
+        .declarations
+        .iter_mut()
+        .find(|declaration| declaration.name == "source")
+        .expect("whole-array copy source declaration");
+    source_declaration.type_name = "logic[7:0]$[0:4]".into();
+    if let Some(assignment) = differential_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "destination")
+            })
+        })
+    {
+        assignment.rhs.symbol = Some("source".into());
+    }
+    let bounded_copy_error = differential_summary
+        .validate_against_design_legacy_compatibility(&reference_copy)
+        .expect_err("wrong bounded whole-array copy source must fail");
+    assert!(
+        bounded_copy_error.contains("Ref:40:u[source]")
+            && bounded_copy_error.contains("Ref:32:u[source]"),
+        "unexpected bounded whole-array copy error: {bounded_copy_error}"
+    );
     let mut direct_copy_simulator =
         Simulator::new(&direct_copy).expect("create direct array-copy simulator");
     direct_copy_simulator
