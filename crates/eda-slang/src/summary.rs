@@ -1797,6 +1797,21 @@ fn type_layout_alias_key(type_name: &str) -> Option<&str> {
     (!alias.is_empty()).then_some(alias)
 }
 
+fn collect_type_alias_members(value: &Value, aliases: &mut Vec<Value>) {
+    if let Some(fields) = value.as_object() {
+        if fields.get("kind").and_then(Value::as_str) == Some("TypeAlias") {
+            aliases.push(value.clone());
+        }
+        for nested in fields.values() {
+            collect_type_alias_members(nested, aliases);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_type_alias_members(nested, aliases);
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlangTypeAliasIndex {
     exact: std::collections::BTreeMap<String, Value>,
@@ -2051,13 +2066,37 @@ fn annotate_memory_element_shapes(
     }
 }
 
+fn lookup_type_layout<'a>(
+    type_name: &str,
+    type_layouts: &'a std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
+) -> Option<&'a SlangTypeLayoutSummary> {
+    let alias = type_layout_alias_key(type_name)?;
+    if let Some(layout) = type_layouts.get(alias) {
+        return Some(layout);
+    }
+    let alias_name = alias
+        .split_whitespace()
+        .next_back()?
+        .rsplit(['.', '#', ':'])
+        .next()?;
+    let matches = type_layouts
+        .keys()
+        .filter(|key| {
+            key.split_whitespace()
+                .next_back()
+                .and_then(|name| name.rsplit(['.', '#', ':']).next())
+                .is_some_and(|name| name == alias_name)
+        })
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| &type_layouts[matches[0]])
+}
+
 fn annotate_packed_member_shapes(
     expression: &mut SlangExpressionSummary,
     type_layouts: &std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
 ) -> Option<()> {
     if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue") {
-        let alias = type_layout_alias_key(&expression.type_name)?;
-        let layout = type_layouts.get(alias)?;
+        let layout = lookup_type_layout(&expression.type_name, type_layouts)?;
         expression.type_width = Some(layout.element_width);
         expression.type_signed.get_or_insert(
             crate::types::simple_type_signed(&expression.type_name).unwrap_or(false),
@@ -2066,8 +2105,7 @@ fn annotate_packed_member_shapes(
     if expression.kind == "MemberAccess" {
         let selected = expression.operands.first_mut()?;
         let member = expression.member_path.first()?.clone();
-        let alias = type_layout_alias_key(&selected.type_name)?;
-        let layout = type_layouts.get(alias)?;
+        let layout = lookup_type_layout(&selected.type_name, type_layouts)?;
         let field = layout
             .fields
             .iter()
@@ -2085,6 +2123,73 @@ fn annotate_packed_member_shapes(
     }
     for operand in &mut expression.operands {
         let _ = annotate_packed_member_shapes(operand, type_layouts);
+    }
+    Some(())
+}
+
+fn collect_instance_member_paths(
+    value: &Value,
+    paths: &mut std::collections::BTreeMap<String, String>,
+) {
+    if let Some(fields) = value.as_object() {
+        if fields.get("kind").and_then(Value::as_str) == Some("Instance") {
+            let instance_name = fields
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !instance_name.is_empty() {
+                if let Some(members) = fields
+                    .get("body")
+                    .and_then(|body| body.get("members"))
+                    .and_then(Value::as_array)
+                {
+                    for member in members {
+                        if let (Some(address), Some(member_name)) = (
+                            member.get("addr").and_then(Value::as_u64),
+                            member.get("name").and_then(Value::as_str),
+                        ) {
+                            if !member_name.is_empty() {
+                                paths.insert(
+                                    format!("{address} {member_name}"),
+                                    format!("{instance_name}.{member_name}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_instance_member_paths(nested, paths);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_instance_member_paths(nested, paths);
+        }
+    }
+}
+
+fn annotate_interface_member_paths(
+    expression: &mut SlangExpressionSummary,
+    interface_members: &std::collections::BTreeMap<String, String>,
+    type_layouts: &std::collections::BTreeMap<String, SlangTypeLayoutSummary>,
+) -> Option<()> {
+    if expression.kind == "HierarchicalValue" {
+        if let Some(path) = expression
+            .symbol_id
+            .as_deref()
+            .and_then(|symbol| interface_members.get(symbol))
+        {
+            expression.interface_path = Some(path.clone());
+            if expression.type_width.is_none() {
+                let layout = lookup_type_layout(&expression.type_name, type_layouts)?;
+                expression.type_width = Some(layout.element_width);
+            }
+            expression.type_signed.get_or_insert(false);
+        }
+    }
+    for operand in &mut expression.operands {
+        let _ = annotate_interface_member_paths(operand, interface_members, type_layouts);
     }
     Some(())
 }
@@ -2254,6 +2359,8 @@ pub struct SlangExpressionSummary {
     /// and unresolved widths remain unresolved.
     pub type_signed: Option<bool>,
     pub symbol: Option<String>,
+    /// Authoritative slang symbol ID, including address and name.
+    pub symbol_id: Option<String>,
     /// Canonical integer-literal fingerprint (`width:bits`, MSB first) for
     /// expressions slang represented as `IntegerLiteral`. Other literal forms
     /// remain unresolved until typed lowering preserves their exact type.
@@ -2269,6 +2376,8 @@ pub struct SlangExpressionSummary {
     pub member_path: Vec<String>,
     /// Physical inclusive bit range selected by a packed member path.
     pub member_range: Option<(usize, usize)>,
+    /// Canonical hierarchical path for a direct interface member reference.
+    pub interface_path: Option<String>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 
@@ -2418,6 +2527,7 @@ impl SlangAstSummary {
             })
             .collect::<Vec<_>>();
         type_alias_members.extend(imported_type_aliases.into_values());
+        collect_type_alias_members(root, &mut type_alias_members);
         loop {
             let mut changed = false;
             for member in &type_alias_members {
@@ -2601,11 +2711,15 @@ impl SlangAstSummary {
         );
         let mut kinds = std::collections::BTreeSet::new();
         collect_kinds(root, &mut kinds);
+        let mut interface_members = std::collections::BTreeMap::new();
+        collect_instance_member_paths(root, &mut interface_members);
         for target in &mut continuous_targets {
             annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
             annotate_enum_name_calls(&mut target.rhs, &enum_types);
             annotate_memory_element_shapes(&mut target.rhs, &type_layouts);
             let _ = annotate_packed_member_shapes(&mut target.rhs, &type_layouts);
+            let _ =
+                annotate_interface_member_paths(&mut target.rhs, &interface_members, &type_layouts);
         }
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
@@ -2613,6 +2727,11 @@ impl SlangAstSummary {
                 annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
                 annotate_memory_element_shapes(&mut assignment.rhs, &type_layouts);
                 let _ = annotate_packed_member_shapes(&mut assignment.rhs, &type_layouts);
+                let _ = annotate_interface_member_paths(
+                    &mut assignment.rhs,
+                    &interface_members,
+                    &type_layouts,
+                );
                 if let Some(selector) = assignment.dynamic_packed_lvalue_selector.as_mut() {
                     annotate_memory_element_shapes(selector, &type_layouts);
                 }

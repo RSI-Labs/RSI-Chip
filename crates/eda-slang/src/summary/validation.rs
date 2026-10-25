@@ -1379,12 +1379,14 @@ fn constant_zero_summary() -> super::SlangExpressionSummary {
         type_width: Some(32),
         type_signed: Some(true),
         symbol: None,
+        symbol_id: None,
         literal: Some(format!("32:{}", "0".repeat(32))),
         repeat_count: None,
         simulation_time_unit: None,
         enum_definition: None,
         member_path: Vec::new(),
         member_range: None,
+        interface_path: None,
         operands: Vec::new(),
     }
 }

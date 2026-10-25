@@ -1,9 +1,9 @@
 //! Expression summaries, fingerprints, and IR-shape comparison helpers.
 
 use crate::ast_util::{
-    bool_field, expression_symbol, expression_target_names, instance_parameters,
-    integer_literal_word, literal_word, named_constant_word, parameter_summary, slang_constant_u64,
-    string_field,
+    bool_field, expression_symbol, expression_symbol_id, expression_target_names,
+    instance_parameters, integer_literal_word, literal_word, named_constant_word,
+    parameter_summary, slang_constant_u64, string_field,
 };
 use crate::types::{
     memory_type, simple_type_shape, simple_type_signed, simple_type_width, string_literal_word,
@@ -58,12 +58,14 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         type_width: string_field(value, "type").and_then(|type_name| simple_type_width(&type_name)),
         type_signed,
         symbol: expression_symbol(value),
+        symbol_id: expression_symbol_id(value),
         literal,
         repeat_count: repeat_count(value),
         simulation_time_unit: None,
         enum_definition: None,
         member_path,
         member_range: None,
+        interface_path: None,
         operands: expression_operands(value),
     }
 }
@@ -77,12 +79,14 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         type_width: None,
         type_signed: None,
         symbol: None,
+        symbol_id: None,
         literal: None,
         repeat_count: None,
         simulation_time_unit: None,
         enum_definition: None,
         member_path: Vec::new(),
         member_range: None,
+        interface_path: None,
         operands: Vec::new(),
     }
 }
@@ -1887,6 +1891,19 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
                 mode,
             )?;
             return Some(format!("PackedSelect:{width}:u[{base},Range:{msb}:{lsb}]"));
+        } else if let Some(path) = expression.interface_path.as_deref() {
+            let width = expression.type_width?;
+            let signed = expression.type_signed.unwrap_or(false);
+            let signed_label = if signed { "s" } else { "u" };
+            return Some(format!("Ref:{width}:{signed_label}[{path}]"));
+        }
+    }
+    if expression.kind == "HierarchicalValue" {
+        if let Some(path) = expression.interface_path.as_deref() {
+            let width = expression.type_width?;
+            let signed = expression.type_signed.unwrap_or(false);
+            let signed_label = if signed { "s" } else { "u" };
+            return Some(format!("Ref:{width}:{signed_label}[{path}]"));
         }
     }
     let root = slang_expression_shape(expression)?;

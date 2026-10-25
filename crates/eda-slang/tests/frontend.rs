@@ -8657,12 +8657,14 @@ endmodule
                 type_width: None,
                 type_signed: None,
                 symbol: None,
+                symbol_id: None,
                 literal: None,
                 repeat_count: None,
                 simulation_time_unit: None,
                 enum_definition: None,
                 member_path: Vec::new(),
                 member_range: None,
+                interface_path: None,
                 operands: Vec::new(),
             },
         });
@@ -9586,6 +9588,35 @@ endmodule
         .find(|declaration| declaration.name == "bus.outgoing")
         .expect("interface outgoing vector");
     assert_eq!(outgoing.width, 8);
+    let interface_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("vector_interface_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface-vector AST");
+    let mut interface_summary = slang
+        .summarize_ast_json(&interface_json)
+        .expect("summarize interface-vector AST");
+    interface_summary
+        .validate_against_design(&design)
+        .expect("exact interface-vector fingerprints should match");
+    if let Some(target) = interface_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "outgoing")
+    {
+        target.rhs.interface_path = Some("bus.wrong".into());
+    }
+    let interface_path_error = interface_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface member path must fail");
+    assert!(
+        interface_path_error.contains("Ref:8:u[bus.wrong]")
+            && interface_path_error.contains("Ref:8:u[bus.outgoing]"),
+        "unexpected interface path error: {interface_path_error}"
+    );
 
     let mut simulator = Simulator::new(&design).expect("create interface-vector simulator");
     simulator
@@ -9645,6 +9676,35 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower interface packed struct members");
+    let interface_struct_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("interface_struct_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize interface packed-struct AST");
+    let mut interface_struct_summary = slang
+        .summarize_ast_json(&interface_struct_json)
+        .expect("summarize interface packed-struct AST");
+    interface_struct_summary
+        .validate_against_design(&design)
+        .expect("exact interface packed-struct fingerprints should match");
+    if let Some(target) = interface_struct_summary
+        .continuous_targets
+        .iter_mut()
+        .find(|target| target.name == "observed")
+    {
+        target.rhs.interface_path = Some("bus.wrong".into());
+    }
+    let interface_aggregate_error = interface_struct_summary
+        .validate_against_design(&design)
+        .expect_err("wrong interface aggregate member must fail");
+    assert!(
+        interface_aggregate_error.contains("Ref:6:u[bus.wrong]")
+            && interface_aggregate_error.contains("Ref:6:u[bus.packet]"),
+        "unexpected interface aggregate error: {interface_aggregate_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create interface struct simulator");
     simulator
         .set_input("value", &LogicWord::from_u64(4, 0b1011))
