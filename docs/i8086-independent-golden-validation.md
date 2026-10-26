@@ -45,13 +45,17 @@ Covered machine-code families include:
 | Immediate shifts/rotates | 0xc0/0xc1 forms, including counts 0, 1, 7, 8, 9, 15, 16, 17, 30, and 31. |
 | Unary groups | TEST, NOT, NEG, MUL, IMUL, DIV, and IDIV in byte and word forms where defined by the directed operands. |
 | Flag control | CMC, CLC, STC, CLI, STI, CLD, STD, and LAHF as exercised by the matrices. |
+| Stack and control flow | PUSH/POP registers, PUSHF/POPF, near CALL/RET, all short conditional-jump predicates, JCXZ, LOOP, short JMP, and near JMP. |
+
+The control-flow lane also uses forward branches over an ALU mutation so both
+taken and untaken paths remain architectural and observable.
 
 Directed result:
 
 ```text
 cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized
 
-15 passed, 0 failed, 220.91 seconds
+17 passed, 0 failed, 230.52 seconds
 ```
 
 ## Deterministic randomized differential
@@ -110,8 +114,8 @@ The independent lane exposed the following machine-code correctness defects:
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add control-flow, stack, string, interrupt, I/O, BCD-adjust, prefix-repeat,
-   and full MZ/COM loader coverage.
+2. Add string instructions, interrupts, I/O, BCD adjust, repeat prefixes, far
+   calls/returns, broader stack forms, and full MZ/COM loader coverage.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz

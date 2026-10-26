@@ -208,6 +208,54 @@ fn deterministic_i8086_primary_word_alu_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_stack_call_return_matrix_matches_golden_model() {
+    let values = [
+        0x1234_u16, 0x5678, 0x9abc, 0x1000, 0xfffe, 0x1000, 0x1002, 0x1004,
+    ];
+    let operations = [
+        0x50, // push ax
+        0x51, // push cx
+        0x5a, // pop dx
+        0x5b, // pop bx
+        0x9c, // pushf
+        0x32, 0xc0, // xor al, al
+        0x9d, // popf
+        0xe8, 0x05, 0x00, // call subroutine
+        0xb3, 0x2a, // mov bl, 42
+        0xeb, 0x04, // jump over subroutine
+        0x90, 0x50, // push ax
+        0x5f, // pop di
+        0xc3, // ret
+    ];
+    let rtl = assert_matches_golden(
+        &initial_program(values, &operations),
+        "stack/call/return matrix",
+    );
+    assert_eq!(rtl.dx, 0x5678);
+    assert_eq!(rtl.bx, 0x122a);
+    assert_eq!(rtl.di, 0x1200);
+    assert_eq!(rtl.sp, 0xfffe);
+}
+
+#[test]
+fn deterministic_i8086_control_flow_matrix_matches_golden_model() {
+    let values = [0x0000_u16, 0x0002, 0x0000, 0x0000, 0xfffe, 0, 0, 0];
+    let mut operations = Vec::new();
+    for operation in 0..16_u8 {
+        operations.extend_from_slice(&[0x70 + operation, 0x03, 0x04, 0x01, 0x90]);
+    }
+    operations.extend_from_slice(&[
+        0xb9, 0x02, 0x00, // mov cx, 2
+        0xe3, 0x03, 0x04, 0x01, 0x90, // jcxz forward
+        0xb9, 0x02, 0x00, // mov cx, 2
+        0xe2, 0x03, 0x04, 0x01, 0x90, // loop forward
+        0xeb, 0x03, 0x04, 0x01, 0x90, // short jmp
+        0xe9, 0x03, 0x00, 0x04, 0x01, 0x90, // near jmp
+    ]);
+    assert_matches_golden(&initial_program(values, &operations), "control-flow matrix");
+}
+
+#[test]
 fn deterministic_i8086_modrm_addressing_matrix_matches_golden_model() {
     let values = [
         0x1234_u16, 0x5678, 0x9abc, 0x1000, 0xfffe, 0x1100, 0x1010, 0x1020,

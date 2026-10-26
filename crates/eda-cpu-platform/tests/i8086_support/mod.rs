@@ -110,14 +110,28 @@ impl ReferenceI8086 {
             0x00..=0x3f if opcode & 0x07 < 0x06 => {
                 let width = if opcode & 1 == 0 { 8 } else { 16 };
                 let operation = opcode >> 3;
-                let (left, right) = self.modrm_pair(override_segment);
-                let destination = if opcode & 0x02 != 0 { right } else { left };
-                let result = self.alu(
-                    operation,
-                    self.read(left, width)?,
-                    self.read(right, width)?,
-                    width,
-                )?;
+                let variant = opcode & 0x07;
+                let (destination, left, right) = if variant <= 3 {
+                    let (left, right) = self.modrm_pair(override_segment);
+                    let destination = if variant & 0x02 != 0 { right } else { left };
+                    (
+                        destination,
+                        self.read(left, width)?,
+                        self.read(right, width)?,
+                    )
+                } else {
+                    let immediate = if width == 8 {
+                        u16::from(self.fetch8())
+                    } else {
+                        self.fetch16()
+                    };
+                    (
+                        Location::Register(0, 0),
+                        self.read(Location::Register(0, 0), width)?,
+                        immediate,
+                    )
+                };
+                let result = self.alu(operation, left, right, width)?;
                 if operation != 7 {
                     self.write(destination, width, result)?;
                 }
@@ -150,6 +164,28 @@ impl ReferenceI8086 {
                     let value = self.read(memory, width)?;
                     self.write(Location::Register(register, 0), width, value)?;
                 }
+            }
+            0x50..=0x57 => {
+                let value = self.read(Location::Register(opcode & 7, 0), 16)?;
+                self.push(value)?;
+            }
+            0x58..=0x5f => {
+                let value = self.pop()?;
+                self.write(Location::Register(opcode & 7, 0), 16, value)?;
+            }
+            0x70..=0x7f => {
+                let displacement = (self.fetch8() as i8) as u16;
+                if self.condition(opcode & 0x0f) {
+                    self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+                }
+            }
+            0x90 => {}
+            0x9c => {
+                let flags = self.flags;
+                self.push(flags)?;
+            }
+            0x9d => {
+                self.flags = self.pop()?;
             }
             0x8e => {
                 let (source, register) = self.modrm(override_segment);
@@ -189,6 +225,14 @@ impl ReferenceI8086 {
                 };
                 self.write(Location::Register(register, width), width, value)?;
             }
+            0xc2 => {
+                let adjustment = self.fetch16();
+                self.instruction_pointer = self.pop()?;
+                self.registers[4] = self.registers[4].wrapping_add(adjustment);
+            }
+            0xc3 => {
+                self.instruction_pointer = self.pop()?;
+            }
             0x9f => {
                 let low = self.flags as u8;
                 self.write(Location::Register(4, 8), 8, u16::from(low))?;
@@ -221,6 +265,34 @@ impl ReferenceI8086 {
                 let (operand, operation) = self.modrm(override_segment);
                 self.unary_group(operand, operation, width)?;
             }
+            0xe0..=0xe3 => {
+                let displacement = (self.fetch8() as i8) as u16;
+                let old_cx = self.registers[1];
+                self.registers[1] = old_cx.wrapping_sub(1);
+                let branch = match opcode {
+                    0xe0 => old_cx != 0 && !self.flag(ZF),
+                    0xe1 => old_cx != 0 && self.flag(ZF),
+                    0xe2 => old_cx != 0,
+                    _ => self.registers[1] == 0,
+                };
+                if branch {
+                    self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+                }
+            }
+            0xe8 => {
+                let displacement = self.fetch16();
+                let return_ip = self.instruction_pointer;
+                self.push(return_ip)?;
+                self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+            }
+            0xe9 => {
+                let displacement = self.fetch16();
+                self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+            }
+            0xeb => {
+                let displacement = (self.fetch8() as i8) as u16;
+                self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+            }
             0xf4 => {
                 self.halted = true;
             }
@@ -247,6 +319,42 @@ impl ReferenceI8086 {
         let low = u16::from(self.fetch8());
         let high = u16::from(self.fetch8());
         (high << 8) | low
+    }
+
+    fn push(&mut self, value: u16) -> Result<(), String> {
+        self.registers[4] = self.registers[4].wrapping_sub(2);
+        let segment = SS;
+        let offset = self.registers[4];
+        self.write(Location::Memory(segment, offset), 16, value)
+    }
+
+    fn pop(&mut self) -> Result<u16, String> {
+        let segment = SS;
+        let offset = self.registers[4];
+        let value = self.read(Location::Memory(segment, offset), 16)?;
+        self.registers[4] = self.registers[4].wrapping_add(2);
+        Ok(value)
+    }
+
+    fn condition(&self, code: u8) -> bool {
+        match code {
+            0 => self.flag(OF),
+            1 => !self.flag(OF),
+            2 => self.flag(CF),
+            3 => !self.flag(CF),
+            4 => self.flag(ZF),
+            5 => !self.flag(ZF),
+            6 => self.flag(CF) || self.flag(ZF),
+            7 => !self.flag(CF) && !self.flag(ZF),
+            8 => self.flag(SF),
+            9 => !self.flag(SF),
+            0xa => self.flag(PF),
+            0xb => !self.flag(PF),
+            0xc => self.flag(SF) != self.flag(OF),
+            0xd => self.flag(SF) == self.flag(OF),
+            0xe => self.flag(ZF) || self.flag(SF) != self.flag(OF),
+            _ => !self.flag(ZF) && self.flag(SF) == self.flag(OF),
+        }
     }
 
     fn modrm_pair(&mut self, override_segment: Option<usize>) -> (Location, Location) {
