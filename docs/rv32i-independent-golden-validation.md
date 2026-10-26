@@ -111,6 +111,9 @@ Covered operations include:
 
 - `CSRRW`, `CSRRS`, and `CSRRC` on `mtvec`;
 - `CSRRW` on `mepc`;
+- `CSRRW`, `CSRRS`, and `CSRRC` on `mstatus`, `medeleg`, `mideleg`,
+  `mcause`, and `mtval`;
+- `CSRRWI`, `CSRRSI`, and `CSRRCI` on `mstatus`;
 - bare-metal `ECALL`;
 - `MRET`;
 - return-PC advancement.
@@ -126,9 +129,10 @@ contracts rather than prove RV32I RTL correctness.
    exposes them.
 2. Extend randomized load/store addresses beyond aligned offsets in one 256-byte
    page, including page crossings and address edges.
-3. Extend independent privileged coverage beyond the tested `mtvec`, `mepc`,
-   `mcause`, and M-mode `ECALL`/`MRET` contract.
-5. Repeat the same external-oracle methodology for i8086; its current reference
+3. Extend independent privileged coverage beyond the CSR surface supported by
+   the selected external executor (`mscratch`, `mie`, and `mip` require a second
+   oracle or explicit bare-metal extension).
+4. Repeat the same external-oracle methodology for i8086; its current reference
    is a separate repository-owned spec-derived implementation.
 
 ## Validation command
@@ -140,12 +144,12 @@ cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture
 Latest full result: 5 tests, 5 passed, 0 failed, 789.03 seconds.
 
 The full run includes the 64-seed randomized differential. The non-randomized
-directed subset currently passes in 31.14 seconds:
+directed subset currently passes in 34.17 seconds:
 
 ```text
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized
 
-4 passed, 0 failed, 32.46 seconds
+5 passed, 0 failed, 34.17 seconds
 ```
 
 ELF/fixture lane:

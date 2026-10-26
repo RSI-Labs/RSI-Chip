@@ -5,6 +5,8 @@ use std::collections::HashMap;
 pub const CSR_MSTATUS: u32 = 0x300;
 pub const CSR_MISA: u32 = 0x301;
 pub const CSR_MIE: u32 = 0x304;
+pub const CSR_MEDELEG: u32 = 0x302;
+pub const CSR_MIDELEG: u32 = 0x303;
 pub const CSR_MTVEC: u32 = 0x305;
 pub const CSR_MSCRATCH: u32 = 0x340;
 pub const CSR_MEPC: u32 = 0x341;
@@ -398,8 +400,10 @@ impl Rv32iMachine {
 
     fn read_csr_or_trap(&self, address: u32) -> Option<u32> {
         match address {
-            CSR_MSTATUS | CSR_MISA | CSR_MIE | CSR_MTVEC | CSR_MSCRATCH | CSR_MEPC | CSR_MCAUSE
-            | CSR_MTVAL | CSR_MIP => Some(*self.csrs.get(&address).unwrap_or(&0)),
+            CSR_MSTATUS | CSR_MISA | CSR_MEDELEG | CSR_MIDELEG | CSR_MIE | CSR_MTVEC
+            | CSR_MSCRATCH | CSR_MEPC | CSR_MCAUSE | CSR_MTVAL | CSR_MIP => {
+                Some(*self.csrs.get(&address).unwrap_or(&0))
+            }
             CSR_CYCLE => Some(self.cycle as u32),
             CSR_TIME => Some(self.cycle as u32),
             CSR_INSTRET => Some(self.instructions_retired as u32),
@@ -409,8 +413,8 @@ impl Rv32iMachine {
 
     fn write_csr_or_trap(&mut self, address: u32, value: u32) -> bool {
         match address {
-            CSR_MSTATUS | CSR_MIE | CSR_MTVEC | CSR_MSCRATCH | CSR_MEPC | CSR_MCAUSE
-            | CSR_MTVAL | CSR_MIP => {
+            CSR_MSTATUS | CSR_MEDELEG | CSR_MIDELEG | CSR_MIE | CSR_MTVEC | CSR_MSCRATCH
+            | CSR_MEPC | CSR_MCAUSE | CSR_MTVAL | CSR_MIP => {
                 self.csrs.insert(address, value);
                 true
             }

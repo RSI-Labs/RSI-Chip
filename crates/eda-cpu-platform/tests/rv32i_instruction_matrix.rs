@@ -187,9 +187,13 @@ struct IndependentRv32iPrivilegedResult {
     regs: [u32; 32],
     pc: u32,
     memory: Ram,
+    mstatus: u32,
+    medeleg: u32,
+    mideleg: u32,
     mtvec: u32,
     mepc: u32,
     mcause: u32,
+    mtval: u32,
 }
 
 fn run_independent_rv32i(
@@ -294,9 +298,13 @@ fn run_independent_rv32i_privileged(
                 regs: cpu.x,
                 pc: cpu.pc.wrapping_sub(4),
                 memory,
+                mstatus: cpu.mstatus,
+                medeleg: cpu.medeleg,
+                mideleg: cpu.mideleg,
                 mtvec: cpu.mtvec,
                 mepc: cpu.mepc,
                 mcause: cpu.mcause,
+                mtval: cpu.mtval,
             };
         }
 
@@ -449,6 +457,67 @@ fn rv32i_machine_csr_matrix_matches_independent_golden_model() {
         oracle.mtvec,
         "built-in and independent mtvec differ"
     );
+}
+
+#[test]
+fn rv32i_extended_machine_csr_matrix_matches_independent_golden_model() {
+    const MSTATUS: u32 = 0x300;
+    const MEDELEG: u32 = 0x302;
+    const MIDELEG: u32 = 0x303;
+    const MCAUSE: u32 = 0x342;
+    const MTVAL: u32 = 0x343;
+
+    let mut program = Vec::new();
+    program.extend(load_upper(1, 0x1234));
+    program.push(addi(2, 0, 0xff));
+    for csr_address in [MSTATUS, MEDELEG, MIDELEG, MCAUSE, MTVAL] {
+        program.push(csr(1, 8, 1, csr_address)); // write pattern
+        program.push(csr(2, 9, 2, csr_address)); // set low bits
+        program.push(csr(3, 10, 2, csr_address)); // clear low bits
+        program.push(csr(1, 0, 0, csr_address)); // clear
+    }
+
+    // Exercise the immediate CSR forms on mstatus as well.
+    program.push(csr(5, 11, 5, MSTATUS)); // csrrwi
+    program.push(csr(6, 12, 10, MSTATUS)); // csrrsi
+    program.push(csr(7, 13, 2, MSTATUS)); // csrrci
+    program.push(ebreak());
+
+    let mut memory = SparseMemory::new();
+    write_program(&mut memory, &program, 0);
+    let mut golden = Rv32iMachine::baremetal(0, memory.clone());
+    assert_eq!(golden.run(100), StopReason::Ebreak);
+
+    let runner = Rv32iSvRunner::new().expect("compile RV32I runtime");
+    let rtl = runner
+        .run_memory(0, memory.clone())
+        .expect("execute RV32I extended CSR matrix");
+    assert_matches_golden(&golden, &rtl);
+
+    let halt_pc = (program.len() as u32 - 1) * 4;
+    let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);
+    assert_rtl_matches_independent_privileged(&rtl, &oracle, 0x2000, "extended machine CSR matrix");
+
+    for (name, expected) in [
+        ("mstatus", oracle.mstatus),
+        ("medeleg", oracle.medeleg),
+        ("mideleg", oracle.mideleg),
+        ("mcause", oracle.mcause),
+        ("mtval", oracle.mtval),
+    ] {
+        let address = match name {
+            "mstatus" => MSTATUS,
+            "medeleg" => MEDELEG,
+            "mideleg" => MIDELEG,
+            "mcause" => MCAUSE,
+            _ => MTVAL,
+        };
+        let built_in = golden.csrs.get(&address).copied().unwrap_or(0);
+        assert_eq!(
+            built_in, expected,
+            "built-in {name} final value differs from independent oracle"
+        );
+    }
 }
 
 #[test]
