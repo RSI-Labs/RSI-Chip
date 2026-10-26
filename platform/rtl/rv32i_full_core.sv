@@ -467,6 +467,12 @@ module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_
                 12'h300: csr_mstatus <= (funct3[1:0] == 2'b01) ? csr_wdata :
                             (funct3[1:0] == 2'b10) ? (csr_mstatus | csr_wdata) :
                             (csr_mstatus & ~csr_wdata);
+                12'h302: csr_medeleg <= (funct3[1:0] == 2'b01) ? csr_wdata :
+                            (funct3[1:0] == 2'b10) ? (csr_medeleg | csr_wdata) :
+                            (csr_medeleg & ~csr_wdata);
+                12'h303: csr_mideleg <= (funct3[1:0] == 2'b01) ? csr_wdata :
+                            (funct3[1:0] == 2'b10) ? (csr_mideleg | csr_wdata) :
+                            (csr_mideleg & ~csr_wdata);
                 12'h304: csr_mie <= (funct3[1:0] == 2'b01) ? csr_wdata :
                             (funct3[1:0] == 2'b10) ? (csr_mie | csr_wdata) :
                             (csr_mie & ~csr_wdata);
@@ -485,6 +491,9 @@ module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_
                 12'h343: csr_mtval <= (funct3[1:0] == 2'b01) ? csr_wdata :
                             (funct3[1:0] == 2'b10) ? (csr_mtval | csr_wdata) :
                             (csr_mtval & ~csr_wdata);
+                12'h344: csr_mip <= (funct3[1:0] == 2'b01) ? csr_wdata :
+                            (funct3[1:0] == 2'b10) ? (csr_mip | csr_wdata) :
+                            (csr_mip & ~csr_wdata);
                 default: x1 <= x1;
               endcase
             end

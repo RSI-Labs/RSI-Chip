@@ -113,15 +113,18 @@ Covered operations include:
 - `CSRRW` on `mepc`;
 - `CSRRW`, `CSRRS`, and `CSRRC` on `mstatus`, `medeleg`, `mideleg`,
   `mcause`, and `mtval`;
+- `CSRRW`, `CSRRS`, and `CSRRC` on `mscratch`, `mie`, and `mip`;
 - `CSRRWI`, `CSRRSI`, and `CSRRCI` on `mstatus`;
+- immediate CSR forms on `mie`, `mscratch`, and `mip`;
 - bare-metal `ECALL`;
 - `MRET`;
 - return-PC advancement.
 
-The legacy `mscratch` CSR read/write/set/clear test remains an internal-model
-differential because Raven does not retain arbitrary scratch CSRs. Using a host
-syscall oracle for that CSR would compare incompatible platform
-contracts rather than prove RV32I RTL correctness.
+Raven does not retain `mscratch`, `mie`, or `mip`. The independent harness
+therefore adds an explicit spec-derived side-table extension for those CSR
+instructions while continuing to use Raven for integer execution and all other
+machine CSRs. The legacy internal-only `mscratch` test remains as an additional
+regression, but the extended matrix now provides a three-lane result.
 
 ## Remaining gaps
 
@@ -129,10 +132,7 @@ contracts rather than prove RV32I RTL correctness.
    exposes them.
 2. Extend randomized load/store addresses beyond aligned offsets in one 256-byte
    page, including page crossings and address edges.
-3. Extend independent privileged coverage beyond the CSR surface supported by
-   the selected external executor (`mscratch`, `mie`, and `mip` require a second
-   oracle or explicit bare-metal extension).
-4. Repeat the same external-oracle methodology for i8086; its current reference
+3. Repeat the same external-oracle methodology for i8086; its current reference
    is a separate repository-owned spec-derived implementation.
 
 ## Validation command
@@ -141,7 +141,7 @@ contracts rather than prove RV32I RTL correctness.
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture
 ```
 
-Latest full result: 5 tests, 5 passed, 0 failed, 789.03 seconds.
+Latest full result: 6 tests, 6 passed, 0 failed, 813.45 seconds.
 
 The full run includes the 64-seed randomized differential. The non-randomized
 directed subset currently passes in 34.17 seconds:
@@ -149,7 +149,7 @@ directed subset currently passes in 34.17 seconds:
 ```text
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized
 
-5 passed, 0 failed, 34.17 seconds
+5 passed, 0 failed, 31.26 seconds
 ```
 
 ELF/fixture lane:

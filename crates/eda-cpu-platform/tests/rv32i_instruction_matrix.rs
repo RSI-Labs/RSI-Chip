@@ -3,6 +3,7 @@ use eda_cpu_platform::systemverilog::{Rv32iSvResult, Rv32iSvRunner};
 use eda_cpu_platform::SparseMemory;
 use raven_riscv_engine::falcon::{exec, memory::Bus, memory::Ram, Cpu};
 use raven_riscv_engine::host::Console;
+use std::collections::BTreeMap;
 
 fn i_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, immediate: i32) -> u32 {
     ((immediate as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
@@ -188,12 +189,15 @@ struct IndependentRv32iPrivilegedResult {
     pc: u32,
     memory: Ram,
     mstatus: u32,
+    mscratch: u32,
+    mie: u32,
     medeleg: u32,
     mideleg: u32,
     mtvec: u32,
     mepc: u32,
     mcause: u32,
     mtval: u32,
+    mip: u32,
 }
 
 fn run_independent_rv32i(
@@ -286,6 +290,7 @@ fn run_independent_rv32i_privileged(
         ..Default::default()
     };
     let mut console = Console::default();
+    let mut extension_csrs = BTreeMap::<u32, u32>::new();
     for _ in 0..100 {
         if cpu.pc == halt_pc {
             let _ = exec::step(&mut cpu, &mut memory, &mut console)
@@ -299,12 +304,15 @@ fn run_independent_rv32i_privileged(
                 pc: cpu.pc.wrapping_sub(4),
                 memory,
                 mstatus: cpu.mstatus,
+                mscratch: *extension_csrs.get(&0x340).unwrap_or(&0),
+                mie: *extension_csrs.get(&0x304).unwrap_or(&0),
                 medeleg: cpu.medeleg,
                 mideleg: cpu.mideleg,
                 mtvec: cpu.mtvec,
                 mepc: cpu.mepc,
                 mcause: cpu.mcause,
                 mtval: cpu.mtval,
+                mip: *extension_csrs.get(&0x344).unwrap_or(&0),
             };
         }
 
@@ -324,6 +332,9 @@ fn run_independent_rv32i_privileged(
             cpu.pc = cpu.mtvec & !3;
             continue;
         }
+        if execute_raven_csr_extension(&mut cpu, &mut extension_csrs, instruction) {
+            continue;
+        }
 
         let continuing = exec::step(&mut cpu, &mut memory, &mut console)
             .unwrap_or_else(|error| panic!("independent privileged oracle failed: {error}"));
@@ -334,6 +345,46 @@ fn run_independent_rv32i_privileged(
     }
 
     panic!("independent privileged oracle did not reach EBREAK at {halt_pc:#010x}");
+}
+
+fn execute_raven_csr_extension(
+    cpu: &mut Cpu,
+    csrs: &mut BTreeMap<u32, u32>,
+    instruction: u32,
+) -> bool {
+    if instruction & 0x7f != 0x73 {
+        return false;
+    }
+    let address = instruction >> 20;
+    if ![0x304, 0x340, 0x344].contains(&address) {
+        return false;
+    }
+
+    let funct3 = (instruction >> 12) & 7;
+    let source_register = (instruction >> 15) & 31;
+    let source = if funct3 >= 5 {
+        source_register
+    } else {
+        cpu.x[source_register as usize]
+    };
+    let old = *csrs.entry(address).or_insert(0);
+    let operation = funct3 & 3;
+    let should_write = matches!(operation, 1..=3) && (operation == 1 || source != 0);
+    if should_write {
+        let value = match operation {
+            1 => source,
+            2 => old | source,
+            _ => old & !source,
+        };
+        csrs.insert(address, value);
+    }
+
+    let destination = (instruction >> 7) & 31;
+    if destination != 0 {
+        cpu.x[destination as usize] = old;
+    }
+    cpu.pc = cpu.pc.wrapping_add(4);
+    true
 }
 
 fn assert_rtl_matches_independent_privileged(
@@ -462,15 +513,18 @@ fn rv32i_machine_csr_matrix_matches_independent_golden_model() {
 #[test]
 fn rv32i_extended_machine_csr_matrix_matches_independent_golden_model() {
     const MSTATUS: u32 = 0x300;
+    const MIE: u32 = 0x304;
     const MEDELEG: u32 = 0x302;
     const MIDELEG: u32 = 0x303;
+    const MSCRATCH: u32 = 0x340;
     const MCAUSE: u32 = 0x342;
     const MTVAL: u32 = 0x343;
+    const MIP: u32 = 0x344;
 
     let mut program = Vec::new();
     program.extend(load_upper(1, 0x1234));
     program.push(addi(2, 0, 0xff));
-    for csr_address in [MSTATUS, MEDELEG, MIDELEG, MCAUSE, MTVAL] {
+    for csr_address in [MSTATUS, MIE, MEDELEG, MIDELEG, MSCRATCH, MCAUSE, MTVAL, MIP] {
         program.push(csr(1, 8, 1, csr_address)); // write pattern
         program.push(csr(2, 9, 2, csr_address)); // set low bits
         program.push(csr(3, 10, 2, csr_address)); // clear low bits
@@ -481,6 +535,9 @@ fn rv32i_extended_machine_csr_matrix_matches_independent_golden_model() {
     program.push(csr(5, 11, 5, MSTATUS)); // csrrwi
     program.push(csr(6, 12, 10, MSTATUS)); // csrrsi
     program.push(csr(7, 13, 2, MSTATUS)); // csrrci
+    program.push(csr(5, 11, 5, MIE)); // csrrwi
+    program.push(csr(6, 12, 10, MSCRATCH)); // csrrsi
+    program.push(csr(7, 13, 2, MIP)); // csrrci
     program.push(ebreak());
 
     let mut memory = SparseMemory::new();
@@ -500,17 +557,23 @@ fn rv32i_extended_machine_csr_matrix_matches_independent_golden_model() {
 
     for (name, expected) in [
         ("mstatus", oracle.mstatus),
+        ("mie", oracle.mie),
         ("medeleg", oracle.medeleg),
         ("mideleg", oracle.mideleg),
+        ("mscratch", oracle.mscratch),
         ("mcause", oracle.mcause),
         ("mtval", oracle.mtval),
+        ("mip", oracle.mip),
     ] {
         let address = match name {
             "mstatus" => MSTATUS,
+            "mie" => MIE,
             "medeleg" => MEDELEG,
             "mideleg" => MIDELEG,
+            "mscratch" => MSCRATCH,
             "mcause" => MCAUSE,
-            _ => MTVAL,
+            "mtval" => MTVAL,
+            _ => MIP,
         };
         let built_in = golden.csrs.get(&address).copied().unwrap_or(0);
         assert_eq!(
