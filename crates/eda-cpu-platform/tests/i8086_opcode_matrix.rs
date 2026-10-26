@@ -399,6 +399,75 @@ fn deterministic_i8086_interrupt_and_iret_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_int3_and_into_matrix_matches_golden_model() {
+    let values = [0_u16, 0, 0, 0, 0xfffe, 0, 0, 0];
+    let mut executable = Vec::new();
+    for (register, value) in values.iter().enumerate() {
+        executable.extend_from_slice(&[0xb8 + register as u8, *value as u8, (*value >> 8) as u8]);
+    }
+
+    for (vector, handler_offset) in [(3_u8, 0x0300_u16), (4, 0x0310)] {
+        let vector_address = u32::from(vector) * 4;
+        executable.extend_from_slice(&[0xb8]);
+        executable.extend_from_slice(&handler_offset.to_le_bytes());
+        executable.extend_from_slice(&[0xa3]);
+        executable.extend_from_slice(&(vector_address as u16).to_le_bytes());
+        executable.extend_from_slice(&[0xb8, 0x00, 0x00]); // handler segment 0
+        executable.extend_from_slice(&[0xa3]);
+        executable.extend_from_slice(&(vector_address as u16 + 2).to_le_bytes());
+    }
+
+    executable.extend_from_slice(&[
+        0xcc, // int3
+        0xb8, 0x7f, 0x00, // mov ax, 0x007f
+        0x04, 0x01, // add al, 1; set OF
+        0xce, // into
+        0xf4, // hlt
+    ]);
+    executable.resize(0x0200, 0x90);
+    executable.extend_from_slice(&[
+        0xb3, 0x2a, // mov bl, 42
+        0xcf, // iret
+    ]);
+    executable.extend_from_slice(&[0x90; 14]);
+    executable.extend_from_slice(&[
+        0xb7, 0x2b, // mov bh, 43
+        0xcf, // iret
+    ]);
+
+    let rtl = assert_matches_golden(&executable, "INT3/INTO matrix");
+    assert_eq!(rtl.bx, 0x2b2a);
+    assert_eq!(rtl.sp, 0xfffe);
+}
+
+#[test]
+fn deterministic_i8086_indirect_far_call_matrix_matches_golden_model() {
+    let values = [0_u16, 0, 0, 0, 0xfffe, 0, 0, 0];
+    let mut executable = Vec::new();
+    for (register, value) in values.iter().enumerate() {
+        executable.extend_from_slice(&[0xb8 + register as u8, *value as u8, (*value >> 8) as u8]);
+    }
+
+    executable.extend_from_slice(&[
+        0xb8, 0x00, 0x00, // mov ax, target offset 0
+        0xa3, 0x00, 0x02, // mov [0x0200], ax
+        0xb8, 0x30, 0x00, // mov ax, target segment 0x0030
+        0xa3, 0x02, 0x02, // mov [0x0202], ax
+        0xff, 0x1e, 0x00, 0x02, // call far [0x0200]
+        0xf4, // hlt
+    ]);
+    executable.resize(0x0200, 0x90);
+    executable.extend_from_slice(&[
+        0xb3, 0x2a, // mov bl, 42
+        0xcb, // retf
+    ]);
+
+    let rtl = assert_matches_golden(&executable, "indirect far CALL matrix");
+    assert_eq!(rtl.bx, 0x002a);
+    assert_eq!(rtl.sp, 0xfffe);
+}
+
+#[test]
 fn deterministic_i8086_string_and_repeat_matrix_matches_golden_model() {
     let values = [
         0x1234_u16, 0x0000, 0x0000, 0x0000, 0xfffe, 0, 0x2000, 0x2100,

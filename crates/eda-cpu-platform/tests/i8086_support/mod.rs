@@ -332,6 +332,50 @@ impl ReferenceI8086 {
                 self.write(destination, width, result)?;
             }
             0xf5 => self.set_flag(CF, !self.flag(CF)),
+            0xff => {
+                let (operand, operation) = self.modrm(override_segment);
+                let value = self.read(operand, 16)?;
+                match operation {
+                    0 | 1 => {
+                        let old_carry = self.flag(CF);
+                        let operation = if operation == 0 { 0 } else { 3 };
+                        let result = self.alu(operation, value, 1, 16)?;
+                        self.set_flag(CF, old_carry);
+                        self.write(operand, 16, result)?;
+                    }
+                    2 => {
+                        let return_ip = self.instruction_pointer;
+                        self.push(return_ip)?;
+                        self.instruction_pointer = value;
+                    }
+                    3 => {
+                        let segment = match operand {
+                            Location::Memory(segment, offset) => {
+                                self.read(Location::Memory(segment, offset.wrapping_add(2)), 16)?
+                            }
+                            _ => return Err("indirect far CALL requires memory".into()),
+                        };
+                        let return_cs = self.segments[CS];
+                        let return_ip = self.instruction_pointer;
+                        self.push(return_cs)?;
+                        self.push(return_ip)?;
+                        self.segments[CS] = segment;
+                        self.instruction_pointer = value;
+                    }
+                    4 => self.instruction_pointer = value,
+                    5 => {
+                        let segment = match operand {
+                            Location::Memory(segment, offset) => {
+                                self.read(Location::Memory(segment, offset.wrapping_add(2)), 16)?
+                            }
+                            _ => return Err("indirect far JMP requires memory".into()),
+                        };
+                        self.segments[CS] = segment;
+                        self.instruction_pointer = value;
+                    }
+                    _ => self.push(value)?,
+                }
+            }
             0xf8 => self.set_flag(CF, false),
             0xf9 => self.set_flag(CF, true),
             0xfa => self.set_flag(IF, false),
