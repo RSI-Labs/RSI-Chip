@@ -238,6 +238,54 @@ fn deterministic_i8086_stack_call_return_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_far_call_and_segment_stack_matrix_matches_golden_model() {
+    let values = [0x0300_u16, 0x0000, 0x0000, 0x0000, 0xfffe, 0, 0, 0];
+    let segment_stack_operations = [
+        0x8e, 0xc0, // mov es, ax
+        0x06, // push es
+        0x0e, // push cs
+        0x16, // push ss
+        0x1e, // push ds
+        0x1f, // pop ds
+        0x17, // pop ss
+        0x58, // pop ax (original CS)
+        0x07, // pop es
+    ];
+
+    let far_call_retf_imm_operations = [
+        0x8e, 0xc0, // mov es, ax
+        // Far routine 0 at 0x0300:0000: mov bl, 42; retf 0.
+        0x26, 0xc6, 0x06, 0x00, 0x00, 0xb3, 0x26, 0xc6, 0x06, 0x01, 0x00, 0x2a, 0x26, 0xc6, 0x06,
+        0x02, 0x00, 0xca, 0x26, 0xc6, 0x06, 0x03, 0x00, 0x00, 0x26, 0xc6, 0x06, 0x04, 0x00, 0x00,
+        0x9a, 0x00, 0x00, 0x00, 0x03, // call far routine 0
+    ];
+
+    let far_call_retf_operations = [
+        0x8e, 0xc0, // mov es, ax
+        // Far routine 1 at 0x0300:0008: mov bl, 43; retf.
+        0x26, 0xc6, 0x06, 0x08, 0x00, 0xb3, 0x26, 0xc6, 0x06, 0x09, 0x00, 0x2b, 0x26, 0xc6, 0x06,
+        0x0a, 0x00, 0xcb, 0x9a, 0x08, 0x00, 0x00, 0x03, // call far routine 1
+    ];
+
+    assert_matches_golden(
+        &initial_program(values, &segment_stack_operations),
+        "segment-stack matrix",
+    );
+    let rtl = assert_matches_golden(
+        &initial_program(values, &far_call_retf_imm_operations),
+        "far-call/retf-imm matrix",
+    );
+    assert_eq!(rtl.bx, 0x2a);
+    let rtl = assert_matches_golden(
+        &initial_program(values, &far_call_retf_operations),
+        "far-call/retf matrix",
+    );
+    assert_eq!(rtl.ax, 0x0300);
+    assert_eq!(rtl.bx, 0x2b);
+    assert_eq!(rtl.sp, 0xfffe);
+}
+
+#[test]
 fn deterministic_i8086_control_flow_matrix_matches_golden_model() {
     let values = [0x0000_u16, 0x0002, 0x0000, 0x0000, 0xfffe, 0, 0, 0];
     let mut operations = Vec::new();

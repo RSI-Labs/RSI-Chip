@@ -110,6 +110,17 @@ impl ReferenceI8086 {
             }
         };
         match opcode {
+            0x06 => {
+                let value = self.segments[ES];
+                self.push(value)?;
+            }
+            0x07 => {
+                self.segments[ES] = self.pop()?;
+            }
+            0x0e => {
+                let value = self.segments[CS];
+                self.push(value)?;
+            }
             0x00..=0x3f if opcode & 0x07 < 0x06 => {
                 let width = if opcode & 1 == 0 { 8 } else { 16 };
                 let operation = opcode >> 3;
@@ -176,6 +187,20 @@ impl ReferenceI8086 {
                 let value = self.pop()?;
                 self.write(Location::Register(opcode & 7, 0), 16, value)?;
             }
+            0x16 => {
+                let value = self.segments[SS];
+                self.push(value)?;
+            }
+            0x17 => {
+                self.segments[SS] = self.pop()?;
+            }
+            0x1e => {
+                let value = self.segments[DS];
+                self.push(value)?;
+            }
+            0x1f => {
+                self.segments[DS] = self.pop()?;
+            }
             0x70..=0x7f => {
                 let displacement = (self.fetch8() as i8) as u16;
                 if self.condition(opcode & 0x0f) {
@@ -239,6 +264,26 @@ impl ReferenceI8086 {
             0xc3 => {
                 self.instruction_pointer = self.pop()?;
             }
+            0xc6 | 0xc7 => {
+                let width = if opcode == 0xc6 { 8 } else { 16 };
+                let (destination, _) = self.modrm(override_segment);
+                let immediate = if width == 8 {
+                    u16::from(self.fetch8())
+                } else {
+                    self.fetch16()
+                };
+                self.write(destination, width, immediate)?;
+            }
+            0xca => {
+                let adjustment = self.fetch16();
+                self.instruction_pointer = self.pop()?;
+                self.segments[CS] = self.pop()?;
+                self.registers[4] = self.registers[4].wrapping_add(adjustment);
+            }
+            0xcb => {
+                self.instruction_pointer = self.pop()?;
+                self.segments[CS] = self.pop()?;
+            }
             0x9f => {
                 let low = self.flags as u8;
                 self.write(Location::Register(4, 8), 8, u16::from(low))?;
@@ -298,6 +343,16 @@ impl ReferenceI8086 {
             0xeb => {
                 let displacement = (self.fetch8() as i8) as u16;
                 self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+            }
+            0x9a => {
+                let offset = self.fetch16();
+                let segment = self.fetch16();
+                let return_segment = self.segments[CS];
+                let return_offset = self.instruction_pointer;
+                self.push(return_segment)?;
+                self.push(return_offset)?;
+                self.segments[CS] = segment;
+                self.instruction_pointer = offset;
             }
             0xf4 => {
                 self.halted = true;

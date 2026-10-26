@@ -91,7 +91,9 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   reg [15:0] far_call_segment;
   reg [15:0] far_jmp_segment;
   reg [15:0] far_call_return_ip;
+  reg [15:0] far_call_return_cs;
   reg [15:0] next_far_call_return_ip;
+  reg [15:0] next_far_call_return_cs;
   reg seg_override_present;
   reg [1:0] seg_override;
   reg rep_none;
@@ -959,6 +961,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     next_rep_while_not_equal = rep_while_not_equal;
     interrupt_vector_input = 8'b0;
     next_far_call_return_ip = far_call_return_ip;
+    next_far_call_return_cs = far_call_return_cs;
     execute_mem_addr = fetch_address;
     execute_mem_wdata = 16'b0;
     execute_mem_we = 1'b0;
@@ -1388,6 +1391,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             next_ip = immediate_r;
             next_cs = far_call_segment;
             next_far_call_return_ip = ip;
+            next_far_call_return_cs = cs;
             next_state = S_FAR_CALL_PUSH_CS;
           end
           8'hcc: begin
@@ -1589,6 +1593,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
               next_ip = rm_result_value;
             end else if (modrm_register == 3'd3) begin
               next_far_call_return_ip = ip;
+              next_far_call_return_cs = cs;
               next_ip = rm_result_value;
               next_cs = source_rdata;
               next_state = S_FAR_CALL_PUSH_CS;
@@ -1867,7 +1872,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     state == S_INT_PUSH_FLAGS ? flags :
     state == S_INT_PUSH_CS ? cs :
     state == S_INT_PUSH_IP ? ip :
-    state == S_FAR_CALL_PUSH_CS ? cs :
+    state == S_FAR_CALL_PUSH_CS ? far_call_return_cs :
     state == S_FAR_CALL_PUSH_IP ? far_call_return_ip :
     execute_mem_wdata;
   assign mem_we =
@@ -1912,6 +1917,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       displacement_r <= 16'b0;
       immediate_r <= 16'b0;
       far_r <= 16'b0;
+      far_call_return_ip <= 16'b0;
+      far_call_return_cs <= 16'b0;
       seg_override_present <= 1'b0;
       seg_override <= 2'b0;
       rep_none <= 1'b0;
@@ -2029,6 +2036,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
           state <= next_state;
           interrupt_vector_r <= interrupt_vector_input;
           far_call_return_ip <= next_far_call_return_ip;
+          far_call_return_cs <= next_far_call_return_cs;
           ax <= next_ax;
           cx <= next_cx;
           dx <= next_dx;
