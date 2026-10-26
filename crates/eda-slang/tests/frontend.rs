@@ -1017,6 +1017,52 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower null class handles");
+    let null_handle_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("null_class_handle_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize null-handle AST");
+    let mut null_handle_summary = slang
+        .summarize_ast_json(&null_handle_json)
+        .expect("summarize null-handle AST");
+    null_handle_summary
+        .validate_against_design(&design)
+        .expect("exact null-handle fingerprints should match");
+    fn replace_null_identity(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("__class_object_id_a") {
+            expression.symbol = Some("__class_object_id_wrong".into());
+            return true;
+        }
+        expression.operands.iter_mut().any(replace_null_identity)
+    }
+    if let Some(assignment) = null_handle_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "after_null")
+            })
+        })
+    {
+        assert!(
+            replace_null_identity(&mut assignment.rhs),
+            "null-handle identity was not found"
+        );
+    }
+    let wrong_null_identity_error = null_handle_summary
+        .validate_against_design(&design)
+        .expect_err("wrong null-handle identity must fail");
+    assert!(
+        wrong_null_identity_error.contains("Ref:64:u[__class_object_id_wrong]")
+            && wrong_null_identity_error.contains("Ref:64:u[__class_object_id_a]"),
+        "unexpected null-handle identity error: {wrong_null_identity_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create null-handle simulator");
     simulator
         .set_input("selector", &LogicWord::from_u64(32, 1))
@@ -1629,6 +1675,55 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower dynamic class handles");
+    let dynamic_class_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_class_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize dynamic-class AST");
+    let mut dynamic_class_summary = slang
+        .summarize_ast_json(&dynamic_class_json)
+        .expect("summarize dynamic-class AST");
+    dynamic_class_summary
+        .validate_against_design(&design)
+        .expect("exact dynamic-virtual fingerprints should match");
+    fn replace_dynamic_class_tag(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.symbol.as_deref() == Some("__class_tag_base") {
+            expression.symbol = Some("__class_tag_wrong".into());
+            return true;
+        }
+        expression
+            .operands
+            .iter_mut()
+            .any(replace_dynamic_class_tag)
+    }
+    if let Some(assignment) = dynamic_class_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "dynamic_total")
+            })
+        })
+    {
+        assert!(
+            replace_dynamic_class_tag(&mut assignment.rhs),
+            "dynamic-virtual class tag was not found"
+        );
+    }
+    let wrong_dynamic_tag_error = dynamic_class_summary
+        .validate_against_design(&design)
+        .expect_err("wrong dynamic-virtual class tag must fail");
+    assert!(
+        wrong_dynamic_tag_error.contains("Ref:32:u[__class_tag_wrong]")
+            && wrong_dynamic_tag_error.contains("Ref:32:u[__class_tag_base]"),
+        "unexpected dynamic-virtual tag error: {wrong_dynamic_tag_error}"
+    );
     let mut simulator = Simulator::new(&design).expect("create dynamic-class simulator");
     simulator
         .set_input("first_value_in", &LogicWord::from_u64(32, 7))

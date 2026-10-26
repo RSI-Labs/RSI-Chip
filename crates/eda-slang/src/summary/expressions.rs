@@ -2060,6 +2060,48 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "__eda_class_handle_eq" | "__eda_class_handle_ne"
+        )
+    {
+        let comparison = if expression.operator == "__eda_class_handle_eq" {
+            "Eq"
+        } else {
+            "Ne"
+        };
+        let left = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let right = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!(
+            "Signed:32:s[Signed:32:u[Concat:32:u[Const:31:u[31:{}],{comparison}:1:u[{left},{right}]]]]",
+            "0".repeat(31)
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "__eda_class_array_read" {
+        let width = expression.type_width?;
+        let operands = expression
+            .operands
+            .iter()
+            .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters, mode))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!(
+            "Cond:{width}:u[{}]",
+            operands
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     if expression.kind == "StringLiteral" {
         let literal = expression.literal.as_deref()?;
         let width = expression.type_width.unwrap_or(STRING_WIDTH);
