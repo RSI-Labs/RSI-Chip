@@ -104,6 +104,7 @@ impl<'a> Synth<'a> {
                 let value = self.blast(e, *width)?;
                 let start_bits = self.blast(start, start.width())?;
                 let mut result = current.clone();
+                let whole_reversed_element = *reversed && *width == *element_width && *ascending;
                 for offset in 0..=(element_width - width) {
                     let selected_start = if *ascending {
                         offset
@@ -118,7 +119,7 @@ impl<'a> Synth<'a> {
                     }
                     let matches = self.eq_net(&start_bits, &expected);
                     for (bit, new_value) in value.iter().enumerate().take(*width) {
-                        let index = if *reversed {
+                        let index = if *reversed && !whole_reversed_element {
                             base_offset + element_width - 1 - (offset + bit)
                         } else {
                             base_offset + offset + bit

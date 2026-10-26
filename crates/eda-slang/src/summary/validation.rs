@@ -948,6 +948,7 @@ fn reversed_dynamic_array_read_fingerprint(
 
         let physical_lsb = (physical_element as usize).checked_mul(element_width)?;
         let bits = (physical_lsb..physical_lsb + element_width)
+            .rev()
             .map(|bit| {
                 format!("PackedSelect:1:u[Ref:{total_width}:u[{target_name}],Range:{bit}:{bit}]")
             })

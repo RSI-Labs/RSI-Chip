@@ -4604,17 +4604,30 @@ endmodule
         .set_input("addr", &LogicWord::from_u64(2, 3))
         .expect("select direct reversed element");
     direct_simulator
-        .set_input("wdata", &LogicWord::from_u64(8, 0x5a))
+        .set_input("wdata", &LogicWord::from_u64(8, 0xd7))
         .expect("set direct reversed data");
     assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x34));
     direct_simulator
         .set_input("clk", &LogicWord::from_u64(1, 1))
         .expect("create direct reversed posedge");
-    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0x5a));
-    // Reversed-element direct/bounded runtime parity is intentionally not
-    // claimed here: the legacy path currently applies its historical logical
-    // bit order to whole-element reads. The exact assignment fingerprints
-    // above still prove selector, offset, reversal flag, and value identity.
+    assert_eq!(direct_simulator.read("q").unwrap().to_u64(), Some(0xd7));
+
+    let mut bounded_simulator =
+        Simulator::new(&bounded).expect("create bounded reversed-array simulator");
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 0))
+        .expect("initialize bounded clock");
+    bounded_simulator
+        .set_input("addr", &LogicWord::from_u64(2, 3))
+        .expect("select bounded reversed element");
+    bounded_simulator
+        .set_input("wdata", &LogicWord::from_u64(8, 0xd7))
+        .expect("set bounded reversed data");
+    assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0x34));
+    bounded_simulator
+        .set_input("clk", &LogicWord::from_u64(1, 1))
+        .expect("create bounded reversed posedge");
+    assert_eq!(bounded_simulator.read("q").unwrap().to_u64(), Some(0xd7));
 }
 
 #[test]

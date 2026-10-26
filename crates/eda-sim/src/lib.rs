@@ -3199,9 +3199,10 @@ impl<'d> Simulator<'d> {
             return None;
         }
         let offset = offset as usize;
+        let whole_reversed_element = reversed && offset == 0 && width == element_width;
         let mut targets = Vec::with_capacity(width);
         for (bit, new_value) in value.bits.iter().enumerate().take(width) {
-            let physical_offset = if reversed {
+            let physical_offset = if reversed && !whole_reversed_element {
                 base_offset + element_width - 1 - (offset + bit)
             } else {
                 base_offset + offset + bit

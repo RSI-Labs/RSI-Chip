@@ -137,9 +137,14 @@ pub(super) fn unpacked_indexed_select_structure(c: &mut CaseList) {
                     .read("whole")
                     .and_then(|word| word.to_u64())
                     .ok_or("unpacked indexed element output is unknown")?;
-                if actual_element != physical_element {
+                let expected_element = if slice_width == element_width {
+                    replacement
+                } else {
+                    physical_element
+                };
+                if actual_element != expected_element {
                     return Err(format!(
-                        "element result={actual_element}, expected={physical_element}"
+                        "element result={actual_element}, expected={expected_element}"
                     ));
                 }
                 Ok(())
@@ -181,7 +186,11 @@ pub(super) fn runtime_array_indexed_select_structure(c: &mut CaseList) {
                     accumulated | (((physical_initial >> bit) & 1) << (element_width - 1 - bit))
                 })
             };
-            let expected = (logical_initial >> start_offset) & slice_mask;
+            let expected = if element_width == slice_width && index % 2 != 0 {
+                physical_initial
+            } else {
+                (logical_initial >> start_offset) & slice_mask
+            };
 
             let element_ascending = index % 2 == 0;
             let element_range = if element_ascending {
@@ -1047,7 +1056,9 @@ pub(super) fn runtime_array_indexed_assignment_structure(c: &mut CaseList) {
                 let logical_element =
                     (logical_initial & !logical_mask) | (replacement << start_offset);
                 let mut expected_values = physical_values.clone();
-                expected_values[physical_element] = if index % 3 == 0 {
+                expected_values[physical_element] = if index % 3 == 0
+                    || slice_width == element_width
+                {
                     logical_element
                 } else {
                     (0..element_width).fold(0_u64, |accumulated, bit| {
@@ -1255,7 +1266,9 @@ pub(super) fn runtime_array_indexed_assignment_synthesis_structure(c: &mut CaseL
                 let logical_element =
                     (logical_initial & !logical_mask) | (replacement << start_offset);
                 let mut expected_values = physical_values.clone();
-                expected_values[physical_element] = if packed_ascending {
+                expected_values[physical_element] = if packed_ascending
+                    || slice_width == element_width
+                {
                     logical_element
                 } else {
                     (0..element_width).fold(0_u64, |accumulated, bit| {
@@ -1520,12 +1533,20 @@ pub(super) fn runtime_array_continuous_indexed_structure(c: &mut CaseList) {
                     initial_values[physical_second_element],
                     transformed(input_third),
                 );
-                let expected_first_first_update = logical_value(update_element(
+                let whole_element_output = |value: u64| {
+                    if slice_width == element_width {
+                        logical_value(value)
+                    } else {
+                        value
+                    }
+                };
+                let expected_first_first_update = whole_element_output(update_element(
                     initial_values[physical_first_element],
                     transformed(input_first),
                 ));
-                let expected_first = logical_value(physical_values[physical_first_element]);
-                let expected_second = logical_value(physical_values[physical_second_element]);
+                let expected_first = whole_element_output(physical_values[physical_first_element]);
+                let expected_second =
+                    whole_element_output(physical_values[physical_second_element]);
                 let input_fourth = !input_third & slice_mask;
 
                 let direction = if index % 4 < 2 { "+" } else { "-" };

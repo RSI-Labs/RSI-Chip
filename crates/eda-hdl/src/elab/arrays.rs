@@ -254,9 +254,14 @@ impl<'a> Elaborator<'a> {
             a: Box::new(logical_start),
             b: Box::new(ExprIR::Const(LogicWord::from_u64(32, logical_base as u64))),
         };
+        let physical_bits: Box<dyn Iterator<Item = _>> = if width == element_width {
+            Box::new((offset..offset + element_width).rev())
+        } else {
+            Box::new(offset..offset + element_width)
+        };
         let normalized_source = if reversed {
             ExprIR::Concat(
-                (offset..offset + element_width)
+                physical_bits
                     .map(|physical_bit| ExprIR::Ref {
                         net: entry.base,
                         decl_width: entry.width,
@@ -399,9 +404,14 @@ impl<'a> Elaborator<'a> {
             };
 
             let physical_lsb = physical_element * element_width;
+            let physical_bits: Box<dyn Iterator<Item = _>> = if width == element_width {
+                Box::new((physical_lsb..physical_lsb + element_width).rev())
+            } else {
+                Box::new(physical_lsb..physical_lsb + element_width)
+            };
             let candidate = if array.element_msb < array.element_lsb {
                 ExprIR::Concat(
-                    (physical_lsb..physical_lsb + element_width)
+                    physical_bits
                         .map(|physical_bit| ExprIR::Ref {
                             net: entry.base,
                             decl_width: entry.width,

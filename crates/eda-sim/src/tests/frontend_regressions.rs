@@ -212,6 +212,34 @@ endmodule
 }
 
 #[test]
+fn runtime_whole_reversed_dense_array_element_preserves_packed_value() {
+    let mut sim = sim_for(
+        r#"
+module m(input clk, input [1:0] selector, input [7:0] din,
+         output [7:0] initial_q, updated_q);
+  logic [0:7] memory [0:3];
+  initial begin
+    memory[3] = 8'h34;
+    initial_q = memory[3];
+  end
+  always @(posedge clk) begin
+    memory[selector] <= din;
+  end
+  assign updated_q = memory[selector];
+endmodule
+"#,
+    );
+
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("selector", &LogicWord::from_u64(2, 3))
+        .unwrap();
+    sim.set_input("din", &LogicWord::from_u64(8, 0xd7)).unwrap();
+    assert_eq!(sim.read("initial_q").unwrap().to_u64(), Some(0x34));
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    assert_eq!(sim.read("updated_q").unwrap().to_u64(), Some(0xd7));
+}
+
+#[test]
 fn sparse_memory_nonblocking_partial_writes_merge_disjoint_fields() {
     let mut sim = sim_for(
         r#"
