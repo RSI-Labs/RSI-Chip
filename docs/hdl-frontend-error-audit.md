@@ -94,6 +94,7 @@ and official UVM commit `78c06547a2a0a29b3dc9dcafae62b75b2ff61544`.
 | `cargo test -p eda-core --all-targets -- --nocapture` | 29 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 86 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
+| `cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture` | 4 passed, 807.55 s |
 | `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | 6,455 cases passed in 158.48 s |
 
 A temporary compatibility probe also compared the direct slang-AST path with
@@ -182,7 +183,7 @@ broader tool-flow percentage.
 | F-17 | Source diagnostics engine | Every parser/elaboration/lowering error needs file, line, column, range, severity, diagnostic code, notes, related locations, suppression, and multi-error recovery. | Direct errors often include slang spans. Bounded parser diagnostics are mostly line-only; many bounded elaboration errors are plain strings. There is no complete structured diagnostic object or suppression system. | P1 | 30% | Snapshot diagnostics for malformed and unsupported corpora; no raw `Result<_, String>` at public boundaries. |
 | F-18 | Include/preprocess traceability | Diagnostics must point through macros and include stacks to user source. | Slang produces authoritative diagnostics and source spans. The bounded compatibility path loses some preprocessor provenance after single-unit preprocessing; direct spans can print non-normalized relative paths. | P1 | 50% | Include/macro expansion stack snapshots and path normalization tests. |
 | F-19 | Separate compilation/library manager | Compile projects using file lists, libraries, configs, search order, encrypted/protected IP, and incremental artifact reuse. | Multiple named files work, but there is no complete config/library manager or protected-IP handling. | P1 | 15% | Project manifest tests with duplicate modules, search paths, selected configs, and cache invalidation. |
-| F-20 | Golden RTL execution | RV32I and i8086 must match independent golden ISA models across memory maps and opcodes. | Repository compilation units pass slang validation and many internal regressions, but exhaustive independent golden closure is still incomplete. | P0 | 50% | Publish opcode/memory-map coverage matrices and differential results against external golden models. |
+| F-20 | Golden RTL execution | RV32I and i8086 must match independent golden ISA models across memory maps and opcodes. | RV32I base-integer and 64-seed deterministic fuzz matrices now compare the built-in model, SystemVerilog RTL, and external `raven-riscv-engine` 0.1.1 across all architectural registers, EBREAK PC, and full checked memory windows; coverage is published in `docs/rv32i-independent-golden-validation.md`. Machine CSR/trap closure, ELF/high-memory images, and i8086 independent golden execution remain open. | P0 | 60% | Add independent bare-metal CSR/trap and ELF/high-memory differentials, then publish the same coverage matrix for i8086. |
 
 ## 5. Detailed direct slang-AST lowering gaps
 

@@ -1,6 +1,8 @@
 use eda_cpu_platform::rv32i::{Rv32iMachine, StopReason};
 use eda_cpu_platform::systemverilog::{Rv32iSvResult, Rv32iSvRunner};
 use eda_cpu_platform::SparseMemory;
+use raven_riscv_engine::falcon::{exec, memory::Bus, memory::Ram, Cpu};
+use raven_riscv_engine::host::Console;
 
 fn i_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, immediate: i32) -> u32 {
     ((immediate as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
@@ -90,6 +92,7 @@ fn base_matrix_program() -> Vec<u32> {
         i_type(0x13, 11, 4, 1, -1), // xori
         i_type(0x13, 12, 6, 4, 0x7f0),
         i_type(0x13, 13, 7, 4, -1),            // andi
+        i_type(0x13, 9, 6, 1, 0x123),          // ori
         i_type(0x13, 14, 1, 6, 7),             // slli
         i_type(0x13, 15, 5, 6, 7),             // srli
         i_type(0x13, 16, 5, 6, 0x20 << 5 | 7), // srai
@@ -146,6 +149,7 @@ fn base_matrix_program() -> Vec<u32> {
     program.push(nop());
     program.push(i_type(0x67, 9, 0, 8, 8));
     program.push(nop());
+    program.push(0x0000_000f); // fence
     program.push(ebreak());
     program
 }
@@ -173,6 +177,84 @@ impl DeterministicRng {
     }
 }
 
+struct IndependentRv32iResult {
+    regs: [u32; 32],
+    pc: u32,
+    memory: Ram,
+}
+
+fn run_independent_rv32i(
+    initial_memory: &SparseMemory,
+    memory_length: u32,
+    entry: u32,
+    halt_pc: u32,
+) -> IndependentRv32iResult {
+    assert_eq!(
+        memory_length % 4,
+        0,
+        "external oracle memory length must be word-aligned"
+    );
+    let mut memory = Ram::new(memory_length as usize);
+    for address in 0..memory_length {
+        memory
+            .store8(address, initial_memory.read_u8(address))
+            .expect("initialize independent oracle memory");
+    }
+
+    let mut cpu = Cpu {
+        pc: entry,
+        ..Default::default()
+    };
+    let mut console = Console::default();
+    for _ in 0..1000 {
+        if cpu.pc == halt_pc {
+            let _ = exec::step(&mut cpu, &mut memory, &mut console)
+                .expect("step independent RV32I oracle");
+            assert!(
+                cpu.ebreak_hit,
+                "independent RV32I oracle stopped without EBREAK at {halt_pc:#010x}"
+            );
+            return IndependentRv32iResult {
+                regs: cpu.x,
+                pc: cpu.pc.wrapping_sub(4),
+                memory,
+            };
+        }
+        let continuing = exec::step(&mut cpu, &mut memory, &mut console)
+            .unwrap_or_else(|error| panic!("independent RV32I oracle failed: {error}"));
+        assert!(continuing, "independent RV32I oracle stopped unexpectedly");
+    }
+
+    panic!("independent RV32I oracle did not reach EBREAK at {halt_pc:#010x}");
+}
+
+fn assert_rtl_matches_independent(
+    rtl: &Rv32iSvResult,
+    oracle: &IndependentRv32iResult,
+    memory_length: u32,
+    context: &str,
+) {
+    assert!(rtl.halted, "{context}: RTL did not halt");
+    assert!(
+        rtl.trap && rtl.trap_cause == 3,
+        "{context}: unexpected RTL trap {}",
+        rtl.trap_cause
+    );
+    assert_eq!(rtl.pc, oracle.pc, "{context}: EBREAK PC differs");
+    assert_eq!(
+        rtl.regs, oracle.regs,
+        "{context}: architectural registers differ from independent oracle"
+    );
+    for address in 0..memory_length {
+        let expected = oracle.memory.as_bytes()[address as usize];
+        assert_eq!(
+            rtl.memory.read_u8(address),
+            expected,
+            "{context}: memory differs from independent oracle at {address:#010x}"
+        );
+    }
+}
+
 fn assert_matches_golden(golden: &Rv32iMachine, rtl: &Rv32iSvResult) {
     assert_eq!(golden.stop, StopReason::Ebreak);
     assert!(rtl.halted);
@@ -194,7 +276,7 @@ fn assert_matches_golden(golden: &Rv32iMachine, rtl: &Rv32iSvResult) {
 }
 
 #[test]
-fn rv32i_base_instruction_matrix_matches_golden_model() {
+fn rv32i_base_instruction_matrix_matches_internal_and_independent_golden_models() {
     let program = base_matrix_program();
     let mut memory = SparseMemory::new();
     write_program(&mut memory, &program, 0);
@@ -203,9 +285,13 @@ fn rv32i_base_instruction_matrix_matches_golden_model() {
 
     let runner = Rv32iSvRunner::new().expect("compile RV32I runtime");
     let rtl = runner
-        .run_memory(0, memory)
+        .run_memory(0, memory.clone())
         .expect("execute RV32I base instruction matrix");
     assert_matches_golden(&golden, &rtl);
+
+    let halt_pc = (program.len() as u32 - 1) * 4;
+    let oracle = run_independent_rv32i(&memory, 0x2000, 0, halt_pc);
+    assert_rtl_matches_independent(&rtl, &oracle, 0x2000, "base instruction matrix");
 }
 
 #[test]
@@ -264,7 +350,7 @@ fn rv32i_trap_csr_and_mret_matrix_matches_golden_model() {
 }
 
 #[test]
-fn rv32i_randomized_differential_fuzz_matches_golden_model() {
+fn rv32i_randomized_differential_fuzz_matches_internal_and_independent_golden_models() {
     const SEEDS: u64 = 64;
     const DATA_BASE: u32 = 0x2000;
     const DATA_LENGTH: u32 = 0x100;
@@ -379,7 +465,7 @@ fn rv32i_randomized_differential_fuzz_matches_golden_model() {
             "seed {seed}: golden model did not reach EBREAK"
         );
         let rtl = runner
-            .run_memory(0, memory)
+            .run_memory(0, memory.clone())
             .unwrap_or_else(|error| panic!("seed {seed}: RTL execution failed: {error}"));
         assert!(rtl.halted, "seed {seed}: RTL did not halt");
         assert!(
@@ -409,6 +495,28 @@ fn rv32i_randomized_differential_fuzz_matches_golden_model() {
             rtl.pc,
             golden.pc.wrapping_sub(4),
             "seed {seed}: EBREAK PC differs"
+        );
+        let halt_pc = (program.len() as u32 - 1) * 4;
+        let oracle = run_independent_rv32i(&memory, DATA_BASE + DATA_LENGTH, 0, halt_pc);
+        if rtl.regs != oracle.regs {
+            for (index, instruction) in program.iter().enumerate() {
+                eprintln!("seed {seed} program[{index:02}] = {instruction:08x}");
+            }
+            for (index, (rtl_value, oracle_value)) in
+                rtl.regs.iter().zip(oracle.regs.iter()).enumerate()
+            {
+                if rtl_value != oracle_value {
+                    eprintln!(
+                        "seed {seed} x{index}: rtl={rtl_value:#010x}, independent={oracle_value:#010x}"
+                    );
+                }
+            }
+        }
+        assert_rtl_matches_independent(
+            &rtl,
+            &oracle,
+            DATA_BASE + DATA_LENGTH,
+            &format!("independent fuzz seed {seed}"),
         );
         for offset in 0..DATA_LENGTH {
             let address = DATA_BASE + offset;

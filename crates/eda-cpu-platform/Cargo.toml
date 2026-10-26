@@ -9,6 +9,10 @@ eda-core = { path = "../eda-core" }
 eda-hdl = { path = "../eda-hdl" }
 eda-sim = { path = "../eda-sim" }
 
+[dev-dependencies]
+# Independent RV32I instruction-set oracle used by the RTL differential tests.
+raven-riscv-engine = "=0.1.1"
+
 [[bin]]
 name = "cpu-platform"
 path = "src/main.rs"
