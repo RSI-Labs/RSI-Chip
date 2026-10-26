@@ -59,6 +59,32 @@ The generator mixes register-register operations, immediate operations, aligned
 byte/half/word loads and stores, and all six branch predicates. It uses a fixed
 xorshift sequence, so failures are reproducible by seed.
 
+## ELF and high-address execution
+
+The program-fixture lane uses the same external Raven executor through a custom
+sparse implementation of Raven's public `Bus` trait. This preserves the
+repository's sparse-memory model and allows a synthetic ELF entry at
+`0x7000_0000` without allocating almost two gigabytes of contiguous oracle
+memory.
+
+Covered images:
+
+1. checked-in `rv32i_exit42.elf`;
+2. checked-in `rv32i_high_memory.elf`;
+3. a generated sparse ELF with entry and data at `0x7000_0000`.
+
+Each image compares:
+
+- all 32 integer registers;
+- final PC;
+- Linux exit code;
+- every byte in the loaded segment, including data modified by the program.
+
+This lane exposed that the SystemVerilog ELF runner reset `x2/SP` to zero even
+though the built-in ELF loader supplies the Linux ABI stack pointer. The RTL now
+has an explicit `init_sp` input, the bare-metal runner passes zero, and the ELF
+runner passes the loader-provided stack pointer.
+
 ## Privileged subset status
 
 The machine-CSR and trap/MRET matrices now add a third lane. Raven executes
@@ -100,8 +126,7 @@ contracts rather than prove RV32I RTL correctness.
    exposes them.
 2. Extend randomized load/store addresses beyond aligned offsets in one 256-byte
    page, including page crossings and address edges.
-3. Add independent ELF and high-memory image execution.
-4. Extend independent privileged coverage beyond the tested `mtvec`, `mepc`,
+3. Extend independent privileged coverage beyond the tested `mtvec`, `mepc`,
    `mcause`, and M-mode `ECALL`/`MRET` contract.
 5. Repeat the same external-oracle methodology for i8086; its current reference
    is a separate repository-owned spec-derived implementation.
@@ -112,7 +137,7 @@ contracts rather than prove RV32I RTL correctness.
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture
 ```
 
-Latest full result: 5 tests, 5 passed, 0 failed, 798.77 seconds.
+Latest full result: 5 tests, 5 passed, 0 failed, 789.03 seconds.
 
 The full run includes the 64-seed randomized differential. The non-randomized
 directed subset currently passes in 31.14 seconds:
@@ -120,5 +145,13 @@ directed subset currently passes in 31.14 seconds:
 ```text
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized
 
-4 passed, 0 failed, 31.14 seconds
+4 passed, 0 failed, 32.46 seconds
+```
+
+ELF/fixture lane:
+
+```text
+cargo test -p eda-cpu-platform --test program_fixtures -- --nocapture
+
+7 passed, 0 failed, 9.40 seconds
 ```

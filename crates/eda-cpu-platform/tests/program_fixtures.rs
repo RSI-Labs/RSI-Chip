@@ -1,5 +1,157 @@
 use eda_cpu_platform::i8086::{I8086Machine, I8086Stop};
 use eda_cpu_platform::rv32i::{Rv32iMachine, StopReason};
+use eda_cpu_platform::systemverilog::Rv32iSvResult;
+use raven_riscv_engine::falcon::errors::FalconError;
+use raven_riscv_engine::falcon::exec;
+use raven_riscv_engine::falcon::memory::{AmoOp, Bus};
+use raven_riscv_engine::falcon::Cpu;
+use raven_riscv_engine::host::Console;
+
+struct SparseRavenBus {
+    memory: eda_cpu_platform::SparseMemory,
+}
+
+impl Bus for SparseRavenBus {
+    fn mem_len(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn load8(&self, address: u32) -> Result<u8, FalconError> {
+        Ok(self.memory.read_u8(address))
+    }
+
+    fn load16(&self, address: u32) -> Result<u16, FalconError> {
+        Ok(self.memory.read_le_u16(address))
+    }
+
+    fn load32(&self, address: u32) -> Result<u32, FalconError> {
+        Ok(self.memory.read_le_u32(address))
+    }
+
+    fn store8(&mut self, address: u32, value: u8) -> Result<(), FalconError> {
+        self.memory.write_u8(address, value);
+        Ok(())
+    }
+
+    fn store16(&mut self, address: u32, value: u16) -> Result<(), FalconError> {
+        self.memory.write_le_u16(address, value);
+        Ok(())
+    }
+
+    fn store32(&mut self, address: u32, value: u32) -> Result<(), FalconError> {
+        self.memory.write_le_u32(address, value);
+        Ok(())
+    }
+
+    fn lr_w(&mut self, _hart_id: u32, address: u32) -> Result<u32, FalconError> {
+        self.load32(address)
+    }
+
+    fn sc_w(&mut self, _hart_id: u32, address: u32, value: u32) -> Result<bool, FalconError> {
+        self.store32(address, value)?;
+        Ok(true)
+    }
+
+    fn amo_w(
+        &mut self,
+        _hart_id: u32,
+        address: u32,
+        operation: AmoOp,
+        operand: u32,
+    ) -> Result<u32, FalconError> {
+        let old = self.load32(address)?;
+        let result = match operation {
+            AmoOp::Swap => operand,
+            AmoOp::Add => old.wrapping_add(operand),
+            AmoOp::Xor => old ^ operand,
+            AmoOp::And => old & operand,
+            AmoOp::Or => old | operand,
+            AmoOp::Max => (old as i32).max(operand as i32) as u32,
+            AmoOp::Min => (old as i32).min(operand as i32) as u32,
+            AmoOp::MaxU => old.max(operand),
+            AmoOp::MinU => old.min(operand),
+        };
+        self.store32(address, result)?;
+        Ok(old)
+    }
+}
+
+struct IndependentElfResult {
+    regs: [u32; 32],
+    pc: u32,
+    exit_code: u32,
+    memory: eda_cpu_platform::SparseMemory,
+}
+
+fn run_independent_rv32i_elf(
+    initial_memory: &eda_cpu_platform::SparseMemory,
+    entry: u32,
+    stack_pointer: u32,
+) -> IndependentElfResult {
+    let mut bus = SparseRavenBus {
+        memory: initial_memory.clone(),
+    };
+    let mut cpu = Cpu {
+        pc: entry,
+        ..Default::default()
+    };
+    cpu.x[2] = stack_pointer;
+    let mut console = Console::default();
+    for _ in 0..100 {
+        let _ = exec::step(&mut cpu, &mut bus, &mut console)
+            .expect("independent RV32I ELF oracle failed");
+        if let Some(exit_code) = cpu.exit_code {
+            return IndependentElfResult {
+                regs: cpu.x,
+                pc: cpu.pc,
+                exit_code,
+                memory: bus.memory,
+            };
+        }
+    }
+    panic!("independent RV32I ELF oracle did not exit");
+}
+
+fn assert_rtl_matches_independent_elf(
+    rtl: &Rv32iSvResult,
+    golden: &Rv32iMachine,
+    oracle: &IndependentElfResult,
+    ranges: &[(u32, u32)],
+    context: &str,
+) {
+    assert!(rtl.halted, "{context}: RTL did not halt");
+    assert!(rtl.trap, "{context}: RTL did not report Linux exit ECALL");
+    assert_eq!(rtl.trap_cause, 11, "{context}: RTL exit trap differs");
+    assert_eq!(rtl.pc, oracle.pc, "{context}: independent PC differs");
+    assert_eq!(
+        rtl.regs, oracle.regs,
+        "{context}: independent registers differ"
+    );
+    assert_eq!(
+        rtl.a0, oracle.exit_code,
+        "{context}: independent exit code differs"
+    );
+    assert_eq!(
+        golden.regs, oracle.regs,
+        "{context}: built-in registers differ"
+    );
+    assert_eq!(golden.pc, oracle.pc, "{context}: built-in PC differs");
+    for &(start, length) in ranges {
+        for offset in 0..length {
+            let address = start.wrapping_add(offset);
+            assert_eq!(
+                rtl.memory.read_u8(address),
+                oracle.memory.read_u8(address),
+                "{context}: memory differs at {address:#010x}"
+            );
+            assert_eq!(
+                golden.memory.read_u8(address),
+                oracle.memory.read_u8(address),
+                "{context}: built-in memory differs at {address:#010x}"
+            );
+        }
+    }
+}
 
 #[test]
 fn checked_in_compiled_program_fixtures_run() {
@@ -73,11 +225,16 @@ fn maximum_size_com_image_uses_the_complete_real_mode_segment() {
 fn checked_in_elf_runs_on_systemverilog_core() {
     let program = include_bytes!("../../../platform/programs/rv32i_exit42.elf");
     let mut golden = Rv32iMachine::load_elf(program, &[]).expect("golden ELF loader");
+    let initial_memory = golden.memory.clone();
+    let entry = golden.pc;
     assert_eq!(golden.run(100), StopReason::Exit(42));
     let rtl = eda_cpu_platform::systemverilog::run_rv32i_elf(program)
         .expect("SystemVerilog ELF execution");
     assert!(rtl.halted);
     assert_eq!(rtl.a0, golden.regs[10]);
+    let oracle = run_independent_rv32i_elf(&initial_memory, entry, golden.regs[2]);
+    assert_eq!(oracle.exit_code, 42);
+    assert_rtl_matches_independent_elf(&rtl, &golden, &oracle, &[(0x1000, 0xc)], "checked-in ELF");
 }
 
 #[test]
@@ -85,6 +242,8 @@ fn high_memory_elf_runs_on_golden_and_systemverilog_models() {
     let program = include_bytes!("../../../platform/programs/rv32i_high_memory.elf");
     assert!(program.len() > 64);
     let mut golden = Rv32iMachine::load_elf(program, &[]).expect("golden high-memory ELF loader");
+    let initial_memory = golden.memory.clone();
+    let entry = golden.pc;
     assert_eq!(golden.run(100), StopReason::Exit(42));
 
     let rtl = eda_cpu_platform::systemverilog::run_rv32i_elf(program)
@@ -93,6 +252,15 @@ fn high_memory_elf_runs_on_golden_and_systemverilog_models() {
     assert!(rtl.trap);
     assert_eq!(rtl.trap_cause, 11);
     assert_eq!(rtl.a0, golden.regs[10]);
+    let oracle = run_independent_rv32i_elf(&initial_memory, entry, golden.regs[2]);
+    assert_eq!(oracle.exit_code, 42);
+    assert_rtl_matches_independent_elf(
+        &rtl,
+        &golden,
+        &oracle,
+        &[(0x1000, 0x88)],
+        "checked-in high-memory ELF",
+    );
 }
 
 #[test]
@@ -162,6 +330,7 @@ fn sparse_rv32i_elf_runs_from_a_high_32_bit_address() {
     let mut golden =
         Rv32iMachine::load_elf(&elf, &[]).expect("golden loader accepts high-address ELF");
     assert_eq!(golden.pc, entry);
+    let initial_memory = golden.memory.clone();
     let stop = golden.run(100);
     assert_eq!(stop, StopReason::Exit(42));
 
@@ -171,4 +340,13 @@ fn sparse_rv32i_elf_runs_from_a_high_32_bit_address() {
     assert!(rtl.trap);
     assert_eq!(rtl.trap_cause, 11);
     assert_eq!(rtl.a0, 42);
+    let oracle = run_independent_rv32i_elf(&initial_memory, entry, golden.regs[2]);
+    assert_eq!(oracle.exit_code, 42);
+    assert_rtl_matches_independent_elf(
+        &rtl,
+        &golden,
+        &oracle,
+        &[(entry, 0x184)],
+        "sparse high-address ELF",
+    );
 }

@@ -1,10 +1,11 @@
 // Event-driven RV32I harness with host-backed sparse instruction/data memory.
-module rv32i_full_runtime_tb(init_pc, imem_rdata, dmem_rdata,
+module rv32i_full_runtime_tb(init_pc, init_sp, imem_rdata, dmem_rdata,
                              clock, halted, trap, trap_cause,
                              imem_addr, dmem_addr, dmem_wdata,
                              dmem_width, dmem_req, dmem_we,
                              dbg_pc, dbg_x, dbg_x10);
   input [31:0] init_pc;
+  input [31:0] init_sp;
   input [31:0] imem_rdata;
   input [31:0] dmem_rdata;
   output clock;
@@ -39,7 +40,7 @@ module rv32i_full_runtime_tb(init_pc, imem_rdata, dmem_rdata,
   end
 
   rv32i_full_core core(
-    .clk(clk), .rst(rst), .init_pc(init_pc),
+    .clk(clk), .rst(rst), .init_pc(init_pc), .init_sp(init_sp),
     .imem_rdata(imem_rdata), .dmem_rdata(dmem_rdata),
     .imem_addr(imem_addr), .dmem_addr(dmem_addr),
     .dmem_wdata(dmem_wdata), .dmem_width(dmem_width),

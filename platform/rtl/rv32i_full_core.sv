@@ -2,12 +2,13 @@
 // The core implements RV32I base plus the machine-mode CSR/trap subset needed
 // to execute freestanding programs. Instruction and data words are supplied
 // combinationally; stores present a merged 32-bit word and byte-enable size.
-module rv32i_full_core(clk, rst, init_pc, imem_rdata, dmem_rdata, imem_addr,
+module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_addr,
                        dmem_addr, dmem_wdata, dmem_width, dmem_req, dmem_we,
                        halted, trap, trap_cause, dbg_pc, dbg_x, dbg_x10);
   input clk;
   input rst;
   input [31:0] init_pc;
+  input [31:0] init_sp;
   input [31:0] imem_rdata;
   input [31:0] dmem_rdata;
   output [31:0] imem_addr;
@@ -377,7 +378,7 @@ module rv32i_full_core(clk, rst, init_pc, imem_rdata, dmem_rdata, imem_addr,
       halted_r <= 1'b0;
       trap_r <= 1'b0;
       trap_cause_r <= 32'b0;
-      x1 <= 0; x2 <= 0; x3 <= 0; x4 <= 0; x5 <= 0; x6 <= 0; x7 <= 0;
+      x1 <= 0; x2 <= init_sp; x3 <= 0; x4 <= 0; x5 <= 0; x6 <= 0; x7 <= 0;
       x8 <= 0; x9 <= 0; x10 <= 0; x11 <= 0; x12 <= 0; x13 <= 0; x14 <= 0;
       x15 <= 0; x16 <= 0; x17 <= 0; x18 <= 0; x19 <= 0; x20 <= 0; x21 <= 0;
       x22 <= 0; x23 <= 0; x24 <= 0; x25 <= 0; x26 <= 0; x27 <= 0; x28 <= 0;

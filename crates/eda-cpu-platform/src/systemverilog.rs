@@ -193,7 +193,7 @@ impl Rv32iSvRunner {
         entry: u32,
         initial_memory: SparseMemory,
     ) -> Result<Rv32iSvResult, String> {
-        execute_rv32i(&self.design, entry, initial_memory)
+        execute_rv32i(&self.design, entry, 0, initial_memory)
     }
 }
 
@@ -204,16 +204,21 @@ pub fn run_rv32i_elf(bytes: &[u8]) -> Result<Rv32iSvResult, String> {
     let source = format!("{RV_CORE}\n{RV_TB}");
     let design =
         eda_hdl::compile(&source, Some("rv32i_full_runtime_tb")).map_err(|e| e.to_string())?;
-    execute_rv32i(&design, entry, golden.memory)
+    execute_rv32i(&design, entry, golden.regs[2], golden.memory)
 }
 
 fn execute_rv32i(
     design: &Design,
     entry: u32,
+    initial_stack_pointer: u32,
     mut memory: SparseMemory,
 ) -> Result<Rv32iSvResult, String> {
     let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
     simulator.set_input("init_pc", &LogicWord::from_u64(32, u64::from(entry)))?;
+    simulator.set_input(
+        "init_sp",
+        &LogicWord::from_u64(32, u64::from(initial_stack_pointer)),
+    )?;
 
     for time in 0..SIMULATION_TIME_BUDGET {
         let clock = output_bool(&simulator, "clock")?;

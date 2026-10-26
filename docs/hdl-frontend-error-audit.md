@@ -94,9 +94,10 @@ and official UVM commit `78c06547a2a0a29b3dc9dcafae62b75b2ff61544`.
 | `cargo test -p eda-core --all-targets -- --nocapture` | 29 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 86 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
-| `cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture` | 5 passed, 798.77 s |
+| `cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture` | 5 passed, 789.03 s |
 | `cargo test -p eda-cpu-platform --lib -- --nocapture` | 11 passed |
-| `cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized --nocapture` | 4 passed, 31.14 s |
+| `cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized --nocapture` | 4 passed, 32.46 s |
+| `cargo test -p eda-cpu-platform --test program_fixtures -- --nocapture` | 7 passed, 9.40 s |
 | `cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized --nocapture` | 15 passed, 220.91 s |
 | i8086 fuzz chunks seeds 0–31 | 4 test chunks passed, 0 failed, 2490.05 s total |
 | `SUITE_FILTER=sv_ cargo test -p eda-tests --test suite full_suite_all_green` | 6,455 cases passed in 158.48 s |
@@ -166,6 +167,7 @@ information from re-entering the roadmap.
 | R-37 | Behavioral-model NEG consumed incoming CF | Fixed by using zero-minus-operand semantics rather than SBB semantics; directed unary and fuzz matrices cover incoming-carry cases. |
 | R-38 | Logical/TEST AF behavior differed across lanes | Fixed by deterministically clearing AF, whose value is undefined for those operations, across model, RTL, and reference. |
 | R-39 | Undefined rotate SF/ZF/PF behavior differed across lanes | Fixed by preserving those undefined flags across model, RTL, and reference while retaining defined CF/count-one OF behavior. |
+| R-40 | SystemVerilog ELF execution reset SP instead of using the loader ABI value | Fixed with an explicit RTL `init_sp` input. Bare-metal memory cases pass zero; ELF execution passes the built-in loader's Linux ABI stack pointer. The checked-in ELF three-lane differential caught the mismatch. |
 
 ## 4. Current P0 and P1 findings
 
@@ -193,7 +195,7 @@ broader tool-flow percentage.
 | F-17 | Source diagnostics engine | Every parser/elaboration/lowering error needs file, line, column, range, severity, diagnostic code, notes, related locations, suppression, and multi-error recovery. | Direct errors often include slang spans. Bounded parser diagnostics are mostly line-only; many bounded elaboration errors are plain strings. There is no complete structured diagnostic object or suppression system. | P1 | 30% | Snapshot diagnostics for malformed and unsupported corpora; no raw `Result<_, String>` at public boundaries. |
 | F-18 | Include/preprocess traceability | Diagnostics must point through macros and include stacks to user source. | Slang produces authoritative diagnostics and source spans. The bounded compatibility path loses some preprocessor provenance after single-unit preprocessing; direct spans can print non-normalized relative paths. | P1 | 50% | Include/macro expansion stack snapshots and path normalization tests. |
 | F-19 | Separate compilation/library manager | Compile projects using file lists, libraries, configs, search order, encrypted/protected IP, and incremental artifact reuse. | Multiple named files work, but there is no complete config/library manager or protected-IP handling. | P1 | 15% | Project manifest tests with duplicate modules, search paths, selected configs, and cache invalidation. |
-| F-20 | Golden RTL execution | RV32I and i8086 must match independent golden ISA models across memory maps and opcodes. | RV32I base-integer and 64-seed deterministic fuzz matrices compare the built-in model, SystemVerilog RTL, and external `raven-riscv-engine` 0.1.1. Directed `mtvec`/`mepc`/`mcause`, bare-metal M-mode `ECALL`, and `MRET` behavior now has the same three-lane coverage. i8086 directed matrices and all 32 deterministic fuzz seeds compare the built-in model, RTL, and a separate spec-derived flat-memory machine-code reference; this exposed and fixed six ALU/flag defects. Coverage is published in `docs/rv32i-independent-golden-validation.md` and `docs/i8086-independent-golden-validation.md`. RV32I ELF/high-memory images, arbitrary-CSR breadth, broader i8086 opcode/control-flow/interrupt coverage, and an external i8086 machine-code oracle remain open. | P0 | 80% | Add independent RV32I ELF/high-memory differentials, broaden privileged-CSR coverage, and extend i8086 beyond the current integer/data/ModRM/shift/unary surface with an external machine-code oracle. |
+| F-20 | Golden RTL execution | RV32I and i8086 must match independent golden ISA models across memory maps and opcodes. | RV32I base-integer, 64-seed fuzz, directed `mtvec`/`mepc`/`mcause`, bare-metal M-mode `ECALL`/`MRET`, checked-in ELF, high-memory ELF, and synthetic `0x7000_0000` sparse-ELF lanes compare the built-in model, SystemVerilog RTL, and external `raven-riscv-engine` 0.1.1 through a sparse bus adapter. i8086 directed matrices and all 32 deterministic fuzz seeds compare the built-in model, RTL, and a separate spec-derived flat-memory machine-code reference; this exposed and fixed seven CPU correctness/ABI defects. Coverage is published in `docs/rv32i-independent-golden-validation.md` and `docs/i8086-independent-golden-validation.md`. RV32I arbitrary-CSR breadth, broader i8086 opcode/control-flow/interrupt coverage, and an external i8086 machine-code oracle remain open. | P0 | 85% | Broaden RV32I privileged-CSR coverage and extend i8086 beyond the current integer/data/ModRM/shift/unary surface with an external machine-code oracle. |
 
 ## 5. Detailed direct slang-AST lowering gaps
 
