@@ -188,6 +188,14 @@ impl I8086Machine {
         self.stop
     }
 
+    pub fn request_interrupt(&mut self, vector: u8) -> I8086Stop {
+        if self.stop != I8086Stop::Running {
+            return self.stop;
+        }
+        self.handle_interrupt(vector);
+        self.stop
+    }
+
     fn fetch_u8(&mut self) -> u8 {
         let value = self.memory.read_u8(self.physical(SEG_CS, self.ip));
         self.ip = self.ip.wrapping_add(1);

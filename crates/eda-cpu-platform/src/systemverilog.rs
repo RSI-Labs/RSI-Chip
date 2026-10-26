@@ -56,6 +56,13 @@ struct I8086InitialState {
     ss: u16,
 }
 
+#[derive(Clone, Copy)]
+struct I8086ExternalInterrupt {
+    vector: u8,
+    after_instructions: u64,
+    nmi: bool,
+}
+
 impl I8086InitialState {
     fn com() -> Self {
         Self {
@@ -102,6 +109,27 @@ impl I8086SvRunner {
             I8086InitialState::com(),
             initial_memory,
             simulation_time_budget,
+            None,
+        )
+    }
+
+    pub fn run_memory_with_external_interrupt(
+        &self,
+        initial_memory: SparseMemory,
+        vector: u8,
+        after_instructions: u64,
+        nmi: bool,
+    ) -> Result<I8086SvResult, String> {
+        execute_i8086(
+            &self.design,
+            I8086InitialState::com(),
+            initial_memory,
+            SIMULATION_TIME_BUDGET,
+            Some(I8086ExternalInterrupt {
+                vector,
+                after_instructions,
+                nmi,
+            }),
         )
     }
 }
@@ -143,6 +171,7 @@ pub fn run_i8086_mz(program: &[u8], load_segment: u16) -> Result<I8086SvResult, 
         I8086InitialState::mz(&golden),
         initial_memory,
         SIMULATION_TIME_BUDGET,
+        None,
     )
 }
 
@@ -151,6 +180,7 @@ fn execute_i8086(
     initial_state: I8086InitialState,
     mut memory: SparseMemory,
     simulation_time_budget: u64,
+    external_interrupt: Option<I8086ExternalInterrupt>,
 ) -> Result<I8086SvResult, String> {
     let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
     simulator.set_input("io_rdata", &LogicWord::from_u64(16, 0))?;
@@ -178,11 +208,31 @@ fn execute_i8086(
         "init_ss",
         &LogicWord::from_u64(16, u64::from(initial_state.ss)),
     )?;
+    simulator.set_input("irq", &LogicWord::from_u64(1, 0))?;
+    simulator.set_input("nmi", &LogicWord::from_u64(1, 0))?;
+    simulator.set_input(
+        "interrupt_vector",
+        &LogicWord::from_u64(
+            8,
+            u64::from(external_interrupt.map_or(0, |interrupt| interrupt.vector)),
+        ),
+    )?;
 
     let mut output = Vec::new();
     let mut io_ports = vec![0_u8; u16::MAX as usize + 1];
+    let mut interrupt_delivered = false;
     for time in 0..simulation_time_budget {
         let clock = output_bool(&simulator, "clock")?;
+        let retired = bus_u64(&simulator, "retired")?;
+        if let Some(interrupt) = external_interrupt {
+            if !interrupt_delivered && retired >= interrupt.after_instructions {
+                let signal = if interrupt.nmi { "nmi" } else { "irq" };
+                simulator.set_input(signal, &LogicWord::from_u64(1, 1))?;
+            } else {
+                simulator.set_input("irq", &LogicWord::from_u64(1, 0))?;
+                simulator.set_input("nmi", &LogicWord::from_u64(1, 0))?;
+            }
+        }
         let mem_address = bus_u64(&simulator, "mem_addr")? as u32;
         let source_address = bus_u64(&simulator, "source_addr")? as u32;
         let io_address = bus_u64(&simulator, "io_addr")? as u16;
@@ -215,6 +265,11 @@ fn execute_i8086(
         simulator.run_until(time + 1)?;
         let clock_now = output_bool(&simulator, "clock")?;
         if clock_now && !clock {
+            if output_bool(&simulator, "interrupt_ack")? {
+                interrupt_delivered = true;
+                simulator.set_input("irq", &LogicWord::from_u64(1, 0))?;
+                simulator.set_input("nmi", &LogicWord::from_u64(1, 0))?;
+            }
             if pending_write {
                 if write_byte {
                     memory.write_u8(write_address, write_value as u8);

@@ -49,7 +49,7 @@ Covered machine-code families include:
 | Stack and control flow | PUSH/POP GPRs and segment registers, PUSHF/POPF, near CALL/RET, direct and indirect far CALL, RETF, RETF imm16, all short conditional-jump predicates, JCXZ, LOOP, short JMP, and near JMP. |
 | Strings and repeat prefixes | Byte/word MOVSB/MOVSW, CMPSB/CMPSW, STOSB/STOSW, LODSB/LODSW, and SCASB/SCASW; REP MOVSW/STOSW/LODSW; REPNE SCASW; forward and DF=1 reverse string operation; CX=0 zero-iteration behavior. |
 | BCD/ASCII adjust | DAA, DAS, AAA, and AAS across no-adjust, low-adjust, and high-adjust inputs with incoming AF/CF states; SAHF/LAHF load and log each architectural result and flag word. |
-| I/O and interrupts | Immediate and DX-indexed byte/word IN/OUT with a host-backed 64 KiB port file; vectored INT, INT3, and INTO with FLAGS/CS/IP stacking and IRET return. |
+| I/O and interrupts | Immediate and DX-indexed byte/word IN/OUT with a host-backed 64 KiB port file; vectored INT, INT3, INTO, asynchronous IRQ, NMI, IF-masked IRQ, and IRET with FLAGS/CS/IP stacking. |
 | MZ loader | Relocatable and non-relocatable MZ images at load segment `0x1000`, including CS/IP/SS/SP/DS/ES initialization, relocation patching, code execution, and data stores. |
 
 The control-flow lane also uses forward branches over an ALU mutation so both
@@ -60,7 +60,7 @@ Directed result:
 ```text
 cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized
 
-24 passed, 0 failed, 631.67 seconds
+25 passed, 0 failed, 533.45 seconds
 ```
 
 ## Deterministic randomized differential
@@ -135,13 +135,16 @@ The independent lane exposed the following machine-code correctness defects:
     data bus. OUT writes were therefore invisible to the host runtime and a
     subsequent IN read zero. The testbench now exposes `io_wdata`, and the host
     runtime maintains a 64 KiB little-endian port file.
+16. The SystemVerilog runtime tied asynchronous IRQ and NMI inputs low. The
+    testbench and host runtime now expose IRQ/NMI/vector/ack signals and can
+    inject one interrupt at a deterministic retired-instruction boundary.
 
 ## Remaining gaps
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add interrupt-controller IRQ/NMI behavior and broader MZ header/relocation
-   edge cases beyond the current two-image differential.
+2. Add broader MZ header/relocation edge cases beyond the current two-image
+   differential.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz

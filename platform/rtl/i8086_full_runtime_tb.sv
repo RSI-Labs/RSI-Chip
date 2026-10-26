@@ -2,6 +2,7 @@
 // and observes bus writes around each rising clock edge.
 module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
                              init_ip, init_sp, init_cs, init_ds, init_es, init_ss,
+                             irq, nmi, interrupt_vector, interrupt_ack,
                              clock, halted, trap, retired,
                              console_write, console_char,
                              mem_addr, mem_wdata, mem_we, mem_width,
@@ -16,6 +17,10 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   input [15:0] init_ds;
   input [15:0] init_es;
   input [15:0] init_ss;
+  input irq;
+  input nmi;
+  input [7:0] interrupt_vector;
+  output interrupt_ack;
   output clock;
   output halted;
   output trap;
@@ -69,7 +74,8 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
     .io_addr(io_addr), .io_we(io_we), .io_width(io_width),
     .io_wdata(io_wdata),
     .console_write(console_write), .console_char(console_char),
-    .irq(1'b0), .nmi(1'b0), .interrupt_vector(8'b0), .interrupt_ack(),
+    .irq(irq), .nmi(nmi), .interrupt_vector(interrupt_vector),
+    .interrupt_ack(interrupt_ack),
     .halted(halted), .trap(trap), .instructions_retired(retired),
     .dbg_ax(ax), .dbg_cx(cx), .dbg_dx(dx), .dbg_bx(bx), .dbg_sp(sp),
     .dbg_bp(bp), .dbg_si(si), .dbg_di(di), .dbg_es(), .dbg_cs(),

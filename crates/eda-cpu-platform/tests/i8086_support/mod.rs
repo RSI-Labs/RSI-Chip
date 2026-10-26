@@ -485,6 +485,10 @@ impl ReferenceI8086 {
         Ok(())
     }
 
+    pub fn external_interrupt(&mut self, vector: u8) -> Result<(), String> {
+        self.take_interrupt(vector)
+    }
+
     fn fetch8(&mut self) -> u8 {
         let value = self.memory[self.physical(CS, self.instruction_pointer) as usize];
         self.instruction_pointer = self.instruction_pointer.wrapping_add(1);

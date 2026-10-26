@@ -441,6 +441,111 @@ fn deterministic_i8086_int3_and_into_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_asynchronous_irq_and_nmi_matrix_matches_golden_model() {
+    fn image_for(vector: u8, operations: &[u8]) -> Vec<u8> {
+        let values = [0_u16, 0, 0, 0, 0xfffe, 0, 0, 0];
+        let vector_address = u32::from(vector) * 4;
+        let mut all_operations = vec![
+            0xb8,
+            0x00,
+            0x03, // mov ax, 0x0300
+            0xa3,
+            vector_address as u8,
+            (vector_address >> 8) as u8, // mov [vector], ax
+            0xb8,
+            0x00,
+            0x00, // mov ax, handler segment 0
+            0xa3,
+            vector_address as u8,
+            ((vector_address + 2) >> 8) as u8, // placeholder repaired below
+        ];
+        // Repair the second displacement because the array above cannot easily
+        // use an arithmetic expression in the middle of its elements.
+        all_operations[10] = (vector_address + 2) as u8;
+        all_operations[11] = ((vector_address + 2) >> 8) as u8;
+        all_operations.extend_from_slice(operations);
+
+        let mut executable = initial_program(values, &all_operations);
+        executable.resize(0x0200, 0x90);
+        executable.extend_from_slice(&[
+            0xb3, 0x2a, // mov bl, 42
+            0xcf, // iret
+        ]);
+        executable
+    }
+
+    fn assert_interrupt_taken(vector: u8, nmi: bool, runner: &I8086SvRunner) {
+        let operations = [0xbf, 0x2c, 0x00]; // mov di, 44 after interrupt return
+        let executable = image_for(vector, &operations);
+
+        let mut golden = I8086Machine::com(&executable, "")
+            .unwrap_or_else(|error| panic!("construct {vector:#04x} golden image: {error}"));
+        for _ in 0..12 {
+            assert_eq!(golden.step(), I8086Stop::Running);
+        }
+        assert_eq!(golden.request_interrupt(vector), I8086Stop::Running);
+        assert_eq!(golden.run(100), I8086Stop::Halt);
+
+        let initial_memory = golden.memory.clone();
+        let mut reference = ReferenceI8086::com(&initial_memory);
+        for _ in 0..12 {
+            reference.step().expect("run independent setup");
+        }
+        reference
+            .external_interrupt(vector)
+            .expect("take independent interrupt");
+        reference.run(100).expect("run independent handler");
+
+        let rtl = runner
+            .run_memory_with_external_interrupt(initial_memory, vector, 12, nmi)
+            .expect("execute asynchronous interrupt in RTL");
+        assert!(rtl.halted);
+        assert!(!rtl.trap);
+        assert_eq!(rtl.bx, 0x002a);
+        assert_eq!(rtl.di, 0x002c);
+        assert_eq!(rtl.sp, 0xfffe);
+        assert_eq!(
+            [rtl.ax, rtl.cx, rtl.dx, rtl.bx, rtl.sp, rtl.bp, rtl.si, rtl.di],
+            golden.regs
+        );
+        assert_eq!(rtl.flags, golden.flags);
+        assert_eq!(rtl.ip, golden.ip);
+        assert_eq!(rtl.memory.read_u8(0x0300), 0xb3);
+
+        assert_eq!(reference.registers(), golden.regs);
+        assert_eq!(reference.segments(), golden.segments);
+        assert_eq!(reference.flags(), golden.flags);
+        assert_eq!(reference.instruction_pointer(), golden.ip);
+    }
+
+    let runner = shared_i8086_runner();
+    assert_interrupt_taken(0x50, false, runner);
+    assert_interrupt_taken(2, true, runner);
+
+    // An IRQ delivered while IF=0 must remain masked; NMI is covered above.
+    let executable = image_for(0x50, &[0xfa]); // cli before appended HLT
+    let mut golden = I8086Machine::com(&executable, "")
+        .unwrap_or_else(|error| panic!("construct masked IRQ golden image: {error}"));
+    for _ in 0..13 {
+        assert_eq!(golden.step(), I8086Stop::Running);
+    }
+    assert_eq!(golden.flags & 0x0200, 0);
+    assert_eq!(golden.run(100), I8086Stop::Halt);
+
+    let rtl = runner
+        .run_memory_with_external_interrupt(golden.memory.clone(), 0x50, 13, false)
+        .expect("execute masked asynchronous IRQ");
+    assert!(rtl.halted);
+    assert!(!rtl.trap);
+    assert_eq!(rtl.bx, 0x0000);
+    assert_eq!(rtl.flags & 0x0200, 0);
+    assert_eq!(
+        [rtl.ax, rtl.cx, rtl.dx, rtl.bx, rtl.sp, rtl.bp, rtl.si, rtl.di],
+        golden.regs
+    );
+}
+
+#[test]
 fn deterministic_i8086_indirect_far_call_matrix_matches_golden_model() {
     let values = [0_u16, 0, 0, 0, 0xfffe, 0, 0, 0];
     let mut executable = Vec::new();
