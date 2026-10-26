@@ -1674,33 +1674,41 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             execute_mem_wdata = ax;
           end
           8'ha4, 8'ha5: begin
-            execute_mem_addr = physical_address(2'b00, di);
-            execute_mem_we = 1'b1;
-            execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
-            execute_mem_wdata = source_rdata;
-            next_si = si + string_delta;
-            next_di = di + string_delta;
-            if (rep_none && cx != 16'd0) begin
-              next_cx = cx - 16'd1;
-              next_state = S_EXECUTE;
-              next_rep_none = rep_none;
-              next_rep_while_equal = rep_while_equal;
-              next_rep_while_not_equal = rep_while_not_equal;
+            if (!(rep_none && cx == 16'd0)) begin
+              execute_mem_addr = physical_address(2'b00, di);
+              execute_mem_we = 1'b1;
+              execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
+              execute_mem_wdata = source_rdata;
+              next_si = si + string_delta;
+              next_di = di + string_delta;
+              if (rep_none && cx != 16'd1) begin
+                next_cx = cx - 16'd1;
+                next_state = S_EXECUTE;
+                next_rep_none = rep_none;
+                next_rep_while_equal = rep_while_equal;
+                next_rep_while_not_equal = rep_while_not_equal;
+              end else if (rep_none) begin
+                next_cx = cx - 16'd1;
+              end
             end
           end
           8'ha6, 8'ha7: begin
-            execute_mem_addr = physical_address(2'b00, di);
-            next_flags = alu_flag_value;
-            next_si = si + string_delta;
-            next_di = di + string_delta;
-            if (rep_none && cx != 16'd0 &&
-                (!rep_while_equal || alu_flag_value[6]) &&
-                (!rep_while_not_equal || !alu_flag_value[6])) begin
-              next_cx = cx - 16'd1;
-              next_state = S_EXECUTE;
-              next_rep_none = rep_none;
-              next_rep_while_equal = rep_while_equal;
-              next_rep_while_not_equal = rep_while_not_equal;
+            if (!(rep_none && cx == 16'd0)) begin
+              execute_mem_addr = physical_address(2'b00, di);
+              next_flags = alu_flag_value;
+              next_si = si + string_delta;
+              next_di = di + string_delta;
+              if (rep_none && cx != 16'd1 &&
+                  (!rep_while_equal || alu_flag_value[6]) &&
+                  (!rep_while_not_equal || !alu_flag_value[6])) begin
+                next_cx = cx - 16'd1;
+                next_state = S_EXECUTE;
+                next_rep_none = rep_none;
+                next_rep_while_equal = rep_while_equal;
+                next_rep_while_not_equal = rep_while_not_equal;
+              end else if (rep_none) begin
+                next_cx = cx - 16'd1;
+              end
             end
           end
           8'ha8: begin
@@ -1710,42 +1718,54 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
             next_flags = test_word_flags;
           end
           8'haa, 8'hab: begin
-            execute_mem_addr = physical_address(2'b00, di);
-            execute_mem_we = 1'b1;
-            execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
-            execute_mem_wdata = ax;
-            next_di = di + string_delta;
-            if (rep_none && cx != 16'd0) begin
-              next_cx = cx - 16'd1;
-              next_state = S_EXECUTE;
-              next_rep_none = rep_none;
-              next_rep_while_equal = rep_while_equal;
-              next_rep_while_not_equal = rep_while_not_equal;
+            if (!(rep_none && cx == 16'd0)) begin
+              execute_mem_addr = physical_address(2'b00, di);
+              execute_mem_we = 1'b1;
+              execute_mem_width = execute_width8 ? SZ_BYTE : SZ_WORD;
+              execute_mem_wdata = ax;
+              next_di = di + string_delta;
+              if (rep_none && cx != 16'd1) begin
+                next_cx = cx - 16'd1;
+                next_state = S_EXECUTE;
+                next_rep_none = rep_none;
+                next_rep_while_equal = rep_while_equal;
+                next_rep_while_not_equal = rep_while_not_equal;
+              end else if (rep_none) begin
+                next_cx = cx - 16'd1;
+              end
             end
           end
           8'hac, 8'had: begin
-            next_ax = source_rdata;
-            next_si = si + string_delta;
-            if (rep_none && cx != 16'd0) begin
-              next_cx = cx - 16'd1;
-              next_state = S_EXECUTE;
-              next_rep_none = rep_none;
-              next_rep_while_equal = rep_while_equal;
-              next_rep_while_not_equal = rep_while_not_equal;
+            if (!(rep_none && cx == 16'd0)) begin
+              next_ax = source_rdata;
+              next_si = si + string_delta;
+              if (rep_none && cx != 16'd1) begin
+                next_cx = cx - 16'd1;
+                next_state = S_EXECUTE;
+                next_rep_none = rep_none;
+                next_rep_while_equal = rep_while_equal;
+                next_rep_while_not_equal = rep_while_not_equal;
+              end else if (rep_none) begin
+                next_cx = cx - 16'd1;
+              end
             end
           end
           8'hae, 8'haf: begin
-            execute_mem_addr = physical_address(2'b00, di);
-            next_flags = alu_flag_value;
-            next_di = di + string_delta;
-            if (rep_none && cx != 16'd0 &&
-                (!rep_while_equal || alu_flag_value[6]) &&
-                (!rep_while_not_equal || !alu_flag_value[6])) begin
-              next_cx = cx - 16'd1;
-              next_state = S_EXECUTE;
-              next_rep_none = rep_none;
-              next_rep_while_equal = rep_while_equal;
-              next_rep_while_not_equal = rep_while_not_equal;
+            if (!(rep_none && cx == 16'd0)) begin
+              execute_mem_addr = physical_address(2'b00, di);
+              next_flags = alu_flag_value;
+              next_di = di + string_delta;
+              if (rep_none && cx != 16'd1 &&
+                  (!rep_while_equal || alu_flag_value[6]) &&
+                  (!rep_while_not_equal || !alu_flag_value[6])) begin
+                next_cx = cx - 16'd1;
+                next_state = S_EXECUTE;
+                next_rep_none = rep_none;
+                next_rep_while_equal = rep_while_equal;
+                next_rep_while_not_equal = rep_while_not_equal;
+              end else if (rep_none) begin
+                next_cx = cx - 16'd1;
+              end
             end
           end
           8'he0, 8'he1, 8'he2: begin

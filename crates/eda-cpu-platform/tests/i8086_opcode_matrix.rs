@@ -256,6 +256,105 @@ fn deterministic_i8086_control_flow_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_string_and_repeat_matrix_matches_golden_model() {
+    let values = [
+        0x1234_u16, 0x0000, 0x0000, 0x0000, 0xfffe, 0, 0x2000, 0x2100,
+    ];
+
+    let single_operations = [
+        0xa4, // movsb
+        0xa5, // movsw
+        0xbe, 0x00, 0x20, // mov si, 0x2000
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xa6, // cmpsb
+        0xa7, // cmpsw
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xaa, // stosb
+        0xab, // stosw
+        0xbe, 0x00, 0x20, // mov si, 0x2000
+        0xac, // lodsb
+        0xad, // lodsw
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xae, // scasb
+        0xaf, // scasw
+    ];
+
+    let repeat_move_operations = [
+        0xbe, 0x00, 0x20, // mov si, 0x2000
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xb9, 0x04, 0x00, // mov cx, 4
+        0xf3, 0xa5, // rep movsw
+    ];
+
+    let repeat_store_operations = [
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xb9, 0x04, 0x00, // mov cx, 4
+        0xf3, 0xab, // rep stosw
+    ];
+
+    let repeat_load_operations = [
+        0xbe, 0x00, 0x20, // mov si, 0x2000
+        0xb9, 0x04, 0x00, // mov cx, 4
+        0xf3, 0xad, // rep lodsw
+    ];
+
+    let repeat_scan_operations = [
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xb9, 0x04, 0x00, // mov cx, 4
+        0xf2, 0xaf, // repne scasw
+    ];
+
+    let zero_repeat_operations = [
+        0xbe, 0x00, 0x20, // mov si, 0x2000
+        0xbf, 0x00, 0x21, // mov di, 0x2100
+        0xb9, 0x00, 0x00, // mov cx, 0
+        0xf3, 0xa5, // rep movsw must execute zero iterations
+        0xf3, 0xab, // rep stosw must execute zero iterations
+        0xf3, 0xad, // rep lodsw must execute zero iterations
+        0xf2, 0xaf, // repne scasw must execute zero iterations
+    ];
+
+    let reverse_operations = [
+        0xfc, // cld
+        0xbe, 0x08, 0x20, // mov si, 0x2008
+        0xbf, 0x08, 0x21, // mov di, 0x2108
+        0xb9, 0x04, 0x00, // mov cx, 4
+        0xfd, // std
+        0xf3, 0xa5, // rep movsw backwards
+        0xfc, // cld
+    ];
+
+    assert_matches_golden(
+        &initial_program(values, &single_operations),
+        "single string matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &repeat_move_operations),
+        "repeat string move matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &repeat_store_operations),
+        "repeat string store matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &repeat_load_operations),
+        "repeat string load matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &repeat_scan_operations),
+        "repeat string scan matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &zero_repeat_operations),
+        "zero-count repeat string matrix",
+    );
+    assert_matches_golden(
+        &initial_program(values, &reverse_operations),
+        "reverse string matrix",
+    );
+}
+
+#[test]
 fn deterministic_i8086_modrm_addressing_matrix_matches_golden_model() {
     let values = [
         0x1234_u16, 0x5678, 0x9abc, 0x1000, 0xfffe, 0x1100, 0x1010, 0x1020,

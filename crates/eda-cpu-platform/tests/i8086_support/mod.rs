@@ -96,6 +96,7 @@ impl ReferenceI8086 {
 
     pub fn step(&mut self) -> Result<(), String> {
         let mut override_segment = None;
+        let mut repeat = None;
         let opcode = loop {
             let byte = self.fetch8();
             match byte {
@@ -103,6 +104,8 @@ impl ReferenceI8086 {
                 0x2e => override_segment = Some(CS),
                 0x36 => override_segment = Some(SS),
                 0x3e => override_segment = Some(DS),
+                0xf2 => repeat = Some(0xf2),
+                0xf3 => repeat = Some(0xf3),
                 other => break other,
             }
         };
@@ -186,6 +189,9 @@ impl ReferenceI8086 {
             }
             0x9d => {
                 self.flags = self.pop()?;
+            }
+            0xa4..=0xa7 | 0xaa..=0xaf => {
+                self.string_operation(opcode, override_segment, repeat)?;
             }
             0x8e => {
                 let (source, register) = self.modrm(override_segment);
@@ -355,6 +361,92 @@ impl ReferenceI8086 {
             0xe => self.flag(ZF) || self.flag(SF) != self.flag(OF),
             _ => !self.flag(ZF) && self.flag(SF) == self.flag(OF),
         }
+    }
+
+    fn string_operation(
+        &mut self,
+        opcode: u8,
+        override_segment: Option<usize>,
+        repeat: Option<u8>,
+    ) -> Result<(), String> {
+        let width = if opcode & 1 == 0 { 8 } else { 16 };
+        let comparison = matches!(opcode, 0xa6 | 0xa7 | 0xae | 0xaf);
+        let Some(repeat) = repeat else {
+            self.string_step(opcode, override_segment, width)?;
+            return Ok(());
+        };
+
+        while self.registers[1] != 0 {
+            self.string_step(opcode, override_segment, width)?;
+            self.registers[1] = self.registers[1].wrapping_sub(1);
+            if self.registers[1] == 0 {
+                break;
+            }
+            if comparison {
+                let continue_repeat = if repeat == 0xf3 {
+                    self.flag(ZF)
+                } else {
+                    !self.flag(ZF)
+                };
+                if !continue_repeat {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn string_step(
+        &mut self,
+        opcode: u8,
+        override_segment: Option<usize>,
+        width: u8,
+    ) -> Result<(), String> {
+        let source_segment = override_segment.unwrap_or(DS);
+        let source_offset = self.registers[6];
+        let destination_offset = self.registers[7];
+        match opcode {
+            0xa4 | 0xa5 => {
+                let value = self.read(Location::Memory(source_segment, source_offset), width)?;
+                self.write(Location::Memory(ES, destination_offset), width, value)?;
+                self.update_string_index(6, width);
+                self.update_string_index(7, width);
+            }
+            0xa6 | 0xa7 => {
+                let left = self.read(Location::Memory(source_segment, source_offset), width)?;
+                let right = self.read(Location::Memory(ES, destination_offset), width)?;
+                self.alu(7, left, right, width)?;
+                self.update_string_index(6, width);
+                self.update_string_index(7, width);
+            }
+            0xaa | 0xab => {
+                let value = self.read(Location::Register(0, 0), width)?;
+                self.write(Location::Memory(ES, destination_offset), width, value)?;
+                self.update_string_index(7, width);
+            }
+            0xac | 0xad => {
+                let value = self.read(Location::Memory(source_segment, source_offset), width)?;
+                self.write(Location::Register(0, 0), width, value)?;
+                self.update_string_index(6, width);
+            }
+            0xae | 0xaf => {
+                let left = self.read(Location::Register(0, 0), width)?;
+                let right = self.read(Location::Memory(ES, destination_offset), width)?;
+                self.alu(7, left, right, width)?;
+                self.update_string_index(7, width);
+            }
+            _ => unreachable!("string opcode already matched"),
+        }
+        Ok(())
+    }
+
+    fn update_string_index(&mut self, register: u8, width: u8) {
+        let delta = if self.flag(DF) {
+            -(width as i16 / 8) as u16
+        } else {
+            width as u16 / 8
+        };
+        self.registers[register as usize] = self.registers[register as usize].wrapping_add(delta);
     }
 
     fn modrm_pair(&mut self, override_segment: Option<usize>) -> (Location, Location) {

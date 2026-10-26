@@ -1201,6 +1201,9 @@ impl I8086Machine {
         segment_override: Option<usize>,
         repeat: Option<u8>,
     ) {
+        if repeat.is_some() && self.regs[REG_CX] == 0 {
+            return;
+        }
         let width = if opcode & 1 == 0 { 8 } else { 16 };
         let delta = if self.get_flag(FLAG_DF) {
             -(width as i16 / 8) as u16

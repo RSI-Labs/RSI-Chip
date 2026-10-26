@@ -46,6 +46,7 @@ Covered machine-code families include:
 | Unary groups | TEST, NOT, NEG, MUL, IMUL, DIV, and IDIV in byte and word forms where defined by the directed operands. |
 | Flag control | CMC, CLC, STC, CLI, STI, CLD, STD, and LAHF as exercised by the matrices. |
 | Stack and control flow | PUSH/POP registers, PUSHF/POPF, near CALL/RET, all short conditional-jump predicates, JCXZ, LOOP, short JMP, and near JMP. |
+| Strings and repeat prefixes | Byte/word MOVSB/MOVSW, CMPSB/CMPSW, STOSB/STOSW, LODSB/LODSW, and SCASB/SCASW; REP MOVSW/STOSW/LODSW; REPNE SCASW; forward and DF=1 reverse string operation; CX=0 zero-iteration behavior. |
 
 The control-flow lane also uses forward branches over an ALU mutation so both
 taken and untaken paths remain architectural and observable.
@@ -55,7 +56,7 @@ Directed result:
 ```text
 cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized
 
-17 passed, 0 failed, 230.52 seconds
+18 passed, 0 failed, 254.62 seconds
 ```
 
 ## Deterministic randomized differential
@@ -109,13 +110,18 @@ The independent lane exposed the following machine-code correctness defects:
 6. Undefined rotate SF/ZF/PF behavior differed across lanes; the model, RTL, and
    reference now leave those flags unchanged and compare only the defined CF and
    count-one OF behavior.
+7. REP-prefixed string instructions had two termination defects. The behavioral
+   model executed once with CX=0 and wrapped CX to 0xffff, while RTL performed
+   one additional iteration after the requested nonzero count. Both lanes now
+   execute zero iterations at CX=0 and exactly CX iterations for non-comparison
+   strings.
 
 ## Remaining gaps
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add string instructions, interrupts, I/O, BCD adjust, repeat prefixes, far
-   calls/returns, broader stack forms, and full MZ/COM loader coverage.
+2. Add interrupts, I/O, BCD adjust, far calls/returns, broader stack forms, and
+   full MZ/COM loader coverage.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz
