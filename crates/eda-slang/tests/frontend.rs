@@ -20546,6 +20546,195 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_integrated_phases_config_tlm_and_sequence() {
+    let Some(slang) = SlangFrontend::discover_optional() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-integrated-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class IntegrationTrace;
+  static int build_ran = 0;
+  static int connect_ran = 0;
+  static int config_found = 0;
+  static int configured_value = -1;
+  static int sequenced_value = -1;
+  static int response_value = -1;
+  static int tlm_value = -1;
+  static int objection_drained = 0;
+endclass
+
+class integration_request extends uvm_sequence_item;
+  int value;
+
+  function new(string name = "integration_request");
+    super.new(name);
+  endfunction
+endclass
+
+class integration_sequence extends uvm_sequence#(integration_request);
+  integration_request item;
+  integration_request response;
+
+  function new(string name = "integration_sequence");
+    super.new(name);
+  endfunction
+
+  virtual task body();
+    item = new("integration_item");
+    start_item(item);
+    item.value = IntegrationTrace::configured_value;
+    finish_item(item);
+    response = new("integration_response");
+    get_response(response);
+    IntegrationTrace::response_value = response.value;
+  endtask
+endclass
+
+class integration_test extends uvm_test;
+  uvm_sequencer#(integration_request) sequencer;
+  integration_sequence sequence;
+  integration_request request;
+  integration_request response;
+  uvm_tlm_fifo#(int) fifo;
+  uvm_put_port#(int) producer;
+  uvm_get_peek_port#(int) consumer;
+  int configured;
+
+  function new(string name = "integration_test",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    IntegrationTrace::build_ran = 1;
+    sequencer = new("sequencer", this);
+    sequence = new("sequence");
+    request = new("request");
+    response = new("response");
+    fifo = new("fifo", this, 1);
+    producer = new("producer", this);
+    consumer = new("consumer", this);
+    if (uvm_config_db#(int)::get(this, "", "integration_value", configured)) begin
+      IntegrationTrace::config_found = 1;
+      IntegrationTrace::configured_value = configured;
+    end
+  endfunction
+
+  virtual function void connect_phase(uvm_phase phase);
+    IntegrationTrace::connect_ran = 1;
+    producer.connect(fifo.put_export);
+    consumer.connect(fifo.get_peek_export);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    fork
+      sequence.start(sequencer);
+      begin
+        sequencer.get_next_item(request);
+        IntegrationTrace::sequenced_value = request.value;
+        response.value = request.value + 1;
+        sequencer.item_done(response);
+        producer.put(response.value);
+      end
+      begin
+        #1;
+        consumer.get(IntegrationTrace::tlm_value);
+      end
+    join
+    phase.drop_objection(this);
+    IntegrationTrace::objection_drained = 1;
+  endtask
+endclass
+
+module official_uvm_integrated_probe(
+  output int build_ran,
+  output int connect_ran,
+  output int config_found,
+  output int configured_value,
+  output int sequenced_value,
+  output int response_value,
+  output int tlm_value,
+  output int objection_drained
+);
+  initial begin
+    uvm_config_db#(int)::set(null, "*", "integration_value", 42);
+    run_test("integration_test");
+    build_ran = IntegrationTrace::build_ran;
+    connect_ran = IntegrationTrace::connect_ran;
+    config_found = IntegrationTrace::config_found;
+    configured_value = IntegrationTrace::configured_value;
+    sequenced_value = IntegrationTrace::sequenced_value;
+    response_value = IntegrationTrace::response_value;
+    tlm_value = IntegrationTrace::tlm_value;
+    objection_drained = IntegrationTrace::objection_drained;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM integrated wrapper");
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_integrated_probe"),
+            &options,
+        )
+        .expect("directly lower an integrated official-UVM environment");
+    let mut simulator = Simulator::new(&design).expect("create integrated official-UVM simulator");
+    simulator
+        .run_until(2)
+        .expect("run integrated official-UVM environment to completion");
+    assert_eq!(simulator.read("build_ran").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("connect_ran").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("config_found").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("configured_value").unwrap().to_u64(),
+        Some(42)
+    );
+    assert_eq!(
+        simulator.read("sequenced_value").unwrap().to_u64(),
+        Some(42),
+        "the sequence request must receive the configured value"
+    );
+    assert_eq!(
+        simulator.read("response_value").unwrap().to_u64(),
+        Some(43),
+        "the sequencer response must return to the sequence"
+    );
+    assert_eq!(
+        simulator.read("tlm_value").unwrap().to_u64(),
+        Some(43),
+        "the TLM FIFO must transport the response value"
+    );
+    assert_eq!(
+        simulator.read("objection_drained").unwrap().to_u64(),
+        Some(1),
+        "the run-phase objection must drain before post-run assertions"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_sequence_response_queue_reaches_depth_eight() {
     let Some(slang) = SlangFrontend::discover_optional() else {
         return;
