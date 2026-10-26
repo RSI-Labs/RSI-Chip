@@ -222,6 +222,67 @@ fn maximum_size_com_image_uses_the_complete_real_mode_segment() {
 }
 
 #[test]
+fn relocatable_mz_runs_on_golden_and_systemverilog_models() {
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn image(with_relocation: bool) -> Vec<u8> {
+        let mut program = vec![0_u8; 0x51];
+        program[0] = b'M';
+        program[1] = b'Z';
+        put_u16(&mut program, 2, 0x51); // bytes in last page
+        put_u16(&mut program, 4, 1); // one 512-byte page
+        put_u16(&mut program, 6, u16::from(with_relocation));
+        put_u16(&mut program, 8, 4); // 64-byte header
+        put_u16(&mut program, 0x0c, 1); // minimum extra paragraphs
+        put_u16(&mut program, 0x0e, 0x10); // stack segment after header
+        put_u16(&mut program, 0x10, 0x0100); // stack pointer
+        put_u16(&mut program, 0x14, 0); // initial IP
+        put_u16(&mut program, 0x16, 0); // code segment after header
+        put_u16(&mut program, 0x18, 0x1c); // relocation table
+        if with_relocation {
+            // Patch the immediate operand of MOV AX, imm16 at file offset 0x41.
+            put_u16(&mut program, 0x1c, 0x41);
+            put_u16(&mut program, 0x1e, 0);
+        }
+
+        let code: [u8; 17] = [
+            0xb8, 0x00, 0x00, // mov ax, image base (relocated)
+            0xbb, 0x78, 0x56, // mov bx, 0x5678
+            0xb9, 0x34, 0x12, // mov cx, 0x1234
+            0xba, 0x00, 0x30, // mov dx, 0x3000
+            0x89, 0x06, 0x00, 0x01, // mov [0x0100], ax
+            0xf4, // hlt
+        ];
+        program[0x40..0x51].copy_from_slice(&code);
+        program
+    }
+
+    for (with_relocation, expected_ax) in [(false, 0), (true, 0x1000)] {
+        let program = image(with_relocation);
+        let mut golden = I8086Machine::mz(&program, 0x1000)
+            .unwrap_or_else(|error| panic!("construct golden MZ image: {error}"));
+        assert_eq!(golden.run(100), I8086Stop::Halt);
+        let rtl = eda_cpu_platform::systemverilog::run_i8086_mz(&program, 0x1000)
+            .unwrap_or_else(|error| panic!("execute MZ image in RTL: {error}"));
+        assert!(rtl.halted);
+        assert!(!rtl.trap);
+        assert_eq!(rtl.ax, expected_ax);
+        assert_eq!(rtl.cx, 0x1234);
+        assert_eq!(rtl.dx, 0x3000);
+        assert_eq!(rtl.bx, 0x5678);
+        assert_eq!(rtl.sp, golden.regs[4]);
+        assert_eq!(rtl.ip, golden.ip);
+        assert_eq!(rtl.flags, golden.flags);
+        assert_eq!(
+            rtl.memory.read_le_u16(0x10100),
+            golden.memory.read_le_u16(0x10100)
+        );
+    }
+}
+
+#[test]
 fn checked_in_elf_runs_on_systemverilog_core() {
     let program = include_bytes!("../../../platform/programs/rv32i_exit42.elf");
     let mut golden = Rv32iMachine::load_elf(program, &[]).expect("golden ELF loader");

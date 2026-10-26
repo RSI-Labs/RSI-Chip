@@ -8,6 +8,7 @@ use eda_core::ir::Design;
 use eda_core::logic::LogicWord;
 use eda_sim::Simulator;
 
+use crate::i8086::I8086Machine;
 use crate::SparseMemory;
 
 const PREFIX: &str = include_str!("../../../platform/rtl/i8086_prefix_decoder.sv");
@@ -46,13 +47,42 @@ pub struct I8086SvRunner {
     design: Design,
 }
 
+struct I8086InitialState {
+    ip: u16,
+    sp: u16,
+    cs: u16,
+    ds: u16,
+    es: u16,
+    ss: u16,
+}
+
+impl I8086InitialState {
+    fn com() -> Self {
+        Self {
+            ip: 0x0100,
+            sp: 0xfffe,
+            cs: 0,
+            ds: 0,
+            es: 0,
+            ss: 0,
+        }
+    }
+
+    fn mz(machine: &I8086Machine) -> Self {
+        Self {
+            ip: machine.ip,
+            sp: machine.regs[crate::i8086::REG_SP],
+            cs: machine.segments[crate::i8086::SEG_CS],
+            ds: machine.segments[crate::i8086::SEG_DS],
+            es: machine.segments[crate::i8086::SEG_ES],
+            ss: machine.segments[crate::i8086::SEG_SS],
+        }
+    }
+}
+
 impl I8086SvRunner {
     pub fn new() -> Result<Self, String> {
-        let testbench = I8086_TB.replace(
-            "parameter INIT_IP = 16'd0;",
-            "parameter INIT_IP = 16'h0100;",
-        );
-        let source = format!("{PREFIX}\n{OPCODE}\n{MODRM}\n{I8086_CORE}\n{testbench}");
+        let source = format!("{PREFIX}\n{OPCODE}\n{MODRM}\n{I8086_CORE}\n{I8086_TB}");
         let design =
             eda_hdl::compile(&source, Some("i8086_full_runtime_tb")).map_err(|e| e.to_string())?;
         Ok(Self { design })
@@ -67,7 +97,12 @@ impl I8086SvRunner {
         initial_memory: SparseMemory,
         simulation_time_budget: u64,
     ) -> Result<I8086SvResult, String> {
-        execute_i8086(&self.design, initial_memory, simulation_time_budget)
+        execute_i8086(
+            &self.design,
+            I8086InitialState::com(),
+            initial_memory,
+            simulation_time_budget,
+        )
     }
 }
 
@@ -96,13 +131,53 @@ pub fn run_i8086_com(program: &[u8]) -> Result<I8086SvResult, String> {
     I8086SvRunner::new()?.run_memory(memory)
 }
 
+pub fn run_i8086_mz(program: &[u8], load_segment: u16) -> Result<I8086SvResult, String> {
+    let golden = I8086Machine::mz(program, load_segment)
+        .map_err(|error| format!("invalid MZ image: {error}"))?;
+    let initial_memory = golden.memory.clone();
+    let source = format!("{PREFIX}\n{OPCODE}\n{MODRM}\n{I8086_CORE}\n{I8086_TB}");
+    let design =
+        eda_hdl::compile(&source, Some("i8086_full_runtime_tb")).map_err(|e| e.to_string())?;
+    execute_i8086(
+        &design,
+        I8086InitialState::mz(&golden),
+        initial_memory,
+        SIMULATION_TIME_BUDGET,
+    )
+}
+
 fn execute_i8086(
     design: &Design,
+    initial_state: I8086InitialState,
     mut memory: SparseMemory,
     simulation_time_budget: u64,
 ) -> Result<I8086SvResult, String> {
     let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
     simulator.set_input("io_rdata", &LogicWord::from_u64(16, 0))?;
+    simulator.set_input(
+        "init_ip",
+        &LogicWord::from_u64(16, u64::from(initial_state.ip)),
+    )?;
+    simulator.set_input(
+        "init_sp",
+        &LogicWord::from_u64(16, u64::from(initial_state.sp)),
+    )?;
+    simulator.set_input(
+        "init_cs",
+        &LogicWord::from_u64(16, u64::from(initial_state.cs)),
+    )?;
+    simulator.set_input(
+        "init_ds",
+        &LogicWord::from_u64(16, u64::from(initial_state.ds)),
+    )?;
+    simulator.set_input(
+        "init_es",
+        &LogicWord::from_u64(16, u64::from(initial_state.es)),
+    )?;
+    simulator.set_input(
+        "init_ss",
+        &LogicWord::from_u64(16, u64::from(initial_state.ss)),
+    )?;
 
     let mut output = Vec::new();
     let mut io_ports = vec![0_u8; u16::MAX as usize + 1];

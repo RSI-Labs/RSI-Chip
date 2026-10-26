@@ -1,6 +1,7 @@
 // Event-driven runtime harness. The host supplies architectural-memory reads
 // and observes bus writes around each rising clock edge.
 module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
+                             init_ip, init_sp, init_cs, init_ds, init_es, init_ss,
                              clock, halted, trap, retired,
                              console_write, console_char,
                              mem_addr, mem_wdata, mem_we, mem_width,
@@ -9,6 +10,12 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   input [15:0] mem_rdata;
   input [15:0] source_rdata;
   input [15:0] io_rdata;
+  input [15:0] init_ip;
+  input [15:0] init_sp;
+  input [15:0] init_cs;
+  input [15:0] init_ds;
+  input [15:0] init_es;
+  input [15:0] init_ss;
   output clock;
   output halted;
   output trap;
@@ -34,8 +41,6 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   output [15:0] di;
   output [15:0] ip;
   output [15:0] flags;
-  parameter INIT_IP = 16'd0;
-  parameter INIT_SP = 16'hfffe;
   reg clk;
   reg rst;
   assign clock = clk;
@@ -55,8 +60,9 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   end
 
   i8086_full_core core(
-    .clk(clk), .rst(rst), .init_ip(INIT_IP), .init_sp(INIT_SP),
-    .init_cs(16'b0), .init_ds(16'b0), .init_es(16'b0), .init_ss(16'b0),
+    .clk(clk), .rst(rst), .init_ip(init_ip), .init_sp(init_sp),
+    .init_cs(init_cs), .init_ds(init_ds), .init_es(init_es),
+    .init_ss(init_ss),
     .mem_rdata(mem_rdata), .mem_addr(mem_addr), .mem_wdata(mem_wdata),
     .mem_we(mem_we), .mem_width(mem_width), .source_rdata(source_rdata),
     .source_addr(source_addr), .io_rdata(io_rdata),

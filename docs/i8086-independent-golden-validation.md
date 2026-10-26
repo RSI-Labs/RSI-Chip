@@ -50,6 +50,7 @@ Covered machine-code families include:
 | Strings and repeat prefixes | Byte/word MOVSB/MOVSW, CMPSB/CMPSW, STOSB/STOSW, LODSB/LODSW, and SCASB/SCASW; REP MOVSW/STOSW/LODSW; REPNE SCASW; forward and DF=1 reverse string operation; CX=0 zero-iteration behavior. |
 | BCD/ASCII adjust | DAA, DAS, AAA, and AAS across no-adjust, low-adjust, and high-adjust inputs with incoming AF/CF states; SAHF/LAHF load and log each architectural result and flag word. |
 | I/O and interrupts | Immediate and DX-indexed byte/word IN/OUT with a host-backed 64 KiB port file; vectored INT, INT3, and INTO with FLAGS/CS/IP stacking and IRET return. |
+| MZ loader | Relocatable and non-relocatable MZ images at load segment `0x1000`, including CS/IP/SS/SP/DS/ES initialization, relocation patching, code execution, and data stores. |
 
 The control-flow lane also uses forward branches over an ALU mutation so both
 taken and untaken paths remain architectural and observable.
@@ -139,7 +140,8 @@ The independent lane exposed the following machine-code correctness defects:
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add interrupt-controller IRQ/NMI behavior and full MZ/COM loader coverage.
+2. Add interrupt-controller IRQ/NMI behavior and broader MZ header/relocation
+   edge cases beyond the current two-image differential.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz
