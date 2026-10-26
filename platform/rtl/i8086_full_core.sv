@@ -407,7 +407,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       unary_flags = {
         flags[15:12], 1'b0, flags[10:8], unary_result_sign,
         (unary_result & (execute_width8 ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], 1'b0, parity_even(unary_result), flags[1], 1'b0
+        flags[5], 1'b0, flags[3], parity_even(unary_result), flags[1], 1'b0
       };
     end else if (modrm_register == 3'd2) begin
       unary_flags = flags;
@@ -417,8 +417,9 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         rm_result_value == (execute_width8 ? 16'h0080 : 16'h8000),
         flags[10:8], unary_result_sign,
         (unary_result & (execute_width8 ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4],
+        flags[5],
         ((rm_result_value ^ unary_result) & 16'h0010) != 0,
+        1'b0,
         parity_even(unary_result), flags[1], rm_result_value != 16'b0
       };
     end else begin
@@ -646,11 +647,12 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       flags[10:8],
       (alu_flag_result & (alu_flag_byte ? 16'h0080 : 16'h8000)) != 0,
       (alu_flag_result & (alu_flag_byte ? 16'h00ff : 16'hffff)) == 0,
-      flags[5:4],
+      flags[5],
       (alu_flag_operation == 3'd1 || alu_flag_operation == 3'd4 ||
        alu_flag_operation == 3'd6)
         ? 1'b0
         : ((alu_flag_a ^ alu_flag_b ^ alu_flag_result) & 16'h0010) != 0,
+      1'b0,
       parity_even(alu_flag_result),
       flags[1],
       alu_flag_preserve_carry ? flags[0] :
@@ -880,7 +882,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
 
   always @* begin
     if (opcode_r == 8'h27) begin
-      if ((al & 8'h0f) > 8'h09 || flags[3]) begin
+      if ((al & 8'h0f) > 8'h09 || flags[4]) begin
         if (al > 8'h99 || flags[0])
           bcd_result = {ah + 8'h01, al + 8'h66};
         else
@@ -890,7 +892,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       else
         bcd_result = {ah, al};
     end else if (opcode_r == 8'h2f) begin
-      if ((al & 8'h0f) > 8'h09 || flags[3]) begin
+      if ((al & 8'h0f) > 8'h09 || flags[4]) begin
         if (al > 8'h99 || flags[0])
           bcd_result = {ah - 8'h01, al - 8'h66};
         else
@@ -900,15 +902,17 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       else
         bcd_result = {ah, al};
     end else if (opcode_r == 8'h37) begin
-      if ((al & 8'h0f) > 8'h09 || flags[3])
-        bcd_result = {(ax + 16'h0106) >> 8, (ax + 16'h0106) & 16'h000f};
+      if ((al & 8'h0f) > 8'h09 || flags[4])
+        bcd_result = (((ax + 16'h0106) >> 8) & 16'h00ff) |
+                     ((ax + 16'h0106) & 16'h000f);
       else
-        bcd_result = {ah, 4'b0000};
+        bcd_result = (ax & 16'hff00) | (ax & 16'h000f);
     end else if (opcode_r == 8'h3f) begin
-      if ((al & 8'h0f) > 8'h09 || flags[3])
-        bcd_result = {(ax - 16'h0106) >> 8, (ax - 16'h0106) & 16'h000f};
+      if ((al & 8'h0f) > 8'h09 || flags[4])
+        bcd_result = (((ax - 16'h0106) >> 8) & 16'h00ff) |
+                     ((ax - 16'h0106) & 16'h000f);
       else
-        bcd_result = {ah, 4'b0000};
+        bcd_result = (ax & 16'hff00) | (ax & 16'h000f);
     end else
       bcd_result = ax;
   end
@@ -921,16 +925,17 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         flags[10:8],
         bcd_result[7],
         bcd_result[7:0] == 8'h00,
-        flags[5:4],
-        (al & 8'h0f) > 8'h09 || flags[3],
+        flags[5],
+        (al & 8'h0f) > 8'h09 || flags[4],
+        flags[3],
         parity_even(bcd_result[7:0]),
-        flags[2:1],
+        flags[1],
         al > 8'h99 || flags[0]
       };
     end else if (opcode_r == 8'h37 || opcode_r == 8'h3f) begin
       bcd_flags = flags;
-      bcd_flags[3] = (al & 8'h0f) > 8'h09 || flags[3];
-      bcd_flags[0] = (al & 8'h0f) > 8'h09 || flags[3];
+      bcd_flags[4] = (al & 8'h0f) > 8'h09 || flags[4];
+      bcd_flags[0] = (al & 8'h0f) > 8'h09 || flags[4];
     end else
       bcd_flags = flags;
   end

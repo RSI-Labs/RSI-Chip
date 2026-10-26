@@ -16,7 +16,7 @@ pub const SEG_DS: usize = 3;
 
 pub const FLAG_CF: u16 = 1 << 0;
 pub const FLAG_PF: u16 = 1 << 2;
-pub const FLAG_AF: u16 = 1 << 3;
+pub const FLAG_AF: u16 = 1 << 4;
 pub const FLAG_ZF: u16 = 1 << 6;
 pub const FLAG_SF: u16 = 1 << 7;
 pub const FLAG_TF: u16 = 1 << 8;
@@ -1347,7 +1347,9 @@ impl I8086Machine {
         }
         if old_al > 0x99 || self.get_flag(FLAG_CF) {
             al = al.wrapping_add(0x60);
+            let ah = (self.regs[REG_AX] >> 8) as u8;
             self.set_flag(FLAG_CF, true);
+            self.set_reg8(4, ah.wrapping_add(1));
         } else {
             self.set_flag(FLAG_CF, false);
         }
@@ -1369,7 +1371,9 @@ impl I8086Machine {
         }
         if old_al > 0x99 || self.get_flag(FLAG_CF) {
             al = al.wrapping_sub(0x60);
+            let ah = (self.regs[REG_AX] >> 8) as u8;
             self.set_flag(FLAG_CF, true);
+            self.set_reg8(4, ah.wrapping_sub(1));
         } else {
             self.set_flag(FLAG_CF, false);
         }
@@ -1392,8 +1396,7 @@ impl I8086Machine {
     fn aas(&mut self) {
         let should_adjust = self.regs[REG_AX] as u8 & 0x0f > 9 || self.get_flag(FLAG_AF);
         if should_adjust {
-            self.regs[REG_AX] = self.regs[REG_AX].wrapping_sub(6);
-            self.regs[REG_AX] = (self.regs[REG_AX] & 0xff00).wrapping_sub(0x100);
+            self.regs[REG_AX] = self.regs[REG_AX].wrapping_sub(0x106);
         }
         self.set_flag(FLAG_AF, should_adjust);
         self.set_flag(FLAG_CF, should_adjust);

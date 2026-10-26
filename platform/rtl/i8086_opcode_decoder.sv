@@ -154,6 +154,9 @@ module i8086_opcode_decoder(opcode, modrm, valid, opcode_class, width8,
         has_modrm_r = 1'b1;
         width8_r = ~opcode[0];
       end
+    else if (opcode == 8'h27 || opcode == 8'h2f ||
+             opcode == 8'h37 || opcode == 8'h3f)
+      begin class_r = CLASS_BCD_ADJUST; end
     else if (opcode >= 8'hd4 && opcode <= 8'hd7)
       begin
         class_r = CLASS_BCD_ADJUST;

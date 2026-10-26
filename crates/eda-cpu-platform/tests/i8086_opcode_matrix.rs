@@ -304,6 +304,46 @@ fn deterministic_i8086_control_flow_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_bcd_adjust_matrix_matches_golden_model() {
+    let values = [0_u16; 8];
+    let flag_cases = [0x0202_u16, 0x0212, 0x0203];
+    let operands = [0x00_u8, 0x0a, 0x99];
+
+    fn program_for(opcode: u8, flag_cases: &[u16], operands: &[u8]) -> Vec<u8> {
+        let mut operations = Vec::new();
+        let mut log_address = 0x3300_u16;
+        for flags in flag_cases {
+            for al in operands {
+                operations.extend_from_slice(&[0xb4, *flags as u8, 0x9e]); // mov ah, flags; sahf
+                operations.extend_from_slice(&[0xb8, *al, 0x05]); // mov ax, 0x05al
+                operations.push(opcode);
+                operations.extend_from_slice(&[0xa3]);
+                operations.extend_from_slice(&log_address.to_le_bytes());
+                operations.push(0x9f); // lahf
+                operations.extend_from_slice(&[0xa2]);
+                operations.extend_from_slice(&(log_address + 2).to_le_bytes());
+                log_address += 4;
+            }
+        }
+        operations
+    }
+
+    for (opcode, context) in [
+        (0x27_u8, "DAA matrix"),
+        (0x2f, "DAS matrix"),
+        (0x37, "AAA matrix"),
+        (0x3f, "AAS matrix"),
+    ] {
+        let operations = program_for(opcode, &flag_cases, &operands);
+        assert_matches_golden_with_event_budget(
+            &initial_program(values, &operations),
+            context,
+            500_000,
+        );
+    }
+}
+
+#[test]
 fn deterministic_i8086_string_and_repeat_matrix_matches_golden_model() {
     let values = [
         0x1234_u16, 0x0000, 0x0000, 0x0000, 0xfffe, 0, 0x2000, 0x2100,

@@ -7,7 +7,7 @@ const DS: usize = 3;
 
 const CF: u16 = 1 << 0;
 const PF: u16 = 1 << 2;
-const AF: u16 = 1 << 3;
+const AF: u16 = 1 << 4;
 const ZF: u16 = 1 << 6;
 const SF: u16 = 1 << 7;
 const IF: u16 = 1 << 9;
@@ -201,6 +201,10 @@ impl ReferenceI8086 {
             0x1f => {
                 self.segments[DS] = self.pop()?;
             }
+            0x27 => self.decimal_adjust_after_add(),
+            0x2f => self.decimal_adjust_after_subtract(),
+            0x37 => self.ascii_adjust_after_add(),
+            0x3f => self.ascii_adjust_after_subtract(),
             0x70..=0x7f => {
                 let displacement = (self.fetch8() as i8) as u16;
                 if self.condition(opcode & 0x0f) {
@@ -214,6 +218,14 @@ impl ReferenceI8086 {
             }
             0x9d => {
                 self.flags = self.pop()?;
+            }
+            0x9e => {
+                let low = self.register8(4);
+                self.flags = (self.flags & 0xff00) | u16::from(low);
+            }
+            0x9f => {
+                let low = self.flags as u8;
+                self.write(Location::Register(4, 8), 8, u16::from(low))?;
             }
             0xa4..=0xa7 | 0xaa..=0xaf => {
                 self.string_operation(opcode, override_segment, repeat)?;
@@ -283,10 +295,6 @@ impl ReferenceI8086 {
             0xcb => {
                 self.instruction_pointer = self.pop()?;
                 self.segments[CS] = self.pop()?;
-            }
-            0x9f => {
-                let low = self.flags as u8;
-                self.write(Location::Register(4, 8), 8, u16::from(low))?;
             }
             0xc0 | 0xc1 | 0xd2 | 0xd3 => {
                 let width = if opcode == 0xc0 || opcode == 0xd2 {
@@ -416,6 +424,80 @@ impl ReferenceI8086 {
             0xe => self.flag(ZF) || self.flag(SF) != self.flag(OF),
             _ => !self.flag(ZF) && self.flag(SF) == self.flag(OF),
         }
+    }
+
+    fn decimal_adjust_after_add(&mut self) {
+        let old_al = self.register8(0);
+        let old_cf = self.flag(CF);
+        let mut al = old_al;
+        let adjust_low = al & 0x0f > 9 || self.flag(AF);
+        if adjust_low {
+            al = al.wrapping_add(6);
+        }
+        let adjust_high = old_al > 0x99 || old_cf;
+        if adjust_high {
+            al = al.wrapping_add(0x60);
+            let ah = self.register8(4).wrapping_add(1);
+            self.write(Location::Register(4, 8), 8, u16::from(ah))
+                .expect("write DAA AH");
+        }
+        self.write(Location::Register(0, 8), 8, u16::from(al))
+            .expect("write DAA AL");
+        self.set_flag(AF, adjust_low);
+        self.set_flag(CF, adjust_high);
+        self.set_flag(SF, al & 0x80 != 0);
+        self.set_flag(ZF, al == 0);
+        self.set_flag(PF, al.count_ones().is_multiple_of(2));
+    }
+
+    fn decimal_adjust_after_subtract(&mut self) {
+        let old_al = self.register8(0);
+        let old_cf = self.flag(CF);
+        let mut al = old_al;
+        let adjust_low = al & 0x0f > 9 || self.flag(AF);
+        if adjust_low {
+            al = al.wrapping_sub(6);
+        }
+        let adjust_high = old_al > 0x99 || old_cf;
+        if adjust_high {
+            al = al.wrapping_sub(0x60);
+            let ah = self.register8(4).wrapping_sub(1);
+            self.write(Location::Register(4, 8), 8, u16::from(ah))
+                .expect("write DAS AH");
+        }
+        self.write(Location::Register(0, 8), 8, u16::from(al))
+            .expect("write DAS AL");
+        self.set_flag(AF, adjust_low);
+        self.set_flag(CF, adjust_high);
+        self.set_flag(SF, al & 0x80 != 0);
+        self.set_flag(ZF, al == 0);
+        self.set_flag(PF, al.count_ones().is_multiple_of(2));
+    }
+
+    fn ascii_adjust_after_add(&mut self) {
+        let should_adjust = self.register8(0) & 0x0f > 9 || self.flag(AF);
+        if should_adjust {
+            let ax = self.registers[0].wrapping_add(0x106);
+            self.registers[0] = ax;
+        }
+        let al = self.register8(0) & 0x0f;
+        self.write(Location::Register(0, 8), 8, u16::from(al))
+            .expect("write AAA AL");
+        self.set_flag(AF, should_adjust);
+        self.set_flag(CF, should_adjust);
+    }
+
+    fn ascii_adjust_after_subtract(&mut self) {
+        let should_adjust = self.register8(0) & 0x0f > 9 || self.flag(AF);
+        if should_adjust {
+            let ax = self.registers[0].wrapping_sub(0x106);
+            self.registers[0] = ax;
+        }
+        let al = self.register8(0) & 0x0f;
+        self.write(Location::Register(0, 8), 8, u16::from(al))
+            .expect("write AAS AL");
+        self.set_flag(AF, should_adjust);
+        self.set_flag(CF, should_adjust);
     }
 
     fn string_operation(

@@ -2,7 +2,8 @@
 
 This record describes the current machine-code differential evidence for the
 8086 execution lanes. It is scoped to the tested integer, data-movement,
-ModRM, flag, shift/rotate, and unary groups; it does not claim a complete
+ModRM, flag, shift/rotate, unary, stack/control, string, and BCD groups; it
+does not claim a complete
 8086 instruction set, interrupt controller, peripheral, DOS/BIOS, or ELF/MZ
 loader oracle.
 
@@ -47,6 +48,7 @@ Covered machine-code families include:
 | Flag control | CMC, CLC, STC, CLI, STI, CLD, STD, and LAHF as exercised by the matrices. |
 | Stack and control flow | PUSH/POP GPRs and segment registers, PUSHF/POPF, near CALL/RET, direct far CALL, RETF, RETF imm16, all short conditional-jump predicates, JCXZ, LOOP, short JMP, and near JMP. |
 | Strings and repeat prefixes | Byte/word MOVSB/MOVSW, CMPSB/CMPSW, STOSB/STOSW, LODSB/LODSW, and SCASB/SCASW; REP MOVSW/STOSW/LODSW; REPNE SCASW; forward and DF=1 reverse string operation; CX=0 zero-iteration behavior. |
+| BCD/ASCII adjust | DAA, DAS, AAA, and AAS across no-adjust, low-adjust, and high-adjust inputs with incoming AF/CF states; SAHF/LAHF load and log each architectural result and flag word. |
 
 The control-flow lane also uses forward branches over an ALU mutation so both
 taken and untaken paths remain architectural and observable.
@@ -56,7 +58,7 @@ Directed result:
 ```text
 cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized
 
-19 passed, 0 failed, 297.46 seconds
+20 passed, 0 failed, 552.48 seconds
 ```
 
 ## Deterministic randomized differential
@@ -89,10 +91,10 @@ Fuzz chunk results:
 
 | Seeds | Result | Time |
 | ---: | --- | ---: |
-| 0–7 | 1 passed, 0 failed | 628.30 s |
-| 8–15 | 1 passed, 0 failed | 633.55 s |
-| 16–23 | 1 passed, 0 failed | 604.87 s |
-| 24–31 | 1 passed, 0 failed | 623.33 s |
+| 0–7 | 1 passed, 0 failed | 777.59 s |
+| 8–15 | 1 passed, 0 failed | 784.29 s |
+| 16–23 | 1 passed, 0 failed | 748.78 s |
+| 24–31 | 1 passed, 0 failed | 767.64 s |
 
 ## Defects exposed and fixed
 
@@ -118,13 +120,21 @@ The independent lane exposed the following machine-code correctness defects:
 8. Direct far CALL pushed the newly selected target CS instead of the caller's
    CS, so RETF returned to the target routine rather than the caller and could
    loop until the event budget expired. RTL now saves both caller CS and IP.
+9. AF was represented at bit 3 instead of ISA bit 4 in the built-in model and
+   RTL.
+10. Built-in DAA/DAS did not increment/decrement AH on the high decimal
+    adjustment.
+11. The RTL opcode decoder rejected DAA/DAS/AAA/AAS machine-code forms.
+12. RTL BCD flag packing duplicated PF into the upper flag slice and shifted
+    the resulting flag word.
+13. RTL AAA/AAS concatenation widths truncated/misplaced the adjusted AX value.
+14. Built-in AAS subtracted in two steps and discarded the adjusted low nibble.
 
 ## Remaining gaps
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add interrupts, I/O, BCD adjust, indirect far calls, and full MZ/COM loader
-   coverage.
+2. Add interrupts, I/O, indirect far calls, and full MZ/COM loader coverage.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz
