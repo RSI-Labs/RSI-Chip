@@ -10,6 +10,7 @@ const PF: u16 = 1 << 2;
 const AF: u16 = 1 << 4;
 const ZF: u16 = 1 << 6;
 const SF: u16 = 1 << 7;
+const TF: u16 = 1 << 8;
 const IF: u16 = 1 << 9;
 const DF: u16 = 1 << 10;
 const OF: u16 = 1 << 11;
@@ -29,6 +30,7 @@ enum Location {
 /// helper functions; it does not call `I8086Machine` or share its lowering code.
 pub struct ReferenceI8086 {
     memory: Vec<u8>,
+    io_ports: Vec<u8>,
     registers: [u16; 8],
     segments: [u16; 4],
     instruction_pointer: u16,
@@ -45,8 +47,10 @@ impl ReferenceI8086 {
         }
         let mut registers = [0; 8];
         registers[4] = 0xfffe;
+        let io_ports = vec![0; u16::MAX as usize + 1];
         Self {
             memory,
+            io_ports,
             registers,
             segments: [0; 4],
             instruction_pointer: 0x0100,
@@ -286,6 +290,7 @@ impl ReferenceI8086 {
                 };
                 self.write(destination, width, immediate)?;
             }
+            0xcc => self.take_interrupt(3)?,
             0xca => {
                 let adjustment = self.fetch16();
                 self.instruction_pointer = self.pop()?;
@@ -295,6 +300,20 @@ impl ReferenceI8086 {
             0xcb => {
                 self.instruction_pointer = self.pop()?;
                 self.segments[CS] = self.pop()?;
+            }
+            0xcd => {
+                let vector = self.fetch8();
+                self.take_interrupt(vector)?;
+            }
+            0xce => {
+                if self.flag(OF) {
+                    self.take_interrupt(4)?;
+                }
+            }
+            0xcf => {
+                self.instruction_pointer = self.pop()?;
+                self.segments[CS] = self.pop()?;
+                self.flags = self.pop()?;
             }
             0xc0 | 0xc1 | 0xd2 | 0xd3 => {
                 let width = if opcode == 0xc0 || opcode == 0xd2 {
@@ -338,6 +357,28 @@ impl ReferenceI8086 {
                     self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
                 }
             }
+            0xe4 => {
+                let port = u16::from(self.fetch8());
+                let value = self.io_port(port);
+                self.write(Location::Register(0, 8), 8, u16::from(value))?;
+            }
+            0xe5 => {
+                let port = u16::from(self.fetch8());
+                let value =
+                    u16::from(self.io_port(port)) | (u16::from(self.io_port(port + 1)) << 8);
+                self.write(Location::Register(0, 0), 16, value)?;
+            }
+            0xe6 => {
+                let port = u16::from(self.fetch8());
+                let value = self.register8(0);
+                self.write_io_port(port, value);
+            }
+            0xe7 => {
+                let port = u16::from(self.fetch8());
+                let value = self.registers[0];
+                self.write_io_port(port, value as u8);
+                self.write_io_port(port + 1, (value >> 8) as u8);
+            }
             0xe8 => {
                 let displacement = self.fetch16();
                 let return_ip = self.instruction_pointer;
@@ -351,6 +392,28 @@ impl ReferenceI8086 {
             0xeb => {
                 let displacement = (self.fetch8() as i8) as u16;
                 self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+            }
+            0xec => {
+                let port = self.registers[2];
+                let value = self.io_port(port);
+                self.write(Location::Register(0, 8), 8, u16::from(value))?;
+            }
+            0xed => {
+                let port = self.registers[2];
+                let value =
+                    u16::from(self.io_port(port)) | (u16::from(self.io_port(port + 1)) << 8);
+                self.write(Location::Register(0, 0), 16, value)?;
+            }
+            0xee => {
+                let port = self.registers[2];
+                let value = self.register8(0);
+                self.write_io_port(port, value);
+            }
+            0xef => {
+                let port = self.registers[2];
+                let value = self.registers[0];
+                self.write_io_port(port, value as u8);
+                self.write_io_port(port + 1, (value >> 8) as u8);
             }
             0x9a => {
                 let offset = self.fetch16();
@@ -424,6 +487,23 @@ impl ReferenceI8086 {
             0xe => self.flag(ZF) || self.flag(SF) != self.flag(OF),
             _ => !self.flag(ZF) && self.flag(SF) == self.flag(OF),
         }
+    }
+
+    fn take_interrupt(&mut self, vector: u8) -> Result<(), String> {
+        let address = u32::from(vector) * 4;
+        let offset = self.read(Location::Memory(DS, address as u16), 16)?;
+        let segment = self.read(Location::Memory(DS, address.wrapping_add(2) as u16), 16)?;
+        let flags = self.flags;
+        let code_segment = self.segments[CS];
+        let instruction_pointer = self.instruction_pointer;
+        self.push(flags)?;
+        self.push(code_segment)?;
+        self.push(instruction_pointer)?;
+        self.set_flag(IF, false);
+        self.set_flag(TF, false);
+        self.segments[CS] = segment;
+        self.instruction_pointer = offset;
+        Ok(())
     }
 
     fn decimal_adjust_after_add(&mut self) {
@@ -701,6 +781,14 @@ impl ReferenceI8086 {
 
     fn physical(&self, segment: usize, offset: u16) -> u32 {
         ((u32::from(self.segments[segment]) << 4).wrapping_add(u32::from(offset))) & 0xff_ffff
+    }
+
+    fn io_port(&self, port: u16) -> u8 {
+        self.io_ports[port as usize]
+    }
+
+    fn write_io_port(&mut self, port: u16, value: u8) {
+        self.io_ports[port as usize] = value;
     }
 
     fn flag(&self, flag: u16) -> bool {

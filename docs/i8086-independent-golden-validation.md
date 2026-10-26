@@ -49,6 +49,7 @@ Covered machine-code families include:
 | Stack and control flow | PUSH/POP GPRs and segment registers, PUSHF/POPF, near CALL/RET, direct far CALL, RETF, RETF imm16, all short conditional-jump predicates, JCXZ, LOOP, short JMP, and near JMP. |
 | Strings and repeat prefixes | Byte/word MOVSB/MOVSW, CMPSB/CMPSW, STOSB/STOSW, LODSB/LODSW, and SCASB/SCASW; REP MOVSW/STOSW/LODSW; REPNE SCASW; forward and DF=1 reverse string operation; CX=0 zero-iteration behavior. |
 | BCD/ASCII adjust | DAA, DAS, AAA, and AAS across no-adjust, low-adjust, and high-adjust inputs with incoming AF/CF states; SAHF/LAHF load and log each architectural result and flag word. |
+| I/O and interrupts | Immediate and DX-indexed byte/word IN/OUT with a host-backed 64 KiB port file; a vectored INT with FLAGS/CS/IP stacking and IRET return. |
 
 The control-flow lane also uses forward branches over an ALU mutation so both
 taken and untaken paths remain architectural and observable.
@@ -58,7 +59,7 @@ Directed result:
 ```text
 cargo test -p eda-cpu-platform --test i8086_opcode_matrix -- --skip randomized
 
-20 passed, 0 failed, 552.48 seconds
+22 passed, 0 failed, 631.34 seconds
 ```
 
 ## Deterministic randomized differential
@@ -129,12 +130,17 @@ The independent lane exposed the following machine-code correctness defects:
     the resulting flag word.
 13. RTL AAA/AAS concatenation widths truncated/misplaced the adjusted AX value.
 14. Built-in AAS subtracted in two steps and discarded the adjusted low nibble.
+15. The SystemVerilog runtime testbench did not expose the core's I/O write
+    data bus. OUT writes were therefore invisible to the host runtime and a
+    subsequent IN read zero. The testbench now exposes `io_wdata`, and the host
+    runtime maintains a 64 KiB little-endian port file.
 
 ## Remaining gaps
 
 1. Add a full external machine-code oracle or a broader spec-derived reference
    for opcodes outside the current matrices.
-2. Add interrupts, I/O, indirect far calls, and full MZ/COM loader coverage.
+2. Add INT3, INTO, interrupt-controller IRQ/NMI behavior, indirect far calls,
+   and full MZ/COM loader coverage.
 3. Compare instruction timings only after defining an authoritative 8086 timing
    source; current tests compare retired instruction count, not cycles.
 4. Extend memory comparisons beyond the directed one-megabyte space and fuzz

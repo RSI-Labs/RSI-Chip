@@ -105,10 +105,20 @@ fn execute_i8086(
     simulator.set_input("io_rdata", &LogicWord::from_u64(16, 0))?;
 
     let mut output = Vec::new();
+    let mut io_ports = vec![0_u8; u16::MAX as usize + 1];
     for time in 0..simulation_time_budget {
         let clock = output_bool(&simulator, "clock")?;
         let mem_address = bus_u64(&simulator, "mem_addr")? as u32;
         let source_address = bus_u64(&simulator, "source_addr")? as u32;
+        let io_address = bus_u64(&simulator, "io_addr")? as u16;
+        simulator.set_input(
+            "io_rdata",
+            &LogicWord::from_u64(
+                16,
+                u64::from(io_ports[io_address as usize])
+                    | (u64::from(io_ports[io_address.wrapping_add(1) as usize]) << 8),
+            ),
+        )?;
         simulator.set_input(
             "mem_rdata",
             &LogicWord::from_u64(16, u64::from(memory.read_le_u16(mem_address))),
@@ -122,6 +132,10 @@ fn execute_i8086(
         let write_address = mem_address;
         let write_value = bus_u64(&simulator, "mem_wdata")? as u16;
         let write_byte = bus_u64(&simulator, "mem_width")? == 0;
+        let pending_io_write = bus_u64(&simulator, "io_we")? == 1;
+        let io_write_address = io_address;
+        let io_write_value = bus_u64(&simulator, "io_wdata")? as u16;
+        let io_write_byte = bus_u64(&simulator, "io_width")? == 0;
 
         simulator.run_until(time + 1)?;
         let clock_now = output_bool(&simulator, "clock")?;
@@ -132,6 +146,23 @@ fn execute_i8086(
                 } else {
                     memory.write_le_u16(write_address, write_value);
                 }
+            }
+            if pending_io_write {
+                if io_write_byte {
+                    io_ports[io_write_address as usize] = io_write_value as u8;
+                } else {
+                    io_ports[io_write_address as usize] = io_write_value as u8;
+                    io_ports[io_write_address.wrapping_add(1) as usize] =
+                        (io_write_value >> 8) as u8;
+                }
+                simulator.set_input(
+                    "io_rdata",
+                    &LogicWord::from_u64(
+                        16,
+                        u64::from(io_ports[io_write_address as usize])
+                            | (u64::from(io_ports[io_write_address.wrapping_add(1) as usize]) << 8),
+                    ),
+                )?;
             }
             supply_i8086_reads(&mut simulator, &memory)?;
             if output_bool(&simulator, "console_write")? {

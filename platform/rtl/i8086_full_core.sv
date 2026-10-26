@@ -4,7 +4,7 @@
 module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, init_ss,
                        mem_rdata, mem_addr, mem_wdata, mem_we, mem_width,
                        source_rdata, source_addr,
-                       io_rdata, io_addr, io_we, io_width,
+                       io_rdata, io_addr, io_we, io_width, io_wdata,
                        console_write, console_char,
                        irq, nmi, interrupt_vector, interrupt_ack,
                        halted, trap, instructions_retired,
@@ -29,6 +29,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   output [15:0] io_addr;
   output io_we;
   output [2:0] io_width;
+  output [15:0] io_wdata;
   output console_write;
   output [7:0] console_char;
   input irq;
@@ -1889,6 +1890,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   assign io_addr = execute_io_addr;
   assign io_we = state == S_EXECUTE && execute_io_we;
   assign io_width = execute_io_width;
+  assign io_wdata = execute_io_wdata;
   assign console_write = console_write_r || (state == S_DOS_PRINT && mem_rdata[7:0] != 8'h24);
   assign console_char = state == S_DOS_PRINT ? mem_rdata[7:0] : console_char_r;
   assign interrupt_ack = state == S_INT_PUSH_FLAGS ||

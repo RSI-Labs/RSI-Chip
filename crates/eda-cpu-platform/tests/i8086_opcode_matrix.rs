@@ -344,6 +344,61 @@ fn deterministic_i8086_bcd_adjust_matrix_matches_golden_model() {
 }
 
 #[test]
+fn deterministic_i8086_port_io_matrix_matches_golden_model() {
+    let values = [0x1234_u16, 0x0000, 0x0060, 0x0000, 0xfffe, 0, 0, 0];
+    let operations = [
+        0xe6, 0x20, // out 0x20, al
+        0xb0, 0x00, // mov al, 0
+        0xe4, 0x20, // in al, 0x20
+        0xe7, 0x21, // out 0x21, ax
+        0xb8, 0x00, 0x00, // mov ax, 0
+        0xe5, 0x21, // in ax, 0x21
+        0xee, // out dx, al
+        0xb0, 0x00, // mov al, 0
+        0xec, // in al, dx
+        0xef, // out dx, ax
+        0xb8, 0x00, 0x00, // mov ax, 0
+        0xed, // in ax, dx
+    ];
+    let rtl = assert_matches_golden(&initial_program(values, &operations), "port-I/O matrix");
+    assert_eq!(rtl.ax, 0x1234);
+}
+
+#[test]
+fn deterministic_i8086_interrupt_and_iret_matrix_matches_golden_model() {
+    let values = [0_u16, 0, 0, 0, 0xfffe, 0, 0, 0];
+    let mut executable = Vec::new();
+    for (register, value) in values.iter().enumerate() {
+        executable.extend_from_slice(&[0xb8 + register as u8, *value as u8, (*value >> 8) as u8]);
+    }
+
+    // Install handlers for vector 3 (INT3), vector 4 (INTO), and vector 0x40.
+    let (vector, handler_offset) = (0x50_u8, 0x0300_u16);
+    let vector_address = u32::from(vector) * 4;
+    executable.extend_from_slice(&[0xb8]);
+    executable.extend_from_slice(&handler_offset.to_le_bytes());
+    executable.extend_from_slice(&[0xa3]);
+    executable.extend_from_slice(&(vector_address as u16).to_le_bytes());
+    executable.extend_from_slice(&[0xb8, 0x00, 0x00]); // segment 0
+    executable.extend_from_slice(&[0xa3]);
+    executable.extend_from_slice(&(vector_address as u16 + 2).to_le_bytes());
+
+    executable.extend_from_slice(&[
+        0xcd, 0x50, // int 0x50
+    ]);
+    executable.push(0xf4); // hlt after all handlers return
+
+    // The COM image starts at 0x0100. Place handlers at exact addresses.
+    executable.resize(0x0200, 0x90);
+    executable.extend_from_slice(&[0xbf, 0x2c, 0x00, 0xcf]); // INT 0x50 handler
+
+    let rtl = assert_matches_golden(&executable, "interrupt/IRET matrix");
+    assert_eq!(rtl.bx, 0x0000);
+    assert_eq!(rtl.di, 0x2c);
+    assert_eq!(rtl.sp, 0xfffe);
+}
+
+#[test]
 fn deterministic_i8086_string_and_repeat_matrix_matches_golden_model() {
     let values = [
         0x1234_u16, 0x0000, 0x0000, 0x0000, 0xfffe, 0, 0x2000, 0x2100,

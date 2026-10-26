@@ -4,7 +4,7 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
                              clock, halted, trap, retired,
                              console_write, console_char,
                              mem_addr, mem_wdata, mem_we, mem_width,
-                             source_addr, io_addr, io_we, io_width,
+                             source_addr, io_addr, io_we, io_width, io_wdata,
                              ax, cx, dx, bx, sp, bp, si, di, ip, flags);
   input [15:0] mem_rdata;
   input [15:0] source_rdata;
@@ -23,6 +23,7 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   output [15:0] io_addr;
   output io_we;
   output [2:0] io_width;
+  output [15:0] io_wdata;
   output [15:0] ax;
   output [15:0] cx;
   output [15:0] dx;
@@ -60,6 +61,7 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
     .mem_we(mem_we), .mem_width(mem_width), .source_rdata(source_rdata),
     .source_addr(source_addr), .io_rdata(io_rdata),
     .io_addr(io_addr), .io_we(io_we), .io_width(io_width),
+    .io_wdata(io_wdata),
     .console_write(console_write), .console_char(console_char),
     .irq(1'b0), .nmi(1'b0), .interrupt_vector(8'b0), .interrupt_ack(),
     .halted(halted), .trap(trap), .instructions_retired(retired),
