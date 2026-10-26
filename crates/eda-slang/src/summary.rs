@@ -14,6 +14,7 @@ use expressions::{
 
 mod classes;
 mod expressions;
+mod memory_files;
 mod patterns;
 mod tasks;
 mod validation;
@@ -1997,6 +1998,7 @@ impl SlangAstSummary {
         collect_simple_function_definitions(&document, false, &mut simple_functions);
         canonicalize_simple_function_calls(&mut root, &simple_functions);
         tasks::canonicalize_simple_task_calls(&document, &mut root);
+        memory_files::canonicalize_memory_file_reads(&mut root)?;
         let mut global_class_properties = std::collections::BTreeMap::new();
         classes::collect_global_class_properties(&document, &mut global_class_properties);
         let simple_instance_methods =

@@ -8350,6 +8350,44 @@ endmodule
     );
     assert_eq!(reference.initials.len(), 1);
 
+    let memory_file_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("readmem"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize memory-file AST");
+    let mut memory_file_summary = slang
+        .summarize_ast_json(&memory_file_json)
+        .expect("summarize memory-file AST");
+    memory_file_summary
+        .validate_against_design(&design)
+        .expect("exact memory-file fingerprints should match");
+    if let Some(assignment) = memory_file_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "mem")
+                    && assignment.rhs.literal.as_deref() == Some("8:00000001")
+            })
+        })
+    {
+        assignment.rhs.literal = Some("8:11111111".into());
+    }
+    let wrong_memory_file_error = memory_file_summary
+        .validate_against_design(&design)
+        .expect_err("wrong memory-file value must fail");
+    assert!(
+        wrong_memory_file_error.contains("Const:8:u[8:11111111]")
+            && wrong_memory_file_error.contains("Const:8:u[8:00000001]"),
+        "unexpected memory-file error: {wrong_memory_file_error}"
+    );
+
     let mut simulator = Simulator::new(&design).expect("create memory-file simulator");
     simulator
         .run_until(0)

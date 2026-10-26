@@ -578,7 +578,12 @@ impl SlangAstSummary {
                                             return Err(error + &self.span_note("procedural:"));
                                         }
                                     }
-                                    None => "?".to_string(),
+                                    None => {
+                                        let error = format!(
+                                            "procedural expression for '{target}' has no exact fingerprint"
+                                        );
+                                        return Err(error + &self.span_note("procedural:"));
+                                    }
                                 }
                             }
                         };

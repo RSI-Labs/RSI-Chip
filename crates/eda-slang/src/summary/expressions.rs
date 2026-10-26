@@ -786,16 +786,8 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
 pub(crate) fn contains_expected_shapes(actual: &[String], expected: &[String]) -> bool {
     let mut remaining = actual.to_vec();
     for shape in expected {
-        let index = if shape == "?" {
-            if remaining.is_empty() {
-                return false;
-            }
-            0
-        } else {
-            let Some(index) = remaining.iter().position(|candidate| candidate == shape) else {
-                return false;
-            };
-            index
+        let Some(index) = remaining.iter().position(|candidate| candidate == shape) else {
+            return false;
         };
         remaining.swap_remove(index);
     }
