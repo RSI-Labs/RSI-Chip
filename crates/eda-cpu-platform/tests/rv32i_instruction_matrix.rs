@@ -183,6 +183,15 @@ struct IndependentRv32iResult {
     memory: Ram,
 }
 
+struct IndependentRv32iPrivilegedResult {
+    regs: [u32; 32],
+    pc: u32,
+    memory: Ram,
+    mtvec: u32,
+    mepc: u32,
+    mcause: u32,
+}
+
 fn run_independent_rv32i(
     initial_memory: &SparseMemory,
     memory_length: u32,
@@ -255,6 +264,96 @@ fn assert_rtl_matches_independent(
     }
 }
 
+fn run_independent_rv32i_privileged(
+    initial_memory: &SparseMemory,
+    memory_length: u32,
+    halt_pc: u32,
+) -> IndependentRv32iPrivilegedResult {
+    assert_eq!(memory_length % 4, 0);
+    let mut memory = Ram::new(memory_length as usize);
+    for address in 0..memory_length {
+        memory
+            .store8(address, initial_memory.read_u8(address))
+            .expect("initialize independent privileged oracle memory");
+    }
+
+    let mut cpu = Cpu {
+        pc: 0,
+        ..Default::default()
+    };
+    let mut console = Console::default();
+    for _ in 0..100 {
+        if cpu.pc == halt_pc {
+            let _ = exec::step(&mut cpu, &mut memory, &mut console)
+                .expect("step independent privileged oracle EBREAK");
+            assert!(
+                cpu.ebreak_hit,
+                "independent privileged oracle missed EBREAK"
+            );
+            return IndependentRv32iPrivilegedResult {
+                regs: cpu.x,
+                pc: cpu.pc.wrapping_sub(4),
+                memory,
+                mtvec: cpu.mtvec,
+                mepc: cpu.mepc,
+                mcause: cpu.mcause,
+            };
+        }
+
+        // Raven models ECALL as a host syscall. For this bare-metal machine
+        // contract, take the architecturally defined M-mode environment-call
+        // trap here and let Raven execute the CSR/MRET handler instructions.
+        let instruction = memory
+            .fetch32(cpu.pc)
+            .expect("fetch independent privileged oracle instruction");
+        if instruction == 0x0000_0073 {
+            let old_mie = (cpu.mstatus >> 3) & 1;
+            cpu.mstatus =
+                (cpu.mstatus & !((0x3 << 11) | (1 << 7) | (1 << 3))) | (0x3 << 11) | (old_mie << 7);
+            cpu.mepc = cpu.pc;
+            cpu.mcause = 11;
+            cpu.mtval = 0;
+            cpu.pc = cpu.mtvec & !3;
+            continue;
+        }
+
+        let continuing = exec::step(&mut cpu, &mut memory, &mut console)
+            .unwrap_or_else(|error| panic!("independent privileged oracle failed: {error}"));
+        assert!(
+            continuing,
+            "independent privileged oracle stopped unexpectedly"
+        );
+    }
+
+    panic!("independent privileged oracle did not reach EBREAK at {halt_pc:#010x}");
+}
+
+fn assert_rtl_matches_independent_privileged(
+    rtl: &Rv32iSvResult,
+    oracle: &IndependentRv32iPrivilegedResult,
+    memory_length: u32,
+    context: &str,
+) {
+    assert!(rtl.halted, "{context}: RTL did not halt");
+    assert!(
+        rtl.trap && rtl.trap_cause == 3,
+        "{context}: unexpected RTL trap {}",
+        rtl.trap_cause
+    );
+    assert_eq!(rtl.pc, oracle.pc, "{context}: EBREAK PC differs");
+    assert_eq!(
+        rtl.regs, oracle.regs,
+        "{context}: architectural registers differ from independent privileged oracle"
+    );
+    for address in 0..memory_length {
+        assert_eq!(
+            rtl.memory.read_u8(address),
+            oracle.memory.as_bytes()[address as usize],
+            "{context}: memory differs from independent privileged oracle at {address:#010x}"
+        );
+    }
+}
+
 fn assert_matches_golden(golden: &Rv32iMachine, rtl: &Rv32iSvResult) {
     assert_eq!(golden.stop, StopReason::Ebreak);
     assert!(rtl.halted);
@@ -319,6 +418,40 @@ fn rv32i_csr_read_write_modify_matrix_matches_golden_model() {
 }
 
 #[test]
+fn rv32i_machine_csr_matrix_matches_independent_golden_model() {
+    const MTVEC: u32 = 0x305;
+    let program = [
+        0x0000_1137, // lui x2, 0x1
+        addi(3, 0, 0xff),
+        csr(1, 8, 2, MTVEC),  // csrrw
+        csr(2, 9, 3, MTVEC),  // csrrs
+        csr(3, 10, 3, MTVEC), // csrrc
+        csr(1, 0, 0, MTVEC),  // clear
+        ebreak(),
+    ];
+    let mut memory = SparseMemory::new();
+    write_program(&mut memory, &program, 0);
+    let mut golden = Rv32iMachine::baremetal(0, memory.clone());
+    assert_eq!(golden.run(100), StopReason::Ebreak);
+
+    let runner = Rv32iSvRunner::new().expect("compile RV32I runtime");
+    let rtl = runner
+        .run_memory(0, memory.clone())
+        .expect("execute RV32I machine-CSR matrix");
+    assert_matches_golden(&golden, &rtl);
+
+    let halt_pc = (program.len() as u32 - 1) * 4;
+    let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);
+    assert_rtl_matches_independent_privileged(&rtl, &oracle, 0x2000, "machine CSR matrix");
+    assert_eq!(oracle.mtvec, 0, "independent mtvec final value differs");
+    assert_eq!(
+        golden.csrs.get(&MTVEC).copied().unwrap_or(0),
+        oracle.mtvec,
+        "built-in and independent mtvec differ"
+    );
+}
+
+#[test]
 fn rv32i_trap_csr_and_mret_matrix_matches_golden_model() {
     const MTVEC: u32 = 0x305;
     const MEPC: u32 = 0x341;
@@ -344,9 +477,21 @@ fn rv32i_trap_csr_and_mret_matrix_matches_golden_model() {
 
     let runner = Rv32iSvRunner::new().expect("compile RV32I runtime");
     let rtl = runner
-        .run_memory(0, memory)
+        .run_memory(0, memory.clone())
         .expect("execute RV32I trap/mret matrix");
     assert_matches_golden(&golden, &rtl);
+
+    let halt_pc = (main.len() as u32 - 1) * 4;
+    let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);
+    assert_rtl_matches_independent_privileged(&rtl, &oracle, 0x2000, "trap/mret matrix");
+    assert_eq!(oracle.mtvec, 0x1000, "independent trap vector differs");
+    assert_eq!(oracle.mcause, 11, "independent trap cause differs");
+    assert_eq!(oracle.mepc, 16, "independent return PC differs");
+    assert_eq!(
+        golden.csrs.get(&MEPC).copied().unwrap_or(0),
+        oracle.mepc,
+        "built-in and independent mepc differ"
+    );
 }
 
 #[test]

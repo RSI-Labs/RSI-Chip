@@ -61,30 +61,50 @@ xorshift sequence, so failures are reproducible by seed.
 
 ## Privileged subset status
 
-The CSR and trap tests still compare RTL against `Rv32iMachine`. They cover:
+The machine-CSR and trap/MRET matrices now add a third lane. Raven executes
+the integer, CSR, and MRET instructions. Because its public `ECALL` behavior is
+a host syscall, the test harness implements the bare-metal M-mode environment
+call entry contract directly:
 
-- `CSRRW`, `CSRRS`, and `CSRRC` on `mscratch`;
-- `mtvec` and `mepc`;
-- `ECALL`;
+- save `mepc`;
+- set `mcause = 11` for environment call from M-mode;
+- clear `mtval`;
+- update `mstatus.MPP/MPIE/MIE`;
+- vector through `mtvec`.
+
+The directed privileged tests compare:
+
+- all integer registers;
+- EBREAK PC;
+- the full checked memory window;
+- `mtvec`;
+- `mepc`;
+- `mcause`.
+
+Covered operations include:
+
+- `CSRRW`, `CSRRS`, and `CSRRC` on `mtvec`;
+- `CSRRW` on `mepc`;
+- bare-metal `ECALL`;
 - `MRET`;
-- trap return-PC advancement.
+- return-PC advancement.
 
-They are not yet counted as independent closure. The selected external oracle
-models `ECALL` as a host syscall and does not retain arbitrary machine CSRs such
-as `mscratch`, so using it for that test would compare incompatible platform
+The legacy `mscratch` CSR read/write/set/clear test remains an internal-model
+differential because Raven does not retain arbitrary scratch CSRs. Using a host
+syscall oracle for that CSR would compare incompatible platform
 contracts rather than prove RV32I RTL correctness.
 
 ## Remaining gaps
 
-1. Add an independent oracle lane for the machine-CSR/trap contract, or select a
-   second oracle that implements bare-metal `ECALL`, `MRET`, and arbitrary CSRs.
-2. Compare instruction counts and trap-state metadata when an independent oracle
+1. Compare instruction counts and trap-state metadata when an independent oracle
    exposes them.
-3. Extend randomized load/store addresses beyond aligned offsets in one 256-byte
+2. Extend randomized load/store addresses beyond aligned offsets in one 256-byte
    page, including page crossings and address edges.
-4. Add independent ELF and high-memory image execution.
-5. Repeat the same three-lane methodology for i8086; its current matrix still
-   uses the repository model as golden.
+3. Add independent ELF and high-memory image execution.
+4. Extend independent privileged coverage beyond the tested `mtvec`, `mepc`,
+   `mcause`, and M-mode `ECALL`/`MRET` contract.
+5. Repeat the same external-oracle methodology for i8086; its current reference
+   is a separate repository-owned spec-derived implementation.
 
 ## Validation command
 
@@ -92,4 +112,13 @@ contracts rather than prove RV32I RTL correctness.
 cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --nocapture
 ```
 
-Latest result: 4 passed, 0 failed, 807.55 seconds.
+Latest full result: 5 tests, 5 passed, 0 failed, 798.77 seconds.
+
+The full run includes the 64-seed randomized differential. The non-randomized
+directed subset currently passes in 31.14 seconds:
+
+```text
+cargo test -p eda-cpu-platform --test rv32i_instruction_matrix -- --skip randomized
+
+4 passed, 0 failed, 31.14 seconds
+```
