@@ -405,7 +405,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       unary_flags = {
         flags[15:12], 1'b0, flags[10:8], unary_result_sign,
         (unary_result & (execute_width8 ? 16'h00ff : 16'hffff)) == 0,
-        flags[5:4], flags[3], parity_even(unary_result), flags[1], 1'b0
+        flags[5:4], 1'b0, parity_even(unary_result), flags[1], 1'b0
       };
     end else if (modrm_register == 3'd2) begin
       unary_flags = flags;
@@ -450,16 +450,19 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         operand_b = source_register_result_value;
       end
       3'd1: begin
-        operand_a = source_register_result_value;
-        operand_b = rm_result_value;
+        // The low opcode bit selects width; direction is bit 1. Thus 01h,
+        // like 00h, computes r/m <- register.
+        operand_a = rm_result_value;
+        operand_b = source_register_result_value;
       end
       3'd2: begin
         operand_a = source_register_result_value;
         operand_b = rm_result_value;
       end
       3'd3: begin
-        operand_a = rm_result_value;
-        operand_b = source_register_result_value;
+        // Likewise 03h, like 02h, computes register <- r/m.
+        operand_a = source_register_result_value;
+        operand_b = rm_result_value;
       end
       3'd4: begin
         operand_a = ax;
@@ -478,7 +481,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         3'd0: operand_result = {8'b0, operand_a[7:0] + operand_b[7:0]};
         3'd1: operand_result = {8'b0, operand_a[7:0] | operand_b[7:0]};
         3'd2: operand_result = {8'b0, operand_a[7:0] + operand_b[7:0] + {7'b0, flags[0]}};
-        3'd3: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0]};
+        3'd3: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0] - {7'b0, flags[0]}};
         3'd4: operand_result = {8'b0, operand_a[7:0] & operand_b[7:0]};
         3'd5: operand_result = {8'b0, operand_a[7:0] - operand_b[7:0]};
         3'd6: operand_result = {8'b0, operand_a[7:0] ^ operand_b[7:0]};
@@ -489,7 +492,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
         3'd0: operand_result = operand_a + operand_b;
         3'd1: operand_result = operand_a | operand_b;
         3'd2: operand_result = operand_a + operand_b + {15'b0, flags[0]};
-        3'd3: operand_result = operand_a - operand_b;
+        3'd3: operand_result = operand_a - operand_b - {15'b0, flags[0]};
         3'd4: operand_result = operand_a & operand_b;
         3'd5: operand_result = operand_a - operand_b;
         3'd6: operand_result = operand_a ^ operand_b;
@@ -522,7 +525,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       flags[15:12], 1'b0, flags[10:8],
       (al & immediate_r[7:0]) & 8'h80,
       (al & immediate_r[7:0]) == 0,
-      flags[5:4], 1'b0,
+      {flags[5], 1'b0},
       parity_even(al & immediate_r[7:0]),
       flags[1], 1'b0
     };
@@ -533,7 +536,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       flags[15:12], 1'b0, flags[10:8],
       (ax & immediate_r) & 16'h8000,
       (ax & immediate_r) == 0,
-      flags[5:4], 1'b0,
+      {flags[5], 1'b0},
       parity_even(ax & immediate_r),
       flags[1], 1'b0
     };
@@ -554,8 +557,8 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       3'd3: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
                            ? (rm_result_value - (opcode_r == 8'h83
                               ? {{8{immediate_r[7]}}, immediate_r[7:0]}
-                              : immediate_r)) :
-                           {8'b0, rm_result_value[7:0] - immediate_r[7:0]};
+                              : immediate_r) - {15'b0, flags[0]}) :
+                           {8'b0, rm_result_value[7:0] - immediate_r[7:0] - {7'b0, flags[0]}};
       3'd4: group_result = (opcode_r == 8'h81 || opcode_r == 8'h83)
                            ? (rm_result_value & (opcode_r == 8'h83
                               ? {{8{immediate_r[7]}}, immediate_r[7:0]}
@@ -642,13 +645,23 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       (alu_flag_result & (alu_flag_byte ? 16'h0080 : 16'h8000)) != 0,
       (alu_flag_result & (alu_flag_byte ? 16'h00ff : 16'hffff)) == 0,
       flags[5:4],
-      ((alu_flag_a ^ alu_flag_b ^ alu_flag_result) & 16'h0010) != 0,
+      (alu_flag_operation == 3'd1 || alu_flag_operation == 3'd4 ||
+       alu_flag_operation == 3'd6)
+        ? 1'b0
+        : ((alu_flag_a ^ alu_flag_b ^ alu_flag_result) & 16'h0010) != 0,
       parity_even(alu_flag_result),
       flags[1],
       alu_flag_preserve_carry ? flags[0] :
-      alu_flag_operation == 3'd0 ? (alu_flag_a + alu_flag_b) > (alu_flag_byte ? 16'h00ff : 16'hffff) :
-      alu_flag_operation == 3'd2 ? (alu_flag_a + alu_flag_b + {15'b0, flags[0]}) > (alu_flag_byte ? 16'h00ff : 16'hffff) :
-      (alu_flag_operation == 3'd3 || alu_flag_operation == 3'd5 || alu_flag_operation == 3'd7) ? alu_flag_a < alu_flag_b : 1'b0
+      alu_flag_operation == 3'd0
+        ? ({1'b0, alu_flag_a} + {1'b0, alu_flag_b}) >
+          (alu_flag_byte ? 17'h0000_00ff : 17'h0001_0000) :
+      alu_flag_operation == 3'd2
+        ? ({1'b0, alu_flag_a} + {1'b0, alu_flag_b} + {16'b0, flags[0]}) >
+          (alu_flag_byte ? 17'h0000_00ff : 17'h0001_0000) :
+      alu_flag_operation == 3'd3
+        ? (alu_flag_a < alu_flag_b ||
+           (alu_flag_a == alu_flag_b && flags[0])) :
+      (alu_flag_operation == 3'd5 || alu_flag_operation == 3'd7) ? alu_flag_a < alu_flag_b : 1'b0
     };
   end
 
@@ -853,7 +866,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
     shift_flags = flags;
     if (shift_count != 5'd0) begin
       shift_flags[11] = shift_overflow;
-      if (modrm_register != 3'd2 && modrm_register != 3'd3) begin
+      if (modrm_register >= 3'd4) begin
         shift_flags[7] = shift_result_sign;
         shift_flags[6] = (shift_result &
                           (shift_byte ? 16'h00ff : 16'hffff)) == 0;
@@ -976,7 +989,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
       begin
         next_flags = alu_flag_value;
         if (alu_operation != 3'd7) begin
-          if (opcode_r[2:0] == 3'd0 || opcode_r[2:0] == 3'd3) begin
+          if (opcode_r[2:0] == 3'd0 || opcode_r[2:0] == 3'd1) begin
             if (modrm_memory) begin
               execute_mem_we = 1'b1;
               execute_mem_wdata = operand_result;
@@ -1004,7 +1017,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
                 default: next_di = operand_result;
               endcase
             end
-          end else if (opcode_r[2:0] == 3'd1 || opcode_r[2:0] == 3'd2) begin
+          end else if (opcode_r[2:0] == 3'd2 || opcode_r[2:0] == 3'd3) begin
             if (opcode_r == 8'hd4 || execute_width8) begin
               case (modrm_register)
                 3'd0: next_ax = {ax[15:8], operand_result[7:0]};

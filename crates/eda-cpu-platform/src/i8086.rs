@@ -270,12 +270,15 @@ impl I8086Machine {
         let carry_in = u16::from(self.get_flag(FLAG_CF));
         let result = match operation {
             2 => raw.wrapping_add(carry_in),
+            // SBB subtracts both the operand and the incoming carry.
+            3 => raw.wrapping_sub(carry_in),
             _ => raw,
         } & mask;
         let carry = match operation {
             0 => u32::from(a) + u32::from(b) > u32::from(mask),
             2 => u32::from(a) + u32::from(b) + u32::from(carry_in) > u32::from(mask),
-            3 | 7 => add_carry,
+            3 => u64::from(a) < u64::from(b) + u64::from(carry_in),
+            7 => add_carry,
             5 => i32::from(a) - i32::from(b) < 0,
             _ => false,
         };
@@ -289,7 +292,10 @@ impl I8086Machine {
         self.set_flag(FLAG_SF, result & sign != 0);
         self.set_flag(FLAG_ZF, result == 0);
         self.set_flag(FLAG_PF, parity(result as u8));
-        self.set_flag(FLAG_AF, (a ^ b ^ result) & 0x10 != 0);
+        self.set_flag(
+            FLAG_AF,
+            matches!(operation, 0 | 2 | 3 | 5 | 7) && (a ^ b ^ result) & 0x10 != 0,
+        );
         result
     }
 
@@ -513,8 +519,10 @@ impl I8086Machine {
                     (destination, source)
                 }
                 1 => {
-                    let (source, register) = self.modrm(segment_override);
-                    let destination = if width == 8 {
+                    // Bit 0 selects width; bit 1 selects direction. Both
+                    // 00h/01h forms therefore write the r/m operand.
+                    let (destination, register) = self.modrm(segment_override);
+                    let source = if width == 8 {
                         Operand::Reg8(register)
                     } else {
                         Operand::Reg16(register)
@@ -531,8 +539,9 @@ impl I8086Machine {
                     (destination, source)
                 }
                 3 => {
-                    let (destination, register) = self.modrm(segment_override);
-                    let source = if width == 8 {
+                    // Both 02h/03h forms write the register operand.
+                    let (source, register) = self.modrm(segment_override);
+                    let destination = if width == 8 {
                         Operand::Reg8(register)
                     } else {
                         Operand::Reg16(register)
@@ -962,7 +971,9 @@ impl I8086Machine {
                     }
                     2 => self.write_operand(operand, width, !value & width_mask(width)),
                     3 => {
-                        let result = self.alu(3, 0, value, width);
+                        // NEG is zero minus the operand; unlike SBB it does
+                        // not consume the incoming carry flag.
+                        let result = self.alu(5, 0, value, width);
                         self.write_operand(operand, width, result);
                     }
                     4 | 5 => {
@@ -1074,6 +1085,7 @@ impl I8086Machine {
         let result = a & b;
         self.set_flag(FLAG_CF, false);
         self.set_flag(FLAG_OF, false);
+        self.set_flag(FLAG_AF, false);
         self.set_flag(FLAG_SF, result & (1 << (width - 1)) != 0);
         self.set_flag(FLAG_ZF, result & width_mask(width) == 0);
         self.set_flag(FLAG_PF, parity(result as u8));
@@ -1173,6 +1185,9 @@ impl I8086Machine {
                 _ => false,
             };
             self.set_flag(FLAG_OF, overflow);
+        }
+        if operation <= 3 {
+            return result;
         }
         self.set_flag(FLAG_SF, result & (1 << (width - 1)) != 0);
         self.set_flag(FLAG_ZF, result == 0);
@@ -1436,5 +1451,48 @@ mod tests {
         assert_eq!(cpu.regs[REG_AX] as u8, 0);
         assert!(cpu.get_flag(FLAG_CF));
         assert!(!cpu.get_flag(FLAG_OF));
+    }
+
+    #[test]
+    fn word_alu_direction_uses_rm_and_register_forms() {
+        let program: &[u8] = &[
+            0xb8, 0x01, 0x00, // mov ax, 1
+            0xb9, 0x02, 0x00, // mov cx, 2
+            0x01, 0xc1, // add cx, ax
+            0xbb, 0x03, 0x00, // mov bx, 3
+            0x03, 0xc3, // add ax, bx
+            0xf4, // hlt
+        ];
+        let mut cpu = I8086Machine::com(program, "").unwrap();
+        assert_eq!(cpu.run(10), I8086Stop::Halt);
+        assert_eq!(cpu.regs[REG_AX], 4);
+        assert_eq!(cpu.regs[REG_CX], 3);
+        assert_eq!(cpu.regs[REG_BX], 3);
+    }
+
+    #[test]
+    fn sbb_consumes_carry_but_neg_does_not() {
+        let sbb_program: &[u8] = &[
+            0xb8, 0x07, 0x00, // mov ax, 7
+            0xbb, 0x07, 0x00, // mov bx, 7
+            0xf9, // stc
+            0x19, 0xc3, // sbb bx, ax
+            0xf4, // hlt
+        ];
+        let mut cpu = I8086Machine::com(sbb_program, "").unwrap();
+        assert_eq!(cpu.run(10), I8086Stop::Halt);
+        assert_eq!(cpu.regs[REG_BX], 0xffff);
+        assert!(cpu.get_flag(FLAG_CF));
+
+        let neg_program: &[u8] = &[
+            0xb8, 0x05, 0x00, // mov ax, 5
+            0xf9, // stc
+            0xf7, 0xd8, // neg ax
+            0xf4, // hlt
+        ];
+        let mut cpu = I8086Machine::com(neg_program, "").unwrap();
+        assert_eq!(cpu.run(10), I8086Stop::Halt);
+        assert_eq!(cpu.regs[REG_AX], 0xfffb);
+        assert!(cpu.get_flag(FLAG_CF));
     }
 }

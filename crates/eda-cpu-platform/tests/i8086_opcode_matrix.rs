@@ -2,6 +2,10 @@ use eda_cpu_platform::i8086::{I8086Machine, I8086Stop};
 use eda_cpu_platform::systemverilog::{I8086SvResult, I8086SvRunner};
 use std::sync::OnceLock;
 
+mod i8086_support;
+
+use i8086_support::ReferenceI8086;
+
 fn shared_i8086_runner() -> &'static I8086SvRunner {
     static RUNNER: OnceLock<I8086SvRunner> = OnceLock::new();
     RUNNER.get_or_init(|| I8086SvRunner::new().expect("compile shared i8086 SystemVerilog runtime"))
@@ -80,6 +84,43 @@ fn assert_matches_golden_with_options(
         I8086Stop::Halt,
         "{context}: golden model did not halt"
     );
+
+    let mut reference = ReferenceI8086::com(&initial_memory);
+    reference
+        .run(1000)
+        .unwrap_or_else(|error| panic!("execute {context} in independent reference: {error}"));
+    assert_eq!(
+        reference.registers(),
+        golden.regs,
+        "{context}: independent architectural registers differ"
+    );
+    assert_eq!(
+        reference.segments(),
+        golden.segments,
+        "{context}: independent segment registers differ"
+    );
+    assert_eq!(
+        reference.instruction_pointer(),
+        golden.ip,
+        "{context}: independent IP differs"
+    );
+    assert_eq!(
+        reference.flags(),
+        golden.flags,
+        "{context}: independent FLAGS differ"
+    );
+    assert_eq!(
+        reference.retired_instructions(),
+        golden.instructions_retired,
+        "{context}: independent instruction count differs"
+    );
+    for address in 0..0x10_0000_u32 {
+        assert_eq!(
+            reference.memory_byte(address),
+            golden.memory.read_u8(address),
+            "{context}: independent memory differs at {address:#06x}"
+        );
+    }
 
     let rtl = shared_i8086_runner()
         .run_memory_with_budget(initial_memory, event_budget)
@@ -621,11 +662,86 @@ fn run_i8086_randomized_differential_fuzz(first_seed: u64, seeds: u64) {
             );
         }
         let initial_memory = golden.memory.clone();
+        let mut reference = ReferenceI8086::com(&initial_memory);
+        let mut stop = I8086Stop::Running;
+        for instruction_index in 0..2000 {
+            let instruction_ip = golden.ip;
+            reference.step().unwrap_or_else(|error| {
+                panic!("seed {seed}: independent reference failed: {error}")
+            });
+            stop = golden.step();
+            if reference.registers() != golden.regs
+                || reference.segments() != golden.segments
+                || reference.instruction_pointer() != golden.ip
+                || reference.flags() != golden.flags
+            {
+                let mut instruction_bytes = [0_u8; 12];
+                for (offset, byte) in instruction_bytes.iter_mut().enumerate() {
+                    *byte = initial_memory.read_u8(
+                        ((golden.segments[1] as u32) << 4)
+                            .wrapping_add(instruction_ip as u32 + offset as u32)
+                            & 0xff_ffff,
+                    );
+                }
+                eprintln!(
+                    "seed {seed}: reference regs={:#06x?}, segments={:#06x?}, ip={:#06x}, flags={:#06x}",
+                    reference.registers(),
+                    reference.segments(),
+                    reference.instruction_pointer(),
+                    reference.flags()
+                );
+                eprintln!(
+                    "seed {seed}: golden regs={:#06x?}, segments={:#06x?}, ip={:#06x}, flags={:#06x}",
+                    golden.regs,
+                    golden.segments,
+                    golden.ip,
+                    golden.flags
+                );
+                panic!(
+                    "seed {seed}: independent divergence at instruction {instruction_index}, IP {instruction_ip:#06x}, bytes {instruction_bytes:02x?}"
+                );
+            }
+            if stop != I8086Stop::Running {
+                break;
+            }
+        }
         assert_eq!(
-            golden.run(2000),
+            stop,
             I8086Stop::Halt,
             "seed {seed}: golden model did not halt"
         );
+        assert_eq!(
+            reference.registers(),
+            golden.regs,
+            "seed {seed}: independent architectural registers differ"
+        );
+        assert_eq!(
+            reference.segments(),
+            golden.segments,
+            "seed {seed}: independent segment registers differ"
+        );
+        assert_eq!(
+            reference.instruction_pointer(),
+            golden.ip,
+            "seed {seed}: independent IP differs"
+        );
+        assert_eq!(
+            reference.flags(),
+            golden.flags,
+            "seed {seed}: independent FLAGS differ"
+        );
+        assert_eq!(
+            reference.retired_instructions(),
+            golden.instructions_retired,
+            "seed {seed}: independent instruction count differs"
+        );
+        for address in MEMORY_FIRST..MEMORY_LAST {
+            assert_eq!(
+                reference.memory_byte(address),
+                golden.memory.read_u8(address),
+                "seed {seed}: independent memory differs at {address:#06x}"
+            );
+        }
         let rtl = runner
             .run_memory(initial_memory)
             .unwrap_or_else(|error| panic!("seed {seed}: RTL execution failed: {error}"));
