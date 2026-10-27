@@ -18498,6 +18498,43 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_rejects_an_explicit_empty_test_name() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-run-test-empty-name");
+    let source_path = root.join("run_test_empty_name.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+task run_test(string class_name = "");
+endtask
+
+module run_test_empty_name_top;
+  initial begin
+    run_test("");
+  end
+endmodule
+"#,
+    )
+    .expect("write direct run_test empty-name source");
+
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("run_test_empty_name_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("explicit empty run_test names must fail closed");
+    assert!(
+        error.contains(
+            "requires a non-empty compile-time string literal or the upstream no-argument test contract"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_executes_a_minimal_phase_schedule() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -20753,6 +20790,50 @@ endmodule
         Some(1),
         "the run-phase objection must drain before post-run assertions"
     );
+}
+
+#[test]
+fn slang_direct_official_upstream_uvm_hello_fixture_compiles_and_runs() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/00hello/test.sv")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM hello fixture");
+    let fixture_text =
+        std::fs::read_to_string(&fixture).expect("read the pinned upstream UVM hello fixture");
+    assert!(
+        fixture_text.contains("program top;"),
+        "the upstream fixture must remain an unmodified program-block test"
+    );
+    assert!(
+        fixture_text.contains("virtual function void report_phase"),
+        "the upstream fixture must retain its report-phase test"
+    );
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let design = slang
+        .compile_files(&[source, fixture], Some("top"), &options)
+        .expect("directly lower the pinned upstream UVM hello fixture");
+    assert_eq!(design.name, "top");
+    let serialized = format!("{design:?}");
+    assert!(
+        serialized.contains("** UVM TEST PASSED **"),
+        "the upstream report phase must be lowered into executable IR"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create the upstream UVM simulator");
+    simulator
+        .run_until(2)
+        .expect("execute the upstream UVM hello fixture through completion");
 }
 
 #[test]

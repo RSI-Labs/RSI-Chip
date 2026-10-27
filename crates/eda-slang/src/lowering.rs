@@ -923,6 +923,7 @@ impl SlangAstLowerer {
                     .lower_instance_array(member)
                     .map_err(|error| with_source_span(member, error))?,
                 "Subroutine" => {}
+                "ClassType" => {}
                 "TypeAlias" => {}
                 "ForwardingTypedef" => {}
                 "EnumType" => {}
