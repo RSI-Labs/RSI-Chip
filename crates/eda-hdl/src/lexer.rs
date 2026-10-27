@@ -141,31 +141,7 @@ impl<'a> Lexer<'a> {
             return self.lex_number(line);
         }
         if c == b'"' {
-            self.bump();
-            let mut s = String::new();
-            while self.peek() != b'"' {
-                if self.pos >= self.src.len() {
-                    return Err(format!("line {}: unterminated string", line));
-                }
-                let ch = self.bump();
-                if ch == b'\\' {
-                    let esc = self.bump();
-                    s.push(match esc {
-                        b'n' => '\n',
-                        b't' => '\t',
-                        b'\\' => '\\',
-                        b'"' => '"',
-                        other => other as char,
-                    });
-                } else {
-                    s.push(ch as char);
-                }
-            }
-            self.bump(); // closing quote
-            return Ok(Token {
-                tok: Tok::Str(s),
-                line,
-            });
+            return self.lex_string(line);
         }
         // punctuation
         for p in PUNCTS3 {
@@ -227,6 +203,70 @@ impl<'a> Lexer<'a> {
             });
         }
         Err(format!("line {}: unexpected character '{}'", line, ch))
+    }
+
+    fn lex_string(&mut self, line: usize) -> Result<Token, String> {
+        self.bump();
+        let mut bytes = Vec::new();
+        while self.peek() != b'"' {
+            if self.pos >= self.src.len() {
+                return Err(format!("line {line}: unterminated string"));
+            }
+
+            let byte = self.bump();
+            if byte != b'\\' {
+                bytes.push(byte);
+                continue;
+            }
+
+            let escaped = self.bump();
+            match escaped {
+                b'\n' => continue,
+                b'\r' if self.peek() == b'\n' => {
+                    self.bump();
+                    continue;
+                }
+                b'n' => bytes.push(b'\n'),
+                b't' => bytes.push(b'\t'),
+                b'\\' => bytes.push(b'\\'),
+                b'"' => bytes.push(b'"'),
+                b'v' => bytes.push(0x0b),
+                b'f' => bytes.push(0x0c),
+                b'a' => bytes.push(0x07),
+                b'0'..=b'7' => {
+                    let mut value = u32::from(escaped - b'0');
+                    let mut digits = 1;
+                    while digits < 3 && matches!(self.peek(), b'0'..=b'7') {
+                        let digit = u32::from(self.bump() - b'0');
+                        value = value
+                            .checked_mul(8)
+                            .and_then(|value| value.checked_add(digit))
+                            .ok_or_else(|| format!("line {line}: octal string escape overflows"))?;
+                        digits += 1;
+                    }
+                    if value > 0x7f {
+                        return Err(format!(
+                            "line {line}: non-ASCII octal string escapes are unsupported"
+                        ));
+                    }
+                    bytes.push(value as u8);
+                }
+                other => {
+                    return Err(format!(
+                        "line {line}: unknown string escape '\\{}'",
+                        other as char
+                    ));
+                }
+            }
+        }
+
+        self.bump();
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("line {line}: string literal is not valid UTF-8"))?;
+        Ok(Token {
+            tok: Tok::Str(text),
+            line,
+        })
     }
 
     /// `'<base>...` (unsized based literal) immediately ahead?
@@ -470,14 +510,32 @@ mod tests {
 
     #[test]
     fn strings() {
-        let toks = kinds("\"a=%b\" \"tab\\there\"");
+        let toks =
+            kinds("\"a=%b\" \"tab\\there\" \"nl\\nquote\\\"bell\\a VT\\vFF\\f NUL\\0 octal\\101\"");
         assert_eq!(
             toks,
             vec![
                 Tok::Str("a=%b".into()),
                 Tok::Str("tab\there".into()),
+                Tok::Str("nl\nquote\"bell\u{7} VT\u{b}FF\u{c} NUL\0 octalA".into()),
                 Tok::Eof
             ]
+        );
+
+        let continued = Lexer::tokenize("\"a\\\n b\" x").expect("continue string across newline");
+        assert_eq!(continued[0].tok, Tok::Str("a b".into()));
+        assert_eq!(continued[1].line, 2);
+
+        let unicode = Lexer::tokenize("\"日本語\"").expect("preserve valid UTF-8 string bytes");
+        assert_eq!(unicode[0].tok, Tok::Str("日本語".into()));
+
+        let error = Lexer::tokenize("\"bad\\q\"").unwrap_err();
+        assert_eq!(error, "line 1: unknown string escape '\\q'");
+
+        let error = Lexer::tokenize("\"high\\377\"").unwrap_err();
+        assert_eq!(
+            error,
+            "line 1: non-ASCII octal string escapes are unsupported"
         );
     }
 
