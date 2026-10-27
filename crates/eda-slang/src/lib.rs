@@ -8,8 +8,10 @@
 //! that the downstream bounded elaborator cannot represent.
 
 use eda_core::ir::Design;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 mod ast_util;
 mod lowering;
@@ -30,9 +32,11 @@ pub use summary::{
 #[derive(Clone, Debug)]
 pub struct SlangFrontend {
     program: PathBuf,
+    timeout: Duration,
 }
 
 const PINNED_SLANG_VERSION: &str = "slang version 12.0.535+54c19b53";
+const DEFAULT_SLANG_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, Default)]
 pub struct PreprocessOptions {
@@ -74,7 +78,10 @@ impl SlangFrontend {
     /// Finds slang through `SLANG_BIN`, `SLANG`, or `PATH`.
     pub fn discover() -> Result<Self, String> {
         let program = self::discover_program()?;
-        let frontend = Self { program };
+        let frontend = Self {
+            program,
+            timeout: timeout_from_env()?,
+        };
         let version = frontend.version()?;
         if !frontend.version_matches(&version) {
             return Err(format!(
@@ -94,17 +101,11 @@ impl SlangFrontend {
     }
 
     pub fn version(&self) -> Result<String, String> {
-        let output = Command::new(&self.program)
-            .arg("--version")
-            .output()
-            .map_err(|error| format!("cannot execute {}: {error}", self.program.display()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot determine slang version: {} exited with {}",
-                self.program.display(),
-                output.status
-            ));
-        }
+        let mut command = Command::new(&self.program);
+        command.arg("--version");
+        let output = self
+            .run_capturing(command)
+            .map_err(|failure| failure.to_string())?;
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if version.starts_with("slang version ") {
             Ok(version)
@@ -377,24 +378,120 @@ impl SlangFrontend {
 
     fn run_capturing(&self, mut command: Command) -> Result<std::process::Output, SlangFailure> {
         command
-            .output()
-            .map_err(|error| SlangFailure {
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|error| SlangFailure {
+            status: None,
+            stdout: String::new(),
+            stderr: format!("cannot execute {}: {error}", self.program.display()),
+        })?;
+        let mut child_stdout = child.stdout.take();
+        let mut child_stderr = child.stderr.take();
+        let stdout = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(stdout) = child_stdout.as_mut() {
+                stdout.read_to_end(&mut buffer)?;
+            }
+            Ok::<_, std::io::Error>(buffer)
+        });
+        let stderr = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(stderr) = child_stderr.as_mut() {
+                stderr.read_to_end(&mut buffer)?;
+            }
+            Ok::<_, std::io::Error>(buffer)
+        });
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(SlangFailure {
+                            status: None,
+                            stdout: String::new(),
+                            stderr: format!(
+                                "slang command '{}' exceeded its {:?} timeout",
+                                self.program.display(),
+                                self.timeout
+                            ),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(SlangFailure {
+                        status: None,
+                        stdout: String::new(),
+                        stderr: format!(
+                            "cannot wait for slang command {}: {error}",
+                            self.program.display()
+                        ),
+                    });
+                }
+            }
+        };
+
+        let stdout = stdout
+            .join()
+            .map_err(|_| SlangFailure {
                 status: None,
                 stdout: String::new(),
-                stderr: format!("cannot execute {}: {error}", self.program.display()),
+                stderr: "slang stdout reader panicked".into(),
             })
-            .and_then(|output| {
-                if output.status.success() {
-                    Ok(output)
-                } else {
-                    Err(SlangFailure {
-                        status: output.status.code(),
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    })
-                }
+            .and_then(|result| {
+                result.map_err(|error| SlangFailure {
+                    status: None,
+                    stdout: String::new(),
+                    stderr: format!("cannot read slang stdout: {error}"),
+                })
+            })?;
+        let stderr = stderr
+            .join()
+            .map_err(|_| SlangFailure {
+                status: None,
+                stdout: String::new(),
+                stderr: "slang stderr reader panicked".into(),
             })
+            .and_then(|result| {
+                result.map_err(|error| SlangFailure {
+                    status: None,
+                    stdout: String::new(),
+                    stderr: format!("cannot read slang stderr: {error}"),
+                })
+            })?;
+
+        if status.success() {
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        } else {
+            Err(SlangFailure {
+                status: status.code(),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            })
+        }
     }
+}
+
+fn timeout_from_env() -> Result<Duration, String> {
+    let Some(value) = std::env::var_os("SLANG_TIMEOUT_SECONDS") else {
+        return Ok(DEFAULT_SLANG_TIMEOUT);
+    };
+    let seconds = value
+        .to_string_lossy()
+        .parse::<u64>()
+        .map_err(|_| "SLANG_TIMEOUT_SECONDS must be a positive integer".to_string())?;
+    if seconds == 0 {
+        return Err("SLANG_TIMEOUT_SECONDS must be a positive integer".into());
+    }
+    Ok(Duration::from_secs(seconds))
 }
 fn add_preprocessor_options(command: &mut Command, options: &PreprocessOptions) {
     for directory in &options.include_directories {
@@ -496,10 +593,29 @@ mod tests {
     fn slang_version_matching_is_exact() {
         let frontend = SlangFrontend {
             program: PathBuf::from("slang"),
+            timeout: DEFAULT_SLANG_TIMEOUT,
         };
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53"));
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53\n"));
         assert!(!frontend.version_matches("slang version 13.0.0"));
         assert!(!frontend.version_matches("slang version 12.0.535"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slang_commands_fail_closed_on_timeout() {
+        let frontend = SlangFrontend {
+            program: PathBuf::from("/bin/sleep"),
+            timeout: Duration::from_millis(50),
+        };
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let error = frontend
+            .run_capturing(command)
+            .expect_err("a hung slang process must time out");
+        assert_eq!(
+            error.stderr,
+            "slang command '/bin/sleep' exceeded its 50ms timeout"
+        );
     }
 }
