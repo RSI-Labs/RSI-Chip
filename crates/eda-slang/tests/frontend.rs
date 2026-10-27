@@ -21279,6 +21279,117 @@ fn slang_direct_official_upstream_uvm_plusargs_fixture_executes_both_branches() 
 }
 
 #[test]
+fn slang_direct_official_upstream_uvm_toolargs_fixture_executes_conjoined_plusargs() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture_directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/07toolargs")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM toolargs fixture");
+    let fixture = fixture_directory.join("test.sv");
+    let fixture_text =
+        std::fs::read_to_string(&fixture).expect("read the pinned upstream UVM toolargs fixture");
+    let defines = std::fs::read_to_string(fixture_directory.join("test.defines"))
+        .expect("read the upstream shared defines");
+    let compile_arguments = std::fs::read_to_string(fixture_directory.join("questa.comp.args"))
+        .expect("read the upstream compile arguments");
+    let fixture_plusargs = std::fs::read_to_string(fixture_directory.join("test.plusargs"))
+        .expect("read the upstream fixture plusargs");
+    let runtime_arguments = std::fs::read_to_string(fixture_directory.join("questa.run.args"))
+        .expect("read the upstream runtime arguments");
+
+    assert!(
+        fixture_text.contains("$test$plusargs(\"OK\") &&"),
+        "the upstream toolargs fixture must retain its first runtime query"
+    );
+    assert!(
+        fixture_text.contains("$test$plusargs(\"Good\")"),
+        "the upstream toolargs fixture must retain its second runtime query"
+    );
+    assert_eq!(defines.trim(), "+define+BAR");
+    assert_eq!(compile_arguments.trim(), "+define+FOO");
+    assert_eq!(runtime_arguments.trim(), "+Good");
+    let base_plusargs = fixture_plusargs
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(base_plusargs, ["+foo", "+OK", "+bar"]);
+    let full_plusargs = base_plusargs
+        .into_iter()
+        .chain([runtime_arguments.trim()])
+        .collect::<Vec<_>>();
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec![
+            "UVM_NO_DPI".to_string(),
+            "FOO".to_string(),
+            "BAR".to_string(),
+        ],
+        undefines: Vec::new(),
+    };
+    let design = slang
+        .compile_files(&[source, fixture], Some("top"), &options)
+        .expect("directly lower the pinned upstream UVM toolargs fixture");
+    assert_eq!(design.name, "top");
+    assert!(design.plusargs.contains_key("OK"));
+    assert!(design.plusargs.contains_key("Good"));
+
+    let mut complete = Simulator::new(&design).expect("create complete toolargs simulator");
+    complete
+        .set_plusargs(full_plusargs.iter().copied())
+        .expect("install all upstream tool arguments");
+    complete
+        .run_until(2)
+        .expect("execute the complete upstream toolargs branch");
+    let complete_output = complete.displays.join("");
+    assert!(
+        complete_output.contains("** UVM TEST PASSED **"),
+        "unexpected complete toolargs output: {complete_output}"
+    );
+    assert!(
+        !complete_output.contains("** UVM TEST FAILED **"),
+        "unexpected complete toolargs output: {complete_output}"
+    );
+
+    let mut partial = Simulator::new(&design).expect("create partial toolargs simulator");
+    partial
+        .set_plusargs(["+foo", "+OK", "+bar"])
+        .expect("install all fixture plusargs except the tool runtime argument");
+    partial
+        .run_until(2)
+        .expect("execute the partial upstream toolargs branch");
+    let partial_output = partial.displays.join("");
+    assert!(
+        partial_output.contains("** UVM TEST FAILED **"),
+        "unexpected partial toolargs output: {partial_output}"
+    );
+    assert!(
+        !partial_output.contains("** UVM TEST PASSED **"),
+        "unexpected partial toolargs output: {partial_output}"
+    );
+
+    let mut absent = Simulator::new(&design).expect("create absent toolargs simulator");
+    absent
+        .run_until(2)
+        .expect("execute the absent upstream toolargs branch");
+    let absent_output = absent.displays.join("");
+    assert!(
+        absent_output.contains("** UVM TEST FAILED **"),
+        "unexpected absent toolargs output: {absent_output}"
+    );
+    assert!(
+        !absent_output.contains("** UVM TEST PASSED **"),
+        "unexpected absent toolargs output: {absent_output}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_selects_classes_from_runtime_uvm_testname() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
