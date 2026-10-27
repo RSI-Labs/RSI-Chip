@@ -31,6 +31,8 @@ This directory contains unmodified test fixtures from Accellera's upstream
   `597525dda52acbaec26cffd0217bf3282d801c17c941d274b53b77b65632a872`
 - `tests/00basic/03error/test.sv`
   SHA-256: `c6bf621d61aeca4a34a54e8dfb5d9c5f4f565ceb9bdc551091fba13521435965`
+- `tests/00basic/01compfail/test.sv`
+  SHA-256: `02a4f64bddf80c89bd11ab0ace57113e4d423cd18b237885fec6fa8eff76a5a6`
 - License: Apache-2.0 (`LICENSE.txt`)
 
 The fixtures are intentionally not reformatted or modified. Regression wrappers

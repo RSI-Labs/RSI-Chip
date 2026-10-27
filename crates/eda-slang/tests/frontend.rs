@@ -21445,6 +21445,43 @@ fn slang_direct_official_upstream_uvm_error_fixture_counts_three_errors() {
 }
 
 #[test]
+fn slang_direct_official_upstream_uvm_compile_failure_fixture_fails_closed() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/01compfail/test.sv")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM compile-failure fixture");
+    let fixture_text = std::fs::read_to_string(&fixture)
+        .expect("read the pinned upstream UVM compile-failure fixture");
+    assert!(
+        fixture_text.contains("UVM TEST COMPILE-TIME FAILURE"),
+        "the upstream compile-failure fixture must retain its expected-failure marker"
+    );
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let error = slang
+        .compile_files(&[source, fixture], Some("top"), &options)
+        .expect_err("the upstream invalid assignment must fail in slang");
+    assert!(
+        error.contains("value of type 'uvm_verbosity' cannot be assigned to type 'uvm_component'"),
+        "unexpected upstream compile-failure diagnostic: {error}"
+    );
+    assert!(
+        error.contains("third_party/uvm-tests/tests/00basic/01compfail/test.sv:33:9"),
+        "the upstream compile failure must retain its source location: {error}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_selects_classes_from_runtime_uvm_testname() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
