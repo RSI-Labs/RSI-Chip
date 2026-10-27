@@ -469,6 +469,24 @@ impl<'d> Simulator<'d> {
                     .any(|candidate| candidate.starts_with(query.as_str())),
             );
         }
+        for (query, net) in &self.design.plusarg_values {
+            if *net >= self.vals.len() {
+                return Err("plusarg value state refers to a missing net".into());
+            }
+            let value = names.iter().find_map(|candidate| {
+                candidate
+                    .strip_prefix(query.as_str())
+                    .and_then(|remainder| remainder.strip_prefix('='))
+            });
+            let value = value.unwrap_or_default();
+            if value.len() > 64 {
+                return Err(format!("plusarg '{query}' value exceeds 64 bytes"));
+            }
+            let word = LogicWord::from_bytes_le(512, value.as_bytes());
+            for (index, bit) in word.bits.into_iter().enumerate() {
+                self.vals[*net + index] = bit;
+            }
+        }
         Ok(())
     }
 

@@ -17,6 +17,8 @@ impl SlangAstLowerer {
     pub(super) fn prepare_plusargs(&mut self, body: &serde_json::Value) -> Result<(), String> {
         let mut calls = Vec::new();
         collect_plusarg_test_calls(body, &mut calls);
+        let mut value_calls = Vec::new();
+        collect_plusarg_value_calls(body, &mut value_calls);
         for call in calls {
             let empty_arguments = Vec::new();
             let arguments = call
@@ -37,32 +39,64 @@ impl SlangAstLowerer {
                         "$test$plusargs requires a non-empty string literal".into(),
                     )
                 })?;
-            if self.plusargs.contains_key(&name) {
+            self.declare_plusarg_query(&name);
+        }
+        for call in value_calls {
+            let plan = value_plusarg_plan(call).map_err(|error| with_source_span(call, error))?;
+            self.declare_plusarg_query(&plan.query);
+            if self.plusarg_values.contains_key(&plan.query) {
                 continue;
             }
-            let net_name = eda_core::ir::plusarg_net_name(&name);
+            let net_name = eda_core::ir::plusarg_value_net_name(&plan.query);
             let base = self.design.n_nets;
-            self.design.n_nets += 1;
+            self.design.n_nets += STRING_WIDTH;
             self.design.net_decls.push(eda_core::ir::NetDecl {
                 name: net_name,
-                width: 1,
+                width: STRING_WIDTH,
                 is_reg: false,
                 is_signed: false,
                 base,
             });
             let symbol = AstLoweredSymbol {
                 base,
-                width: 1,
+                width: STRING_WIDTH,
                 signed: false,
                 bounds: None,
                 dimensions: Vec::new(),
                 memory: None,
                 struct_fields: std::collections::BTreeMap::new(),
             };
-            self.plusargs.insert(name.clone(), symbol);
-            self.design.plusargs.insert(name, base);
+            self.plusarg_values.insert(plan.query.clone(), symbol);
+            self.design.plusarg_values.insert(plan.query, base);
         }
         Ok(())
+    }
+
+    fn declare_plusarg_query(&mut self, name: &str) {
+        if self.plusargs.contains_key(name) {
+            return;
+        }
+        let net_name = eda_core::ir::plusarg_net_name(name);
+        let base = self.design.n_nets;
+        self.design.n_nets += 1;
+        self.design.net_decls.push(eda_core::ir::NetDecl {
+            name: net_name,
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base,
+        });
+        let symbol = AstLoweredSymbol {
+            base,
+            width: 1,
+            signed: false,
+            bounds: None,
+            dimensions: Vec::new(),
+            memory: None,
+            struct_fields: std::collections::BTreeMap::new(),
+        };
+        self.plusargs.insert(name.to_string(), symbol);
+        self.design.plusargs.insert(name.to_string(), base);
     }
 
     fn insert_type_alias(
@@ -863,4 +897,82 @@ fn collect_plusarg_test_calls<'value>(
             collect_plusarg_test_calls(nested, calls);
         }
     }
+}
+
+fn collect_plusarg_value_calls<'value>(
+    value: &'value serde_json::Value,
+    calls: &mut Vec<&'value serde_json::Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine").as_deref() == Some("$value$plusargs")
+        {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_plusarg_value_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_plusarg_value_calls(nested, calls);
+        }
+    }
+}
+
+pub(super) struct PlusargValue<'a> {
+    pub(super) query: String,
+    pub(super) specifier: char,
+    pub(super) target: &'a serde_json::Value,
+}
+
+pub(super) fn value_plusarg_plan(call: &serde_json::Value) -> Result<PlusargValue<'_>, String> {
+    let arguments = call
+        .get("arguments")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "$value$plusargs call has no arguments".to_string())?;
+    if arguments.len() != 2 {
+        return Err("$value$plusargs requires format and output arguments".into());
+    }
+    let format = string_literal(&arguments[0])
+        .ok_or_else(|| "$value$plusargs format must be a string literal".to_string())?;
+    let Some(percent) = format.find('%') else {
+        return Err("$value$plusargs format requires one conversion".into());
+    };
+    let mut characters = format[percent + 1..].chars();
+    let Some(specifier) = characters.next() else {
+        return Err("$value$plusargs format has a trailing '%'".into());
+    };
+    if characters.next().is_some() {
+        return Err("$value$plusargs supports exactly one conversion".into());
+    }
+    if !matches!(specifier, 'd' | 'h' | 'o' | 'b' | 's') {
+        return Err(format!(
+            "$value$plusargs does not support conversion '%{specifier}'"
+        ));
+    }
+    let prefix = &format[..percent];
+    let Some(query) = prefix.strip_suffix('=') else {
+        return Err("$value$plusargs format must be NAME=<conversion>".into());
+    };
+    if query.is_empty() {
+        return Err("$value$plusargs query name cannot be empty".into());
+    }
+    let target = arguments[1]
+        .get("left")
+        .ok_or_else(|| "$value$plusargs output argument has no target".to_string())?;
+    match arguments[1].get("right") {
+        Some(right) if string_field(right, "kind").as_deref() == Some("EmptyArgument") => {}
+        _ => {
+            return Err(
+                "$value$plusargs output argument must be an empty assignment target".into(),
+            );
+        }
+    }
+    Ok(PlusargValue {
+        query: query.to_string(),
+        specifier,
+        target,
+    })
 }

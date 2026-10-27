@@ -275,6 +275,188 @@ endmodule
 }
 
 #[test]
+fn slang_direct_lowering_executes_runtime_value_plusargs() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("runtime-value-plusargs");
+    let source_path = root.join("value_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module value_plusargs_probe(
+  output int assignment_status,
+  output int assignment_value,
+  output bit condition_status,
+  output int condition_value
+);
+  initial begin
+    assignment_status = $value$plusargs("NUM=%d", assignment_value);
+    if ($value$plusargs("ENABLE=%d", condition_value)) begin
+      condition_status = 1;
+    end else begin
+      condition_status = 0;
+    end
+  end
+endmodule
+"#,
+    )
+    .expect("write runtime value-plusargs source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("value_plusargs_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower runtime value plusargs");
+    assert_eq!(design.plusargs.len(), 2);
+    assert_eq!(design.plusarg_values.len(), 2);
+
+    let mut present = Simulator::new(&design).expect("create present value-plusargs simulator");
+    present
+        .set_plusargs(["+NUM=42", "+ENABLE=7"])
+        .expect("install present value plusargs");
+    present
+        .run_until(0)
+        .expect("execute present value plusargs");
+    assert_eq!(present.read("assignment_status").unwrap().to_u64(), Some(1));
+    assert_eq!(present.read("assignment_value").unwrap().to_u64(), Some(42));
+    assert_eq!(present.read("condition_status").unwrap().to_u64(), Some(1));
+    assert_eq!(present.read("condition_value").unwrap().to_u64(), Some(7));
+
+    let mut absent = Simulator::new(&design).expect("create absent value-plusargs simulator");
+    absent.run_until(0).expect("execute absent value plusargs");
+    assert_eq!(absent.read("assignment_status").unwrap().to_u64(), Some(0));
+    assert!(absent.read("assignment_value").unwrap().to_u64().is_none());
+    assert_eq!(absent.read("condition_status").unwrap().to_u64(), Some(0));
+    assert!(absent.read("condition_value").unwrap().to_u64().is_none());
+}
+
+#[test]
+fn slang_direct_lowering_executes_radix_and_string_value_plusargs() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("radix-string-value-plusargs");
+    let source_path = root.join("radix_string_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module radix_string_plusargs_probe(
+  output bit hex_status,
+  output int hex_value,
+  output bit string_status,
+  output string text_value
+);
+  initial begin
+    hex_status = $value$plusargs("HEX=%h", hex_value);
+    string_status = $value$plusargs("TEXT=%s", text_value);
+  end
+endmodule
+"#,
+    )
+    .expect("write radix/string plusargs source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("radix_string_plusargs_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower radix/string plusargs");
+    let mut simulator = Simulator::new(&design).expect("create radix/string plusargs simulator");
+    simulator
+        .set_plusargs(["+HEX=2a", "+TEXT=abc"])
+        .expect("install radix/string plusargs");
+    simulator
+        .run_until(0)
+        .expect("execute radix/string plusargs");
+    assert_eq!(simulator.read("hex_status").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("hex_value").unwrap().to_u64(), Some(42));
+    assert_eq!(simulator.read("string_status").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator
+            .read("text_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "abc"
+    );
+}
+
+#[test]
+fn slang_direct_lowering_executes_value_plusargs_from_a_child_instance() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("child-value-plusargs");
+    let source_path = root.join("child_value_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(output int value);
+  int status;
+  initial begin
+    status = $value$plusargs("CHILD_VALUE=%d", value);
+  end
+endmodule
+
+module top(output int value);
+  child u1(.value(value));
+endmodule
+"#,
+    )
+    .expect("write child value-plusargs source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower child value plusargs");
+    assert_eq!(design.plusarg_values.len(), 1);
+    let mut simulator = Simulator::new(&design).expect("create child value-plusargs simulator");
+    simulator
+        .set_plusargs(["+CHILD_VALUE=19"])
+        .expect("install child value plusarg");
+    simulator.run_until(0).expect("execute child value plusarg");
+    assert_eq!(simulator.read("value").unwrap().to_u64(), Some(19));
+}
+
+#[test]
+fn slang_direct_lowering_rejects_wide_value_plusarg_integer_targets() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("wide-value-plusargs");
+    let source_path = root.join("wide_value_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module wide_value_plusargs_probe(output int status, output logic [63:0] value);
+  initial begin
+    status = $value$plusargs("NUM=%d", value);
+  end
+endmodule
+"#,
+    )
+    .expect("write wide value-plusargs source");
+
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("wide_value_plusargs_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("wide integer value-plusargs targets must fail closed");
+    assert!(
+        error.contains("$value$plusargs '%d' currently supports targets up to 32 bits"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_simple_class_objects() {
     let Some(slang) = discover_slang_for_tests() else {
         return;

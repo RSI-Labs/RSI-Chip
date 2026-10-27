@@ -53,6 +53,19 @@ impl SlangAstLowerer {
                 signed: false,
             });
         }
+        if function_name == "$value$plusargs" {
+            let plan = super::declarations::value_plusarg_plan(value)?;
+            let symbol = self
+                .plusargs
+                .get(&plan.query)
+                .ok_or_else(|| format!("plusarg '{}' was not prepared", plan.query))?;
+            return Ok(eda_core::ir::Expr::Ref {
+                net: symbol.base,
+                decl_width: 1,
+                range: eda_core::ir::Range::Bit(0),
+                signed: false,
+            });
+        }
         if matches!(function_name, "$time" | "$stime") {
             let empty_arguments = Vec::new();
             let arguments = value

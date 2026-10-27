@@ -5,7 +5,7 @@ use super::hierarchy::full_range;
 use super::{declaration_name, AstLoweredSymbol, SlangAstLowerer};
 use crate::ast_util::{
     bool_field, expression_symbol, resolve_memory_file_path, resolve_memory_output_path,
-    slang_constant_u64, string_field, usize_field, with_source_span,
+    slang_constant_u64, string_field, unwrap_conversion, usize_field, with_source_span,
 };
 use crate::types::{is_dynamic_container_type, memory_type, AstPackedDimension};
 use eda_core::logic::{LogicValue, LogicWord};
@@ -671,6 +671,9 @@ impl SlangAstLowerer {
             ),
             "Disable" => self.lower_named_disable(statement),
             "Conditional" => {
+                if let Some(statement) = self.lower_value_plusarg_conditional(statement)? {
+                    return Ok(statement);
+                }
                 if let Some(statement) = self.lower_uvm_resource_read_type_conditional(statement)? {
                     return Ok(statement);
                 }
@@ -1800,6 +1803,9 @@ impl SlangAstLowerer {
         {
             return Ok(statement);
         }
+        if let Some(statement) = self.lower_value_plusarg_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
         if let Some(statement) = self.lower_class_null_assignment(assignment)? {
             return Ok(statement);
         }
@@ -1887,6 +1893,119 @@ impl SlangAstLowerer {
         } else {
             Ok(Stmt::Bl { lv, e: expression })
         }
+    }
+
+    fn lower_value_plusarg_output(
+        &self,
+        call: &Value,
+    ) -> Result<(eda_core::ir::Stmt, eda_core::ir::Expr), String> {
+        use eda_core::ir::{Expr, Stmt};
+        let plan = super::declarations::value_plusarg_plan(call)?;
+        if !self.plusargs.contains_key(&plan.query) {
+            return Err(format!("plusarg '{}' was not prepared", plan.query));
+        }
+        let value = self
+            .plusarg_values
+            .get(&plan.query)
+            .ok_or_else(|| format!("plusarg value '{}' was not prepared", plan.query))?;
+        let target = self.lower_lvalue(plan.target)?;
+        let parsed = match plan.specifier {
+            's' => Expr::Ref {
+                net: value.base,
+                decl_width: value.width,
+                range: full_range(value.width),
+                signed: false,
+            },
+            specifier => {
+                if target.decl_width > 32 {
+                    return Err(format!(
+                        "$value$plusargs '%{specifier}' currently supports targets up to 32 bits"
+                    ));
+                }
+                let radix = match specifier {
+                    'd' => 10,
+                    'h' => 16,
+                    'o' => 8,
+                    'b' => 2,
+                    _ => unreachable!("validated $value$plusargs specifier"),
+                };
+                Expr::StringToRadix {
+                    e: Box::new(Expr::Ref {
+                        net: value.base,
+                        decl_width: value.width,
+                        range: full_range(value.width),
+                        signed: false,
+                    }),
+                    radix,
+                }
+            }
+        };
+        let status = self.lower_expression(call)?;
+        let output = Stmt::If {
+            c: status.clone(),
+            t: Box::new(Stmt::Bl {
+                lv: target,
+                e: parsed,
+            }),
+            f: None,
+        };
+        Ok((output, status))
+    }
+
+    fn lower_value_plusarg_assignment(
+        &self,
+        assignment: &Value,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        use eda_core::ir::Stmt;
+        let call = unwrap_conversion(right);
+        if string_field(call, "kind").as_deref() != Some("Call")
+            || string_field(call, "subroutine").as_deref() != Some("$value$plusargs")
+        {
+            return Ok(None);
+        }
+        let (output, _) = self.lower_value_plusarg_output(call)?;
+        let status = self.lower_expression(right)?;
+        let status_lv = self.lower_lvalue(left)?;
+        let status_assignment = if bool_field(assignment, "isNonBlocking") {
+            Stmt::NBl {
+                lv: status_lv,
+                e: status,
+            }
+        } else {
+            Stmt::Bl {
+                lv: status_lv,
+                e: status,
+            }
+        };
+        Ok(Some(Stmt::Block(vec![output, status_assignment])))
+    }
+
+    fn lower_value_plusarg_conditional(
+        &self,
+        statement: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        use eda_core::ir::Stmt;
+        let conditions = statement
+            .get("conditions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "conditional statement has no conditions".to_string())?;
+        if conditions.len() != 1 {
+            return Ok(None);
+        }
+        let Some(condition) = conditions.first().and_then(|value| value.get("expr")) else {
+            return Ok(None);
+        };
+        let call = unwrap_conversion(condition);
+        if string_field(call, "kind").as_deref() != Some("Call")
+            || string_field(call, "subroutine").as_deref() != Some("$value$plusargs")
+        {
+            return Ok(None);
+        }
+        let (output, _) = self.lower_value_plusarg_output(call)?;
+        let selection = self.lower_unchecked_conditional_statement(statement)?;
+        Ok(Some(Stmt::Block(vec![output, selection])))
     }
 
     fn whole_memory_assignment(

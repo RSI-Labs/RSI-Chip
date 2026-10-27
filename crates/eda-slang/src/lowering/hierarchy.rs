@@ -1211,6 +1211,7 @@ impl super::SlangAstLowerer {
             interface_modport_symbols: std::collections::BTreeMap::new(),
             interface_modport_names: std::collections::BTreeMap::new(),
             plusargs: std::collections::BTreeMap::new(),
+            plusarg_values: std::collections::BTreeMap::new(),
             time_scale: super::body_time_scale(body),
             global_time_precision: self.global_time_precision,
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
@@ -1479,6 +1480,20 @@ impl super::SlangAstLowerer {
                 }
             } else {
                 self.design.plusargs.insert(name.clone(), remapped);
+            }
+        }
+        for (name, net) in &child.design.plusarg_values {
+            let remapped = net + offset;
+            if let Some(existing) = self.design.plusarg_values.get(name) {
+                if *existing != remapped {
+                    plusarg_net_rewrites.push(NetRewrite {
+                        from: remapped,
+                        to: *existing,
+                        width: 512,
+                    });
+                }
+            } else {
+                self.design.plusarg_values.insert(name.clone(), remapped);
             }
         }
         static_net_rewrites.extend(plusarg_net_rewrites);

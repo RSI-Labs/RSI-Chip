@@ -64,15 +64,15 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     } else {
         string_field(value, "type").and_then(|type_name| simple_type_width(&type_name))
     };
-    let plusarg_name = (kind == "Call" && operator.as_deref() == Some("$test$plusargs"))
-        .then(|| {
-            value
-                .get("arguments")
-                .and_then(Value::as_array)
-                .and_then(|arguments| arguments.first())
-                .and_then(string_literal)
-        })
-        .flatten();
+    let plusarg_name = if kind == "Call"
+        && matches!(
+            operator.as_deref(),
+            Some("$test$plusargs") | Some("$value$plusargs")
+        ) {
+        plusarg_query(value)
+    } else {
+        None
+    };
     SlangExpressionSummary {
         kind,
         type_name: string_field(value, "type").unwrap_or_default(),
@@ -144,6 +144,50 @@ pub(crate) fn expression_literal(value: &Value) -> Option<String> {
     };
     let width = word.width();
     Some(format!("{width}:{}", word.to_bin_str()))
+}
+
+fn plusarg_query(value: &Value) -> Option<String> {
+    let argument = value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())?;
+    let literal = string_literal(argument)?;
+    if string_field(value, "subroutine").as_deref() == Some("$test$plusargs") {
+        return Some(literal);
+    }
+    let percent = literal.find('%')?;
+    literal[..percent].strip_suffix('=').map(str::to_string)
+}
+
+fn value_plusarg_summary(value: &Value) -> Option<SlangExpressionSummary> {
+    let query = plusarg_query(value)?;
+    let format = value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())
+        .and_then(string_literal)?;
+    let percent = format.find('%')?;
+    let specifier = format[percent + 1..].chars().next()?;
+    let mut summary = empty_expression_summary();
+    summary.plusarg_name = Some(query);
+    if specifier == 's' {
+        summary.kind = "Ref".into();
+        summary.type_width = Some(512);
+        summary.type_signed = Some(false);
+    } else {
+        let radix = match specifier {
+            'd' => "10",
+            'h' => "16",
+            'o' => "8",
+            'b' => "2",
+            _ => return None,
+        };
+        summary.kind = "StringToRadix".into();
+        summary.operator = radix.into();
+        summary.type_width = Some(32);
+        summary.type_signed = Some(true);
+    }
+    Some(summary)
 }
 
 pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> {
@@ -338,6 +382,36 @@ pub(crate) fn procedural_assignments(
             .is_some_and(|count| count == 0)
     {
         return assignments;
+    }
+    if string_field(value, "kind").as_deref() == Some("Call")
+        && string_field(value, "subroutine").as_deref() == Some("$value$plusargs")
+    {
+        if let Some(target) = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .and_then(|arguments| arguments.get(1))
+            .and_then(|argument| argument.get("left"))
+        {
+            if let Some(rhs) = value_plusarg_summary(value) {
+                assignments.push(SlangAssignmentSummary {
+                    target_names: expression_target_names(target),
+                    rhs,
+                    nonblocking: false,
+                    dynamic_packed_lvalue: false,
+                    dynamic_packed_lvalue_selector: None,
+                    memory_member_lvalue: None,
+                    constant_array_element_lvalue: false,
+                    dynamic_array_lvalue_indexes: Vec::new(),
+                    array_part_lvalue: None,
+                    class_handle_source: None,
+                    class_handle_target_key: None,
+                    class_handle_source_key: None,
+                    class_handle_dynamic_sources: Vec::new(),
+                    class_handle_dynamic_targets: Vec::new(),
+                });
+                return assignments;
+            }
+        }
     }
     if string_field(value, "kind").as_deref() == Some("Assignment") {
         if let (Some(left), Some(right)) = (value.get("left"), value.get("right")) {
@@ -2077,7 +2151,28 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
-    if expression.kind == "Call" && expression.operator == "$test$plusargs" {
+    if expression.kind == "StringToRadix" {
+        if let Some(name) = expression.plusarg_name.as_deref() {
+            return Some(format!(
+                "StringToRadix:32:s[Radix{}:Ref:512:u[{}]]",
+                expression.operator,
+                eda_core::ir::plusarg_value_net_name(name)
+            ));
+        }
+    }
+    if expression.kind == "Ref" && expression.plusarg_name.is_some() {
+        let name = expression.plusarg_name.as_deref()?;
+        return Some(format!(
+            "Ref:512:u[{}]",
+            eda_core::ir::plusarg_value_net_name(name)
+        ));
+    }
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$test$plusargs" | "$value$plusargs"
+        )
+    {
         let name = expression.plusarg_name.as_deref()?;
         return Some(format!("Ref:1:u[{}]", eda_core::ir::plusarg_net_name(name)));
     }
