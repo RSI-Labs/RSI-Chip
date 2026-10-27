@@ -240,6 +240,65 @@ endmodule
 }
 
 #[test]
+fn constant_arithmetic_overflow_fails_closed() {
+    let cases = [
+        (
+            r#"
+module top;
+parameter HALF = 64'd4611686018427387903;
+parameter MAX = HALF * 2 + 1;
+parameter BAD = MAX + 1;
+wire [BAD-1:0] y;
+assign y = 1'b0;
+endmodule
+"#,
+            "constant addition overflows in module 'top'",
+        ),
+        (
+            r#"
+module top;
+parameter HALF = 64'd4611686018427387903;
+parameter BAD = HALF * 3;
+wire [BAD-1:0] y;
+assign y = 1'b0;
+endmodule
+"#,
+            "constant multiplication overflows in module 'top'",
+        ),
+        (
+            r#"
+module top;
+parameter HALF = 64'd4611686018427387903;
+parameter MIN = -HALF * 2 - 2;
+parameter BAD = -MIN;
+wire [BAD-1:0] y;
+assign y = 1'b0;
+endmodule
+"#,
+            "constant unary negation overflows in module 'top'",
+        ),
+        (
+            r#"
+module top;
+parameter HALF = 64'd4611686018427387903;
+parameter MAX = HALF * 2 + 1;
+parameter BAD = MAX << 64;
+wire [BAD-1:0] y;
+assign y = 1'b0;
+endmodule
+"#,
+            "constant left shift count 64 is outside 0..63 in module 'top'",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let error =
+            compile(source, None).expect_err("constant arithmetic overflow must not wrap silently");
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+}
+
+#[test]
 fn wildcard_import_name_collisions_fail_closed() {
     let cases = [
         (

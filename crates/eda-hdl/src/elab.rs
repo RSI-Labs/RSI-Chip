@@ -1176,7 +1176,9 @@ fn const_eval(
         ast::Expr::Un(op, a) => {
             let v = const_eval(a, params, module_name)?;
             Ok(match op {
-                ast::UnOpSrc::Minus => -v,
+                ast::UnOpSrc::Minus => v.checked_neg().ok_or_else(|| {
+                    format!("constant unary negation overflows in module '{module_name}'")
+                })?,
                 ast::UnOpSrc::Plus => v,
                 ast::UnOpSrc::LogNot => (v == 0) as i64,
                 _ => return Err("unsupported constant unary operator".into()),
@@ -1186,17 +1188,43 @@ fn const_eval(
             let x = const_eval(a, params, module_name)?;
             let y = const_eval(b, params, module_name)?;
             Ok(match op {
-                ast::BinOpSrc::Add => x.wrapping_add(y),
-                ast::BinOpSrc::Sub => x.wrapping_sub(y),
-                ast::BinOpSrc::Mul => x.wrapping_mul(y),
+                ast::BinOpSrc::Add => x.checked_add(y).ok_or_else(|| {
+                    format!("constant addition overflows in module '{module_name}'")
+                })?,
+                ast::BinOpSrc::Sub => x.checked_sub(y).ok_or_else(|| {
+                    format!("constant subtraction overflows in module '{module_name}'")
+                })?,
+                ast::BinOpSrc::Mul => x.checked_mul(y).ok_or_else(|| {
+                    format!("constant multiplication overflows in module '{module_name}'")
+                })?,
                 ast::BinOpSrc::Div => {
                     if y == 0 {
                         return Err("division by zero in constant".into());
                     }
-                    x / y
+                    x.checked_div(y).ok_or_else(|| {
+                        format!("constant division overflows in module '{module_name}'")
+                    })?
                 }
-                ast::BinOpSrc::Shl => x.wrapping_shl(y as u32),
-                ast::BinOpSrc::Shr => x.wrapping_shr(y as u32),
+                ast::BinOpSrc::Shl => {
+                    if !(0..64).contains(&y) {
+                        return Err(format!(
+                            "constant left shift count {y} is outside 0..63 in module '{module_name}'"
+                         ));
+                    }
+                    x.checked_shl(y as u32).ok_or_else(|| {
+                        format!("constant left shift overflows in module '{module_name}'")
+                    })?
+                }
+                ast::BinOpSrc::Shr => {
+                    if !(0..64).contains(&y) {
+                        return Err(format!(
+                            "constant right shift count {y} is outside 0..63 in module '{module_name}'"
+                         ));
+                    }
+                    x.checked_shr(y as u32).ok_or_else(|| {
+                        format!("constant right shift overflows in module '{module_name}'")
+                    })?
+                }
                 ast::BinOpSrc::Eq => (x == y) as i64,
                 ast::BinOpSrc::Ne => (x != y) as i64,
                 ast::BinOpSrc::Lt => (x < y) as i64,
