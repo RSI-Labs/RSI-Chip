@@ -48,3 +48,29 @@ endmodule
         "{output}"
     );
 }
+
+#[test]
+fn slang_info_reports_incomplete_constant_cases() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "incomplete-case.sv",
+        r#"
+module incomplete_case(input [1:0] selector, output reg y);
+always @* begin
+  case (selector)
+    2'd0: y = 1'b0;
+    2'd1: y = 1'b1;
+  endcase
+end
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "incomplete_case"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("IncompleteCase: 'selector' leaves 2 selector value(s) unhandled"),
+        "{output}"
+    );
+}

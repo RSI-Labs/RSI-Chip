@@ -1018,6 +1018,7 @@ pub struct Assign {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LintIssueKind {
+    IncompleteCase,
     CombinationalLoop,
     MultipleContinuousDrivers,
 }
@@ -1198,6 +1199,120 @@ fn lint_visit_loop_node(
     state.insert(node, DfsState::Black);
 }
 
+fn lint_visit_case_statement(
+    statement: &Stmt,
+    design: &Design,
+    issues: &mut std::collections::BTreeMap<String, LintIssue>,
+) {
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter()
+            .for_each(|nested| lint_visit_case_statement(nested, design, issues)),
+        Stmt::Forever(body) | Stmt::Delay { body, .. } | Stmt::Scope(body) => {
+            lint_visit_case_statement(body, design, issues)
+        }
+        Stmt::If { t, f, .. } => {
+            lint_visit_case_statement(t, design, issues);
+            if let Some(f) = f {
+                lint_visit_case_statement(f, design, issues);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            lint_record_case(e, arms, dflt.as_deref(), design, issues);
+            for (_, body) in arms {
+                lint_visit_case_statement(body, design, issues);
+            }
+            if let Some(body) = dflt {
+                lint_visit_case_statement(body, design, issues);
+            }
+        }
+        Stmt::Wait { body, .. } | Stmt::EventWait { body, .. } | Stmt::Repeat { body, .. } => {
+            lint_visit_case_statement(body, design, issues)
+        }
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(success) = success {
+                lint_visit_case_statement(success, design, issues);
+            }
+            if let Some(failure) = failure {
+                lint_visit_case_statement(failure, design, issues);
+            }
+        }
+        Stmt::Fork { branches, .. } => branches
+            .iter()
+            .for_each(|nested| lint_visit_case_statement(nested, design, issues)),
+        Stmt::While { body, steps, .. } => {
+            lint_visit_case_statement(body, design, issues);
+            steps
+                .iter()
+                .for_each(|nested| lint_visit_case_statement(nested, design, issues));
+        }
+        _ => {}
+    }
+}
+
+fn lint_record_case(
+    selector: &Expr,
+    arms: &[(Expr, Stmt)],
+    default: Option<&Stmt>,
+    design: &Design,
+    issues: &mut std::collections::BTreeMap<String, LintIssue>,
+) {
+    if default.is_some() {
+        return;
+    }
+
+    let width = selector.width();
+    let mut missing = 1_usize;
+    if width <= 12 {
+        let total = 1_usize << width;
+        let mut covered = std::collections::BTreeSet::new();
+        let mut labels_are_constant = true;
+        for (label, _) in arms {
+            match label {
+                Expr::Const(value) => {
+                    let Some(value) = value.to_u64() else {
+                        labels_are_constant = false;
+                        break;
+                    };
+                    covered.insert(value);
+                }
+                _ => {
+                    labels_are_constant = false;
+                    break;
+                }
+            }
+        }
+        if !labels_are_constant {
+            missing = 1;
+        } else {
+            missing = total.saturating_sub(covered.len());
+        }
+    }
+    if missing == 0 {
+        return;
+    }
+
+    let mut nets = Vec::new();
+    lint_expression_nets(selector, &mut nets);
+    let selector_name = nets
+        .first()
+        .map(|net| {
+            let bit_name = design.net_name(*net);
+            bit_name.split('[').next().unwrap_or(&bit_name).to_string()
+        })
+        .unwrap_or_else(|| format!("{selector:?}"));
+    issues
+        .entry(selector_name.clone())
+        .and_modify(|issue| issue.count = issue.count.saturating_add(missing))
+        .or_insert(LintIssue {
+            kind: LintIssueKind::IncompleteCase,
+            net: selector_name,
+            count: missing,
+        });
+}
+
 #[derive(Clone, Debug)]
 pub struct ClockingBlock {
     pub name: String,
@@ -1315,6 +1430,22 @@ impl Design {
                 continue;
             }
             lint_visit_loop_node(node, &graph, &mut state, &mut path, &mut issues, self);
+        }
+        issues.into_values().collect()
+    }
+
+    /// Report case statements whose label set is not provably exhaustive.
+    ///
+    /// A `default` arm proves exhaustiveness. Without one, only a fully
+    /// covered small constant selector is considered complete.
+    pub fn lint_incomplete_cases(&self) -> Vec<LintIssue> {
+        let mut issues: std::collections::BTreeMap<String, LintIssue> =
+            std::collections::BTreeMap::new();
+        for process in &self.processes {
+            lint_visit_case_statement(&process.body, self, &mut issues);
+        }
+        for statement in self.initials.iter().chain(self.final_blocks.iter()) {
+            lint_visit_case_statement(statement, self, &mut issues);
         }
         issues.into_values().collect()
     }
@@ -2063,6 +2194,52 @@ mod tests {
                 count: 3,
             }]
         );
+    }
+
+    #[test]
+    fn lint_reports_only_uncovered_constant_cases() {
+        let mut design = Design {
+            name: "cases".into(),
+            ..Default::default()
+        };
+        let selector = || Expr::Ref {
+            net: 0,
+            decl_width: 2,
+            range: Range::Span { msb: 1, lsb: 0 },
+            signed: false,
+        };
+        let label = |value: u64| Expr::Const(LogicWord::from_u64(2, value));
+        let assignment = || Stmt::Bl {
+            lv: LValue {
+                net: 0,
+                decl_width: 2,
+                range: Range::Span { msb: 1, lsb: 0 },
+            },
+            e: label(0),
+        };
+        design.processes.push(Process {
+            sens: Sens::Comb,
+            body: Stmt::Case {
+                e: selector(),
+                arms: vec![(label(0), assignment()), (label(1), assignment())],
+                dflt: None,
+            },
+        });
+        assert_eq!(
+            design.lint_incomplete_cases(),
+            vec![LintIssue {
+                kind: LintIssueKind::IncompleteCase,
+                net: "net0".into(),
+                count: 2,
+            }]
+        );
+
+        let mut complete = design;
+        if let Stmt::Case { arms, .. } = &mut complete.processes[0].body {
+            arms.push((label(2), assignment()));
+            arms.push((label(3), assignment()));
+        }
+        assert!(complete.lint_incomplete_cases().is_empty());
     }
 
     #[test]

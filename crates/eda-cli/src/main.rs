@@ -160,6 +160,7 @@ fn main() -> ExitCode {
                     );
                     let mut lint_issues = design.lint_multiple_continuous_drivers();
                     lint_issues.extend(design.lint_combinational_loops());
+                    lint_issues.extend(design.lint_incomplete_cases());
                     println!("  lint findings: {}", lint_issues.len());
                     for issue in lint_issues {
                         match issue.kind {
@@ -169,6 +170,10 @@ fn main() -> ExitCode {
                             ),
                             eda_core::ir::LintIssueKind::CombinationalLoop => println!(
                                 "    {:?}: '{}' has {} nodes in a continuous cycle",
+                                issue.kind, issue.net, issue.count
+                            ),
+                            eda_core::ir::LintIssueKind::IncompleteCase => println!(
+                                "    {:?}: '{}' leaves {} selector value(s) unhandled",
                                 issue.kind, issue.net, issue.count
                             ),
                         }
