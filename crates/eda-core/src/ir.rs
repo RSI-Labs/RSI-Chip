@@ -14,6 +14,14 @@ pub enum Range {
     Span { msb: usize, lsb: usize },
 }
 
+pub fn plusarg_net_name(name: &str) -> String {
+    let encoded = name
+        .bytes()
+        .map(|byte| format!("_{byte:02x}"))
+        .collect::<String>();
+    format!("__eda_plusarg{encoded}")
+}
+
 impl Range {
     pub fn width(&self) -> usize {
         match self {
@@ -1025,6 +1033,8 @@ pub struct Design {
     pub clocking_blocks: Vec<ClockingBlock>,
     /// Elaborated module instances retained after flattening.
     pub hierarchy: Vec<HierarchicalInstance>,
+    /// One-bit state initialized from simulator plusargs.
+    pub plusargs: std::collections::BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

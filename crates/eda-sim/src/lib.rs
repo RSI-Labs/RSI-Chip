@@ -381,6 +381,12 @@ impl<'d> Simulator<'d> {
             zero_delay_feedback_nets,
             cancellation: FlowCancellation::new(),
         };
+        for net in design.plusargs.values() {
+            if *net >= n {
+                return Err("plusarg state refers to a missing net".into());
+            }
+            sim.vals[*net] = LogicValue::Zero;
+        }
         for init in &design.initials {
             sim.conts.entry(0).or_default().push(Cont {
                 process: None,
@@ -432,6 +438,38 @@ impl<'d> Simulator<'d> {
 
     pub fn set_print_stdout(&mut self, on: bool) {
         self.print_stdout = on;
+    }
+
+    /// Install runtime `+ARG` strings before time-zero processes execute.
+    pub fn set_plusargs<I, S>(&mut self, plusargs: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if self.now != 0 || self.finished {
+            return Err("plusargs must be installed before simulation starts".into());
+        }
+        let names = plusargs
+            .into_iter()
+            .map(|argument| {
+                argument
+                    .as_ref()
+                    .trim_start_matches('+')
+                    .trim_start()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for (query, net) in &self.design.plusargs {
+            if *net >= self.vals.len() {
+                return Err("plusarg state refers to a missing net".into());
+            }
+            self.vals[*net] = LogicValue::bit(
+                names
+                    .iter()
+                    .any(|candidate| candidate.starts_with(query.as_str())),
+            );
+        }
+        Ok(())
     }
 
     /// Install a shared cancellation token checked inside delta cycles.

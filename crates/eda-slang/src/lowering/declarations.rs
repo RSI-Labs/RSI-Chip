@@ -4,7 +4,8 @@ use super::{
     declaration_name, AstEnumType, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer,
 };
 use crate::ast_util::{
-    bool_field, literal_word, memory_initializer_statements, string_field, usize_field,
+    bool_field, literal_word, memory_initializer_statements, string_field, string_literal,
+    usize_field, with_source_span,
 };
 use crate::types::{
     associative_memory_type, dynamic_memory_type, memory_type, memory_type_with_element,
@@ -13,6 +14,57 @@ use crate::types::{
 };
 
 impl SlangAstLowerer {
+    pub(super) fn prepare_plusargs(&mut self, body: &serde_json::Value) -> Result<(), String> {
+        let mut calls = Vec::new();
+        collect_plusarg_test_calls(body, &mut calls);
+        for call in calls {
+            let empty_arguments = Vec::new();
+            let arguments = call
+                .get("arguments")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err(with_source_span(
+                    call,
+                    "$test$plusargs requires one string literal argument".into(),
+                ));
+            }
+            let name = string_literal(&arguments[0])
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    with_source_span(
+                        call,
+                        "$test$plusargs requires a non-empty string literal".into(),
+                    )
+                })?;
+            if self.plusargs.contains_key(&name) {
+                continue;
+            }
+            let net_name = eda_core::ir::plusarg_net_name(&name);
+            let base = self.design.n_nets;
+            self.design.n_nets += 1;
+            self.design.net_decls.push(eda_core::ir::NetDecl {
+                name: net_name,
+                width: 1,
+                is_reg: false,
+                is_signed: false,
+                base,
+            });
+            let symbol = AstLoweredSymbol {
+                base,
+                width: 1,
+                signed: false,
+                bounds: None,
+                dimensions: Vec::new(),
+                memory: None,
+                struct_fields: std::collections::BTreeMap::new(),
+            };
+            self.plusargs.insert(name.clone(), symbol);
+            self.design.plusargs.insert(name, base);
+        }
+        Ok(())
+    }
+
     fn insert_type_alias(
         &mut self,
         name: String,
@@ -788,5 +840,27 @@ fn detailed_type_signed(type_value: &serde_json::Value) -> bool {
             Some("byte unsigned" | "shortint unsigned" | "int unsigned" | "longint unsigned")
         ),
         _ => bool_field(type_value, "isSigned"),
+    }
+}
+
+fn collect_plusarg_test_calls<'value>(
+    value: &'value serde_json::Value,
+    calls: &mut Vec<&'value serde_json::Value>,
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Call")
+            && string_field(value, "subroutine").as_deref() == Some("$test$plusargs")
+        {
+            calls.push(value);
+        }
+        for nested in fields.values() {
+            collect_plusarg_test_calls(nested, calls);
+        }
+        return;
+    }
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_plusarg_test_calls(nested, calls);
+        }
     }
 }

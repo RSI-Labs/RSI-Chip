@@ -2,7 +2,7 @@
 
 use super::statements::event_array_condition;
 use super::{declaration_name, SlangAstLowerer};
-use crate::ast_util::{bool_field, expression_symbol, string_field};
+use crate::ast_util::{bool_field, expression_symbol, string_field, string_literal};
 use crate::types::simple_type_shape;
 use serde_json::{json, Value};
 
@@ -30,6 +30,29 @@ impl SlangAstLowerer {
             .split_whitespace()
             .next_back()
             .unwrap_or_default();
+        if function_name == "$test$plusargs" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$test$plusargs requires one string literal argument".into());
+            }
+            let name = string_literal(&arguments[0])
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "$test$plusargs requires a non-empty string literal".to_string())?;
+            let symbol = self
+                .plusargs
+                .get(&name)
+                .ok_or_else(|| format!("plusarg '{name}' was not prepared"))?;
+            return Ok(eda_core::ir::Expr::Ref {
+                net: symbol.base,
+                decl_width: 1,
+                range: eda_core::ir::Range::Bit(0),
+                signed: false,
+            });
+        }
         if matches!(function_name, "$time" | "$stime") {
             let empty_arguments = Vec::new();
             let arguments = value

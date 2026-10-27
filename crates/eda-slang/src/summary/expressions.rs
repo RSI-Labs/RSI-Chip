@@ -3,7 +3,7 @@
 use crate::ast_util::{
     bool_field, expression_symbol, expression_symbol_id, expression_target_names,
     instance_parameters, integer_literal_word, literal_word, named_constant_word,
-    parameter_summary, slang_constant_u64, string_field,
+    parameter_summary, slang_constant_u64, string_field, string_literal,
 };
 use crate::types::{
     associative_memory_type, dynamic_memory_type, memory_type, memory_type_with_element,
@@ -64,6 +64,15 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     } else {
         string_field(value, "type").and_then(|type_name| simple_type_width(&type_name))
     };
+    let plusarg_name = (kind == "Call" && operator.as_deref() == Some("$test$plusargs"))
+        .then(|| {
+            value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .and_then(|arguments| arguments.first())
+                .and_then(string_literal)
+        })
+        .flatten();
     SlangExpressionSummary {
         kind,
         type_name: string_field(value, "type").unwrap_or_default(),
@@ -81,6 +90,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         member_range: None,
         interface_path: None,
         streaming_slice_size,
+        plusarg_name,
         operands: expression_operands(value),
     }
 }
@@ -103,6 +113,7 @@ pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
         member_range: None,
         interface_path: None,
         streaming_slice_size: None,
+        plusarg_name: None,
         operands: Vec::new(),
     }
 }
@@ -2066,6 +2077,10 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    if expression.kind == "Call" && expression.operator == "$test$plusargs" {
+        let name = expression.plusarg_name.as_deref()?;
+        return Some(format!("Ref:1:u[{}]", eda_core::ir::plusarg_net_name(name)));
+    }
     if expression.kind == "Call"
         && matches!(
             expression.operator.as_str(),

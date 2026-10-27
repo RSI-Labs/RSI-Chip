@@ -199,6 +199,82 @@ endmodule
 }
 
 #[test]
+fn slang_direct_lowering_executes_runtime_test_plusargs() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("runtime-test-plusargs");
+    let source_path = root.join("test_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module plusargs_probe(output bit present, output bit absent);
+  initial begin
+    present = $test$plusargs("OK");
+    absent = $test$plusargs("MISSING");
+  end
+endmodule
+"#,
+    )
+    .expect("write runtime plusargs source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("plusargs_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower runtime plusargs");
+    assert_eq!(design.plusargs.len(), 2);
+    let mut simulator = Simulator::new(&design).expect("create plusargs simulator");
+    simulator
+        .set_plusargs(["+OK", "UNRELATED"])
+        .expect("install runtime plusargs");
+    simulator.run_until(0).expect("execute plusargs probes");
+    assert_eq!(simulator.read("present").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("absent").unwrap().to_u64(), Some(0));
+}
+
+#[test]
+fn slang_direct_lowering_executes_plusargs_from_a_child_instance() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("child-test-plusargs");
+    let source_path = root.join("child_test_plusargs.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module child(output bit present);
+  initial begin
+    present = $test$plusargs("CHILD_OK");
+  end
+endmodule
+
+module top(output bit present);
+  child u1(.present(present));
+endmodule
+"#,
+    )
+    .expect("write child plusargs source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower child plusargs");
+    assert_eq!(design.plusargs.len(), 1);
+    let mut simulator = Simulator::new(&design).expect("create child plusargs simulator");
+    simulator
+        .set_plusargs(["+CHILD_OK"])
+        .expect("install child plusarg");
+    simulator.run_until(0).expect("execute child plusarg");
+    assert_eq!(simulator.read("present").unwrap().to_u64(), Some(1));
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_simple_class_objects() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -9088,6 +9164,7 @@ endmodule
                 member_range: None,
                 interface_path: None,
                 streaming_slice_size: None,
+                plusarg_name: None,
                 operands: Vec::new(),
             },
         });
@@ -20951,6 +21028,72 @@ fn slang_direct_official_upstream_uvm_compatibility_fixture_compiles_with_versio
     simulator
         .run_until(2)
         .expect("execute the upstream UVM compatibility fixture through completion");
+}
+
+#[test]
+fn slang_direct_official_upstream_uvm_plusargs_fixture_executes_both_branches() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture_directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/06plusargs")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM plusargs fixture");
+    let fixture = fixture_directory.join("test.sv");
+    let fixture_text =
+        std::fs::read_to_string(&fixture).expect("read the pinned upstream UVM plusargs fixture");
+    let defines = std::fs::read_to_string(fixture_directory.join("test.defines"))
+        .expect("read the pinned upstream UVM plusargs defines");
+    assert!(
+        fixture_text.contains("$test$plusargs(\"OK\")"),
+        "the upstream plusargs fixture must retain its runtime query"
+    );
+    assert_eq!(defines.trim(), "+define+BAR");
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string(), "BAR".to_string()],
+        undefines: Vec::new(),
+    };
+    let design = slang
+        .compile_files(&[source, fixture], Some("top"), &options)
+        .expect("directly lower the pinned upstream UVM plusargs fixture");
+    assert_eq!(design.name, "top");
+    assert!(design.plusargs.contains_key("OK"));
+
+    let mut present = Simulator::new(&design).expect("create the present-plusargs simulator");
+    present
+        .set_plusargs(["+OK"])
+        .expect("install the upstream OK plusarg");
+    present
+        .run_until(2)
+        .expect("execute the upstream present-plusargs branch");
+    let present_output = present.displays.join("");
+    assert!(
+        present_output.contains("** UVM TEST PASSED **"),
+        "unexpected present-plusargs output: {present_output}"
+    );
+    assert!(
+        !present_output.contains("** UVM TEST FAILED **"),
+        "unexpected present-plusargs output: {present_output}"
+    );
+
+    let mut absent = Simulator::new(&design).expect("create the absent-plusargs simulator");
+    absent
+        .run_until(2)
+        .expect("execute the upstream absent-plusargs branch");
+    let absent_output = absent.displays.join("");
+    assert!(
+        absent_output.contains("** UVM TEST FAILED **"),
+        "unexpected absent-plusargs output: {absent_output}"
+    );
+    assert!(
+        !absent_output.contains("** UVM TEST PASSED **"),
+        "unexpected absent-plusargs output: {absent_output}"
+    );
 }
 
 #[test]

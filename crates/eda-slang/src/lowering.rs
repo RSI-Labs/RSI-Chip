@@ -646,6 +646,7 @@ pub(super) struct SlangAstLowerer {
     clocking_variables: std::collections::BTreeMap<String, AstClockingVariable>,
     interface_modport_symbols: std::collections::BTreeMap<String, InterfaceModportSymbols>,
     interface_modport_names: std::collections::BTreeMap<String, String>,
+    plusargs: std::collections::BTreeMap<String, AstLoweredSymbol>,
     time_scale: AstTimeScale,
     global_time_precision: i8,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
@@ -812,6 +813,7 @@ impl SlangAstLowerer {
             clocking_variables: std::collections::BTreeMap::new(),
             interface_modport_symbols: std::collections::BTreeMap::new(),
             interface_modport_names: std::collections::BTreeMap::new(),
+            plusargs: std::collections::BTreeMap::new(),
             time_scale: body_time_scale(body),
             global_time_precision: root
                 .get("eda_global_time_precision")
@@ -836,6 +838,7 @@ impl SlangAstLowerer {
                 ports: Vec::new(),
             });
         lowerer.collect_compilation_unit_members(root)?;
+        lowerer.prepare_plusargs(body)?;
         lowerer.lower_body(body)?;
         let top_ports = lowerer
             .design

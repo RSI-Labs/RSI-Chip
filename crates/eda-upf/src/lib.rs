@@ -1228,6 +1228,7 @@ mod tests {
             final_blocks: Vec::new(),
             clocking_blocks: Vec::new(),
             hierarchy: Vec::new(),
+            plusargs: std::collections::BTreeMap::new(),
         }
     }
 

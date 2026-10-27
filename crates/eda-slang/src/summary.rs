@@ -1955,6 +1955,8 @@ pub struct SlangExpressionSummary {
     pub interface_path: Option<String>,
     /// Slice size for a SystemVerilog streaming concatenation.
     pub streaming_slice_size: Option<usize>,
+    /// Original plusarg name for `$test$plusargs`.
+    pub plusarg_name: Option<String>,
     pub operands: Vec<SlangExpressionSummary>,
 }
 

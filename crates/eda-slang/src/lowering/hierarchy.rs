@@ -1210,6 +1210,7 @@ impl super::SlangAstLowerer {
             clocking_variables: std::collections::BTreeMap::new(),
             interface_modport_symbols: std::collections::BTreeMap::new(),
             interface_modport_names: std::collections::BTreeMap::new(),
+            plusargs: std::collections::BTreeMap::new(),
             time_scale: super::body_time_scale(body),
             global_time_precision: self.global_time_precision,
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
@@ -1341,6 +1342,7 @@ impl super::SlangAstLowerer {
                 }
             }
         }
+        child.prepare_plusargs(body)?;
         child.lower_body(body)?;
 
         if is_interface {
@@ -1406,6 +1408,7 @@ impl super::SlangAstLowerer {
         let child_ports = child.design.ports.clone();
         let child_memories = child.design.memories.clone();
         let mut static_net_rewrites = Vec::new();
+        let mut plusarg_net_rewrites = Vec::new();
         for memory in &child.design.memories {
             let mut memory = memory.clone();
             memory.name = format!("{scoped_instance_name}.{}", memory.name);
@@ -1464,6 +1467,21 @@ impl super::SlangAstLowerer {
                 base: declaration.base + offset,
             });
         }
+        for (name, net) in &child.design.plusargs {
+            let remapped = net + offset;
+            if let Some(existing) = self.design.plusargs.get(name) {
+                if *existing != remapped {
+                    plusarg_net_rewrites.push(NetRewrite {
+                        from: remapped,
+                        to: *existing,
+                        width: 1,
+                    });
+                }
+            } else {
+                self.design.plusargs.insert(name.clone(), remapped);
+            }
+        }
+        static_net_rewrites.extend(plusarg_net_rewrites);
         self.design.n_nets += child.design.n_nets;
 
         for mut assignment in child.design.assigns {

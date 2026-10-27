@@ -83,6 +83,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
         final_blocks: Vec::new(),
         clocking_blocks: Vec::new(),
         hierarchy: Vec::new(),
+        plusargs: std::collections::BTreeMap::new(),
     }
 }
 
@@ -159,6 +160,7 @@ fn ordinary_array_design() -> Design {
         final_blocks: Vec::new(),
         clocking_blocks: Vec::new(),
         hierarchy: Vec::new(),
+        plusargs: std::collections::BTreeMap::new(),
     }
 }
 

@@ -8,6 +8,20 @@ pub(super) fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
+pub(super) fn string_literal(value: &Value) -> Option<String> {
+    string_field(unwrap_conversion(value), "literal")
+}
+
+pub(super) fn unwrap_conversion(mut value: &Value) -> &Value {
+    while value.get("kind").and_then(Value::as_str) == Some("Conversion") {
+        let Some(operand) = value.get("operand") else {
+            break;
+        };
+        value = operand;
+    }
+    value
+}
+
 pub(super) fn normalize_instance_bodies(value: &mut Value) {
     let mut bodies = std::collections::BTreeMap::new();
     collect_instance_bodies(value, &mut bodies);
