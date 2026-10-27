@@ -23921,6 +23921,118 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_resolves_a_runtime_factory_type_alias() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-runtime-type-alias-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class RuntimeTypeAliasTrace;
+  static int stage = 0;
+endclass
+
+class test extends uvm_test;
+  `uvm_component_utils(test)
+
+  function new(string name = "test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    RuntimeTypeAliasTrace::stage = 1;
+  endfunction
+endclass
+
+class runtime_alias_base extends uvm_test;
+  `uvm_component_utils(runtime_alias_base)
+
+  function new(string name = "runtime_alias_base",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    RuntimeTypeAliasTrace::stage = 3;
+  endfunction
+endclass
+
+class runtime_alias_derived extends runtime_alias_base;
+  `uvm_component_utils(runtime_alias_derived)
+
+  function new(string name = "runtime_alias_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    RuntimeTypeAliasTrace::stage = 2;
+  endfunction
+endclass
+
+module official_uvm_runtime_type_alias_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_alias(
+      "runtime_alias",
+      runtime_alias_base::get_type()
+    );
+    uvm_factory::get().set_type_override_by_name(
+      "runtime_alias",
+      "runtime_alias_derived"
+    );
+    run_test();
+    stage = RuntimeTypeAliasTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM runtime type-alias wrapper");
+
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_runtime_type_alias_probe"),
+            &options,
+        )
+        .expect("directly lower runtime UVM type-alias selection");
+
+    let mut default = Simulator::new(&design).expect("create default alias simulator");
+    default
+        .run_until(2)
+        .expect("run the absent-plusarg default test");
+    assert_eq!(default.read("stage").unwrap().to_u64(), Some(1));
+
+    let mut aliased = Simulator::new(&design).expect("create runtime alias simulator");
+    aliased
+        .set_plusargs(["+UVM_TESTNAME=runtime_alias"])
+        .expect("select the runtime factory type alias");
+    aliased
+        .run_until(2)
+        .expect("run the alias-resolved runtime test");
+    assert_eq!(aliased.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_run_test_applies_a_type_based_factory_override() {
     let Some(slang) = discover_slang_for_tests() else {
         return;

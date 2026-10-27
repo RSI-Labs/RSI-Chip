@@ -523,7 +523,14 @@ impl SlangAstLowerer {
             let requested_names = if run_test_uses_runtime_default(call) {
                 self.declare_plusarg_query("UVM_TESTNAME");
                 self.declare_plusarg_value("UVM_TESTNAME");
-                self.local_uvm_test_class_names(body)?
+                let mut names = self
+                    .local_uvm_test_class_names(body)?
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                for alias in &self.uvm_factory_type_aliases {
+                    names.insert(alias.alias_name.clone());
+                }
+                names.into_iter().collect::<Vec<_>>()
             } else {
                 vec![run_test_class_name(call)?]
             };
@@ -540,6 +547,9 @@ impl SlangAstLowerer {
         };
         let mut names = std::collections::BTreeSet::new();
         for (candidate, class) in &self.class_definitions {
+            if candidate.contains('@') {
+                continue;
+            }
             if string_field(class, "source_file").as_deref() != Some(root_source.as_str()) {
                 continue;
             }
@@ -558,6 +568,7 @@ impl SlangAstLowerer {
         requested_class_name: String,
         objection_timeout: u64,
     ) -> Result<(), String> {
+        let external_class_name = requested_class_name.clone();
         let requested_class_name = self.resolve_uvm_type_alias(&requested_class_name)?;
         let class_name = self.resolve_global_uvm_factory_class(&requested_class_name)?;
         let requested_class_key = self.class_type_key(&requested_class_name);
@@ -780,7 +791,7 @@ impl SlangAstLowerer {
         }
         self.initialized_class_objects.insert(object_key.clone());
         self.run_test_objects.insert(
-            requested_class_name,
+            external_class_name,
             super::AstRunTestObject {
                 class_name: class_key,
                 root_object_key,
@@ -907,18 +918,19 @@ impl SlangAstLowerer {
                 range: full_range(argument.width),
                 signed: false,
             };
+            let Some(default_object) = self.run_test_objects.get("test") else {
+                return Err(
+                    "runtime run_test selection requires a local class named 'test' as the absent-plusarg default"
+                        .into(),
+                );
+            };
+            let default_statement = self.lower_prepared_run_test_object("test", default_object)?;
             let mut branches = Vec::new();
-            let mut has_default_test = false;
             for (class_name, run_object) in &self.run_test_objects {
-                let mut condition = Self::plusarg_string_equals(selected.clone(), class_name);
                 if *class_name == "test" {
-                    has_default_test = true;
-                    condition = Expr::Bin {
-                        op: BinOp::LogOr,
-                        a: Box::new(condition),
-                        b: Box::new(Self::plusarg_string_equals(selected.clone(), "")),
-                    };
+                    continue;
                 }
+                let condition = Self::plusarg_string_equals(selected.clone(), class_name);
                 let statement = self.lower_prepared_run_test_object(class_name, run_object)?;
                 branches.push((condition, statement));
             }
@@ -933,12 +945,11 @@ impl SlangAstLowerer {
                     f: Some(Box::new(selection)),
                 };
             }
-            if !has_default_test {
-                return Err(
-                    "runtime run_test selection requires a local class named 'test' as the absent-plusarg default"
-                        .into(),
-                );
-            }
+            selection = Stmt::If {
+                c: Self::plusarg_string_equals(selected, ""),
+                t: Box::new(default_statement),
+                f: Some(Box::new(selection)),
+            };
             return Ok(Some(selection));
         }
         let class_name = run_test_class_name(value)?;
