@@ -16,6 +16,22 @@ fn temporary_directory(name: &str) -> PathBuf {
     path
 }
 
+fn external_oracles_are_required() -> bool {
+    std::env::var_os("EDA_REQUIRE_EXTERNAL_ORACLES").is_some_and(|value| value != "0")
+}
+
+fn discover_slang_for_tests() -> Option<SlangFrontend> {
+    match SlangFrontend::discover() {
+        Ok(frontend) => Some(frontend),
+        Err(error) => {
+            if external_oracles_are_required() {
+                panic!("EDA_REQUIRE_EXTERNAL_ORACLES is set, but slang is unavailable: {error}");
+            }
+            None
+        }
+    }
+}
+
 fn validate_official_uvm_root(root: &Path) -> Result<PathBuf, String> {
     let source = root.join("src").join("uvm.sv");
     if !source.is_file() {
@@ -44,7 +60,12 @@ fn validate_official_uvm_root(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn official_uvm_sources() -> Option<(PathBuf, PathBuf)> {
-    let uvm_home = std::env::var_os("UVM_HOME")?;
+    let Some(uvm_home) = std::env::var_os("UVM_HOME") else {
+        if external_oracles_are_required() {
+            panic!("EDA_REQUIRE_EXTERNAL_ORACLES is set, but UVM_HOME is not set");
+        }
+        return None;
+    };
     let root = PathBuf::from(uvm_home);
     let source = validate_official_uvm_root(&root).expect("valid official UVM 2020.3.1 source");
     Some((root, source))
@@ -79,7 +100,7 @@ fn official_uvm_validation_rejects_the_wrong_version() {
 
 #[test]
 fn slang_compiles_macros_and_includes_through_the_direct_default_path() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("macros");
@@ -118,7 +139,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_simple_class_objects() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-simple-class");
@@ -227,7 +248,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_class_property_initializers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-property-initializers");
@@ -289,7 +310,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_successful_class_casts() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-cast");
@@ -397,7 +418,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_cast_conditions() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-cast-condition");
@@ -500,7 +521,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_constant_indexed_class_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-array");
@@ -567,7 +588,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_class_array_method_reads() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-class-array");
@@ -641,7 +662,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_excessive_class_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-excessive-class-array");
@@ -674,7 +695,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_class_array_writes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-class-array-write");
@@ -772,7 +793,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_class_array_handle_assignment() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-class-handle");
@@ -954,7 +975,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_null_class_handles() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-null-class-handles");
@@ -1082,7 +1103,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_class_composition() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-composition");
@@ -1322,7 +1343,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_class_valued_array_properties() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-composition-array");
@@ -1416,7 +1437,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_unsupported_class_forms() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-invalid");
@@ -1455,7 +1476,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_class_inheritance() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-inheritance");
@@ -1563,7 +1584,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_class_handles() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-class");
@@ -1770,7 +1791,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_static_class_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-static-class");
@@ -1954,7 +1975,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_parameterized_classes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-parameterized-class");
@@ -2182,7 +2203,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_shares_hierarchy_global_static_class_storage() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-child-static-class");
@@ -2316,7 +2337,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_null_class_access() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-null-class");
@@ -2354,7 +2375,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_null_class_handle_propagation() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-null-class-propagation");
@@ -2395,7 +2416,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_class_property_shadowing() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-class-shadowing");
@@ -2432,7 +2453,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_compiles_and_simulates_simple_modules() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast");
@@ -2540,7 +2561,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_display_tasks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-display");
@@ -2596,7 +2617,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_invalid_display_formats() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-display-invalid");
@@ -2647,7 +2668,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_monitor_tasks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-monitor");
@@ -2681,7 +2702,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_simulation_time_functions() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-simulation-time");
@@ -2721,7 +2742,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_timeformat_tasks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-timeformat");
@@ -2786,7 +2807,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_module_timescales() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-module-timescales");
@@ -2885,7 +2906,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_timeunit_declarations() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-timeunit");
@@ -2927,7 +2948,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-realtime");
@@ -2956,7 +2977,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_wildcard_package_imports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-package-import");
@@ -3159,7 +3180,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_package_classes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-package-classes");
@@ -3357,7 +3378,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_simple_type_aliases_and_string_parameters() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-simple-type-aliases");
@@ -3437,7 +3458,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_package_typedefs_and_enums() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-package-types");
@@ -3525,7 +3546,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_compiles_procedural_control_flow() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-procedural");
@@ -3634,7 +3655,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_flattens_simple_hierarchy() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-hierarchy");
@@ -3762,7 +3783,7 @@ module top(input logic a, output logic y); middle u (.a(a), .y(y)); endmodule
 
 #[test]
 fn slang_ast_direct_lowering_uses_sparse_memory_operations() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory");
@@ -3982,7 +4003,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_rejects_wrong_sparse_memory_read_and_part_shapes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory-summary");
@@ -4068,7 +4089,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_rejects_wrong_packed_select_shapes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-packed-summary");
@@ -4222,7 +4243,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_uses_sparse_memory_part_selects() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory-parts");
@@ -4467,7 +4488,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_uses_reversed_dynamic_array_fingerprints() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("reversed-dynamic-array");
@@ -4632,7 +4653,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_uses_wide_dynamic_array_fingerprints() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("wide-dynamic-array-parts");
@@ -4959,7 +4980,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_paths_lower_array_element_simple_ranges() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("array-simple-range");
@@ -5101,7 +5122,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_uses_multidimensional_sparse_memory() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory2d");
@@ -5370,7 +5391,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_uses_multidimensional_indexed_part_writes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory2d-parts");
@@ -5586,7 +5607,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_uses_multidimensional_array_part_layouts() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory2d-constant-parts");
@@ -5883,7 +5904,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_shares_child_sparse_memory_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory-port");
@@ -5987,7 +6008,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_and_bounded_paths_share_nested_ordinary_array_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-nested-ordinary-array-ports");
@@ -6129,7 +6150,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_initializes_multidimensional_ordinary_array() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory-init");
@@ -6192,7 +6213,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_directional_sparse_memory_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-directional-memory-port");
@@ -6252,7 +6273,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_directional_ordinary_array_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-ordinary-array-ports");
@@ -6398,7 +6419,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_top_level_sparse_memory_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-top-memory-port");
@@ -6478,7 +6499,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_fixed_array_copies_and_size() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-fixed-array-copy-size");
@@ -6717,7 +6738,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_fixed_array_bounds() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-fixed-array-bounds");
@@ -6821,7 +6842,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_array_dimension_and_bit_queries() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-array-dimension-bits");
@@ -7014,7 +7035,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_unpacked_assignment_patterns() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-unpacked-assignment-pattern");
@@ -7223,7 +7244,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_associative_array_traversal() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-associative-traversal");
@@ -7353,7 +7374,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_container_copies() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-container-copies");
@@ -7523,7 +7544,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_array_lifecycle() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-array-lifecycle");
@@ -7650,7 +7671,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_queue_lifecycle() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-queue-lifecycle");
@@ -7857,7 +7878,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_discards_bounded_queue_overflow() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-queue-overflow");
@@ -7939,7 +7960,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_associative_array_lifecycle() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-associative-array-lifecycle");
@@ -8101,7 +8122,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_top_level_inout_memory_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-top-inout-memory-port");
@@ -8172,7 +8193,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_memory_ranges() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-multidimensional-memory-range");
@@ -8259,7 +8280,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_reads_sparse_memory_files() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-readmem");
@@ -8431,7 +8452,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_memory_file_ranges_load_the_same_elements() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-readmem-range");
@@ -8490,7 +8511,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_paths_infer_fixed_partial_write_masks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("fixed-write-mask");
@@ -8549,7 +8570,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_paths_infer_aligned_byte_enables() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("aligned-byte-enable");
@@ -8596,7 +8617,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_paths_infer_synchronous_rom_template() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("synchronous-rom-template");
@@ -8656,7 +8677,7 @@ endmodule
 
 #[test]
 fn slang_and_bounded_paths_write_sparse_memory_files() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("memory-write-files");
@@ -8716,7 +8737,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_validates_elaborated_structure_after_lowering() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("ast-summary");
@@ -9139,7 +9160,7 @@ endmodule
 
 #[test]
 fn slang_front_end_rejects_invalid_rtl() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("invalid");
@@ -9158,7 +9179,7 @@ fn slang_front_end_rejects_invalid_rtl() {
 
 #[test]
 fn slang_structural_validation_accepts_generate_instances() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let design = slang
@@ -9186,7 +9207,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_accepts_generated_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let source = r#"
@@ -9248,7 +9269,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_accepts_generate_for_assignments() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-generate-for");
@@ -9343,7 +9364,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_accepts_generate_for_instances() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-generate-instances");
@@ -9398,7 +9419,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_continuous_assignment_delay() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-delay");
@@ -9435,7 +9456,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_fork_join_all() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-fork-join");
@@ -9517,7 +9538,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_fork_join_any_and_none() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-fork-modes");
@@ -9600,7 +9621,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_flattens_instance_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-instance-array");
@@ -9698,7 +9719,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_flattens_generated_instance_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-generated-instance-array");
@@ -9755,7 +9776,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_modports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-modport");
@@ -9875,7 +9896,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_interface_vectors() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-vector");
@@ -9970,7 +9991,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_packed_struct_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-packed-struct");
@@ -10061,7 +10082,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_unpacked_struct_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-unpacked-struct");
@@ -10177,7 +10198,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_parameterized_interface_specializations() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-parameterized-interface");
@@ -10238,7 +10259,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_parameterized_interface_aggregate_specializations() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-parameterized-interface-aggregate");
@@ -10323,7 +10344,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_packed_union_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-packed-union");
@@ -10376,7 +10397,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_unpacked_union_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-unpacked-union");
@@ -10464,7 +10485,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_nested_struct_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-nested-struct");
@@ -10577,7 +10598,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_array_port_struct_members() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-struct");
@@ -10685,7 +10706,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_interface_vectors() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-vector-multi");
@@ -10758,7 +10779,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_unpacked_interface_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-member");
@@ -10872,7 +10893,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_unpacked_interface_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-member-2d");
@@ -10955,7 +10976,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_instance_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-instance-array");
@@ -11061,7 +11082,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_interface_instance_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-instance-array-2d");
@@ -11147,7 +11168,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_array_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port");
@@ -11222,7 +11243,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_interface_array_ports() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-2d");
@@ -11307,7 +11328,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_interface_array_port_vectors() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-vector");
@@ -11362,7 +11383,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_shares_interface_array_ports_between_consumers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-shared");
@@ -11440,7 +11461,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_interface_array_port_input_writes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-input");
@@ -11487,7 +11508,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_interface_array_port_shape_mismatches() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-interface-array-port-shape");
@@ -11535,7 +11556,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_multi_packed_width() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-multi-packed");
@@ -11628,7 +11649,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_unpacked_aggregate_types() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-unpacked-aggregate");
@@ -11748,7 +11769,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_nested_unpacked_aggregates() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-nested-unpacked");
@@ -11883,7 +11904,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_unsupported_unpacked_aggregate_forms() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-unpacked-aggregate-invalid");
@@ -11946,7 +11967,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_struct_types() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-packed-struct");
@@ -12026,7 +12047,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_nested_packed_struct_types() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-nested-packed-struct");
@@ -12106,7 +12127,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_union_types() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-packed-union");
@@ -12183,7 +12204,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_struct_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-packed-struct-array");
@@ -12266,7 +12287,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_rejects_wrong_memory_member_lvalue_shapes() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-memory-member-summary");
@@ -12571,7 +12592,7 @@ endmodule
 
 #[test]
 fn slang_ast_summary_uses_package_memory_member_layouts() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-package-memory-member");
@@ -12673,7 +12694,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_union_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-packed-union-array");
@@ -12780,7 +12801,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_packed_struct_assignment_patterns() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-struct-patterns");
@@ -12885,7 +12906,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_enum_types() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-enum");
@@ -12986,7 +13007,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_enum_next_and_prev() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-enum-next-prev");
@@ -13114,7 +13135,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_string_literals_and_enum_names() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-strings");
@@ -13747,7 +13768,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_event_sensitivity_lists() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-events");
@@ -13861,7 +13882,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_named_event_triggers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-events");
@@ -13909,7 +13930,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_event_list_controls() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-list");
@@ -13951,7 +13972,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_edge_qualified_event_lists() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-edge-event-list");
@@ -14004,7 +14025,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_event_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-array");
@@ -14140,7 +14161,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_runtime_out_of_range_event_waits() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-array-range");
@@ -14181,7 +14202,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_constant_nonblocking_event_array_triggers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-array-constant");
@@ -14221,7 +14242,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_multidimensional_event_arrays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-array-2d");
@@ -14284,7 +14305,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_clocking_block_events() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-clocking-event");
@@ -14350,7 +14371,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_unsupported_clocking_semantics() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-clocking-unsupported");
@@ -14382,7 +14403,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_clocking_output_drives() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-clocking-drive");
@@ -14431,7 +14452,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_clocking_cycle_delays() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-clocking-cycle-delay");
@@ -14500,7 +14521,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_clocking_blocks_across_hierarchy() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-clocking-hierarchy");
@@ -14570,7 +14591,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_nonblocking_event_triggers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-nonblocking-events");
@@ -14622,7 +14643,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_force_and_release() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-force");
@@ -14677,7 +14698,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_wait_order() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-wait-order");
@@ -14760,7 +14781,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_event_triggered() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-event-triggered");
@@ -14817,7 +14838,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_final_blocks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-final-blocks");
@@ -14868,7 +14889,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_constant_delay_controls() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-delays");
@@ -14986,7 +15007,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_wait_statements() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-wait");
@@ -15045,7 +15066,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_runtime_repeat_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-repeat");
@@ -15144,7 +15165,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_runtime_while_and_for_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-runtime-loops");
@@ -15308,7 +15329,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_lexical_named_block_disable() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-named-disable");
@@ -15387,7 +15408,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_named_block_disable_from_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-named-disable-loop");
@@ -15433,7 +15454,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_forks_inside_named_blocks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-named-disable-fork");
@@ -15498,7 +15519,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_runtime_do_while_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-do-while");
@@ -15549,7 +15570,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_runtime_break_and_continue() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-loop-jumps");
@@ -15636,7 +15657,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_replication() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-replication");
@@ -15673,7 +15694,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_packed_select() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-packed");
@@ -15715,7 +15736,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_dynamic_packed_lvalues() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-dynamic-packed-lvalue");
@@ -15931,7 +15952,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_arithmetic_shifts() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-arithmetic-shift");
@@ -15993,7 +16014,7 @@ endmodule
 
 #[test]
 fn slang_direct_and_bounded_paths_match_64_bit_and_unsigned_i64_boundaries() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("width-boundaries");
@@ -16129,7 +16150,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_power_operator() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-power");
@@ -16177,7 +16198,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_streaming_concatenation() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-streaming");
@@ -16294,7 +16315,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_ascending_indexed_packed_selects() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-ascending-indexed");
@@ -16397,7 +16418,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_integral_conversions() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     fn set_conversion_leaf_symbol(
@@ -16563,7 +16584,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_straight_line_function_calls() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-functions");
@@ -16721,7 +16742,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_recursive_function_calls() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-recursive-function");
@@ -16752,7 +16773,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_tasks_with_output_arguments() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-output");
@@ -16797,7 +16818,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_task_inout_and_ref_arguments() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-inout-ref");
@@ -16850,7 +16871,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_task_returns() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-return");
@@ -16917,7 +16938,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_task_local_variables() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-locals");
@@ -17009,7 +17030,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_task_local_conditionals() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-local-conditionals");
@@ -17087,7 +17108,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_task_local_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-task-local-loops");
@@ -17150,7 +17171,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_recursive_tasks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-recursive-task");
@@ -17182,7 +17203,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_excessive_function_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-excessive-function-loop");
@@ -17215,7 +17236,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_rejects_excessive_while_and_repeat_loops() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let cases = [
@@ -17267,7 +17288,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_case_equality() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-case-equality");
@@ -17319,7 +17340,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_unary_operators() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-unary-operators");
@@ -17409,7 +17430,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_logical_implication_and_equivalence() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-logical-composition");
@@ -17554,7 +17575,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_wildcard_and_inside_cases() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-wildcard-cases");
@@ -17663,7 +17684,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_qualified_if_and_case_checks() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-qualified-checks");
@@ -17896,7 +17917,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_indexed_packed_part_selects() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-indexed-packed");
@@ -17953,7 +17974,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_resolves_elaborated_parameters() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-parameters");
@@ -17990,7 +18011,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_reduces_logical_not_to_one_bit() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-logical-not");
@@ -18024,7 +18045,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_preserves_ascending_packed_selects() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-ascending");
@@ -18063,7 +18084,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_wildcard_equality() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-wildcard-equality");
@@ -18157,7 +18178,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_supports_inside() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-inside");
@@ -18237,7 +18258,7 @@ endmodule
 
 #[test]
 fn slang_ast_direct_lowering_reports_expression_source_spans() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-ast-source-span");
@@ -18272,7 +18293,7 @@ endmodule
 
 #[test]
 fn slang_ast_json_contains_elaborated_module_symbols() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let design = slang
@@ -18307,7 +18328,7 @@ fn slang_ast_json_contains_elaborated_module_symbols() {
 
 #[test]
 fn slang_directly_lowers_and_runs_a_minimal_class_derived_from_official_uvm() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18372,7 +18393,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_bootstraps_a_minimal_official_uvm_class() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18434,7 +18455,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_rejects_a_class_outside_official_uvm() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = temporary_directory("direct-run-test-non-uvm");
@@ -18478,7 +18499,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_executes_a_minimal_phase_schedule() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18582,7 +18603,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_reports_literal_messages() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18671,7 +18692,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_queries_report_controls() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18784,7 +18805,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_hooks_can_suppress_messages() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18882,7 +18903,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_log_action_uses_default_stdout_suppression() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -18956,7 +18977,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_can_catch_messages() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19047,7 +19068,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_modifies_messages() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19141,7 +19162,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_scopes_to_context_object() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19255,7 +19276,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_delete_unregisters() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19341,7 +19362,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_object_callbacks_execute_derived_methods() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19471,7 +19492,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_typewide_callbacks_execute_for_matching_targets() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19559,7 +19580,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_analysis_port_broadcasts_to_subscribers() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19662,7 +19683,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_analysis_export_cycles_fail_closed() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19735,7 +19756,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_fifo_try_operations_execute_in_order() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19852,7 +19873,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_fifo_expression_side_effects_fail_closed() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -19919,7 +19940,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_ports_route_to_bounded_fifos() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20024,7 +20045,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_port_export_mismatches_fail_closed() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20095,7 +20116,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_export_chains_route_to_fifos() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20201,7 +20222,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_export_cycles_fail_closed() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20277,7 +20298,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_tlm_blocking_ports_handshake_through_fifo() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20395,7 +20416,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_sequence_sequencer_driver_handshake() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20547,7 +20568,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_integrated_phases_config_tlm_and_sequence() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20613,7 +20634,7 @@ endclass
 
 class integration_test extends uvm_test;
   uvm_sequencer#(integration_request) sequencer;
-  integration_sequence sequence;
+  integration_sequence sequence_instance;
   integration_request request;
   integration_request response;
   uvm_tlm_fifo#(int) fifo;
@@ -20629,7 +20650,7 @@ class integration_test extends uvm_test;
   virtual function void build_phase(uvm_phase phase);
     IntegrationTrace::build_ran = 1;
     sequencer = new("sequencer", this);
-    sequence = new("sequence");
+    sequence_instance = new("sequence_instance");
     request = new("request");
     response = new("response");
     fifo = new("fifo", this, 1);
@@ -20650,7 +20671,7 @@ class integration_test extends uvm_test;
   virtual task run_phase(uvm_phase phase);
     phase.raise_objection(this);
     fork
-      sequence.start(sequencer);
+      sequence_instance.start(sequencer);
       begin
         sequencer.get_next_item(request);
         IntegrationTrace::sequenced_value = request.value;
@@ -20736,7 +20757,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_sequence_response_queue_reaches_depth_eight() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -20894,7 +20915,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_sequence_selects_response_by_transaction_id() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21053,7 +21074,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21138,7 +21159,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_catcher_delete_by_name_unregisters() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21238,7 +21259,7 @@ endmodule
 
 #[test]
 fn slang_direct_official_uvm_report_count_exits_at_max() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21302,7 +21323,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_fails_closed_on_undrained_objections() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21364,7 +21385,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_waits_for_asynchronous_objection_drain() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21433,7 +21454,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_honors_configured_objection_timeout() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21497,7 +21518,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_sets_and_gets_literals() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21621,7 +21642,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_matches_wildcards_and_precedence() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -21842,7 +21863,7 @@ endmodule
 
 #[test]
 fn slang_direct_resource_db_sets_and_reads_literals() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -22339,7 +22360,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_exists_checks_scoped_resources() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -22458,7 +22479,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_wait_modified_wakes_on_matching_set() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -22551,7 +22572,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -22639,7 +22660,7 @@ endmodule
 
 #[test]
 fn slang_direct_config_db_fails_closed_on_unsupported_forms() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23025,7 +23046,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_applies_a_name_based_factory_override() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23102,7 +23123,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_applies_a_type_based_factory_override() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23222,7 +23243,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_resolves_factory_type_aliases() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23311,7 +23332,7 @@ endmodule
 
 #[test]
 fn slang_direct_factory_creates_components_by_name() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23430,7 +23451,7 @@ endmodule
 
 #[test]
 fn slang_direct_factory_creates_objects_by_name() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23544,7 +23565,7 @@ endmodule
 
 #[test]
 fn slang_direct_factory_creates_components_and_objects_by_type() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23707,7 +23728,7 @@ endmodule
 
 #[test]
 fn slang_direct_component_registry_applies_instance_overrides() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23873,7 +23894,7 @@ endmodule
 
 #[test]
 fn slang_direct_component_registry_creates_a_component() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -23962,7 +23983,7 @@ endmodule
 
 #[test]
 fn slang_direct_component_registry_applies_factory_overrides() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24067,7 +24088,7 @@ endmodule
 
 #[test]
 fn slang_direct_component_registry_preserves_component_names() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24380,7 +24401,7 @@ endmodule
 
 #[test]
 fn slang_direct_component_registry_rejects_duplicate_child_names() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24458,7 +24479,7 @@ endmodule
 
 #[test]
 fn slang_direct_object_registry_applies_factory_overrides() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24559,7 +24580,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_rejects_incompatible_factory_override() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24629,7 +24650,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_tracks_objections_by_owner() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24700,7 +24721,7 @@ endmodule
 
 #[test]
 fn slang_direct_run_test_selects_objection_owners_by_runtime_identity() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let Some((root, source)) = official_uvm_sources() else {
@@ -24776,7 +24797,7 @@ endmodule
 
 #[test]
 fn slang_validates_the_repository_cpu_rtl_compilation_units() {
-    let Some(slang) = SlangFrontend::discover_optional() else {
+    let Some(slang) = discover_slang_for_tests() else {
         return;
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

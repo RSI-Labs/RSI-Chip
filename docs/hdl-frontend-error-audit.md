@@ -59,7 +59,7 @@ direct-AST coverage gaps (`D-*`), 12 bounded-path limitations (`B-*`), and 17
 additional confirmed bounded-path defects/blind spots (`O-*`). It also records
 19 explicit resource limits (`L-*`). These categories overlap intentionally:
 `F-*` rows are architectural rollups, while `D-*`, `B-*`, and `O-*` expose their
-specific known consequences. The 33 `R-*` rows are former defects retained only
+specific known consequences. The 55 `R-*` rows are former defects retained only
 to document their fixes; they are not current errors.
 
 ### 1.3 Remaining structural and runtime-parity sites
@@ -91,7 +91,7 @@ and official UVM commit `78c06547a2a0a29b3dc9dcafae62b75b2ff61544`.
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test -p eda-hdl --all-targets -- --nocapture` | 90 passed |
 | `cargo test -p eda-slang --all-targets -- --nocapture` | 235 passed, 2677.24 s with the pinned official UVM checkout |
-| `cargo test -p eda-slang --test frontend slang_direct_official_uvm_integrated_phases_config_tlm_and_sequence -- --exact --nocapture` | 1 passed |
+| `EDA_REQUIRE_EXTERNAL_ORACLES=1 UVM_HOME=/tmp/uvm-core-pinned SLANG_BIN=/tmp/slang-build-pinned/bin/slang cargo test -p eda-slang --test frontend slang_direct_official_uvm_integrated_phases_config_tlm_and_sequence -- --exact --nocapture` | 1 passed, 185.94 s |
 | `cargo test -p eda-core --all-targets -- --nocapture` | 29 passed |
 | `cargo test -p eda-sim --all-targets -- --nocapture` | 86 passed |
 | `cargo test -p eda-synth --all-targets -- --nocapture` | 44 passed |
@@ -120,7 +120,8 @@ The official-UVM integration tests use an explicit source contract: when
 `UVM_HOME` is provided, `src/uvm.sv` and the Accellera UVM 2020.3.1 version
 marker must be present, and an invalid checkout fails the test rather than
 silently returning success. Omitting `UVM_HOME` still selects the optional
-lane; the required gate must set it explicitly.
+lane for developer runs, but `EDA_REQUIRE_EXTERNAL_ORACLES=1` makes both a
+missing slang executable and a missing UVM checkout a hard test failure.
 
 ## 3. Previously identified severe defects that are fixed
 
@@ -182,6 +183,8 @@ information from re-entering the roadmap.
 | R-51 | The i8086 RTL runtime could not initialize MZ segment state | Fixed by exposing top-level initial IP/SP/CS/DS/ES/SS inputs and adding `run_i8086_mz`; relocatable and non-relocatable MZ images now execute with loader-initialized state. |
 | R-52 | The i8086 runtime tied asynchronous IRQ and NMI inputs low | Fixed by exposing IRQ/NMI/vector/ack through the testbench and adding deterministic retired-instruction injection. IRQ, NMI, IF masking, handler execution, and IRET now execute across built-in, RTL, and independent-reference lanes. |
 | R-53 | RTL marked `medeleg`, `mideleg`, and `mip` CSR writes legal but silently ignored them | Fixed by adding all three CSR write cases. The extended independent matrix now proves read/write/set/clear and immediate forms for every supported machine CSR. |
+| R-54 | The integrated official-UVM wrapper used the reserved identifier `sequence` as a class property | Fixed by renaming the property to `sequence_instance`. The explicit pinned slang run rejects the original wrapper with `expected member` and proves that slang, not repository preprocessing, is the syntax authority. |
+| R-55 | Optional external-oracle lanes could return success when slang or UVM was absent | Fixed for required gates by `EDA_REQUIRE_EXTERNAL_ORACLES=1`: missing slang or `UVM_HOME` now panics instead of taking the optional early-return path. The integrated official-UVM lane passes in 185.94 s with both pinned oracles. |
 
 ## 4. Current P0 and P1 findings
 
