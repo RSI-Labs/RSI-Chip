@@ -23744,6 +23744,183 @@ endmodule
 }
 
 #[test]
+fn slang_direct_run_test_applies_a_factory_override_to_runtime_selection() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-runtime-factory-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class RuntimeFactoryTrace;
+  static int stage = 0;
+endclass
+
+class test extends uvm_test;
+  function new(string name = "test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    RuntimeFactoryTrace::stage = 1;
+  endfunction
+endclass
+
+class runtime_factory_derived extends test;
+  function new(string name = "runtime_factory_derived",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    RuntimeFactoryTrace::stage = 2;
+  endfunction
+endclass
+
+module official_uvm_runtime_factory_probe(output int stage);
+  initial begin
+    uvm_factory::get().set_type_override_by_name(
+      "test",
+      "runtime_factory_derived"
+    );
+    run_test();
+    stage = RuntimeFactoryTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM runtime factory wrapper");
+
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_runtime_factory_probe"),
+            &options,
+        )
+        .expect("directly lower a runtime UVM factory override");
+
+    let mut default = Simulator::new(&design).expect("create default runtime factory simulator");
+    default
+        .run_until(2)
+        .expect("run the default runtime factory selection");
+    assert_eq!(default.read("stage").unwrap().to_u64(), Some(2));
+
+    let mut named = Simulator::new(&design).expect("create named runtime factory simulator");
+    named
+        .set_plusargs(["+UVM_TESTNAME=test"])
+        .expect("select the overridden runtime base test");
+    named
+        .run_until(2)
+        .expect("run the named runtime factory selection");
+    assert_eq!(named.read("stage").unwrap().to_u64(), Some(2));
+}
+
+#[test]
+fn slang_direct_run_test_selects_a_package_class_from_runtime_uvm_testname() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-package-runtime-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+package runtime_selection_pkg;
+  import uvm_pkg::*;
+
+  class PackageSelectionTrace;
+    static int selected = 0;
+  endclass
+
+  class test extends uvm_test;
+    function new(string name = "test", uvm_component parent = null);
+      super.new(name, parent);
+    endfunction
+
+    virtual function void report_phase(uvm_phase phase);
+      PackageSelectionTrace::selected = 1;
+    endfunction
+  endclass
+
+  class package_alternate extends uvm_test;
+    function new(string name = "package_alternate",
+                 uvm_component parent = null);
+      super.new(name, parent);
+    endfunction
+
+    virtual function void report_phase(uvm_phase phase);
+      PackageSelectionTrace::selected = 2;
+    endfunction
+  endclass
+endpackage
+
+module official_uvm_package_runtime_probe(output int selected);
+  import runtime_selection_pkg::*;
+  import uvm_pkg::*;
+
+  initial begin
+    run_test();
+    selected = PackageSelectionTrace::selected;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM package runtime-selection wrapper");
+
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_package_runtime_probe"),
+            &options,
+        )
+        .expect("directly lower package runtime UVM test selection");
+
+    let mut alternate = Simulator::new(&design).expect("create package-selection simulator");
+    alternate
+        .set_plusargs(["+UVM_TESTNAME=package_alternate"])
+        .expect("select the package-local UVM test");
+    alternate
+        .run_until(2)
+        .expect("execute the package-local UVM test");
+    assert_eq!(alternate.read("selected").unwrap().to_u64(), Some(2));
+}
+
+#[test]
 fn slang_direct_run_test_applies_a_type_based_factory_override() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
