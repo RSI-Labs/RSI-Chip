@@ -158,13 +158,20 @@ fn main() -> ExitCode {
                         design.processes.len(),
                         design.initials.len()
                     );
-                    let lint_issues = design.lint_multiple_continuous_drivers();
+                    let mut lint_issues = design.lint_multiple_continuous_drivers();
+                    lint_issues.extend(design.lint_combinational_loops());
                     println!("  lint findings: {}", lint_issues.len());
                     for issue in lint_issues {
-                        println!(
-                            "    {:?}: '{}' has {} continuous drivers",
-                            issue.kind, issue.net, issue.driver_count
-                        );
+                        match issue.kind {
+                            eda_core::ir::LintIssueKind::MultipleContinuousDrivers => println!(
+                                "    {:?}: '{}' has {} continuous drivers",
+                                issue.kind, issue.net, issue.count
+                            ),
+                            eda_core::ir::LintIssueKind::CombinationalLoop => println!(
+                                "    {:?}: '{}' has {} nodes in a continuous cycle",
+                                issue.kind, issue.net, issue.count
+                            ),
+                        }
                     }
                     ExitCode::SUCCESS
                 }

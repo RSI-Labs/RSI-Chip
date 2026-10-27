@@ -1018,6 +1018,7 @@ pub struct Assign {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LintIssueKind {
+    CombinationalLoop,
     MultipleContinuousDrivers,
 }
 
@@ -1025,7 +1026,7 @@ pub enum LintIssueKind {
 pub struct LintIssue {
     pub kind: LintIssueKind,
     pub net: String,
-    pub driver_count: usize,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1071,6 +1072,130 @@ impl Default for TimeScale {
             precision_exponent: -9,
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DfsState {
+    White,
+    Gray,
+    Black,
+}
+
+fn lint_lvalue_bits(lvalue: &LValue) -> Vec<usize> {
+    match lvalue.range {
+        Range::Bit(bit) => vec![lvalue.net + bit],
+        Range::Span { msb, lsb } => (lsb..=msb).map(|bit| lvalue.net + bit).collect(),
+    }
+}
+
+fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
+    match expression {
+        Expr::Const(_) | Expr::SimulationTime { .. } | Expr::MemorySize { .. } => {}
+        Expr::Ref { net, range, .. } => match range {
+            Range::Bit(bit) => output.push(net + bit),
+            Range::Span { msb, lsb } => output.extend((*lsb..=*msb).map(|bit| net + bit)),
+        },
+        Expr::Un { a, .. }
+        | Expr::Signed { e: a, .. }
+        | Expr::Index { e: a, .. }
+        | Expr::StringLength { e: a }
+        | Expr::StringCase { e: a, .. }
+        | Expr::StringToRadix { e: a, .. } => lint_expression_nets(a, output),
+        Expr::Bin { a, b, .. }
+        | Expr::StringConcat {
+            left: a, right: b, ..
+        }
+        | Expr::StringCompare {
+            left: a, right: b, ..
+        } => {
+            lint_expression_nets(a, output);
+            lint_expression_nets(b, output);
+        }
+        Expr::Cond { c, t, f } => {
+            lint_expression_nets(c, output);
+            lint_expression_nets(t, output);
+            lint_expression_nets(f, output);
+        }
+        Expr::Concat(parts) => parts
+            .iter()
+            .for_each(|part| lint_expression_nets(part, output)),
+        Expr::Repeat { e, .. } => lint_expression_nets(e, output),
+        Expr::MemoryRead { indexes, .. } => indexes
+            .iter()
+            .for_each(|index| lint_expression_nets(index, output)),
+        Expr::MemoryReadPart { indexes, start, .. } => {
+            indexes
+                .iter()
+                .for_each(|index| lint_expression_nets(index, output));
+            lint_expression_nets(start, output);
+        }
+        Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
+            lint_expression_nets(index, output)
+        }
+        Expr::StringGetByte { e, index } => {
+            lint_expression_nets(e, output);
+            lint_expression_nets(index, output);
+        }
+        Expr::StringPutc { e, index, value } => {
+            lint_expression_nets(e, output);
+            lint_expression_nets(index, output);
+            lint_expression_nets(value, output);
+        }
+        Expr::StringSubstr { e, left, right } => {
+            lint_expression_nets(e, output);
+            lint_expression_nets(left, output);
+            lint_expression_nets(right, output);
+        }
+        Expr::StringFromRadix { value, .. } => lint_expression_nets(value, output),
+        Expr::EventTriggered { net } => output.push(*net),
+    }
+}
+
+fn lint_visit_loop_node(
+    node: usize,
+    graph: &std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    state: &mut std::collections::BTreeMap<usize, DfsState>,
+    path: &mut Vec<usize>,
+    issues: &mut std::collections::BTreeMap<String, LintIssue>,
+    design: &Design,
+) {
+    *state.entry(node).or_insert(DfsState::White) = DfsState::Gray;
+    path.push(node);
+    let neighbors = graph
+        .get(&node)
+        .map(|neighbors| neighbors.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for neighbor in neighbors {
+        match state.get(&neighbor) {
+            None | Some(DfsState::White) => {
+                lint_visit_loop_node(neighbor, graph, state, path, issues, design);
+            }
+            Some(DfsState::Gray) => {
+                let start = path
+                    .iter()
+                    .position(|candidate| *candidate == neighbor)
+                    .unwrap_or(path.len().saturating_sub(1));
+                let cycle = &path[start..];
+                let first_name = design.net_name(*cycle.first().unwrap_or(&neighbor));
+                let net = first_name
+                    .split('[')
+                    .next()
+                    .unwrap_or(&first_name)
+                    .to_string();
+                issues
+                    .entry(net.clone())
+                    .and_modify(|issue| issue.count = issue.count.max(cycle.len()))
+                    .or_insert(LintIssue {
+                        kind: LintIssueKind::CombinationalLoop,
+                        net,
+                        count: cycle.len(),
+                    });
+            }
+            Some(DfsState::Black) => {}
+        }
+    }
+    path.pop();
+    state.insert(node, DfsState::Black);
 }
 
 #[derive(Clone, Debug)]
@@ -1141,12 +1266,55 @@ impl Design {
             let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
             issues
                 .entry(net.clone())
-                .and_modify(|issue| issue.driver_count = issue.driver_count.max(driver_count))
+                .and_modify(|issue| issue.count = issue.count.max(driver_count))
                 .or_insert(LintIssue {
                     kind: LintIssueKind::MultipleContinuousDrivers,
                     net,
-                    driver_count,
+                    count: driver_count,
                 });
+        }
+        issues.into_values().collect()
+    }
+
+    /// Report cycles among zero-delay continuous assignments.
+    ///
+    /// This lint is deliberately scoped to `Design.assigns`; event-driven,
+    /// delayed, and nonblocking process semantics remain the simulator's
+    /// responsibility.
+    pub fn lint_combinational_loops(&self) -> Vec<LintIssue> {
+        let mut graph: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
+            std::collections::BTreeMap::new();
+        for assignment in &self.assigns {
+            if assignment.delay != 0 {
+                continue;
+            }
+            let mut reads = Vec::new();
+            lint_expression_nets(&assignment.e, &mut reads);
+            let writes = lint_lvalue_bits(&assignment.lv);
+            for read in reads {
+                graph
+                    .entry(read)
+                    .or_default()
+                    .extend(writes.iter().copied());
+            }
+            for write in writes {
+                graph.entry(write).or_default();
+            }
+        }
+
+        let mut state: std::collections::BTreeMap<usize, DfsState> =
+            std::collections::BTreeMap::new();
+        let mut path = Vec::new();
+        let mut issues: std::collections::BTreeMap<String, LintIssue> =
+            std::collections::BTreeMap::new();
+        for node in graph.keys().copied().collect::<Vec<_>>() {
+            if state
+                .get(&node)
+                .is_some_and(|state| *state != DfsState::White)
+            {
+                continue;
+            }
+            lint_visit_loop_node(node, &graph, &mut state, &mut path, &mut issues, self);
         }
         issues.into_values().collect()
     }
@@ -1845,7 +2013,54 @@ mod tests {
             vec![LintIssue {
                 kind: LintIssueKind::MultipleContinuousDrivers,
                 net: "bus".into(),
-                driver_count: 2,
+                count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn lint_reports_continuous_assignment_cycles() {
+        let mut design = Design {
+            name: "loop".into(),
+            ..Default::default()
+        };
+        for name in ["x", "y", "z"] {
+            let base = design.n_nets;
+            design.net_decls.push(NetDecl {
+                name: name.into(),
+                width: 1,
+                is_reg: false,
+                is_signed: false,
+                base,
+            });
+            design.n_nets += 1;
+        }
+        let reference = |net: usize| Expr::Ref {
+            net,
+            decl_width: 1,
+            range: Range::Bit(0),
+            signed: false,
+        };
+        let assignment = |target: usize, source: usize| Assign {
+            lv: LValue {
+                net: target,
+                decl_width: 1,
+                range: Range::Bit(0),
+            },
+            e: reference(source),
+            delay: 0,
+        };
+        design.assigns.push(assignment(0, 1));
+        design.assigns.push(assignment(1, 2));
+        assert!(design.lint_combinational_loops().is_empty());
+
+        design.assigns.push(assignment(2, 0));
+        assert_eq!(
+            design.lint_combinational_loops(),
+            vec![LintIssue {
+                kind: LintIssueKind::CombinationalLoop,
+                net: "x".into(),
+                count: 3,
             }]
         );
     }
