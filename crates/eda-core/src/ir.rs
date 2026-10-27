@@ -1018,6 +1018,7 @@ pub struct Assign {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LintIssueKind {
+    LatchRisk,
     IncompleteCase,
     CombinationalLoop,
     MultipleContinuousDrivers,
@@ -1313,6 +1314,117 @@ fn lint_record_case(
         });
 }
 
+fn lint_guaranteed_assignment_bits(statement: &Stmt) -> std::collections::BTreeSet<usize> {
+    match statement {
+        Stmt::Bl { lv, .. } | Stmt::NBl { lv, .. } => lint_lvalue_bits(lv).into_iter().collect(),
+        Stmt::Block(statements) => statements.iter().map(lint_guaranteed_assignment_bits).fold(
+            Default::default(),
+            |mut all: std::collections::BTreeSet<_>, nested| {
+                all.extend(nested);
+                all
+            },
+        ),
+        Stmt::If { t, f, .. } => {
+            let true_bits = lint_guaranteed_assignment_bits(t);
+            let Some(f) = f else {
+                return Default::default();
+            };
+            let false_bits = lint_guaranteed_assignment_bits(f);
+            true_bits.intersection(&false_bits).copied().collect()
+        }
+        Stmt::Scope(body) => lint_guaranteed_assignment_bits(body),
+        _ => Default::default(),
+    }
+}
+
+fn lint_visit_latch_statement(
+    statement: &Stmt,
+    defaults: &std::collections::BTreeSet<usize>,
+    design: &Design,
+    issues: &mut std::collections::BTreeMap<String, LintIssue>,
+) {
+    match statement {
+        Stmt::Block(statements) => {
+            let mut branch_defaults = defaults.clone();
+            for nested in statements {
+                lint_visit_latch_statement(nested, &branch_defaults, design, issues);
+                branch_defaults.extend(lint_guaranteed_assignment_bits(nested));
+            }
+        }
+        Stmt::If { t, f, .. } => {
+            lint_record_latch_risk(t, f.as_deref(), defaults, design, issues);
+            lint_visit_latch_statement(t, defaults, design, issues);
+            if let Some(f) = f {
+                lint_visit_latch_statement(f, defaults, design, issues);
+            }
+        }
+        Stmt::Forever(body) | Stmt::Delay { body, .. } | Stmt::Scope(body) => {
+            lint_visit_latch_statement(body, defaults, design, issues)
+        }
+        Stmt::Wait { body, .. } | Stmt::EventWait { body, .. } | Stmt::Repeat { body, .. } => {
+            lint_visit_latch_statement(body, defaults, design, issues)
+        }
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            if let Some(success) = success {
+                lint_visit_latch_statement(success, defaults, design, issues);
+            }
+            if let Some(failure) = failure {
+                lint_visit_latch_statement(failure, defaults, design, issues);
+            }
+        }
+        Stmt::Fork { branches, .. } => branches
+            .iter()
+            .for_each(|nested| lint_visit_latch_statement(nested, defaults, design, issues)),
+        Stmt::While { body, steps, .. } => {
+            lint_visit_latch_statement(body, defaults, design, issues);
+            steps
+                .iter()
+                .for_each(|nested| lint_visit_latch_statement(nested, defaults, design, issues));
+        }
+        _ => {}
+    }
+}
+
+fn lint_record_latch_risk(
+    true_branch: &Stmt,
+    false_branch: Option<&Stmt>,
+    defaults: &std::collections::BTreeSet<usize>,
+    design: &Design,
+    issues: &mut std::collections::BTreeMap<String, LintIssue>,
+) {
+    let true_bits = lint_guaranteed_assignment_bits(true_branch);
+    let false_bits = false_branch
+        .map(lint_guaranteed_assignment_bits)
+        .unwrap_or_default();
+    let mut risks = true_bits
+        .difference(&false_bits)
+        .copied()
+        .chain(false_bits.difference(&true_bits).copied())
+        .filter(|bit| !defaults.contains(bit))
+        .collect::<Vec<_>>();
+    risks.sort_unstable();
+    if risks.is_empty() {
+        return;
+    }
+
+    let first_name = design.net_name(risks[0]);
+    let net = first_name
+        .split('[')
+        .next()
+        .unwrap_or(&first_name)
+        .to_string();
+    issues
+        .entry(net.clone())
+        .and_modify(|issue| issue.count = issue.count.max(risks.len()))
+        .or_insert(LintIssue {
+            kind: LintIssueKind::LatchRisk,
+            net,
+            count: risks.len(),
+        });
+}
+
 #[derive(Clone, Debug)]
 pub struct ClockingBlock {
     pub name: String,
@@ -1446,6 +1558,28 @@ impl Design {
         }
         for statement in self.initials.iter().chain(self.final_blocks.iter()) {
             lint_visit_case_statement(statement, self, &mut issues);
+        }
+        issues.into_values().collect()
+    }
+
+    /// Report combinational-process targets assigned on only some paths.
+    ///
+    /// This lint recognizes unconditional defaults, matching if/else paths,
+    /// and indexed part writes. More complete abstract interpretation is still
+    /// future work; unknown constructs are ignored rather than guessed.
+    pub fn lint_latch_risks(&self) -> Vec<LintIssue> {
+        let mut issues: std::collections::BTreeMap<String, LintIssue> =
+            std::collections::BTreeMap::new();
+        for process in &self.processes {
+            if !matches!(process.sens, Sens::Comb) {
+                continue;
+            }
+            lint_visit_latch_statement(
+                &process.body,
+                &std::collections::BTreeSet::new(),
+                self,
+                &mut issues,
+            );
         }
         issues.into_values().collect()
     }
@@ -2240,6 +2374,71 @@ mod tests {
             arms.push((label(3), assignment()));
         }
         assert!(complete.lint_incomplete_cases().is_empty());
+    }
+
+    #[test]
+    fn lint_reports_latch_risks_only_without_full_path_assignment() {
+        let mut design = Design {
+            name: "latches".into(),
+            ..Default::default()
+        };
+        design.net_decls.push(NetDecl {
+            name: "q".into(),
+            width: 2,
+            is_reg: true,
+            is_signed: false,
+            base: 0,
+        });
+        design.net_decls.push(NetDecl {
+            name: "en".into(),
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base: 2,
+        });
+        design.n_nets = 3;
+        let enable = || Expr::Ref {
+            net: 2,
+            decl_width: 1,
+            range: Range::Bit(0),
+            signed: false,
+        };
+        let assignment = |value: u64| Stmt::Bl {
+            lv: LValue {
+                net: 0,
+                decl_width: 2,
+                range: Range::Span { msb: 1, lsb: 0 },
+            },
+            e: Expr::Const(LogicWord::from_u64(2, value)),
+        };
+        design.processes.push(Process {
+            sens: Sens::Comb,
+            body: Stmt::If {
+                c: enable(),
+                t: Box::new(assignment(2)),
+                f: None,
+            },
+        });
+        assert_eq!(
+            design.lint_latch_risks(),
+            vec![LintIssue {
+                kind: LintIssueKind::LatchRisk,
+                net: "q".into(),
+                count: 2,
+            }]
+        );
+
+        if let Stmt::If { f, .. } = &mut design.processes[0].body {
+            *f = Some(Box::new(assignment(3)));
+        }
+        assert!(design.lint_latch_risks().is_empty());
+
+        if let Stmt::If { f, .. } = &mut design.processes[0].body {
+            *f = None;
+        }
+        let process = &mut design.processes[0];
+        process.body = Stmt::Block(vec![assignment(0), process.body.clone()]);
+        assert!(design.lint_latch_risks().is_empty());
     }
 
     #[test]

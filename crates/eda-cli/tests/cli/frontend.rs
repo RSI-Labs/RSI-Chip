@@ -74,3 +74,26 @@ endmodule
         "{output}"
     );
 }
+
+#[test]
+fn slang_info_reports_latch_risks() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "latch-risk.sv",
+        r#"
+module latch_risk(input en, d, output reg q);
+always @* begin
+  if (en) q = d;
+end
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "latch_risk"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("LatchRisk: 'q' has 1 conditionally assigned bit(s)"),
+        "{output}"
+    );
+}
