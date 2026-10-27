@@ -977,6 +977,43 @@ impl SlangAstLowerer {
         }
     }
 
+    fn uvm_report_summary_statement(&self) -> Stmt {
+        let controls = self.uvm_report_controls.borrow();
+        let mut text = String::from("\n--- UVM Report Summary ---\n\n");
+        if controls.max_quit_count != 0 {
+            if controls.quit_count >= controls.max_quit_count {
+                text.push_str("Quit count reached!\n");
+            }
+            text.push_str(&format!(
+                "Quit count : {:5} of {:5}\n",
+                controls.quit_count, controls.max_quit_count
+            ));
+        }
+        text.push_str("** Report counts by severity\n");
+        for severity in ["UVM_FATAL", "UVM_ERROR", "UVM_WARNING", "UVM_INFO"] {
+            let control_severity = severity.trim_start_matches("UVM_");
+            text.push_str(&format!(
+                "{severity} :{:5}\n",
+                controls
+                    .severity_counts
+                    .get(control_severity)
+                    .copied()
+                    .unwrap_or(0)
+            ));
+        }
+        if !controls.id_counts.is_empty() {
+            text.push_str("** Report counts by id\n");
+            for (id, count) in &controls.id_counts {
+                text.push_str(&format!("[{id}] {count:5}\n"));
+            }
+        }
+        Stmt::Display {
+            parts: vec![eda_core::ir::DispPart::Str(text)],
+            args: Vec::new(),
+            monitor: false,
+        }
+    }
+
     fn lower_prepared_run_test_object(
         &self,
         class_name: &str,
@@ -1164,6 +1201,9 @@ impl SlangAstLowerer {
                     }),
                 });
             }
+        }
+        if self.run_test_objects.len() == 1 {
+            statements.push(self.uvm_report_summary_statement());
         }
         Ok(Stmt::Block(statements))
     }

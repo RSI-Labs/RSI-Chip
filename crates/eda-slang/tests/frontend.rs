@@ -21442,6 +21442,25 @@ fn slang_direct_official_upstream_uvm_error_fixture_counts_three_errors() {
         !output.contains("** UVM TEST FAILED **"),
         "unexpected upstream error fixture output: {output}"
     );
+    assert!(
+        output.contains("--- UVM Report Summary ---"),
+        "the official UVM report summary is missing: {output}"
+    );
+    for (severity, count) in [
+        ("UVM_FATAL", "0"),
+        ("UVM_ERROR", "3"),
+        ("UVM_WARNING", "0"),
+        ("UVM_INFO", "0"),
+    ] {
+        assert!(
+            output.contains(&format!("{severity} :{count:>5}")),
+            "official {severity} summary count is missing: {output}"
+        );
+    }
+    assert!(
+        output.contains("[Test]     3"),
+        "official report-by-id summary is missing: {output}"
+    );
 }
 
 #[test]
