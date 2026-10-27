@@ -27,33 +27,28 @@ impl<'a> Elaborator<'a> {
         }
         // 1. parameters (may reference earlier parameters). Values passed
         //    down from a parent instance take precedence over defaults.
-        let mut params = parent_params.clone();
-        let mut local_types = HashMap::new();
-        let mut local_functions = HashMap::new();
+        let mut import_scope = ImportScope {
+            params: parent_params.clone(),
+            types: HashMap::new(),
+            functions: HashMap::new(),
+            origins: HashMap::new(),
+        };
         for import in self.file_imports {
-            self.apply_import(
-                import,
-                &mut params,
-                &mut local_types,
-                &mut local_functions,
-                parent_params,
-                &module.name,
-            )?;
+            self.apply_import(import, &mut import_scope, parent_params, &module.name)?;
         }
         for item in &module.items {
             if let ast::Item::Imports(imports) = item {
                 for import in imports {
-                    self.apply_import(
-                        import,
-                        &mut params,
-                        &mut local_types,
-                        &mut local_functions,
-                        parent_params,
-                        &module.name,
-                    )?;
+                    self.apply_import(import, &mut import_scope, parent_params, &module.name)?;
                 }
             }
         }
+        let ImportScope {
+            mut params,
+            types: mut local_types,
+            functions: mut local_functions,
+            origins: _,
+        } = import_scope;
         let mut declared_parameter_names = std::collections::HashSet::new();
         for item in &module.items {
             if let ast::Item::Params(list) = item {

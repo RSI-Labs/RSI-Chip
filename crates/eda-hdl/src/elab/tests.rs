@@ -240,6 +240,95 @@ endmodule
 }
 
 #[test]
+fn wildcard_import_name_collisions_fail_closed() {
+    let cases = [
+        (
+            r#"
+package left;
+parameter VALUE = 1;
+endpackage
+
+package right;
+parameter VALUE = 2;
+endpackage
+
+import left::*;
+import right::*;
+
+module top(output [VALUE-1:0] y);
+assign y = 1'b0;
+endmodule
+"#,
+            "imported name 'VALUE' is ambiguous between packages 'left' and 'right'",
+        ),
+        (
+            r#"
+package left;
+typedef struct packed { logic a; } item_t;
+endpackage
+
+package right;
+typedef struct packed { logic b; } item_t;
+endpackage
+
+import left::*;
+import right::*;
+
+module top(output logic y);
+assign y = 1'b0;
+endmodule
+"#,
+            "imported name 'item_t' is ambiguous between packages 'left' and 'right'",
+        ),
+        (
+            r#"
+package left;
+function logic [31:0] value(input logic dummy);
+value = 1;
+endfunction
+endpackage
+
+package right;
+function logic [31:0] value(input logic dummy);
+value = 2;
+endfunction
+endpackage
+
+import left::*;
+import right::*;
+
+module top(output logic y);
+assign y = 1'b0;
+endmodule
+"#,
+            "imported name 'value' is ambiguous between packages 'left' and 'right'",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let error = compile(source, None).expect_err("ambiguous wildcard imports must fail closed");
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+
+    let design = compile_ok(
+        r#"
+package single;
+parameter FIRST = 1;
+parameter SECOND = 2;
+endpackage
+
+import single::FIRST;
+import single::*;
+
+module top(output [FIRST+SECOND-1:0] y);
+assign y = 1'b0;
+endmodule
+"#,
+    );
+    assert_eq!(design.port("y").unwrap().width, 3);
+}
+
+#[test]
 fn enum_typedefs_define_width_and_constants() {
     let local = compile_ok(
         r#"

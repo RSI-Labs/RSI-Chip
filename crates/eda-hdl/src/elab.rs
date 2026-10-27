@@ -495,13 +495,37 @@ fn flatten_generate_construct(
     Ok(())
 }
 
+struct ImportScope {
+    params: HashMap<String, i64>,
+    types: HashMap<String, ResolvedType>,
+    functions: HashMap<String, ast::FunctionDef>,
+    origins: HashMap<String, String>,
+}
+
 impl<'a> Elaborator<'a> {
+    fn record_import(
+        scope: &mut ImportScope,
+        name: &str,
+        package: &str,
+        module_name: &str,
+    ) -> Result<(), String> {
+        if let Some(existing) = scope.origins.get(name) {
+            if existing != package {
+                return Err(format!(
+                    "module '{}': imported name '{}' is ambiguous between packages '{}' and '{}'",
+                    module_name, name, existing, package
+                ));
+            }
+        } else {
+            scope.origins.insert(name.to_string(), package.to_string());
+        }
+        Ok(())
+    }
+
     fn apply_import(
         &self,
         import: &ast::Import,
-        params: &mut HashMap<String, i64>,
-        types: &mut HashMap<String, ResolvedType>,
-        functions: &mut HashMap<String, ast::FunctionDef>,
+        scope: &mut ImportScope,
         parent_params: &HashMap<String, i64>,
         module_name: &str,
     ) -> Result<(), String> {
@@ -534,32 +558,39 @@ impl<'a> Elaborator<'a> {
         if import.names.is_empty() {
             for (name, value) in values {
                 if !parent_params.contains_key(name) {
-                    params.insert(name.clone(), *value);
+                    Self::record_import(scope, name, &import.package, module_name)?;
+                    scope.params.insert(name.clone(), *value);
                 }
             }
             for (name, definition) in package_types {
-                types.insert(name.clone(), definition.clone());
+                Self::record_import(scope, name, &import.package, module_name)?;
+                scope.types.insert(name.clone(), definition.clone());
             }
             for (name, definition) in package_functions {
-                functions.insert(name.clone(), definition.clone());
+                Self::record_import(scope, name, &import.package, module_name)?;
+                scope.functions.insert(name.clone(), definition.clone());
             }
         } else {
             for name in &import.names {
                 if let Some(value) = values.get(name).copied() {
                     if !parent_params.contains_key(name) {
-                        params.insert(name.clone(), value);
+                        Self::record_import(scope, name, &import.package, module_name)?;
+                        scope.params.insert(name.clone(), value);
                     }
                 } else if let Some(definition) = package_types.get(name).cloned() {
+                    Self::record_import(scope, name, &import.package, module_name)?;
                     if let ResolvedType::Enum(enum_definition) = &definition {
                         for (constant, value) in &enum_definition.constants {
                             if !parent_params.contains_key(constant) {
-                                params.insert(constant.clone(), *value);
+                                Self::record_import(scope, constant, &import.package, module_name)?;
+                                scope.params.insert(constant.clone(), *value);
                             }
                         }
                     }
-                    types.insert(name.clone(), definition);
+                    scope.types.insert(name.clone(), definition);
                 } else if let Some(definition) = package_functions.get(name).cloned() {
-                    functions.insert(name.clone(), definition);
+                    Self::record_import(scope, name, &import.package, module_name)?;
+                    scope.functions.insert(name.clone(), definition);
                 } else {
                     return Err(format!(
                         "module '{}': package '{}' has no imported name '{}'",
