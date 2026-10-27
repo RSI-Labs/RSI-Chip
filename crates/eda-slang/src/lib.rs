@@ -18,6 +18,8 @@ mod lowering;
 mod summary;
 mod types;
 
+pub const SUPPORTED_SLANG_AST_SCHEMA: &str = lowering::SUPPORTED_SLANG_AST_SCHEMA;
+
 use lowering::{
     annotate_interface_array_port_connections, interface_array_port_member_count,
     interface_array_port_plan_has_members, interface_array_port_scope_paths, lower_root,

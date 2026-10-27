@@ -15,6 +15,9 @@ mod interface_ports;
 mod statements;
 mod uvm;
 
+pub(crate) const SUPPORTED_SLANG_AST_SCHEMA: &str =
+    "slang-ast-json-v1:root+definitions+source-info";
+
 pub(crate) use interface_ports::{
     annotate_interface_array_port_connections, interface_array_port_member_count,
     interface_array_port_plan_has_members, interface_array_port_scope_paths,
@@ -55,7 +58,26 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
         .ok_or_else(|| "slang AST output did not contain a JSON object".to_string())?;
     let document: serde_json::Value = serde_json::from_str(&json[start..])
         .map_err(|error| format!("invalid slang AST JSON: {error}"))?;
-    let design = document.get("design").unwrap_or(&document);
+    let design = if let Some(design) = document.get("design") {
+        validate_ast_schema_contract(design)?;
+        if document
+            .get("definitions")
+            .and_then(serde_json::Value::as_array)
+            .is_none()
+        {
+            return Err(format!(
+                "unsupported slang AST schema ({SUPPORTED_SLANG_AST_SCHEMA}): definitions are not an array"
+            ));
+        }
+        design
+    } else if string_field(&document, "kind").as_deref() == Some("Instance") {
+        validate_instance_schema(&document).map_err(|error| {
+            format!("unsupported slang AST schema ({SUPPORTED_SLANG_AST_SCHEMA}): {error}")
+        })?;
+        &document
+    } else {
+        return Err("slang AST schema has no design object or bare root Instance".into());
+    };
     let root = if string_field(design, "kind").as_deref() == Some("Root") {
         design
             .get("members")
@@ -155,6 +177,61 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
             );
     }
     Ok(root)
+}
+
+fn validate_ast_schema_contract(design: &serde_json::Value) -> Result<(), String> {
+    let invalid = |message: String| {
+        format!("unsupported slang AST schema ({SUPPORTED_SLANG_AST_SCHEMA}): {message}")
+    };
+    if !design.is_object() {
+        return Err(invalid("design is not an object".into()));
+    }
+    if string_field(design, "kind").as_deref() != Some("Root") {
+        return Err(invalid("design kind is not Root".into()));
+    }
+    if string_field(design, "name").is_none() {
+        return Err(invalid("design has no name".into()));
+    }
+    let members = design
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid("design members are not an array".into()))?;
+    let Some(root_instance) = members
+        .iter()
+        .find(|member| string_field(member, "kind").as_deref() == Some("Instance"))
+    else {
+        return Err(invalid("design has no elaborated root Instance".into()));
+    };
+    validate_instance_schema(root_instance).map_err(invalid)?;
+    Ok(())
+}
+
+fn validate_instance_schema(instance: &serde_json::Value) -> Result<(), String> {
+    if string_field(instance, "kind").as_deref() != Some("Instance") {
+        return Err("root member kind is not Instance".into());
+    }
+    if string_field(instance, "name").is_none() {
+        return Err("root Instance has no name".into());
+    }
+    for field in ["source_file", "source_line", "source_column"] {
+        if instance.get(field).is_none() {
+            return Err(format!("root Instance has no {field}"));
+        }
+    }
+    let body = instance
+        .get("body")
+        .ok_or_else(|| "root Instance has no body".to_string())?;
+    if string_field(body, "kind").as_deref() != Some("InstanceBody") {
+        return Err("root Instance body kind is not InstanceBody".into());
+    }
+    if body
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
+        return Err("root Instance body members are not an array".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {

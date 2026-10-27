@@ -43,6 +43,80 @@ fn slang_discovery_requires_the_pinned_runtime_version() {
     );
 }
 
+#[test]
+fn slang_ast_lowering_enforces_the_schema_contract() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("ast-schema-contract");
+    let source_path = root.join("schema_contract.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module schema_contract(output logic y);
+assign y = 1'b1;
+endmodule
+"#,
+    )
+    .expect("write schema-contract source");
+    let valid = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("schema_contract"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize schema-contract AST");
+    let valid =
+        serde_json::from_str::<serde_json::Value>(&valid).expect("parse schema-contract AST");
+    slang
+        .lower_ast_json(&valid.to_string())
+        .expect("valid pinned slang AST satisfies the schema contract");
+    assert_eq!(
+        eda_slang::SUPPORTED_SLANG_AST_SCHEMA,
+        "slang-ast-json-v1:root+definitions+source-info"
+    );
+
+    let mut missing_definitions = valid.clone();
+    missing_definitions
+        .as_object_mut()
+        .expect("AST document object")
+        .remove("definitions");
+    let error = slang
+        .lower_ast_json(&missing_definitions.to_string())
+        .expect_err("missing definitions must fail the schema contract");
+    assert!(
+        error.contains("unsupported slang AST schema")
+            && error.contains("definitions are not an array"),
+        "unexpected missing-definitions error: {error}"
+    );
+
+    let mut missing_body = valid;
+    if let Some(members) = missing_body
+        .get_mut("design")
+        .and_then(|d| d.get_mut("members"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if let Some(instance) = members
+            .iter_mut()
+            .find(|member| member.get("kind").and_then(|k| k.as_str()) == Some("Instance"))
+        {
+            instance
+                .as_object_mut()
+                .expect("root Instance object")
+                .remove("body");
+        }
+    }
+    let error = slang
+        .lower_ast_json(&missing_body.to_string())
+        .expect_err("missing root body must fail the schema contract");
+    assert!(
+        error.contains("unsupported slang AST schema")
+            && error.contains("root Instance has no body"),
+        "unexpected missing-body error: {error}"
+    );
+}
+
 fn validate_official_uvm_root(root: &Path) -> Result<PathBuf, String> {
     let source = root.join("src").join("uvm.sv");
     if !source.is_file() {
