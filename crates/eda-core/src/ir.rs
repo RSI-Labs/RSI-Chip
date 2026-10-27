@@ -1016,6 +1016,18 @@ pub struct Assign {
     pub delay: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LintIssueKind {
+    MultipleContinuousDrivers,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LintIssue {
+    pub kind: LintIssueKind,
+    pub net: String,
+    pub driver_count: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Design {
     pub name: String,
@@ -1098,6 +1110,45 @@ impl Design {
 
     pub fn port(&self, name: &str) -> Option<&PortDecl> {
         self.ports.iter().find(|p| p.name == name)
+    }
+
+    /// Report bits driven by more than one continuous assignment.
+    ///
+    /// This diagnostic does not change net resolution; the simulator retains
+    /// its existing multi-driver behavior.
+    pub fn lint_multiple_continuous_drivers(&self) -> Vec<LintIssue> {
+        let mut driver_counts: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for assignment in &self.assigns {
+            let bits = match assignment.lv.range {
+                Range::Bit(bit) => vec![assignment.lv.net + bit],
+                Range::Span { msb, lsb } => (lsb..=msb)
+                    .map(|bit| assignment.lv.net + bit)
+                    .collect::<Vec<_>>(),
+            };
+            for bit in bits {
+                *driver_counts.entry(bit).or_insert(0) += 1;
+            }
+        }
+
+        let mut issues: std::collections::BTreeMap<String, LintIssue> =
+            std::collections::BTreeMap::new();
+        for (bit, driver_count) in driver_counts {
+            if driver_count <= 1 {
+                continue;
+            }
+            let bit_name = self.net_name(bit);
+            let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
+            issues
+                .entry(net.clone())
+                .and_modify(|issue| issue.driver_count = issue.driver_count.max(driver_count))
+                .or_insert(LintIssue {
+                    kind: LintIssueKind::MultipleContinuousDrivers,
+                    net,
+                    driver_count,
+                });
+        }
+        issues.into_values().collect()
     }
 
     pub fn instance(&self, path: &str) -> Option<&HierarchicalInstance> {
@@ -1758,6 +1809,45 @@ mod tests {
         assert_eq!(d.net_name(2), "a[2]");
         assert_eq!(d.net_name(4), "clk");
         assert_eq!(d.net_name(9), "net9");
+    }
+
+    #[test]
+    fn lint_reports_overlapping_continuous_drivers_only() {
+        let mut design = Design {
+            name: "drivers".into(),
+            ..Default::default()
+        };
+        design.net_decls.push(NetDecl {
+            name: "bus".into(),
+            width: 4,
+            is_reg: false,
+            is_signed: false,
+            base: 0,
+        });
+        design.n_nets = 4;
+        let constant = || Expr::Const(LogicWord::zero(1));
+        let driver = |msb: usize, lsb: usize| Assign {
+            lv: LValue {
+                net: 0,
+                decl_width: 4,
+                range: Range::Span { msb, lsb },
+            },
+            e: constant(),
+            delay: 0,
+        };
+        design.assigns.push(driver(1, 0));
+        design.assigns.push(driver(3, 2));
+        assert!(design.lint_multiple_continuous_drivers().is_empty());
+
+        design.assigns.push(driver(3, 1));
+        assert_eq!(
+            design.lint_multiple_continuous_drivers(),
+            vec![LintIssue {
+                kind: LintIssueKind::MultipleContinuousDrivers,
+                net: "bus".into(),
+                driver_count: 2,
+            }]
+        );
     }
 
     #[test]

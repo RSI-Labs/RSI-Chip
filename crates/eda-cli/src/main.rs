@@ -158,6 +158,14 @@ fn main() -> ExitCode {
                         design.processes.len(),
                         design.initials.len()
                     );
+                    let lint_issues = design.lint_multiple_continuous_drivers();
+                    println!("  lint findings: {}", lint_issues.len());
+                    for issue in lint_issues {
+                        println!(
+                            "    {:?}: '{}' has {} continuous drivers",
+                            issue.kind, issue.net, issue.driver_count
+                        );
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
