@@ -138,6 +138,67 @@ endmodule
 }
 
 #[test]
+fn slang_direct_lowering_supports_integer_valued_real_literal_comparisons() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("integer-valued-real-literals");
+    let source_path = root.join("real_literals.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module real_literal_probe(output bit same, output bit different);
+  assign same = (2.0 == 2.0);
+  assign different = (2.0 != 3.0);
+endmodule
+"#,
+    )
+    .expect("write integer-valued real-literal source");
+
+    let design = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("real_literal_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower integer-valued real literals");
+    let mut simulator = Simulator::new(&design).expect("create real-literal simulator");
+    simulator.run_until(0).expect("evaluate real literals");
+    assert_eq!(simulator.read("same").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("different").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_direct_lowering_rejects_fractional_real_literals() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("fractional-real-literal");
+    let source_path = root.join("fractional_real.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module fractional_real_probe(output bit value);
+  assign value = 1.5 == 1.5;
+endmodule
+"#,
+    )
+    .expect("write fractional real-literal source");
+
+    let error = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("fractional_real_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("fractional real literals must fail closed");
+    assert!(
+        error.contains("supports only nonnegative integer-valued real literals"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_simple_class_objects() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -20834,6 +20895,62 @@ fn slang_direct_official_upstream_uvm_hello_fixture_compiles_and_runs() {
     simulator
         .run_until(2)
         .expect("execute the upstream UVM hello fixture through completion");
+}
+
+#[test]
+fn slang_direct_official_upstream_uvm_compatibility_fixture_compiles_with_version_mismatch() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/99compat/7455/test.sv")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM compatibility fixture");
+    let fixture_text = std::fs::read_to_string(&fixture)
+        .expect("read the pinned upstream UVM compatibility fixture");
+    assert!(
+        fixture_text.contains("package test_pkg;"),
+        "the upstream compatibility fixture must retain its package boundary"
+    );
+    assert!(
+        fixture_text.contains("run_test(\"test\");"),
+        "the upstream compatibility fixture must retain its explicit test selection"
+    );
+    assert!(
+        fixture_text.contains("`UVM_MINOR_REV != 2.0"),
+        "the upstream compatibility fixture must retain its version-sensitive check"
+    );
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let design = slang
+        .compile_files(&[source, fixture], Some("test"), &options)
+        .expect("directly lower the pinned upstream UVM compatibility fixture");
+    assert_eq!(design.name, "test");
+    let serialized = format!("{design:?}");
+    assert!(
+        serialized.contains("Back compat macro version ladder checks out OK"),
+        "the upstream compatibility pass branch must be lowered into executable IR: {serialized}"
+    );
+    assert!(
+        serialized.contains("Error in back compat macro version ladder"),
+        "the upstream compatibility failure branch must also remain executable"
+    );
+
+    // Pinned UVM 2020.3.1 reports minor revision 3, while this upstream issue
+    // fixture checks against 2.0. Both report branches must elaborate and the
+    // simulator must execute the selected mismatch path.
+    let mut simulator =
+        Simulator::new(&design).expect("create the upstream UVM compatibility simulator");
+    simulator
+        .run_until(2)
+        .expect("execute the upstream UVM compatibility fixture through completion");
 }
 
 #[test]

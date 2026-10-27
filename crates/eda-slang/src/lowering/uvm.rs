@@ -547,10 +547,10 @@ impl SlangAstLowerer {
                     ),
                 ));
             }
-            let Some(official_index) = official_uvm_test_index(&chain) else {
+            let Some(official_index) = official_uvm_component_index(&chain) else {
                 return Err(with_source_span(
                     call,
-                    format!("run_test class '{class_name}' must derive from official uvm_test"),
+                    format!("run_test class '{class_name}' must derive from official uvm_test or uvm_component"),
                 ));
             };
             if let Some(run_phase) = user_phase_method(&chain, official_index, "run_phase") {
@@ -952,8 +952,9 @@ impl SlangAstLowerer {
         };
 
         let chain = self.class_chain(&run_object.class_name)?;
-        let official_index = official_uvm_test_index(&chain)
-            .ok_or_else(|| format!("run_test class '{class_name}' is not official UVM"))?;
+        let official_index = official_uvm_component_index(&chain).ok_or_else(|| {
+            format!("run_test class '{class_name}' is not official UVM component-derived test")
+        })?;
         let mut statements = vec![construction];
         statements.push(Stmt::Bl {
             lv: class_lvalue(&run_object.objection_count),
@@ -2639,7 +2640,7 @@ impl SlangAstLowerer {
             return self.lower_uvm_report_call(call);
         };
         let chain = self.class_chain(&active_class)?;
-        let Some(official_index) = official_uvm_test_index(&chain) else {
+        let Some(official_index) = official_uvm_component_index(&chain) else {
             return self.lower_uvm_report_call(call);
         };
 
@@ -5382,7 +5383,7 @@ impl SlangAstLowerer {
             .cloned()
             .ok_or_else(|| format!("class object '{active_object}' has no type"))?;
         let chain = self.class_chain(&active_class)?;
-        if official_uvm_test_index(&chain).is_none() {
+        if official_uvm_component_index(&chain).is_none() {
             return Ok(None);
         }
         let Some(method_name) = string_field(call, "subroutine").and_then(|subroutine| {
@@ -5492,7 +5493,7 @@ impl SlangAstLowerer {
             .cloned()
             .ok_or_else(|| format!("class object '{active_object}' has no type"))?;
         let chain = self.class_chain(&active_class)?;
-        if official_uvm_test_index(&chain).is_none() {
+        if official_uvm_component_index(&chain).is_none() {
             return Ok(None);
         }
         let empty_arguments = Vec::new();
@@ -6692,13 +6693,14 @@ fn is_this_reference(value: &Value) -> bool {
             == Some("this")
 }
 
-fn official_uvm_test_index(chain: &[(String, Value)]) -> Option<usize> {
+fn official_uvm_component_index(chain: &[(String, Value)]) -> Option<usize> {
     chain.iter().position(|(owner, class)| {
-        owner.split('@').next() == Some("uvm_test")
-            && string_field(class, "source_file")
-                .and_then(|file| file.split('/').next_back().map(str::to_string))
-                .as_deref()
-                == Some("uvm_test.svh")
+        let class_name = owner.split('@').next();
+        let source_file = string_field(class, "source_file")
+            .and_then(|file| file.split('/').next_back().map(str::to_string));
+        (class_name == Some("uvm_test") && source_file.as_deref() == Some("uvm_test.svh"))
+            || (class_name == Some("uvm_component")
+                && source_file.as_deref() == Some("uvm_component.svh"))
     })
 }
 

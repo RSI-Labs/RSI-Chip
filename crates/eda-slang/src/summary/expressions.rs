@@ -54,17 +54,22 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     };
     // The bounded IR folds parameter constants to unsigned 32-bit Const nodes.
     // Keep those leaves comparable without inventing a signed Constant type.
-    let type_signed = if kind == "NamedValue" && literal.is_some() {
+    let type_signed = if kind == "RealLiteral" || (kind == "NamedValue" && literal.is_some()) {
         Some(false)
     } else {
         string_field(value, "type").and_then(|type_name| simple_type_signed(&type_name))
+    };
+    let type_width = if kind == "RealLiteral" {
+        Some(64)
+    } else {
+        string_field(value, "type").and_then(|type_name| simple_type_width(&type_name))
     };
     SlangExpressionSummary {
         kind,
         type_name: string_field(value, "type").unwrap_or_default(),
         operator: operator.unwrap_or_default(),
         selection_kind: string_field(value, "selectionKind").unwrap_or_default(),
-        type_width: string_field(value, "type").and_then(|type_name| simple_type_width(&type_name)),
+        type_width,
         type_signed,
         symbol: expression_symbol(value),
         symbol_id: expression_symbol_id(value),
@@ -106,6 +111,15 @@ pub(crate) fn expression_literal(value: &Value) -> Option<String> {
     let kind = string_field(value, "kind")?;
     let raw = match kind.as_str() {
         "IntegerLiteral" => string_field(value, "value")?,
+        "RealLiteral" => {
+            let real = value.get("value").and_then(Value::as_f64).filter(|real| {
+                real.is_finite() && *real >= 0.0 && real.fract() == 0.0 && *real <= u64::MAX as f64
+            })?;
+            return Some(format!(
+                "64:{}",
+                LogicWord::from_u64(64, real as u64).to_bin_str()
+            ));
+        }
         "NamedValue" => string_field(value, "constant")?,
         "StringLiteral" => string_field(value, "literal")?,
         _ => return None,

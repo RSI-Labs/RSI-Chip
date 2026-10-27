@@ -2259,9 +2259,18 @@ fn parse_display_format(
             literal.push('%');
             continue;
         }
-        let specifier = characters
+        let mut specifier = characters
             .next()
             .ok_or_else(|| "display format has a trailing '%'".to_string())?;
+        if specifier == '0' {
+            // `%0d` requests the minimum natural width (no leading padding).
+            // The current formatter already emits natural-width decimal, hex,
+            // binary, and ASCII values, so consume the zero-width modifier and
+            // preserve the conversion specifier.
+            specifier = characters
+                .next()
+                .ok_or_else(|| "display format has a trailing '%0'".to_string())?;
+        }
         match specifier {
             'b' | 'B' => {
                 push_display_literal(&mut parts, &mut literal);

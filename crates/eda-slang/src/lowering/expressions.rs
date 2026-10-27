@@ -381,6 +381,20 @@ impl super::SlangAstLowerer {
                     Ok(Expr::Const(word))
                 }
             }
+            "RealLiteral" => {
+                let real = value
+                    .get("value")
+                    .and_then(serde_json::Value::as_f64)
+                    .ok_or_else(|| "real literal has no numeric value".to_string())?;
+                if !real.is_finite() || real < 0.0 || real.fract() != 0.0 || real > u64::MAX as f64
+                {
+                    return Err(
+                        "direct lowering supports only nonnegative integer-valued real literals"
+                            .into(),
+                    );
+                }
+                Ok(Expr::Const(LogicWord::from_u64(64, real as u64)))
+            }
             "StringLiteral" => {
                 let literal = string_field(value, "literal")
                     .ok_or_else(|| "string literal has no value".to_string())?;
