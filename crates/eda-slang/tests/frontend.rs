@@ -32,6 +32,17 @@ fn discover_slang_for_tests() -> Option<SlangFrontend> {
     }
 }
 
+#[test]
+fn slang_discovery_requires_the_pinned_runtime_version() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    assert_eq!(
+        slang.version().expect("read pinned slang version"),
+        "slang version 12.0.535+54c19b53"
+    );
+}
+
 fn validate_official_uvm_root(root: &Path) -> Result<PathBuf, String> {
     let source = root.join("src").join("uvm.sv");
     if !source.is_file() {

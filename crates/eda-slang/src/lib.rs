@@ -32,6 +32,8 @@ pub struct SlangFrontend {
     program: PathBuf,
 }
 
+const PINNED_SLANG_VERSION: &str = "slang version 12.0.535+54c19b53";
+
 #[derive(Clone, Debug, Default)]
 pub struct PreprocessOptions {
     pub include_directories: Vec<PathBuf>,
@@ -71,24 +73,15 @@ impl std::error::Error for SlangFailure {}
 impl SlangFrontend {
     /// Finds slang through `SLANG_BIN`, `SLANG`, or `PATH`.
     pub fn discover() -> Result<Self, String> {
-        if let Some(path) = std::env::var_os("SLANG_BIN") {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return Ok(Self { program: path });
-            }
+        let program = self::discover_program()?;
+        let frontend = Self { program };
+        let version = frontend.version()?;
+        if !frontend.version_matches(&version) {
             return Err(format!(
-                "SLANG_BIN does not point to slang: {}",
-                path.display()
+                "unsupported slang runtime: expected '{PINNED_SLANG_VERSION}', found '{version}'"
             ));
         }
-        if let Some(path) = std::env::var_os("SLANG") {
-            let path = PathBuf::from(path);
-            if path.is_file() {
-                return Ok(Self { program: path });
-            }
-            return Err(format!("SLANG does not point to slang: {}", path.display()));
-        }
-        which("slang").map(|program| Self { program })
+        Ok(frontend)
     }
 
     /// Used by tests so machines without slang can still run the workspace.
@@ -100,6 +93,62 @@ impl SlangFrontend {
         &self.program
     }
 
+    pub fn version(&self) -> Result<String, String> {
+        let output = Command::new(&self.program)
+            .arg("--version")
+            .output()
+            .map_err(|error| format!("cannot execute {}: {error}", self.program.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot determine slang version: {} exited with {}",
+                self.program.display(),
+                output.status
+            ));
+        }
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if version.starts_with("slang version ") {
+            Ok(version)
+        } else {
+            Err(format!(
+                "unrecognized slang version output from {}: {version}",
+                self.program.display()
+            ))
+        }
+    }
+
+    fn version_matches(&self, version: &str) -> bool {
+        version.trim() == PINNED_SLANG_VERSION
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.arg("--quiet");
+        command
+    }
+}
+
+fn discover_program() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("SLANG_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "SLANG_BIN does not point to slang: {}",
+            path.display()
+        ));
+    }
+    if let Some(path) = std::env::var_os("SLANG") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!("SLANG does not point to slang: {}", path.display()));
+    }
+    which("slang")
+}
+
+impl SlangFrontend {
     /// Runs slang's full parse/type/elaboration action.
     pub fn check_files(&self, files: &[PathBuf], top: Option<&str>) -> Result<(), SlangFailure> {
         self.check_files_with_options(files, top, &PreprocessOptions::default())
@@ -322,12 +371,6 @@ impl SlangFrontend {
         result
     }
 
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.arg("--quiet");
-        command
-    }
-
     fn run(&self, command: Command) -> Result<(), SlangFailure> {
         self.run_capturing(command).map(|_| ())
     }
@@ -443,4 +486,20 @@ fn write_temporary_source(source: &str) -> Result<PathBuf, String> {
         )
     })?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slang_version_matching_is_exact() {
+        let frontend = SlangFrontend {
+            program: PathBuf::from("slang"),
+        };
+        assert!(frontend.version_matches("slang version 12.0.535+54c19b53"));
+        assert!(frontend.version_matches("slang version 12.0.535+54c19b53\n"));
+        assert!(!frontend.version_matches("slang version 13.0.0"));
+        assert!(!frontend.version_matches("slang version 12.0.535"));
+    }
 }
