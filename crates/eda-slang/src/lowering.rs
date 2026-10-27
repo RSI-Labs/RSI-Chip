@@ -426,6 +426,7 @@ pub(super) struct AstUvmConfigWait {
     pub(super) net: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct AstUvmReportControls {
     pub(super) default_verbosity: Option<u64>,
     pub(super) id_verbosity: std::collections::BTreeMap<String, u64>,

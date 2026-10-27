@@ -21539,6 +21539,7 @@ class test extends uvm_test;
 
   virtual function void report_phase(uvm_phase phase);
     SelectionTrace::selected = 1;
+    uvm_report_warning("Selection", "default warning");
   endfunction
 endclass
 
@@ -21549,11 +21550,13 @@ class alternate extends uvm_test;
 
   virtual function void report_phase(uvm_phase phase);
     SelectionTrace::selected = 2;
+    uvm_report_error("Selection", "alternate error");
   endfunction
 endclass
 
 module official_uvm_runtime_selection_probe(output int selected);
   initial begin
+    uvm_report_info("Baseline", "report before run_test");
     run_test();
     selected = SelectionTrace::selected;
   end
@@ -21576,6 +21579,19 @@ endmodule
         .run_until(2)
         .expect("execute the absent-plusarg default UVM test");
     assert_eq!(default.read("selected").unwrap().to_u64(), Some(1));
+    let default_output = default.displays.join("");
+    assert!(
+        default_output.contains("UVM_WARNING :    1"),
+        "default candidate summary is wrong: {default_output}"
+    );
+    assert!(
+        default_output.contains("UVM_ERROR :    0"),
+        "default candidate leaked alternate error counts: {default_output}"
+    );
+    assert!(
+        default_output.contains("UVM_INFO :    1"),
+        "default candidate lost baseline report counts: {default_output}"
+    );
 
     let mut alternate = Simulator::new(&design).expect("create alternate UVM-selection simulator");
     alternate
@@ -21585,6 +21601,19 @@ endmodule
         .run_until(2)
         .expect("execute the selected alternate UVM test");
     assert_eq!(alternate.read("selected").unwrap().to_u64(), Some(2));
+    let alternate_output = alternate.displays.join("");
+    assert!(
+        alternate_output.contains("UVM_ERROR :    1"),
+        "alternate candidate summary is wrong: {alternate_output}"
+    );
+    assert!(
+        alternate_output.contains("UVM_WARNING :    0"),
+        "alternate candidate leaked default warning counts: {alternate_output}"
+    );
+    assert!(
+        alternate_output.contains("UVM_INFO :    1"),
+        "alternate candidate lost baseline report counts: {alternate_output}"
+    );
 
     let mut unknown = Simulator::new(&design).expect("create unknown UVM-selection simulator");
     unknown

@@ -1019,6 +1019,13 @@ impl SlangAstLowerer {
         class_name: &str,
         run_object: &super::AstRunTestObject,
     ) -> Result<Stmt, String> {
+        let report_baseline = self.uvm_report_controls.borrow().clone();
+        {
+            let mut controls = self.uvm_report_controls.borrow_mut();
+            controls.severity_counts.clear();
+            controls.id_counts.clear();
+            controls.quit_count = 0;
+        }
         let chain = self.class_chain(&run_object.class_name)?;
         let constructor = chain
             .iter()
@@ -1202,9 +1209,33 @@ impl SlangAstLowerer {
                 });
             }
         }
-        if self.run_test_objects.len() == 1 {
-            statements.push(self.uvm_report_summary_statement());
+        let branch_controls = self.uvm_report_controls.borrow().clone();
+        let mut summary_controls = branch_controls.clone();
+        for (severity, count) in &report_baseline.severity_counts {
+            let merged = summary_controls
+                .severity_counts
+                .entry(severity.clone())
+                .or_insert(0)
+                .saturating_add(*count);
+            summary_controls
+                .severity_counts
+                .insert(severity.clone(), merged);
         }
+        for (id, count) in &report_baseline.id_counts {
+            let merged = summary_controls
+                .id_counts
+                .entry(id.clone())
+                .or_insert(0)
+                .saturating_add(*count);
+            summary_controls.id_counts.insert(id.clone(), merged);
+        }
+        summary_controls.quit_count = summary_controls
+            .quit_count
+            .saturating_add(report_baseline.quit_count);
+        *self.uvm_report_controls.borrow_mut() = summary_controls;
+        let summary = self.uvm_report_summary_statement();
+        *self.uvm_report_controls.borrow_mut() = report_baseline;
+        statements.push(summary);
         Ok(Stmt::Block(statements))
     }
 
