@@ -387,6 +387,14 @@ impl<'d> Simulator<'d> {
             }
             sim.vals[*net] = LogicValue::Zero;
         }
+        for net in design.plusarg_values.values() {
+            if net.checked_add(512).is_none_or(|end| end > n) {
+                return Err("plusarg value state refers to a missing net".into());
+            }
+            for (offset, bit) in LogicWord::zero(512).bits.into_iter().enumerate() {
+                sim.vals[*net + offset] = bit;
+            }
+        }
         for init in &design.initials {
             sim.conts.entry(0).or_default().push(Cont {
                 process: None,

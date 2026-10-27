@@ -21279,6 +21279,105 @@ fn slang_direct_official_upstream_uvm_plusargs_fixture_executes_both_branches() 
 }
 
 #[test]
+fn slang_direct_run_test_selects_classes_from_runtime_uvm_testname() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-runtime-selection-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class SelectionTrace;
+  static int selected = 0;
+endclass
+
+class test extends uvm_test;
+  function new(string name = "test", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    SelectionTrace::selected = 1;
+  endfunction
+endclass
+
+class alternate extends uvm_test;
+  function new(string name = "alternate", uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    SelectionTrace::selected = 2;
+  endfunction
+endclass
+
+module official_uvm_runtime_selection_probe(output int selected);
+  initial begin
+    run_test();
+    selected = SelectionTrace::selected;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM runtime-selection wrapper");
+
+    let design = slang
+        .compile_files(
+            &[source, wrapper],
+            Some("official_uvm_runtime_selection_probe"),
+            &options,
+        )
+        .expect("directly lower runtime UVM test selection");
+    assert!(design.plusarg_values.contains_key("UVM_TESTNAME"));
+
+    let mut default = Simulator::new(&design).expect("create default UVM-selection simulator");
+    default
+        .run_until(2)
+        .expect("execute the absent-plusarg default UVM test");
+    assert_eq!(default.read("selected").unwrap().to_u64(), Some(1));
+
+    let mut alternate = Simulator::new(&design).expect("create alternate UVM-selection simulator");
+    alternate
+        .set_plusargs(["+UVM_TESTNAME=alternate"])
+        .expect("install the alternate UVM test name");
+    alternate
+        .run_until(2)
+        .expect("execute the selected alternate UVM test");
+    assert_eq!(alternate.read("selected").unwrap().to_u64(), Some(2));
+
+    let mut unknown = Simulator::new(&design).expect("create unknown UVM-selection simulator");
+    unknown
+        .set_plusargs(["+UVM_TESTNAME=missing"])
+        .expect("install an unknown UVM test name");
+    let error = unknown
+        .run_until(2)
+        .expect_err("unknown runtime UVM test names must fail closed");
+    assert!(
+        error.contains("runtime +UVM_TESTNAME did not match a local UVM test class"),
+        "{error}"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_sequence_response_queue_reaches_depth_eight() {
     let Some(slang) = discover_slang_for_tests() else {
         return;

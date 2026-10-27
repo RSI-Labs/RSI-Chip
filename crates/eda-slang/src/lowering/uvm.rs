@@ -1,6 +1,7 @@
 //! Minimal direct-lowering bootstrap for official-UVM `run_test`.
 
 use super::classes::{class_expr, class_lvalue, method_return_type};
+use super::hierarchy::full_range;
 use super::SlangAstLowerer;
 use crate::ast_util::{bool_field, slang_constant_u64, string_field, with_source_span};
 use eda_core::ir::{BinOp, EventEdge, EventWatch, Expr, Stmt};
@@ -500,10 +501,7 @@ impl SlangAstLowerer {
                     )
                 })?;
             let timeout_location = source_location(timeout_call).ok_or_else(|| {
-                with_source_span(
-                    timeout_call,
-                    "UVM timeout configuration has no source location".into(),
-                )
+                with_source_span(timeout_call, "UVM timeout has no source location".into())
             })?;
             if timeout_location >= run_test_location {
                 return Err(with_source_span(
@@ -513,257 +511,287 @@ impl SlangAstLowerer {
             }
             objection_timeout = uvm_timeout_value(timeout_call)?;
         }
+        let mut saw_run_test = false;
         for call in calls {
-            if !self.run_test_objects.is_empty() {
+            if saw_run_test {
                 return Err(with_source_span(
                     call,
                     "only one direct-lowering run_test call is supported per module".into(),
                 ));
             }
-            let requested_class_name = run_test_class_name(call)?;
-            let requested_class_name = self.resolve_uvm_type_alias(&requested_class_name)?;
-            let class_name = self.resolve_global_uvm_factory_class(&requested_class_name)?;
-            let requested_class_key = self.class_type_key(&requested_class_name);
-            let class_key = self.class_type_key(&class_name);
-            if !self.class_definitions.contains_key(&class_key) {
-                return Err(with_source_span(
-                    call,
-                    format!("run_test class '{class_name}' is unknown"),
-                ));
-            }
-            let chain = self
-                .class_chain(&class_key)
-                .map_err(|error| with_source_span(call, error))?;
-            if class_name != requested_class_name
-                && !chain.iter().any(|(owner, _)| {
-                    owner == &requested_class_key
-                        || owner.split('@').next() == requested_class_key.split('@').next()
-                })
-            {
-                return Err(with_source_span(
-                    call,
-                    format!(
-                        "UVM factory override '{class_name}' is not derived from '{requested_class_name}'"
-                    ),
-                ));
-            }
-            let Some(official_index) = official_uvm_component_index(&chain) else {
-                return Err(with_source_span(
-                    call,
-                    format!("run_test class '{class_name}' must derive from official uvm_test or uvm_component"),
-                ));
+            saw_run_test = true;
+            let requested_names = if run_test_uses_runtime_default(call) {
+                self.declare_plusarg_query("UVM_TESTNAME");
+                self.declare_plusarg_value("UVM_TESTNAME");
+                self.local_uvm_test_class_names(body)?
+            } else {
+                vec![run_test_class_name(call)?]
             };
-            if let Some(run_phase) = user_phase_method(&chain, official_index, "run_phase") {
-                if let Err(error) = validate_bootstrap_phase_method(run_phase, "run_phase") {
-                    return Err(with_source_span(
-                        call,
-                        format!("run_test class '{class_name}' run_phase is invalid: {error}"),
-                    ));
-                }
+            for requested_class_name in requested_names {
+                self.prepare_run_test_object(call, requested_class_name, objection_timeout)?;
             }
-            let constructor = chain.iter().find_map(|(_, class)| {
-                let empty_members = Vec::new();
-                class
-                    .get("members")
-                    .and_then(Value::as_array)
-                    .unwrap_or(&empty_members)
-                    .iter()
-                    .find(|member| {
-                        string_field(member, "kind").as_deref() == Some("Subroutine")
-                            && string_field(member, "name").as_deref() == Some("new")
-                    })
-                    .cloned()
-            });
-            let Some(constructor) = constructor else {
+        }
+        Ok(())
+    }
+
+    fn local_uvm_test_class_names(&self, body: &Value) -> Result<Vec<String>, String> {
+        let Some(root_source) = string_field(body, "source_file") else {
+            return Err("run_test runtime selection requires a source-tagged root body".into());
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for (candidate, class) in &self.class_definitions {
+            if string_field(class, "source_file").as_deref() != Some(root_source.as_str()) {
+                continue;
+            }
+            let class_name = self.class_type_key(candidate);
+            let chain = self.class_chain(&class_name)?;
+            if official_uvm_component_index(&chain).is_some_and(|index| index > 0) {
+                names.insert(class_name);
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    fn prepare_run_test_object(
+        &mut self,
+        call: &Value,
+        requested_class_name: String,
+        objection_timeout: u64,
+    ) -> Result<(), String> {
+        let requested_class_name = self.resolve_uvm_type_alias(&requested_class_name)?;
+        let class_name = self.resolve_global_uvm_factory_class(&requested_class_name)?;
+        let requested_class_key = self.class_type_key(&requested_class_name);
+        let class_key = self.class_type_key(&class_name);
+        if !self.class_definitions.contains_key(&class_key) {
+            return Err(with_source_span(
+                call,
+                format!("run_test class '{class_name}' is unknown"),
+            ));
+        }
+        let chain = self
+            .class_chain(&class_key)
+            .map_err(|error| with_source_span(call, error))?;
+        if class_name != requested_class_name
+            && !chain.iter().any(|(owner, _)| {
+                owner == &requested_class_key
+                    || owner.split('@').next() == requested_class_key.split('@').next()
+            })
+        {
+            return Err(with_source_span(
+                call,
+                format!(
+                    "UVM factory override '{class_name}' is not derived from '{requested_class_name}'"
+                ),
+            ));
+        }
+        let Some(official_index) = official_uvm_component_index(&chain) else {
+            return Err(with_source_span(
+                call,
+                format!("run_test class '{class_name}' must derive from official uvm_test or uvm_component"),
+            ));
+        };
+        if let Some(run_phase) = user_phase_method(&chain, official_index, "run_phase") {
+            if let Err(error) = validate_bootstrap_phase_method(run_phase, "run_phase") {
                 return Err(with_source_span(
                     call,
-                    format!("run_test class '{class_name}' has no explicit constructor"),
+                    format!("run_test class '{class_name}' run_phase is invalid: {error}"),
                 ));
-            };
-            let empty_arguments = Vec::new();
-            let formals = constructor
-                .get("arguments")
+            }
+        }
+        let constructor = chain.iter().find_map(|(_, class)| {
+            let empty_members = Vec::new();
+            class
+                .get("members")
                 .and_then(Value::as_array)
-                .unwrap_or(&empty_arguments);
-            if formals
+                .unwrap_or(&empty_members)
                 .iter()
-                .skip(1)
-                .any(|formal| formal.get("defaultValue").is_none())
-            {
-                return Err(with_source_span(
-                    call,
-                    format!(
-                        "run_test class '{class_name}' constructor arguments must have defaults"
-                    ),
-                ));
-            }
-            let first_formal = formals.first().ok_or_else(|| {
-                with_source_span(
-                    call,
-                    format!(
-                        "run_test class '{class_name}' constructor requires a string name argument"
-                    ),
-                )
-            })?;
-            if !string_field(first_formal, "type")
+                .find(|member| {
+                    string_field(member, "kind").as_deref() == Some("Subroutine")
+                        && string_field(member, "name").as_deref() == Some("new")
+                })
+                .cloned()
+        });
+        let Some(constructor) = constructor else {
+            return Err(with_source_span(
+                call,
+                format!("run_test class '{class_name}' has no explicit constructor"),
+            ));
+        };
+        let empty_arguments = Vec::new();
+        let formals = constructor
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if formals
+            .iter()
+            .skip(1)
+            .any(|formal| formal.get("defaultValue").is_none())
+        {
+            return Err(with_source_span(
+                call,
+                format!("run_test class '{class_name}' constructor arguments must have defaults"),
+            ));
+        }
+        let first_formal = formals.first().ok_or_else(|| {
+            with_source_span(
+                call,
+                format!(
+                    "run_test class '{class_name}' constructor requires a string name argument"
+                ),
+            )
+        })?;
+        if !string_field(first_formal, "type")
+            .unwrap_or_default()
+            .contains("string")
+        {
+            return Err(with_source_span(
+                call,
+                format!("run_test class '{class_name}' constructor name argument must be a string"),
+            ));
+        }
+        // Official uvm_root::run_test creates the selected test component
+        // under the fixed instance name "uvm_test_top"; the constructor's
+        // name default is only a validation contract for this bootstrap.
+        let root_name = "uvm_test_top".to_string();
+
+        let root_handle_address = self.next_synthetic_class_handle;
+        self.next_synthetic_class_handle = self
+            .next_synthetic_class_handle
+            .checked_sub(1)
+            .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
+        let root_object_key = format!("{root_handle_address} __uvm_root");
+        self.ensure_class_object_serial()?;
+        let root_name_symbol = self.declare_class_internal_net(
+            &format!("__uvm_root_name_{root_handle_address}"),
+            crate::types::STRING_WIDTH,
+        );
+        let root_full_name_symbol = self.declare_class_internal_net(
+            &format!("__uvm_root_full_name_{root_handle_address}"),
+            crate::types::STRING_WIDTH,
+        );
+        let root_tag =
+            self.declare_class_internal_net(&format!("__uvm_root_tag_{root_handle_address}"), 32);
+        let root_id =
+            self.declare_class_internal_net(&format!("__uvm_root_id_{root_handle_address}"), 64);
+        self.design.initials.extend([
+            Stmt::Bl {
+                lv: class_lvalue(&root_name_symbol),
+                e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&root_full_name_symbol),
+                e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&root_tag),
+                e: Expr::Const(LogicWord::zero(32)),
+            },
+            Stmt::Bl {
+                lv: class_lvalue(&root_id),
+                e: Expr::Const(LogicWord::zero(64)),
+            },
+        ]);
+        self.class_objects
+            .insert(root_object_key.clone(), BTreeMap::new());
+        self.class_object_types
+            .insert(root_object_key.clone(), "uvm_root".to_string());
+        self.class_object_names
+            .insert(root_object_key.clone(), root_name_symbol);
+        self.class_object_full_names
+            .insert(root_object_key.clone(), root_full_name_symbol);
+        self.class_object_tags
+            .insert(root_object_key.clone(), root_tag);
+        self.class_object_ids
+            .insert(root_object_key.clone(), root_id.clone());
+        self.class_object_parent_ids
+            .insert(root_object_key.clone(), root_id);
+        self.class_object_declared_names
+            .borrow_mut()
+            .insert(root_object_key.clone(), "__top__".to_string());
+        self.class_object_declared_full_names
+            .borrow_mut()
+            .insert(root_object_key.clone(), String::new());
+        self.initialized_class_objects
+            .insert(root_object_key.clone());
+
+        let handle_address = self.next_synthetic_class_handle;
+        self.next_synthetic_class_handle = self
+            .next_synthetic_class_handle
+            .checked_sub(1)
+            .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
+        let object_name = format!(
+            "__uvm_run_test_{}",
+            class_name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        );
+        let synthetic_member = json!({
+            "name": object_name,
+            "kind": "Variable",
+            "type": class_key,
+            "lifetime": "Static",
+            "addr": handle_address,
+        });
+        if !self.declare_class_object(&synthetic_member, &object_name)? {
+            return Err(with_source_span(
+                call,
+                format!("run_test cannot allocate class '{class_name}'"),
+            ));
+        }
+        let object_key = format!("{handle_address} {object_name}");
+        self.class_object_parent_keys
+            .borrow_mut()
+            .insert(object_key.clone(), root_object_key.clone());
+        self.class_object_declared_names
+            .borrow_mut()
+            .insert(object_key.clone(), root_name.clone());
+        self.class_object_declared_full_names
+            .borrow_mut()
+            .insert(object_key.clone(), root_name.clone());
+        self.class_object_children
+            .borrow_mut()
+            .insert(root_object_key.clone(), vec![object_key.clone()]);
+        self.prepare_uvm_config_waits(&chain, &object_key, handle_address)?;
+        let phase_key = format!("{handle_address} __uvm_phase");
+        let objection_count = self
+            .declare_class_internal_net(&format!("__uvm_run_test_objections_{handle_address}"), 32);
+        let objection_drained = self
+            .declare_class_internal_net(&format!("__uvm_objections_drained_{handle_address}"), 1);
+        let owner_keys = self.uvm_objection_owner_keys(&object_key);
+        let mut objection_owner_counts = BTreeMap::new();
+        for (owner_index, owner_key) in owner_keys.into_iter().enumerate() {
+            let owner_address = owner_key
+                .split_whitespace()
+                .next()
                 .unwrap_or_default()
-                .contains("string")
-            {
-                return Err(with_source_span(
-                    call,
-                    format!(
-                        "run_test class '{class_name}' constructor name argument must be a string"
-                    ),
-                ));
-            }
-            // Official uvm_root::run_test creates the selected test component
-            // under the fixed instance name "uvm_test_top"; the constructor's
-            // name default is only a validation contract for this bootstrap.
-            let root_name = "uvm_test_top".to_string();
-
-            let root_handle_address = self.next_synthetic_class_handle;
-            self.next_synthetic_class_handle = self
-                .next_synthetic_class_handle
-                .checked_sub(1)
-                .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
-            let root_object_key = format!("{root_handle_address} __uvm_root");
-            self.ensure_class_object_serial()?;
-            let root_name_symbol = self.declare_class_internal_net(
-                &format!("__uvm_root_name_{root_handle_address}"),
-                crate::types::STRING_WIDTH,
-            );
-            let root_full_name_symbol = self.declare_class_internal_net(
-                &format!("__uvm_root_full_name_{root_handle_address}"),
-                crate::types::STRING_WIDTH,
-            );
-            let root_tag = self
-                .declare_class_internal_net(&format!("__uvm_root_tag_{root_handle_address}"), 32);
-            let root_id = self
-                .declare_class_internal_net(&format!("__uvm_root_id_{root_handle_address}"), 64);
-            self.design.initials.extend([
-                Stmt::Bl {
-                    lv: class_lvalue(&root_name_symbol),
-                    e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
-                },
-                Stmt::Bl {
-                    lv: class_lvalue(&root_full_name_symbol),
-                    e: Expr::Const(LogicWord::zero(crate::types::STRING_WIDTH)),
-                },
-                Stmt::Bl {
-                    lv: class_lvalue(&root_tag),
-                    e: Expr::Const(LogicWord::zero(32)),
-                },
-                Stmt::Bl {
-                    lv: class_lvalue(&root_id),
-                    e: Expr::Const(LogicWord::zero(64)),
-                },
-            ]);
-            self.class_objects
-                .insert(root_object_key.clone(), BTreeMap::new());
-            self.class_object_types
-                .insert(root_object_key.clone(), "uvm_root".to_string());
-            self.class_object_names
-                .insert(root_object_key.clone(), root_name_symbol);
-            self.class_object_full_names
-                .insert(root_object_key.clone(), root_full_name_symbol);
-            self.class_object_tags
-                .insert(root_object_key.clone(), root_tag);
-            self.class_object_ids
-                .insert(root_object_key.clone(), root_id.clone());
-            self.class_object_parent_ids
-                .insert(root_object_key.clone(), root_id);
-            self.class_object_declared_names
-                .borrow_mut()
-                .insert(root_object_key.clone(), "__top__".to_string());
-            self.class_object_declared_full_names
-                .borrow_mut()
-                .insert(root_object_key.clone(), String::new());
-            self.initialized_class_objects
-                .insert(root_object_key.clone());
-
-            let handle_address = self.next_synthetic_class_handle;
-            self.next_synthetic_class_handle = self
-                .next_synthetic_class_handle
-                .checked_sub(1)
-                .ok_or_else(|| "synthetic class-handle address space exhausted".to_string())?;
-            let object_name = format!(
-                "__uvm_run_test_{}",
-                class_name
-                    .chars()
-                    .map(|character| {
-                        if character.is_ascii_alphanumeric() {
-                            character
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
-            );
-            let synthetic_member = json!({
-                "name": object_name,
-                "kind": "Variable",
-                "type": class_key,
-                "lifetime": "Static",
-                "addr": handle_address,
-            });
-            if !self.declare_class_object(&synthetic_member, &object_name)? {
-                return Err(with_source_span(
-                    call,
-                    format!("run_test cannot allocate class '{class_name}'"),
-                ));
-            }
-            let object_key = format!("{handle_address} {object_name}");
-            self.class_object_parent_keys
-                .borrow_mut()
-                .insert(object_key.clone(), root_object_key.clone());
-            self.class_object_declared_names
-                .borrow_mut()
-                .insert(object_key.clone(), root_name.clone());
-            self.class_object_declared_full_names
-                .borrow_mut()
-                .insert(object_key.clone(), root_name.clone());
-            self.class_object_children
-                .borrow_mut()
-                .insert(root_object_key.clone(), vec![object_key.clone()]);
-            self.prepare_uvm_config_waits(&chain, &object_key, handle_address)?;
-            let phase_key = format!("{handle_address} __uvm_phase");
-            let objection_count = self.declare_class_internal_net(
-                &format!("__uvm_run_test_objections_{handle_address}"),
+                .replace(['[', ']'], "_");
+            let count = self.declare_class_internal_net(
+                &format!("__uvm_objection_owner_{owner_address}_{owner_index}"),
                 32,
             );
-            let objection_drained = self.declare_class_internal_net(
-                &format!("__uvm_objections_drained_{handle_address}"),
-                1,
-            );
-            let owner_keys = self.uvm_objection_owner_keys(&object_key);
-            let mut objection_owner_counts = BTreeMap::new();
-            for (owner_index, owner_key) in owner_keys.into_iter().enumerate() {
-                let owner_address = owner_key
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .replace(['[', ']'], "_");
-                let count = self.declare_class_internal_net(
-                    &format!("__uvm_objection_owner_{owner_address}_{owner_index}"),
-                    32,
-                );
-                objection_owner_counts.insert(owner_key, count);
-            }
-            self.initialized_class_objects.insert(object_key.clone());
-            self.run_test_objects.insert(
-                requested_class_name,
-                super::AstRunTestObject {
-                    class_name: class_key,
-                    root_object_key,
-                    object_key,
-                    phase_key,
-                    objection_count,
-                    objection_drained,
-                    objection_timeout,
-                    objection_owner_counts,
-                },
-            );
+            objection_owner_counts.insert(owner_key, count);
         }
+        self.initialized_class_objects.insert(object_key.clone());
+        self.run_test_objects.insert(
+            requested_class_name,
+            super::AstRunTestObject {
+                class_name: class_key,
+                root_object_key,
+                object_key,
+                phase_key,
+                objection_count,
+                objection_drained,
+                objection_timeout,
+                objection_owner_counts,
+            },
+        );
         Ok(())
     }
 
@@ -868,12 +896,81 @@ impl SlangAstLowerer {
         if subroutine.split_whitespace().next_back() != Some("run_test") {
             return Ok(None);
         }
+        if run_test_uses_runtime_default(value) {
+            let name = "UVM_TESTNAME";
+            let Some(argument) = self.plusarg_values.get(name) else {
+                return Err("runtime UVM_TESTNAME plusarg state was not prepared".into());
+            };
+            let selected = Expr::Ref {
+                net: argument.base,
+                decl_width: argument.width,
+                range: full_range(argument.width),
+                signed: false,
+            };
+            let mut branches = Vec::new();
+            let mut has_default_test = false;
+            for (class_name, run_object) in &self.run_test_objects {
+                let mut condition = Self::plusarg_string_equals(selected.clone(), class_name);
+                if *class_name == "test" {
+                    has_default_test = true;
+                    condition = Expr::Bin {
+                        op: BinOp::LogOr,
+                        a: Box::new(condition),
+                        b: Box::new(Self::plusarg_string_equals(selected.clone(), "")),
+                    };
+                }
+                let statement = self.lower_prepared_run_test_object(class_name, run_object)?;
+                branches.push((condition, statement));
+            }
+            let mut selection = Stmt::Assert {
+                cond: Expr::Const(LogicWord::zero(1)),
+                message: Some("runtime +UVM_TESTNAME did not match a local UVM test class".into()),
+            };
+            for (condition, statement) in branches.into_iter().rev() {
+                selection = Stmt::If {
+                    c: condition,
+                    t: Box::new(statement),
+                    f: Some(Box::new(selection)),
+                };
+            }
+            if !has_default_test {
+                return Err(
+                    "runtime run_test selection requires a local class named 'test' as the absent-plusarg default"
+                        .into(),
+                );
+            }
+            return Ok(Some(selection));
+        }
         let class_name = run_test_class_name(value)?;
         let Some(run_object) = self.run_test_objects.get(&class_name) else {
             return Err(format!(
                 "run_test object for class '{class_name}' was not prepared"
             ));
         };
+        self.lower_prepared_run_test_object(&class_name, run_object)
+            .map(Some)
+    }
+
+    fn plusarg_string_equals(left: Expr, text: &str) -> Expr {
+        Expr::Bin {
+            op: BinOp::Eq,
+            a: Box::new(Expr::StringCompare {
+                left: Box::new(left),
+                right: Box::new(Expr::Const(LogicWord::from_bytes_le(
+                    crate::types::STRING_WIDTH,
+                    text.as_bytes(),
+                ))),
+                ignore_case: false,
+            }),
+            b: Box::new(Expr::Const(LogicWord::zero(32))),
+        }
+    }
+
+    fn lower_prepared_run_test_object(
+        &self,
+        class_name: &str,
+        run_object: &super::AstRunTestObject,
+    ) -> Result<Stmt, String> {
         let chain = self.class_chain(&run_object.class_name)?;
         let constructor = chain
             .iter()
@@ -1057,7 +1154,7 @@ impl SlangAstLowerer {
                 });
             }
         }
-        Ok(Some(Stmt::Block(statements)))
+        Ok(Stmt::Block(statements))
     }
 
     pub(super) fn lower_uvm_super_phase_call(&self, value: &Value) -> Result<Option<Stmt>, String> {
@@ -7589,6 +7686,23 @@ fn source_location(value: &Value) -> Option<(String, u64, u64)> {
         value.get("source_line_start").and_then(Value::as_u64)?,
         value.get("source_column_start").and_then(Value::as_u64)?,
     ))
+}
+
+fn run_test_uses_runtime_default(call: &Value) -> bool {
+    let Some(argument) = call
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())
+    else {
+        return true;
+    };
+    let argument = unwrap_conversion(argument);
+    if string_literal_allow_empty(argument).as_deref() != Some("") {
+        return false;
+    }
+    let call_file = string_field(call, "source_file_start");
+    let argument_file = string_field(argument, "source_file_start");
+    call_file.is_some() && argument_file.is_some() && call_file != argument_file
 }
 
 fn run_test_class_name(call: &Value) -> Result<String, String> {

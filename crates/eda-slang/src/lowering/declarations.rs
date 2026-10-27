@@ -44,35 +44,12 @@ impl SlangAstLowerer {
         for call in value_calls {
             let plan = value_plusarg_plan(call).map_err(|error| with_source_span(call, error))?;
             self.declare_plusarg_query(&plan.query);
-            if self.plusarg_values.contains_key(&plan.query) {
-                continue;
-            }
-            let net_name = eda_core::ir::plusarg_value_net_name(&plan.query);
-            let base = self.design.n_nets;
-            self.design.n_nets += STRING_WIDTH;
-            self.design.net_decls.push(eda_core::ir::NetDecl {
-                name: net_name,
-                width: STRING_WIDTH,
-                is_reg: false,
-                is_signed: false,
-                base,
-            });
-            let symbol = AstLoweredSymbol {
-                base,
-                width: STRING_WIDTH,
-                signed: false,
-                bounds: None,
-                dimensions: Vec::new(),
-                memory: None,
-                struct_fields: std::collections::BTreeMap::new(),
-            };
-            self.plusarg_values.insert(plan.query.clone(), symbol);
-            self.design.plusarg_values.insert(plan.query, base);
+            self.declare_plusarg_value(&plan.query);
         }
         Ok(())
     }
 
-    fn declare_plusarg_query(&mut self, name: &str) {
+    pub(super) fn declare_plusarg_query(&mut self, name: &str) {
         if self.plusargs.contains_key(name) {
             return;
         }
@@ -97,6 +74,33 @@ impl SlangAstLowerer {
         };
         self.plusargs.insert(name.to_string(), symbol);
         self.design.plusargs.insert(name.to_string(), base);
+    }
+
+    pub(super) fn declare_plusarg_value(&mut self, name: &str) {
+        if self.plusarg_values.contains_key(name) {
+            return;
+        }
+        let net_name = eda_core::ir::plusarg_value_net_name(name);
+        let base = self.design.n_nets;
+        self.design.n_nets += STRING_WIDTH;
+        self.design.net_decls.push(eda_core::ir::NetDecl {
+            name: net_name,
+            width: STRING_WIDTH,
+            is_reg: false,
+            is_signed: false,
+            base,
+        });
+        let symbol = AstLoweredSymbol {
+            base,
+            width: STRING_WIDTH,
+            signed: false,
+            bounds: None,
+            dimensions: Vec::new(),
+            memory: None,
+            struct_fields: std::collections::BTreeMap::new(),
+        };
+        self.plusarg_values.insert(name.to_string(), symbol);
+        self.design.plusarg_values.insert(name.to_string(), base);
     }
 
     fn insert_type_alias(
