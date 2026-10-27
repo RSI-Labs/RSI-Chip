@@ -1797,6 +1797,69 @@ fn runtime_whole_unpacked_array_elements_compile_as_reads_and_writes() {
 }
 
 #[test]
+fn negative_array_bases_use_the_runtime_element_fast_path() {
+    fn conditional_depth(expression: &Expr) -> usize {
+        match expression {
+            Expr::Cond { f, .. } => 1 + conditional_depth(f),
+            _ => 0,
+        }
+    }
+
+    fn statement_depth(statement: &Stmt) -> usize {
+        match statement {
+            Stmt::If { f, .. } => {
+                1 + f
+                    .as_ref()
+                    .map(|nested| statement_depth(nested))
+                    .unwrap_or_default()
+            }
+            Stmt::Block(statements) => statements.iter().map(statement_depth).sum(),
+            Stmt::Bl { e, .. } => conditional_depth(e),
+            _ => 0,
+        }
+    }
+
+    let read = compile_ok(
+        "module m(input logic signed [3:0] selector, output [7:0] q); \
+         logic [7:0] memory [-4:3]; \
+         initial begin \
+           memory[-4] = 8'd10; memory[-3] = 8'd20; \
+           memory[-2] = 8'd30; memory[-1] = 8'd40; \
+           memory[0] = 8'd50; memory[1] = 8'd60; \
+           memory[2] = 8'd70; memory[3] = 8'd80; \
+         end \
+         assign q = memory[selector]; \
+         endmodule",
+    );
+    let output = read.port("q").expect("output port");
+    let read_assignment = read
+        .assigns
+        .iter()
+        .find(|assignment| assignment.lv.net == output.base)
+        .expect("continuous array read");
+    assert_eq!(
+        conditional_depth(&read_assignment.e),
+        1,
+        "negative bases must not expand into one conditional per element: {:?}",
+        read_assignment.e
+    );
+
+    let write = compile_ok(
+        "module m(input logic signed [3:0] selector, input [7:0] din); \
+         logic [7:0] memory [-4:3]; \
+         always @* memory[selector] = din; \
+         endmodule",
+    );
+    assert_eq!(write.processes.len(), 1);
+    assert_eq!(
+        statement_depth(&write.processes[0].body),
+        1,
+        "negative bases must use one guarded runtime write, not an element chain: {:?}",
+        write.processes[0].body
+    );
+}
+
+#[test]
 fn sequence_composition_with_repetition_is_rejected() {
     let error = compile(
         "module m(input clk, req, first, second); \

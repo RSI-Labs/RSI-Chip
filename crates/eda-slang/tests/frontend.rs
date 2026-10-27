@@ -2964,6 +2964,59 @@ endmodule
 }
 
 #[test]
+fn slang_bounded_negative_array_runtime_indices_execute() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("bounded-negative-array");
+    let source_path = root.join("negative_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module negative_array(
+  input logic signed [3:0] selector,
+  output [7:0] q
+);
+logic [7:0] memory [-4:3];
+initial begin
+  memory[-4] = 8'd10;
+  memory[-3] = 8'd20;
+  memory[-2] = 8'd30;
+  memory[-1] = 8'd40;
+  memory[0] = 8'd50;
+  memory[1] = 8'd60;
+  memory[2] = 8'd70;
+  memory[3] = 8'd80;
+end
+assign q = memory[selector];
+endmodule
+"#,
+    )
+    .expect("write negative-array source");
+
+    let design = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("negative_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower a negative-base unpacked array through the bounded path");
+    let mut simulator = Simulator::new(&design).expect("create negative-array simulator");
+    for index in -4_i64..=3 {
+        simulator
+            .set_input("selector", &LogicWord::from_u64(4, index as u32 as u64))
+            .expect("set signed array selector");
+        simulator.run_until(0).expect("evaluate array selector");
+        let expected = ((index + 5) * 10) as u64;
+        assert_eq!(
+            simulator.read("q").unwrap().to_u64(),
+            Some(expected),
+            "wrong memory value for index {index}"
+        );
+    }
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_display_tasks() {
     let Some(slang) = discover_slang_for_tests() else {
         return;

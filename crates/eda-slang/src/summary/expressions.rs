@@ -921,8 +921,14 @@ pub(crate) fn parameter_constant_fingerprint(parameter: &SlangParameterSummary) 
 }
 
 pub(crate) fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option<i64> {
+    if expression.kind == "UnaryOp" && expression.operator == "Minus" {
+        return 0_i64.checked_sub(summary_literal_i64(expression.operands.first()?)?);
+    }
     let (_, bits) = expression.literal.as_deref()?.split_once(':')?;
-    let mut value = 0_i64;
+    if bits.len() > 64 {
+        return None;
+    }
+    let mut value = 0_i128;
     for bit in bits.chars() {
         value = value.checked_mul(2)?;
         if bit == '1' {
@@ -931,7 +937,10 @@ pub(crate) fn summary_literal_i64(expression: &SlangExpressionSummary) -> Option
             return None;
         }
     }
-    Some(value)
+    if expression.type_signed == Some(true) && bits.starts_with('1') {
+        value -= 1_i128 << bits.len();
+    }
+    i64::try_from(value).ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

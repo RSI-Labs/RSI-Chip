@@ -499,14 +499,6 @@ impl<'a> Elaborator<'a> {
         array: &NetArray,
         runtime_indexes: &[ExprIR],
     ) -> Option<(ExprIR, ExprIR)> {
-        if array
-            .dimensions
-            .iter()
-            .any(|dimension| dimension.base < 0 || dimension.base > i64::from(u32::MAX))
-        {
-            return None;
-        }
-
         let mut physical_index = ExprIR::Const(LogicWord::zero(32));
         let mut all_in_range = ExprIR::Const(LogicWord::from_u64(1, 1));
         let mut stride = array.length;
@@ -516,15 +508,18 @@ impl<'a> Elaborator<'a> {
             let last = base + dimension.step * (dimension.length as i64 - 1);
             let lower = base.min(last);
             let upper = base.max(last);
+            let signed_dimension = lower < 0 || upper < 0;
+            let lower_const = runtime_index_bound_const(lower, signed_dimension)?;
+            let upper_const = runtime_index_bound_const(upper, signed_dimension)?;
             let lower_bound = ExprIR::Bin {
                 op: BinOp::Ge,
                 a: Box::new(runtime_index.clone()),
-                b: Box::new(ExprIR::Const(LogicWord::from_u64(32, lower.unsigned_abs()))),
+                b: Box::new(lower_const),
             };
             let upper_bound = ExprIR::Bin {
                 op: BinOp::Le,
                 a: Box::new(runtime_index.clone()),
-                b: Box::new(ExprIR::Const(LogicWord::from_u64(32, upper.unsigned_abs()))),
+                b: Box::new(upper_const),
             };
             all_in_range = ExprIR::Bin {
                 op: BinOp::LogAnd,
@@ -539,12 +534,12 @@ impl<'a> Elaborator<'a> {
                 ExprIR::Bin {
                     op: BinOp::Sub,
                     a: Box::new(runtime_index.clone()),
-                    b: Box::new(ExprIR::Const(LogicWord::from_u64(32, base.unsigned_abs()))),
+                    b: Box::new(runtime_index_bound_const(base, signed_dimension)?),
                 }
             } else {
                 ExprIR::Bin {
                     op: BinOp::Sub,
-                    a: Box::new(ExprIR::Const(LogicWord::from_u64(32, base.unsigned_abs()))),
+                    a: Box::new(runtime_index_bound_const(base, signed_dimension)?),
                     b: Box::new(runtime_index.clone()),
                 }
             };
@@ -1928,6 +1923,19 @@ impl<'a> Elaborator<'a> {
             },
         ))
     }
+}
+
+fn runtime_index_bound_const(value: i64, signed: bool) -> Option<ExprIR> {
+    let value = i32::try_from(value).ok()?;
+    let word = LogicWord::from_u64(32, value as u32 as u64);
+    Some(if signed {
+        ExprIR::Signed {
+            e: Box::new(ExprIR::Const(word)),
+            signed: true,
+        }
+    } else {
+        ExprIR::Const(word)
+    })
 }
 
 fn low_mask(total_width: usize, selected_width: usize) -> LogicWord {
