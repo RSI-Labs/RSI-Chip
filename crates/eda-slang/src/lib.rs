@@ -259,8 +259,10 @@ impl SlangFrontend {
         top: Option<&str>,
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
-        self.check_files_with_options(files, top, options)
-            .map_err(|error| error.to_string())?;
+        // The AST request is itself a full slang parse/type/elaboration run.
+        // It validates the source before the compatibility elaborator can run,
+        // so an additional check-only invocation would duplicate the expensive
+        // frontend lifecycle for large official-UVM compilations.
         let authoritative_ast = self
             .ast_json_with_options(files, top, &[], options)
             .map_err(|error| error.to_string())?;
@@ -285,8 +287,9 @@ impl SlangFrontend {
         top: Option<&str>,
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
-        self.check_files_with_options(files, top, options)
-            .map_err(|error| error.to_string())?;
+        // Requesting slang's elaborated AST is itself the authoritative parse,
+        // type-check, and elaboration gate. Do not run a second check-only
+        // slang process before it.
         let json = self
             .ast_json_with_options(files, top, &[], options)
             .map_err(|error| error.to_string())?;
