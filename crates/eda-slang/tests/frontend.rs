@@ -21390,6 +21390,61 @@ fn slang_direct_official_upstream_uvm_toolargs_fixture_executes_conjoined_plusar
 }
 
 #[test]
+fn slang_direct_official_upstream_uvm_error_fixture_counts_three_errors() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../third_party/uvm-tests/tests/00basic/03error/test.sv")
+        .canonicalize()
+        .expect("resolve the pinned upstream UVM error fixture");
+    let fixture_text =
+        std::fs::read_to_string(&fixture).expect("read the pinned upstream UVM error fixture");
+    for error in ["Error 1...", "Error 2...", "Error 3..."] {
+        assert!(
+            fixture_text.contains(error),
+            "the upstream error fixture must retain '{error}'"
+        );
+    }
+
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+    };
+    let design = slang
+        .compile_files(&[source, fixture], Some("top"), &options)
+        .expect("directly lower the pinned upstream UVM error fixture");
+    assert_eq!(design.name, "top");
+
+    let mut simulator = Simulator::new(&design).expect("create the upstream UVM error simulator");
+    simulator
+        .run_until(2)
+        .expect("execute the upstream UVM error fixture through completion");
+    let output = simulator.displays.join("");
+    for error in ["Error 1...", "Error 2...", "Error 3..."] {
+        assert_eq!(output.matches(error).count(), 1, "output: {output}");
+    }
+    assert_eq!(
+        output.matches("UVM TEST EXPECT 3 UVM_ERROR").count(),
+        1,
+        "output: {output}"
+    );
+    assert_eq!(
+        output.matches("** UVM TEST PASSED **").count(),
+        1,
+        "output: {output}"
+    );
+    assert!(
+        !output.contains("** UVM TEST FAILED **"),
+        "unexpected upstream error fixture output: {output}"
+    );
+}
+
+#[test]
 fn slang_direct_run_test_selects_classes_from_runtime_uvm_testname() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
