@@ -162,6 +162,7 @@ fn main() -> ExitCode {
                     lint_issues.extend(design.lint_combinational_loops());
                     lint_issues.extend(design.lint_incomplete_cases());
                     lint_issues.extend(design.lint_latch_risks());
+                    lint_issues.extend(design.lint_unused_names());
                     println!("  lint findings: {}", lint_issues.len());
                     for issue in lint_issues {
                         match issue.kind {
@@ -179,6 +180,10 @@ fn main() -> ExitCode {
                             ),
                             eda_core::ir::LintIssueKind::LatchRisk => println!(
                                 "    {:?}: '{}' has {} conditionally assigned bit(s)",
+                                issue.kind, issue.net, issue.count
+                            ),
+                            eda_core::ir::LintIssueKind::UnusedName => println!(
+                                "    {:?}: '{}' declares {} unused bit(s)",
                                 issue.kind, issue.net, issue.count
                             ),
                         }

@@ -1018,6 +1018,7 @@ pub struct Assign {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LintIssueKind {
+    UnusedName,
     LatchRisk,
     IncompleteCase,
     CombinationalLoop,
@@ -1425,6 +1426,214 @@ fn lint_record_latch_risk(
         });
 }
 
+fn lint_statement_touched_nets(statement: &Stmt, touched: &mut std::collections::BTreeSet<usize>) {
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter()
+            .for_each(|nested| lint_statement_touched_nets(nested, touched)),
+        Stmt::Forever(body) | Stmt::Scope(body) => lint_statement_touched_nets(body, touched),
+        Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
+            let mut bits = lint_lvalue_bits(lv);
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::MemoryBl { indexes, e, .. } | Stmt::MemoryNBl { indexes, e, .. } => {
+            for index in indexes {
+                let mut bits = Vec::new();
+                lint_expression_nets(index, &mut bits);
+                touched.extend(bits);
+            }
+            let mut bits = Vec::new();
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::MemoryCopy { .. } | Stmt::MemoryDelete { .. } => {}
+        Stmt::MemoryNew { size, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(size, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::QueuePush { value, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(value, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::QueuePop { destination, .. } => touched.extend(lint_lvalue_bits(destination)),
+        Stmt::QueueInsert { index, value, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(index, &mut bits);
+            lint_expression_nets(value, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::QueueDelete { index, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(index, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::AssocDelete {
+            index: Some(index), ..
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(index, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::AssocDelete { index: None, .. } => {}
+        Stmt::AssocWrite { index, value, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(index, &mut bits);
+            lint_expression_nets(value, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::AssocTraversal {
+            key, destination, ..
+        } => {
+            touched.extend(lint_lvalue_bits(key));
+            touched.extend(lint_lvalue_bits(destination));
+        }
+        Stmt::MemoryBlPart {
+            indexes, start, e, ..
+        }
+        | Stmt::MemoryNBlPart {
+            indexes, start, e, ..
+        } => {
+            for index in indexes {
+                let mut bits = Vec::new();
+                lint_expression_nets(index, &mut bits);
+                touched.extend(bits);
+            }
+            let mut bits = Vec::new();
+            lint_expression_nets(start, &mut bits);
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::BlIndexed {
+            net,
+            decl_width,
+            start,
+            e,
+            ..
+        }
+        | Stmt::NBlIndexed {
+            net,
+            decl_width,
+            start,
+            e,
+            ..
+        } => {
+            touched.extend(*net..*net + *decl_width);
+            let mut bits = Vec::new();
+            lint_expression_nets(start, &mut bits);
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::If { c, t, f } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(c, &mut bits);
+            touched.extend(bits);
+            lint_statement_touched_nets(t, touched);
+            if let Some(f) = f {
+                lint_statement_touched_nets(f, touched);
+            }
+        }
+        Stmt::Case { e, arms, dflt } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+            for (label, body) in arms {
+                let mut bits = Vec::new();
+                lint_expression_nets(label, &mut bits);
+                touched.extend(bits);
+                lint_statement_touched_nets(body, touched);
+            }
+            if let Some(body) = dflt {
+                lint_statement_touched_nets(body, touched);
+            }
+        }
+        Stmt::Delay { body, .. } => lint_statement_touched_nets(body, touched),
+        Stmt::Repeat { count, body } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(count, &mut bits);
+            touched.extend(bits);
+            lint_statement_touched_nets(body, touched)
+        }
+        Stmt::Wait { cond, body } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(cond, &mut bits);
+            touched.extend(bits);
+            lint_statement_touched_nets(body, touched);
+        }
+        Stmt::EventWait { watches, body } => {
+            touched.extend(watches.iter().map(|watch| watch.net));
+            lint_statement_touched_nets(body, touched);
+        }
+        Stmt::WaitOrder {
+            events,
+            success,
+            failure,
+        } => {
+            touched.extend(events.iter().copied());
+            for body in success.iter().chain(failure.iter()) {
+                lint_statement_touched_nets(body, touched);
+            }
+        }
+        Stmt::Fork { branches, .. } => branches
+            .iter()
+            .for_each(|nested| lint_statement_touched_nets(nested, touched)),
+        Stmt::While { cond, body, steps } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(cond, &mut bits);
+            touched.extend(bits);
+            lint_statement_touched_nets(body, touched);
+            for nested in steps {
+                lint_statement_touched_nets(nested, touched);
+            }
+        }
+        Stmt::Force { lv, e } => {
+            touched.extend(lint_lvalue_bits(lv));
+            let mut bits = Vec::new();
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::Release { lv } => touched.extend(lint_lvalue_bits(lv)),
+        Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Display { args, .. } => {
+            for argument in args {
+                let mut bits = Vec::new();
+                lint_expression_nets(argument, &mut bits);
+                touched.extend(bits);
+            }
+        }
+        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(cond, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::WriteMem { start, finish, .. } => {
+            for expression in start.iter().chain(finish.iter()) {
+                let mut bits = Vec::new();
+                lint_expression_nets(expression, &mut bits);
+                touched.extend(bits);
+            }
+        }
+    }
+}
+
+fn lint_sensitivity_touched_nets(
+    sensitivity: &Sens,
+    touched: &mut std::collections::BTreeSet<usize>,
+) {
+    match sensitivity {
+        Sens::Comb | Sens::Timed => {}
+        Sens::Any(net) | Sens::Posedge(net) | Sens::Negedge(net) => {
+            touched.insert(*net);
+        }
+        Sens::List(items) => items
+            .iter()
+            .for_each(|item| lint_sensitivity_touched_nets(item, touched)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClockingBlock {
     pub name: String,
@@ -1582,6 +1791,64 @@ impl Design {
             );
         }
         issues.into_values().collect()
+    }
+
+    /// Report top-level user-named nets that no supported IR object touches.
+    ///
+    /// Ports, memories, hierarchy-flattened dotted names, and compiler-generated
+    /// names are excluded because external or object references do not prove
+    /// that a declaration is unused.
+    pub fn lint_unused_names(&self) -> Vec<LintIssue> {
+        let mut touched = std::collections::BTreeSet::new();
+        for assignment in &self.assigns {
+            let mut bits = Vec::new();
+            lint_expression_nets(&assignment.e, &mut bits);
+            touched.extend(bits);
+            touched.extend(lint_lvalue_bits(&assignment.lv));
+        }
+        for process in &self.processes {
+            lint_sensitivity_touched_nets(&process.sens, &mut touched);
+            lint_statement_touched_nets(&process.body, &mut touched);
+        }
+        for statement in self.initials.iter().chain(self.final_blocks.iter()) {
+            lint_statement_touched_nets(statement, &mut touched);
+        }
+        for block in &self.clocking_blocks {
+            for input in &block.inputs {
+                touched.extend(lint_lvalue_bits(&input.target));
+                touched.extend(lint_lvalue_bits(&input.sample));
+            }
+        }
+
+        let port_bits = self
+            .ports
+            .iter()
+            .flat_map(|port| port.base..port.base + port.width)
+            .collect::<std::collections::BTreeSet<_>>();
+        let memory_names = self
+            .memories
+            .iter()
+            .map(|memory| memory.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        self.net_decls
+            .iter()
+            .filter(|declaration| {
+                !declaration.name.starts_with("__")
+                    && !declaration.name.contains('.')
+                    && !port_bits.contains(&declaration.base)
+                    && !memory_names.contains(declaration.name.as_str())
+            })
+            .filter_map(|declaration| {
+                let all_bits_unused = (declaration.base..declaration.base + declaration.width)
+                    .all(|bit| !touched.contains(&bit));
+                all_bits_unused.then_some(LintIssue {
+                    kind: LintIssueKind::UnusedName,
+                    net: declaration.name.clone(),
+                    count: declaration.width,
+                })
+            })
+            .collect()
     }
 
     pub fn instance(&self, path: &str) -> Option<&HierarchicalInstance> {
@@ -2439,6 +2706,94 @@ mod tests {
         let process = &mut design.processes[0];
         process.body = Stmt::Block(vec![assignment(0), process.body.clone()]);
         assert!(design.lint_latch_risks().is_empty());
+    }
+
+    #[test]
+    fn lint_reports_completely_unused_user_names_only() {
+        let mut design = Design {
+            name: "unused_names".into(),
+            ..Default::default()
+        };
+        for (name, width, base) in [
+            ("unused", 2, 0),
+            ("partial", 2, 2),
+            ("used", 1, 4),
+            ("sensitive", 1, 5),
+            ("repeat_count", 1, 6),
+            ("forced", 1, 7),
+            ("hier.signal", 1, 8),
+            ("__generated", 1, 9),
+        ] {
+            design.net_decls.push(NetDecl {
+                name: name.into(),
+                width,
+                is_reg: false,
+                is_signed: false,
+                base,
+            });
+            design.n_nets += width;
+        }
+        design.ports.push(PortDecl {
+            name: "y".into(),
+            dir: Dir::Out,
+            base: 6,
+            width: 1,
+        });
+        design.n_nets += 1;
+        design.processes.push(Process {
+            sens: Sens::Any(5),
+            body: Stmt::Block(vec![
+                Stmt::Repeat {
+                    count: Expr::Ref {
+                        net: 6,
+                        decl_width: 1,
+                        range: Range::Bit(0),
+                        signed: false,
+                    },
+                    body: Box::new(Stmt::Finish),
+                },
+                Stmt::Force {
+                    lv: LValue {
+                        net: 7,
+                        decl_width: 1,
+                        range: Range::Bit(0),
+                    },
+                    e: Expr::Const(LogicWord::from_u64(1, 1)),
+                },
+            ]),
+        });
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 6,
+                decl_width: 1,
+                range: Range::Bit(0),
+            },
+            e: Expr::Ref {
+                net: 4,
+                decl_width: 1,
+                range: Range::Bit(0),
+                signed: false,
+            },
+            delay: 0,
+        });
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 2,
+                decl_width: 2,
+                range: Range::Bit(1),
+            },
+            e: Expr::Const(LogicWord::from_u64(1, 1)),
+            delay: 0,
+        });
+
+        assert_eq!(
+            design.lint_unused_names(),
+            vec![LintIssue {
+                kind: LintIssueKind::UnusedName,
+                net: "unused".into(),
+                count: 2,
+            }]
+        );
     }
 
     #[test]

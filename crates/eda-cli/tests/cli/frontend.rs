@@ -97,3 +97,26 @@ endmodule
         "{output}"
     );
 }
+
+#[test]
+fn slang_info_reports_unused_user_names() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "unused-name.sv",
+        r#"
+module unused_name(output y);
+wire unused;
+wire used = 1'b1;
+assign y = used;
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "unused_name"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("UnusedName: 'unused' declares 1 unused bit(s)"),
+        "{output}"
+    );
+}
