@@ -1601,6 +1601,7 @@ impl super::SlangAstLowerer {
                 Some((name, local_index))
             })
             .collect();
+        let empty_argument = serde_json::json!({ "kind": "EmptyArgument" });
         for connection in member
             .get("connections")
             .and_then(serde_json::Value::as_array)
@@ -1618,9 +1619,7 @@ impl super::SlangAstLowerer {
                     "instance '{scoped_instance_name}' connects unknown child port '{port_name}'"
                 ));
             };
-            let expression = connection
-                .get("expr")
-                .ok_or_else(|| "instance connection has no expression".to_string())?;
+            let expression = connection.get("expr").unwrap_or(&empty_argument);
             if let Some(local_memory) = memory_ports.get(&port_name).copied() {
                 let parent_target =
                     if string_field(expression, "kind").as_deref() == Some("Assignment") {

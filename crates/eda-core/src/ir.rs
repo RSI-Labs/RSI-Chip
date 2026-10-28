@@ -1025,6 +1025,7 @@ pub enum LintIssueKind {
     MultipleContinuousDrivers,
     WidthMismatch,
     SignednessMismatch,
+    UnconnectedPort,
 }
 
 impl LintIssueKind {
@@ -1037,6 +1038,7 @@ impl LintIssueKind {
             "MultipleContinuousDrivers" => Ok(Self::MultipleContinuousDrivers),
             "WidthMismatch" => Ok(Self::WidthMismatch),
             "SignednessMismatch" => Ok(Self::SignednessMismatch),
+            "UnconnectedPort" => Ok(Self::UnconnectedPort),
             other => Err(format!("unknown lint rule '{other}'")),
         }
     }
@@ -2050,6 +2052,57 @@ impl Design {
             .collect()
     }
 
+    /// Report child instance ports with no external connection evidence.
+    ///
+    /// Input connectivity is proven by an assignment driving the child port;
+    /// output connectivity is proven by a parent-side expression reading that
+    /// port. Internal behavior alone does not prove that the parent connected
+    /// the pin.
+    pub fn lint_unconnected_ports(&self) -> Vec<LintIssue> {
+        let mut input_driven = std::collections::BTreeSet::new();
+        let mut output_read = std::collections::BTreeSet::new();
+        for assignment in &self.assigns {
+            input_driven.extend(lint_lvalue_bits(&assignment.lv));
+            let mut reads = Vec::new();
+            lint_expression_nets(&assignment.e, &mut reads);
+            output_read.extend(reads);
+        }
+
+        let mut issues: std::collections::BTreeMap<String, LintIssue> =
+            std::collections::BTreeMap::new();
+        for instance in &self.hierarchy {
+            if instance.parent.is_none() {
+                continue;
+            }
+            for port in &instance.ports {
+                let connected_bits = match port.direction {
+                    Dir::In => (port.base..port.base + port.width)
+                        .filter(|bit| input_driven.contains(bit))
+                        .count(),
+                    Dir::Out => (port.base..port.base + port.width)
+                        .filter(|bit| output_read.contains(bit))
+                        .count(),
+                };
+                let missing_bits = port.width.saturating_sub(connected_bits);
+                if missing_bits == 0 {
+                    continue;
+                }
+
+                let bit_name = self.net_name(port.base);
+                let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
+                issues
+                    .entry(net.clone())
+                    .and_modify(|issue| issue.count = issue.count.max(missing_bits))
+                    .or_insert(LintIssue {
+                        kind: LintIssueKind::UnconnectedPort,
+                        net,
+                        count: missing_bits,
+                    });
+            }
+        }
+        issues.into_values().collect()
+    }
+
     /// Report cycles among zero-delay continuous assignments.
     ///
     /// The graph also includes simple guaranteed assignments from combinational
@@ -3023,6 +3076,103 @@ mod tests {
         let error = LintPolicy::parse("waive UnknownRule net reason")
             .expect_err("unknown rules must fail closed");
         assert!(error.contains("unknown lint rule"), "{error}");
+    }
+
+    #[test]
+    fn lint_reports_unconnected_instance_ports_only() {
+        let mut design = Design {
+            name: "unconnected_ports".into(),
+            ..Default::default()
+        };
+        for name in ["top_x", "u.a", "u.b", "u.c", "top_y", "u.d"] {
+            let base = design.n_nets;
+            design.net_decls.push(NetDecl {
+                name: name.into(),
+                width: 1,
+                is_reg: false,
+                is_signed: false,
+                base,
+            });
+            design.n_nets += 1;
+        }
+        design.hierarchy.push(HierarchicalInstance {
+            path: "top.u".into(),
+            module: "child".into(),
+            parent: Some("top".into()),
+            depth: 1,
+            net_start: 1,
+            net_end: 6,
+            ports: vec![
+                HierarchicalPort {
+                    name: "a".into(),
+                    direction: Dir::In,
+                    base: 1,
+                    width: 1,
+                    connections: vec![Some(0)],
+                },
+                HierarchicalPort {
+                    name: "b".into(),
+                    direction: Dir::In,
+                    base: 2,
+                    width: 1,
+                    connections: vec![None],
+                },
+                HierarchicalPort {
+                    name: "c".into(),
+                    direction: Dir::Out,
+                    base: 3,
+                    width: 1,
+                    connections: vec![Some(4)],
+                },
+                HierarchicalPort {
+                    name: "d".into(),
+                    direction: Dir::Out,
+                    base: 5,
+                    width: 1,
+                    connections: vec![None],
+                },
+            ],
+        });
+        let reference = |net: usize| Expr::Ref {
+            net,
+            decl_width: 1,
+            range: Range::Bit(0),
+            signed: false,
+        };
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 1,
+                decl_width: 1,
+                range: Range::Bit(0),
+            },
+            e: reference(0),
+            delay: 0,
+        });
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 4,
+                decl_width: 1,
+                range: Range::Bit(0),
+            },
+            e: reference(3),
+            delay: 0,
+        });
+
+        assert_eq!(
+            design.lint_unconnected_ports(),
+            vec![
+                LintIssue {
+                    kind: LintIssueKind::UnconnectedPort,
+                    net: "u.b".into(),
+                    count: 1,
+                },
+                LintIssue {
+                    kind: LintIssueKind::UnconnectedPort,
+                    net: "u.d".into(),
+                    count: 1,
+                },
+            ]
+        );
     }
 
     #[test]

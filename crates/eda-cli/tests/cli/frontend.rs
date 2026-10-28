@@ -298,3 +298,33 @@ endmodule
         missing_value.1
     );
 }
+
+#[test]
+fn slang_info_reports_unconnected_instance_ports() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "unconnected-ports.sv",
+        r#"
+module ports_child(input logic a, b, output logic c, d);
+assign c = a;
+assign d = b;
+endmodule
+
+module unconnected_ports(input logic a, output logic c);
+ports_child child(.a(a), .c(c));
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "unconnected_ports"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("UnconnectedPort: 'child.b' leaves 1 pin bit(s) unconnected"),
+        "{output}"
+    );
+    assert!(
+        output.contains("UnconnectedPort: 'child.d' leaves 1 pin bit(s) unconnected"),
+        "{output}"
+    );
+}
