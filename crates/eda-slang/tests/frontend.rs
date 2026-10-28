@@ -124,6 +124,78 @@ endmodule
 }
 
 #[test]
+fn slang_compile_files_reuses_named_file_ast_cache_and_invalidates_content() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("named-file-ast-cache");
+    let source_path = root.join("cached_named_top.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module cached_named_top(output logic y);
+assign y = 1'b1;
+endmodule
+"#,
+    )
+    .expect("write named cache source");
+
+    let first = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("cached_named_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("compile named file for first cache miss");
+    let second = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("cached_named_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("compile identical named file for cache hit");
+    assert_eq!(first.name, second.name);
+    assert_eq!(first.n_nets, second.n_nets);
+    assert_eq!(first.assigns.len(), second.assigns.len());
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("read named-file cache statistics"),
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 1,
+            insertions: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+
+    std::fs::write(
+        &source_path,
+        r#"
+module cached_named_top(output logic y);
+assign y = 1'b0;
+endmodule
+"#,
+    )
+    .expect("change named cache source content");
+    let changed = slang
+        .compile_files(
+            std::slice::from_ref(&source_path),
+            Some("cached_named_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("compile changed named file for a new cache key");
+    assert_eq!(changed.name, "cached_named_top");
+    let stats = slang
+        .ast_cache_stats()
+        .expect("read changed named-file cache statistics");
+    assert_eq!(stats.misses, 2);
+    assert_eq!(stats.insertions, 2);
+    assert_eq!(stats.entries, 2);
+}
+
+#[test]
 fn slang_ast_lowering_enforces_the_schema_contract() {
     let Some(slang) = discover_slang_for_tests() else {
         return;

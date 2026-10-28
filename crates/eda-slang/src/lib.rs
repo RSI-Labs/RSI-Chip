@@ -45,13 +45,26 @@ const DEFAULT_SLANG_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_AST_CACHE_ENTRIES: usize = 4;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SlangSourceCacheKey {
+struct SlangNamedSourceCacheKey {
+    path: PathBuf,
+    content: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SlangAstCacheInput {
+    Source(String),
+    NamedFiles(Vec<SlangNamedSourceCacheKey>),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SlangAstCacheKey {
     program: String,
-    source: String,
     top: Option<String>,
     include_directories: Vec<PathBuf>,
     defines: Vec<String>,
     undefines: Vec<String>,
+    scopes: Vec<String>,
+    input: SlangAstCacheInput,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,8 +79,8 @@ pub struct SlangAstCacheStats {
 #[derive(Debug)]
 struct SlangAstCache {
     capacity: usize,
-    entries: BTreeMap<SlangSourceCacheKey, Arc<String>>,
-    order: VecDeque<SlangSourceCacheKey>,
+    entries: BTreeMap<SlangAstCacheKey, Arc<String>>,
+    order: VecDeque<SlangAstCacheKey>,
     hits: u64,
     misses: u64,
     insertions: u64,
@@ -87,7 +100,7 @@ impl SlangAstCache {
         }
     }
 
-    fn get(&mut self, key: &SlangSourceCacheKey) -> Option<Arc<String>> {
+    fn get(&mut self, key: &SlangAstCacheKey) -> Option<Arc<String>> {
         let result = self.entries.get(key).cloned();
         if result.is_some() {
             if let Some(index) = self.order.iter().position(|entry| entry == key) {
@@ -101,7 +114,7 @@ impl SlangAstCache {
         result
     }
 
-    fn insert(&mut self, key: SlangSourceCacheKey, value: Arc<String>) {
+    fn insert(&mut self, key: SlangAstCacheKey, value: Arc<String>) {
         if self.capacity == 0 {
             return;
         }
@@ -312,6 +325,37 @@ impl SlangFrontend {
         scopes: &[String],
         options: &PreprocessOptions,
     ) -> Result<String, SlangFailure> {
+        let cache_key = self.named_file_cache_key(files, top, scopes, options);
+        let cached_ast = cache_key
+            .as_ref()
+            .map(|key| {
+                self.ast_cache
+                    .lock()
+                    .map(|mut cache| cache.get(key))
+                    .map_err(|_| self.cache_poisoned_failure())
+            })
+            .transpose()?
+            .flatten();
+        if let Some(json) = cached_ast {
+            return Ok((*json).clone());
+        }
+
+        let json = self.ast_json_without_cache(files, top, scopes, options)?;
+        if let Some(key) = cache_key {
+            if let Ok(mut cache) = self.ast_cache.lock() {
+                cache.insert(key, Arc::new(json.clone()));
+            }
+        }
+        Ok(json)
+    }
+
+    fn ast_json_without_cache(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        scopes: &[String],
+        options: &PreprocessOptions,
+    ) -> Result<String, SlangFailure> {
         let mut command = self.command();
         if let Some(top) = top {
             command.arg("--top").arg(top);
@@ -328,6 +372,52 @@ impl SlangFrontend {
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         let start = text.find('{').unwrap_or(0);
         Ok(text[start..].to_string())
+    }
+
+    fn named_file_cache_key(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        scopes: &[String],
+        options: &PreprocessOptions,
+    ) -> Option<SlangAstCacheKey> {
+        if !options.include_directories.is_empty()
+            || options
+                .defines
+                .iter()
+                .chain(options.undefines.iter())
+                .any(|value| value.contains("`include"))
+        {
+            return None;
+        }
+        let mut named_files = Vec::with_capacity(files.len());
+        for path in files {
+            let content = std::fs::read_to_string(path).ok()?;
+            if content.contains("`include") {
+                return None;
+            }
+            named_files.push(SlangNamedSourceCacheKey {
+                path: path.clone(),
+                content,
+            });
+        }
+        Some(SlangAstCacheKey {
+            program: self.program.to_string_lossy().into_owned(),
+            top: top.map(str::to_string),
+            include_directories: options.include_directories.clone(),
+            defines: options.defines.clone(),
+            undefines: options.undefines.clone(),
+            scopes: scopes.to_vec(),
+            input: SlangAstCacheInput::NamedFiles(named_files),
+        })
+    }
+
+    fn cache_poisoned_failure(&self) -> SlangFailure {
+        SlangFailure {
+            status: None,
+            stdout: String::new(),
+            stderr: "slang AST cache mutex poisoned".into(),
+        }
     }
 
     /// Parses slang's AST JSON into the shallow authoritative summary used by
@@ -474,13 +564,14 @@ impl SlangFrontend {
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
         let cacheable = options.include_directories.is_empty() && !source.contains("`include");
-        let cache_key = cacheable.then(|| SlangSourceCacheKey {
+        let cache_key = cacheable.then(|| SlangAstCacheKey {
             program: self.program.to_string_lossy().into_owned(),
-            source: source.to_string(),
             top: top.map(str::to_string),
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
             undefines: options.undefines.clone(),
+            scopes: Vec::new(),
+            input: SlangAstCacheInput::Source(source.to_string()),
         });
         let cached_ast = cache_key
             .as_ref()
@@ -502,7 +593,7 @@ impl SlangFrontend {
             )
         } else {
             let json = self
-                .ast_json_with_options(std::slice::from_ref(&path), top, &[], options)
+                .ast_json_without_cache(std::slice::from_ref(&path), top, &[], options)
                 .map_err(|error| error.to_string());
             let json = match json {
                 Ok(json) => Arc::new(json),
@@ -759,13 +850,14 @@ mod tests {
 
     #[test]
     fn ast_cache_is_bounded_and_least_recently_used() {
-        let key = |source: &str| SlangSourceCacheKey {
+        let key = |source: &str| SlangAstCacheKey {
             program: "slang".into(),
-            source: source.into(),
             top: Some("top".into()),
             include_directories: Vec::new(),
             defines: Vec::new(),
             undefines: Vec::new(),
+            scopes: Vec::new(),
+            input: SlangAstCacheInput::Source(source.into()),
         };
         let mut cache = SlangAstCache::new(2);
         let first = key("first");
