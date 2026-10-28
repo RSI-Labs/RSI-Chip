@@ -487,6 +487,7 @@ struct SlangProjectCacheRecord {
 
 const SLANG_PROJECT_CACHE_SCHEMA: u32 = 6;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
+const SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA: u32 = 1;
 
 fn parse_path_array(
     value: &serde_json::Value,
@@ -1116,6 +1117,37 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
 
 fn unit_ir_cache_key(program: &str, semantic: &str) -> String {
     sha256_hex(format!("{program}\0{semantic}").as_bytes())
+}
+
+fn save_composite_ir_artifact(path: &Path, cache_key: &str, design: &Design) -> Result<(), String> {
+    let design = serde_json::to_value(design)
+        .map_err(|error| format!("cannot serialize composite IR: {error}"))?;
+    let artifact = serde_json::json!({
+        "schema": SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA,
+        "cache_key": cache_key,
+        "design_sha256": sha256_hex(design.to_string().as_bytes()),
+        "design": design,
+    });
+    atomic_write(path, &artifact.to_string())
+}
+
+fn load_composite_ir_artifact(path: &Path, cache_key: &str) -> Option<Design> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    if value.get("schema").and_then(serde_json::Value::as_u64)?
+        != u64::from(SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA)
+    {
+        return None;
+    }
+    if value.get("cache_key").and_then(serde_json::Value::as_str) != Some(cache_key) {
+        return None;
+    }
+    let design = value.get("design")?.clone();
+    let expected = value.get("design_sha256")?.as_str()?;
+    if sha256_hex(design.to_string().as_bytes()) != expected {
+        return None;
+    }
+    serde_json::from_value(design).ok()
 }
 
 fn composite_unit_ir_cache_key(
@@ -2301,6 +2333,7 @@ impl SlangFrontend {
         let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
         let program = self.program.to_string_lossy().into_owned();
         let cache_key = composite_unit_ir_cache_key(&record, &artifacts, &program)?;
+        let ir_artifact_path = cache_directory.join("composite-ir.json");
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
             if let Some(design) = cache.get(&cache_key) {
                 return Ok(SlangCachedUnitDesign {
@@ -2308,6 +2341,16 @@ impl SlangFrontend {
                     cache_hit: true,
                 });
             }
+        }
+        if let Some(design) = load_composite_ir_artifact(&ir_artifact_path, &cache_key) {
+            let design = Arc::new(design);
+            if let Ok(mut cache) = self.unit_ir_cache.lock() {
+                cache.insert(cache_key, Arc::clone(&design));
+            }
+            return Ok(SlangCachedUnitDesign {
+                design,
+                cache_hit: true,
+            });
         }
         let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
             .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
@@ -2317,8 +2360,9 @@ impl SlangFrontend {
             self.unit_ir_cache.clone(),
         )?);
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
-            cache.insert(cache_key, Arc::clone(&design));
+            cache.insert(cache_key.clone(), Arc::clone(&design));
         }
+        save_composite_ir_artifact(&ir_artifact_path, &cache_key, &design)?;
         Ok(SlangCachedUnitDesign {
             design,
             cache_hit: false,

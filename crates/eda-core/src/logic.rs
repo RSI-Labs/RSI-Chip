@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LogicValue {
     Zero,
     One,
@@ -140,7 +140,7 @@ impl std::ops::Not for LogicValue {
 }
 
 /// A packed vector of logic values. Index 0 is the LSB.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LogicWord {
     pub bits: Vec<LogicValue>,
 }

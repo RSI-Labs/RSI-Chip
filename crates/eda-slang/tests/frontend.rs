@@ -4,6 +4,7 @@ use eda_slang::{
     PreprocessOptions, SlangCompilationUnit, SlangFrontend, SlangProjectDependencyDatabase,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn temporary_directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -643,6 +644,37 @@ endmodule
             evictions: 0,
             entries: 2,
         }
+    );
+    let third_frontend =
+        discover_slang_for_tests().expect("rediscover pinned slang for persistent IR");
+    let persisted_composite = third_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("load persistent composite IR in a new frontend");
+    assert!(persisted_composite.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&persisted_composite.design)).unwrap(),
+        serde_json::to_value(&artifact_design).unwrap()
+    );
+
+    std::fs::write(cache.join("composite-ir.json"), r#"{"schema":1}"#)
+        .expect("corrupt persistent composite IR");
+    let fourth_frontend =
+        discover_slang_for_tests().expect("rediscover pinned slang after IR corruption");
+    let recovered_composite = fourth_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("recover from corrupt persistent composite IR");
+    assert!(!recovered_composite.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&recovered_composite.design)).unwrap(),
+        serde_json::to_value(&artifact_design).unwrap()
+    );
+    let repaired_persistent_composite = fourth_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("load repaired persistent composite IR");
+    assert!(repaired_persistent_composite.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&repaired_persistent_composite.design)).unwrap(),
+        serde_json::to_value(&artifact_design).unwrap()
     );
     let composite_error = second_frontend
         .compile_leaf_unit_artifact(&cache, "persistent_top")

@@ -8,7 +8,7 @@
 use crate::logic::LogicWord;
 
 /// Range within a net declaration. Indices are declaration-relative.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Range {
     Bit(usize),
     Span { msb: usize, lsb: usize },
@@ -39,13 +39,13 @@ impl Range {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dir {
     In,
     Out,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NetDecl {
     pub name: String,
     pub width: usize,
@@ -55,7 +55,7 @@ pub struct NetDecl {
     pub base: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PortDecl {
     pub name: String,
     pub dir: Dir,
@@ -64,7 +64,7 @@ pub struct PortDecl {
 }
 
 /// One unpacked-array dimension retained by a first-class memory object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryDimension {
     /// First logical index exposed by this dimension.
     pub base: i64,
@@ -77,7 +77,7 @@ pub struct MemoryDimension {
 ///
 /// This is not yet a vendor macro mapping, but it separates read-only storage
 /// from runtime-writable storage before synthesis and physical mapping.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryKind {
     #[default]
     Ram,
@@ -89,7 +89,7 @@ pub enum MemoryKind {
 /// Ordinary arrays carry aggregate/value semantics and do not participate in
 /// sparse RAM/ROM macro planning. Sparse objects use first-class memory
 /// storage and memory-port inference.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryStorage {
     #[default]
     Ordinary,
@@ -102,7 +102,7 @@ pub enum MemoryStorage {
 /// candidates together with depth, width, library, timing, and routing
 /// constraints to choose distributed logic, LUT RAM, block RAM, or a vendor
 /// macro.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryTemplate {
     #[default]
     Unmapped,
@@ -119,7 +119,7 @@ pub enum MemoryTemplate {
 /// A `true` bit means some runtime write port may update that element bit.
 /// Unknown dynamic starts conservatively set the complete mask. ROMs have no
 /// runtime write mask.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryWriteMask {
     pub width: usize,
     /// LSB-first, matching `LogicWord` and flat net ordering.
@@ -143,7 +143,7 @@ impl MemoryWriteMask {
 ///
 /// This metadata is `None` when writes are narrower than a byte, cross byte
 /// boundaries, or otherwise cannot be represented by aligned byte lanes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryByteEnable {
     pub lane_width: usize,
     pub lanes: Vec<bool>,
@@ -189,7 +189,7 @@ impl MemoryByteEnable {
 /// partitions already present in the source shape so synthesis can evaluate
 /// conflict, mapping, and implementation choices without flattening that
 /// structure.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryBanking {
     /// Number of logical banks; one for a one-dimensional memory.
     pub count: u64,
@@ -233,7 +233,7 @@ impl MemoryBanking {
 /// Memory elements do not need to occupy flat net IDs. This is the IR boundary
 /// for RAM/ROM storage; read/write operations still carry source expressions
 /// for their logical indexes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryDecl {
     pub name: String,
     pub element_width: usize,
@@ -269,7 +269,7 @@ pub struct MemoryDecl {
 
 /// Aliases a child instance's memory object to the parent memory supplied on
 /// an `inout` unpacked-array port.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryConnection {
     pub child: usize,
     pub parent: usize,
@@ -277,20 +277,20 @@ pub struct MemoryConnection {
 
 /// Aliases a child instance's ordinary unpacked-array object to the parent
 /// aggregate supplied on an array port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArrayConnection {
     pub child: usize,
     pub parent: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryPortDirection {
     In,
     Out,
     InOut,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryPortDecl {
     pub name: String,
     pub direction: MemoryPortDirection,
@@ -302,7 +302,7 @@ pub struct MemoryPortDecl {
 /// Ordinary arrays use aggregate/value semantics and must not acquire sparse
 /// RAM/ROM port contracts. The direction representation is shared with memory
 /// ports, but the port object and storage contract are deliberately separate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArrayPortDecl {
     pub name: String,
     pub direction: MemoryPortDirection,
@@ -383,7 +383,7 @@ impl MemoryDecl {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnOp {
     Not,
     AndR,
@@ -391,7 +391,7 @@ pub enum UnOp {
     XorR,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -416,7 +416,7 @@ pub enum BinOp {
     CaseNe,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     Const(LogicWord),
     Ref {
@@ -653,14 +653,14 @@ impl Expr {
 }
 
 /// Assignment target.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LValue {
     pub net: usize,
     pub decl_width: usize,
     pub range: Range,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DispPart {
     Str(String),
     /// Index into `Stmt::Display::args`.
@@ -669,7 +669,7 @@ pub enum DispPart {
     Time(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Stmt {
     Block(Vec<Stmt>),
     /// `forever stmt` (also how `always #d ...` clock generators are lowered).
@@ -922,7 +922,7 @@ pub enum Stmt {
 
 /// Distinguishes whole-object assignment semantics for storage families that
 /// share the first-class memory representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryCopyKind {
     FixedArray,
     DynamicArray,
@@ -932,7 +932,7 @@ pub enum MemoryCopyKind {
 
 /// Associative-array traversal direction for built-in `first`, `last`,
 /// `next`, and `prev` methods.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssocTraversalOp {
     First,
     Last,
@@ -940,27 +940,27 @@ pub enum AssocTraversalOp {
     Prev,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ForkMode {
     JoinAll,
     JoinAny,
     JoinNone,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EventEdge {
     Any,
     Posedge,
     Negedge,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventWatch {
     pub net: usize,
     pub edge: EventEdge,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Sens {
     /// `@(*)` — combinational.
     Comb,
@@ -974,14 +974,14 @@ pub enum Sens {
     List(Vec<Sens>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Process {
     pub sens: Sens,
     pub body: Stmt,
 }
 
 /// One elaborated module instance in the design hierarchy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalInstance {
     /// Stable dotted instance path, such as `top.u1.u2`.
     pub path: String,
@@ -998,7 +998,7 @@ pub struct HierarchicalInstance {
 }
 
 /// A module port resolved to its flat net range.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalPort {
     pub name: String,
     pub direction: Dir,
@@ -1008,7 +1008,7 @@ pub struct HierarchicalPort {
     pub connections: Vec<Option<usize>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Assign {
     pub lv: LValue,
     pub e: Expr,
@@ -1016,7 +1016,9 @@ pub struct Assign {
     pub delay: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum LintIssueKind {
     UnusedName,
     LatchRisk,
@@ -1044,14 +1046,16 @@ impl LintIssueKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LintIssue {
     pub kind: LintIssueKind,
     pub net: String,
     pub count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum LintSeverity {
     Error,
     Warning,
@@ -1069,7 +1073,7 @@ impl LintSeverity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LintWaiver {
     pub rule: LintIssueKind,
     pub selector: String,
@@ -1090,7 +1094,7 @@ impl LintWaiver {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LintPolicy {
     pub waivers: Vec<LintWaiver>,
     pub severities: std::collections::BTreeMap<LintIssueKind, LintSeverity>,
@@ -1336,7 +1340,7 @@ fn lint_json_optional_string(value: Option<&str>) -> String {
     value.map(lint_json_string).unwrap_or_else(|| "null".into())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActiveLintIssue {
     pub issue: LintIssue,
     pub severity: LintSeverity,
@@ -1348,7 +1352,7 @@ impl ActiveLintIssue {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WaivedLintIssue {
     pub issue: LintIssue,
     pub owner: String,
@@ -1356,7 +1360,7 @@ pub struct WaivedLintIssue {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LintReport {
     pub active: Vec<ActiveLintIssue>,
     pub waived: Vec<WaivedLintIssue>,
@@ -1407,7 +1411,7 @@ impl LintReport {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Design {
     pub name: String,
     /// Type changes observed before lowering normalized assignment context.
@@ -1445,7 +1449,7 @@ pub struct Design {
     pub plusarg_values: std::collections::BTreeMap<String, usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TimeScale {
     /// Decimal second exponent of one simulation tick; -9 means nanoseconds.
     pub precision_exponent: i8,
@@ -2112,14 +2116,14 @@ fn lint_sensitivity_touched_nets(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClockingBlock {
     pub name: String,
     pub event: EventWatch,
     pub inputs: Vec<ClockingInput>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClockingInput {
     pub target: LValue,
     pub sample: LValue,
