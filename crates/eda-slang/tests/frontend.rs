@@ -1,6 +1,8 @@
 use eda_core::logic::{LogicValue, LogicWord};
 use eda_sim::Simulator;
-use eda_slang::{PreprocessOptions, SlangFrontend, SlangProjectDependencyDatabase};
+use eda_slang::{
+    PreprocessOptions, SlangCompilationUnit, SlangFrontend, SlangProjectDependencyDatabase,
+};
 use std::path::{Path, PathBuf};
 
 fn temporary_directory(name: &str) -> PathBuf {
@@ -585,6 +587,7 @@ endmodule
     let clean = database.partial_recompilation_plan();
     assert_eq!(clean.clean_projects, manifests);
     assert!(clean.dirty_projects.is_empty());
+    assert!(clean.dirty_compilation_units.is_empty());
     assert!(clean.changed_files.is_empty());
     assert!(clean.missing_files.is_empty());
 
@@ -608,6 +611,15 @@ endmodule
     assert_eq!(dirty.dirty_projects, vec![manifests[0].clone()]);
     assert_eq!(dirty.clean_projects, vec![manifests[1].clone()]);
     assert_eq!(dirty.changed_files, vec![selected_dependencies[0].clone()]);
+    assert_eq!(
+        dirty.dirty_compilation_units,
+        vec![SlangCompilationUnit {
+            project_manifest: manifests[0].clone(),
+            name: "shared_child0".into(),
+            kind: "Module".into(),
+            source_path: selected_dependencies[0].clone(),
+        }]
+    );
 
     slang
         .compile_project_manifest_with_shared_cache(&manifests[0], &cache_root, &database_path)
@@ -616,6 +628,7 @@ endmodule
         .expect("reload repaired shared database")
         .partial_recompilation_plan();
     assert!(repaired.dirty_projects.is_empty());
+    assert!(repaired.dirty_compilation_units.is_empty());
     assert_eq!(repaired.clean_projects.len(), 2);
 }
 

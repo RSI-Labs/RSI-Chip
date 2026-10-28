@@ -332,8 +332,17 @@ pub struct SlangProjectDependencyDatabase {
 pub struct SlangPartialRecompilationPlan {
     pub clean_projects: Vec<PathBuf>,
     pub dirty_projects: Vec<PathBuf>,
+    pub dirty_compilation_units: Vec<SlangCompilationUnit>,
     pub changed_files: Vec<PathBuf>,
     pub missing_files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SlangCompilationUnit {
+    pub project_manifest: PathBuf,
+    pub name: String,
+    pub kind: String,
+    pub source_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -345,6 +354,14 @@ pub struct SlangReverseDependency {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SlangProjectFileRecord {
     path: PathBuf,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SlangCompilationUnitRecord {
+    name: String,
+    kind: String,
+    source_path: PathBuf,
     sha256: String,
 }
 
@@ -363,11 +380,12 @@ struct SlangProjectCacheRecord {
     library_extensions: Vec<String>,
     roots: Vec<SlangProjectFileRecord>,
     dependencies: Vec<SlangProjectFileRecord>,
+    compilation_units: Vec<SlangCompilationUnitRecord>,
     library_inventory: Vec<(PathBuf, Vec<PathBuf>)>,
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 2;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 3;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
 
 fn parse_path_array(
@@ -435,6 +453,33 @@ fn project_file_records(paths: &[PathBuf]) -> Result<Vec<SlangProjectFileRecord>
     paths.iter().map(|path| project_file_record(path)).collect()
 }
 
+fn project_compilation_units(ast: &str) -> Option<Vec<SlangCompilationUnitRecord>> {
+    let document = serde_json::from_str::<serde_json::Value>(ast).ok()?;
+    let definitions = document.get("definitions")?.as_array()?;
+    definitions
+        .iter()
+        .map(|definition| {
+            let name = definition.get("name")?.as_str()?.to_string();
+            let kind = definition
+                .get("definitionKind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unknown")
+                .to_string();
+            let source = definition.get("source_file")?.as_str()?;
+            let source_path = canonical_path(Path::new(source));
+            let sha256 = std::fs::read(&source_path)
+                .ok()
+                .map(|content| sha256_hex(&content))?;
+            Some(SlangCompilationUnitRecord {
+                name,
+                kind,
+                source_path,
+                sha256,
+            })
+        })
+        .collect()
+}
+
 fn canonical_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().map(|path| canonical_path(path)).collect()
 }
@@ -475,6 +520,12 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
         "dependencies": record.dependencies.iter().map(|file| serde_json::json!({
             "path": file.path,
             "sha256": file.sha256,
+        })).collect::<Vec<_>>(),
+        "compilation_units": record.compilation_units.iter().map(|unit| serde_json::json!({
+            "name": unit.name,
+            "kind": unit.kind,
+            "source_path": unit.source_path,
+            "sha256": unit.sha256,
         })).collect::<Vec<_>>(),
         "library_inventory": record.library_inventory.iter().map(|(directory, entries)| {
             serde_json::json!({"directory": directory, "entries": entries})
@@ -523,6 +574,25 @@ fn json_file_records(
         .collect()
 }
 
+fn json_compilation_units(
+    value: &serde_json::Value,
+    field: &str,
+) -> Option<Vec<SlangCompilationUnitRecord>> {
+    value
+        .get(field)?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some(SlangCompilationUnitRecord {
+                name: entry.get("name")?.as_str()?.to_string(),
+                kind: entry.get("kind")?.as_str()?.to_string(),
+                source_path: json_path(entry, "source_path")?,
+                sha256: entry.get("sha256")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn json_library_inventory(
     value: &serde_json::Value,
     field: &str,
@@ -565,6 +635,7 @@ fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectC
         library_extensions: json_string_array_value(value, "library_extensions")?,
         roots: json_file_records(value, "roots")?,
         dependencies: json_file_records(value, "dependencies")?,
+        compilation_units: json_compilation_units(value, "compilation_units")?,
         library_inventory: json_library_inventory(value, "library_inventory")?,
         ast_sha256: value.get("ast_sha256")?.as_str()?.to_string(),
     })
@@ -745,35 +816,67 @@ impl SlangProjectDependencyDatabase {
     pub fn partial_recompilation_plan(&self) -> SlangPartialRecompilationPlan {
         let mut clean_projects = Vec::new();
         let mut dirty_projects = Vec::new();
+        let mut dirty_compilation_units = BTreeSet::new();
         let mut changed_files = BTreeSet::new();
         let mut missing_files = BTreeSet::new();
         for record in self.projects.values() {
             let mut dirty = false;
+            let mut project_changed_files = Vec::new();
+            let mut project_missing_files = Vec::new();
             for file in record.roots.iter().chain(record.dependencies.iter()) {
                 match project_file_record(&file.path) {
                     Ok(current) => {
                         if current.sha256 != file.sha256 {
                             changed_files.insert(file.path.clone());
+                            project_changed_files.push(file.path.clone());
                             dirty = true;
                         }
                     }
                     Err(_) => {
                         missing_files.insert(file.path.clone());
+                        project_missing_files.push(file.path.clone());
                         dirty = true;
                     }
                 }
             }
             let current_inventory = project_library_inventory(&record.library_directories);
+            let mut inventory_changed = false;
             if current_inventory != record.library_inventory {
                 dirty = true;
+                inventory_changed = true;
             }
+            let mut manifest_changed = false;
             if project_file_record(&record.manifest_path)
                 .map(|manifest| manifest.sha256 != record.manifest_sha256)
                 .unwrap_or(true)
             {
                 changed_files.insert(record.manifest_path.clone());
+                project_changed_files.push(record.manifest_path.clone());
                 dirty = true;
+                manifest_changed = true;
             }
+
+            let mut record_dirty_units = BTreeSet::new();
+            for unit in &record.compilation_units {
+                if project_changed_files.contains(&unit.source_path)
+                    || project_missing_files.contains(&unit.source_path)
+                {
+                    record_dirty_units.insert(unit.clone());
+                }
+            }
+            if (inventory_changed || manifest_changed)
+                && record_dirty_units.len() < record.compilation_units.len()
+            {
+                record_dirty_units.extend(record.compilation_units.iter().cloned());
+            }
+            dirty_compilation_units.extend(record_dirty_units.into_iter().map(|unit| {
+                SlangCompilationUnit {
+                    project_manifest: record.manifest_path.clone(),
+                    name: unit.name,
+                    kind: unit.kind,
+                    source_path: unit.source_path,
+                }
+            }));
             if dirty {
                 dirty_projects.push(record.manifest_path.clone());
             } else {
@@ -783,6 +886,7 @@ impl SlangProjectDependencyDatabase {
         SlangPartialRecompilationPlan {
             clean_projects,
             dirty_projects,
+            dirty_compilation_units: dirty_compilation_units.into_iter().collect(),
             changed_files: changed_files.into_iter().collect(),
             missing_files: missing_files.into_iter().collect(),
         }
@@ -1329,11 +1433,15 @@ impl SlangFrontend {
                     if let Some(ast) =
                         load_project_cache_ast(&cache_directory.join("ast.json"), &record)
                     {
-                        if let Ok(design) = self.lower_ast_json(&ast) {
-                            return Ok(SlangCachedDesign {
-                                design,
-                                cache_hit: true,
-                            });
+                        if project_compilation_units(&ast).as_ref()
+                            == Some(&record.compilation_units)
+                        {
+                            if let Ok(design) = self.lower_ast_json(&ast) {
+                                return Ok(SlangCachedDesign {
+                                    design,
+                                    cache_hit: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -1376,6 +1484,12 @@ impl SlangFrontend {
                 .filter(|path| !root_paths.contains(*path))
                 .map(|path| project_file_record(path))
                 .collect::<Result<Vec<_>, String>>()?;
+            let Some(compilation_units) = project_compilation_units(&ast) else {
+                return Ok(SlangCachedDesign {
+                    design,
+                    cache_hit: false,
+                });
+            };
             let record = SlangProjectCacheRecord {
                 schema: SLANG_PROJECT_CACHE_SCHEMA,
                 program,
@@ -1390,6 +1504,7 @@ impl SlangFrontend {
                 library_extensions: manifest.library_extensions.clone(),
                 roots,
                 dependencies,
+                compilation_units,
                 library_inventory,
                 ast_sha256: sha256_hex(ast.as_bytes()),
             };
