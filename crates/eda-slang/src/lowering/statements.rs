@@ -256,7 +256,7 @@ impl SlangAstLowerer {
             return Ok(());
         }
         let lv = self.lower_lvalue(left)?;
-        self.record_implicit_width_mismatch(&lv, right)?;
+        self.record_implicit_type_mismatch(&lv, right)?;
         let rhs = self.lower_expression(right)?;
         self.design
             .assigns
@@ -264,7 +264,7 @@ impl SlangAstLowerer {
         Ok(())
     }
 
-    fn record_implicit_width_mismatch(
+    pub(super) fn record_implicit_type_mismatch(
         &mut self,
         lvalue: &eda_core::ir::LValue,
         expression: &Value,
@@ -294,35 +294,44 @@ impl SlangAstLowerer {
 
         let target_type = string_field(expression, "type").unwrap_or_default();
         let source_type = string_field(operand, "type").unwrap_or_default();
-        let (target_shape, _, _) = self.net_type(&target_type)?;
-        let (source_shape, _, _) = self.net_type(&source_type)?;
-        let difference = target_shape.width.abs_diff(source_shape.width);
-        if difference == 0 {
-            return Ok(());
-        }
-
+        let (target_shape, target_signed, _) = self.net_type(&target_type)?;
+        let (source_shape, source_signed, _) = self.net_type(&source_type)?;
+        let width_difference = target_shape.width.abs_diff(source_shape.width);
         let first_bit = match lvalue.range {
             eda_core::ir::Range::Bit(bit) => lvalue.net + bit,
             eda_core::ir::Range::Span { msb, lsb } => lvalue.net + lsb.min(msb),
         };
         let bit_name = self.design.net_name(first_bit);
         let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
-        let issue = eda_core::ir::LintIssue {
-            kind: eda_core::ir::LintIssueKind::WidthMismatch,
-            net,
-            count: difference,
-        };
+
+        if width_difference != 0 {
+            self.record_type_mismatch(eda_core::ir::LintIssue {
+                kind: eda_core::ir::LintIssueKind::WidthMismatch,
+                net: net.clone(),
+                count: width_difference,
+            });
+        }
+        if target_signed != source_signed {
+            self.record_type_mismatch(eda_core::ir::LintIssue {
+                kind: eda_core::ir::LintIssueKind::SignednessMismatch,
+                net,
+                count: 1,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_type_mismatch(&mut self, issue: eda_core::ir::LintIssue) {
         if let Some(existing) = self
             .design
-            .recorded_width_mismatches
+            .recorded_type_mismatches
             .iter_mut()
-            .find(|existing| existing.net == issue.net)
+            .find(|existing| existing.kind == issue.kind && existing.net == issue.net)
         {
             existing.count = existing.count.max(issue.count);
         } else {
-            self.design.recorded_width_mismatches.push(issue);
+            self.design.recorded_type_mismatches.push(issue);
         }
-        Ok(())
     }
 
     pub(super) fn lower_procedural_block(

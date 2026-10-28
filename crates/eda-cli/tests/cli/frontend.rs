@@ -182,3 +182,64 @@ endmodule
         "explicit cast was reported as implicit: {output}"
     );
 }
+
+#[test]
+fn slang_info_reports_implicit_signedness_mismatches() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "signedness-mismatch.sv",
+        r#"
+module signed_child(input logic signed [7:0] x);
+endmodule
+
+module signed_output_child(output logic signed [7:0] q);
+assign q = 8'sh00;
+endmodule
+
+module signedness_mismatch(input logic [7:0] a, output logic signed [7:0] y);
+wire logic [7:0] unsigned_source = 8'h00;
+wire logic [7:0] unsigned_sink;
+assign y = unsigned_source;
+signed_child child(.x(a));
+signed_output_child source(.q(unsigned_sink));
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "signedness_mismatch"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("SignednessMismatch: 'y' destination/source signedness differs"),
+        "{output}"
+    );
+    assert!(
+        output.contains("SignednessMismatch: 'child.x' destination/source signedness differs"),
+        "{output}"
+    );
+    assert!(
+        output
+            .contains("SignednessMismatch: 'unsigned_sink' destination/source signedness differs"),
+        "{output}"
+    );
+
+    let explicit = TempFile::new(
+        "explicit-signedness.sv",
+        r#"
+module explicit_signedness(input logic [7:0] a, output logic signed [7:0] y);
+assign y = signed'(a);
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&[
+        "slang-info",
+        explicit.path(),
+        "--top",
+        "explicit_signedness",
+    ]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        !output.contains("SignednessMismatch: 'y'"),
+        "explicit signed cast was reported as implicit: {output}"
+    );
+}

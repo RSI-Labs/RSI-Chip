@@ -1024,6 +1024,7 @@ pub enum LintIssueKind {
     CombinationalLoop,
     MultipleContinuousDrivers,
     WidthMismatch,
+    SignednessMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1036,12 +1037,13 @@ pub struct LintIssue {
 #[derive(Clone, Debug, Default)]
 pub struct Design {
     pub name: String,
-    /// Width changes observed before lowering normalized assignment context.
+    /// Type changes observed before lowering normalized assignment context.
     ///
     /// Slang's AST makes implicit truncation/extension explicit with conversion
-    /// nodes. Once those nodes are lowered, the original source width is gone,
-    /// so direct lowering records the diagnostic here.
-    pub recorded_width_mismatches: Vec<LintIssue>,
+    /// and signedness changes explicit with conversion nodes. Once those nodes
+    /// are lowered, the original source type is gone, so direct lowering records
+    /// diagnostics here.
+    pub recorded_type_mismatches: Vec<LintIssue>,
     /// Canonical simulator tick precision as a decimal second exponent.
     pub time_scale: TimeScale,
     /// First-class top-level sparse-memory port contracts.
@@ -1822,8 +1824,9 @@ impl Design {
     /// This diagnostic reports the magnitude without changing execution semantics.
     pub fn lint_width_mismatches(&self) -> Vec<LintIssue> {
         let mut issues: std::collections::BTreeMap<String, LintIssue> = self
-            .recorded_width_mismatches
+            .recorded_type_mismatches
             .iter()
+            .filter(|issue| issue.kind == LintIssueKind::WidthMismatch)
             .map(|issue| (issue.net.clone(), issue.clone()))
             .collect();
         for assignment in &self.assigns {
@@ -1850,6 +1853,19 @@ impl Design {
                 });
         }
         issues.into_values().collect()
+    }
+
+    /// Report implicit signedness conversions recorded before normalization.
+    ///
+    /// The lowered IR preserves enough signedness for evaluation, but implicit
+    /// source-type conversion has already been erased. Direct slang lowering
+    /// therefore records whether an assignment context changed signedness.
+    pub fn lint_signedness_mismatches(&self) -> Vec<LintIssue> {
+        self.recorded_type_mismatches
+            .iter()
+            .filter(|issue| issue.kind == LintIssueKind::SignednessMismatch)
+            .cloned()
+            .collect()
     }
 
     /// Report cycles among zero-delay continuous assignments.
@@ -2749,6 +2765,21 @@ mod tests {
                 kind: LintIssueKind::WidthMismatch,
                 net: "narrow".into(),
                 count: 3,
+            }]
+        );
+
+        let mut signedness = design;
+        signedness.recorded_type_mismatches.push(LintIssue {
+            kind: LintIssueKind::SignednessMismatch,
+            net: "wide".into(),
+            count: 1,
+        });
+        assert_eq!(
+            signedness.lint_signedness_mismatches(),
+            vec![LintIssue {
+                kind: LintIssueKind::SignednessMismatch,
+                net: "wide".into(),
+                count: 1,
             }]
         );
     }

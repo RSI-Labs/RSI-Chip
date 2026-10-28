@@ -1407,6 +1407,20 @@ impl super::SlangAstLowerer {
         let offset = child_offset;
         let child_net_start = offset;
         let child_ports = child.design.ports.clone();
+        let child_port_signedness = child_ports
+            .iter()
+            .map(|port| {
+                let signed = child
+                    .design
+                    .net_decls
+                    .iter()
+                    .find(|declaration| {
+                        declaration.base == port.base && declaration.width == port.width
+                    })
+                    .is_some_and(|declaration| declaration.is_signed);
+                (port.base, signed)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
         let child_memories = child.design.memories.clone();
         let mut static_net_rewrites = Vec::new();
         let mut plusarg_net_rewrites = Vec::new();
@@ -1652,16 +1666,18 @@ impl super::SlangAstLowerer {
             }
             match port.dir {
                 eda_core::ir::Dir::In => {
+                    let child_lvalue = eda_core::ir::LValue {
+                        net: port.base + offset,
+                        decl_width: port.width,
+                        range: full_range(port.width),
+                    };
+                    self.record_implicit_type_mismatch(&child_lvalue, expression)?;
                     let rhs = self.lower_expression(expression)?;
                     if let Some(parent_bits) = expression_parent_bits(&rhs) {
                         connections.insert(port_name.to_string(), parent_bits);
                     }
                     self.design.assigns.push(eda_core::ir::Assign {
-                        lv: eda_core::ir::LValue {
-                            net: port.base + offset,
-                            decl_width: port.width,
-                            range: full_range(port.width),
-                        },
+                        lv: child_lvalue,
                         e: rhs,
                         delay: 0,
                     });
@@ -1678,6 +1694,31 @@ impl super::SlangAstLowerer {
                     let target = self.lower_lvalue(parent_target)?;
                     if let Some(parent_bits) = lvalue_parent_bits(&target) {
                         connections.insert(port_name.to_string(), parent_bits);
+                    }
+                    if let Some(child_signed) = child_port_signedness.get(&port.base) {
+                        let parent_bit = match target.range {
+                            eda_core::ir::Range::Bit(bit) => target.net + bit,
+                            eda_core::ir::Range::Span { msb, lsb } => target.net + lsb.min(msb),
+                        };
+                        let parent_signed = self
+                            .design
+                            .net_decls
+                            .iter()
+                            .find(|declaration| {
+                                declaration.base == parent_bit
+                                    || (parent_bit > declaration.base
+                                        && parent_bit < declaration.base + declaration.width)
+                            })
+                            .is_some_and(|declaration| declaration.is_signed);
+                        if parent_signed != *child_signed {
+                            let bit_name = self.design.net_name(parent_bit);
+                            let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
+                            self.record_type_mismatch(eda_core::ir::LintIssue {
+                                kind: eda_core::ir::LintIssueKind::SignednessMismatch,
+                                net,
+                                count: 1,
+                            });
+                        }
                     }
                     self.design.assigns.push(eda_core::ir::Assign {
                         lv: target,
