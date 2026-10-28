@@ -72,6 +72,20 @@ struct SlangAstCacheKey {
     input: SlangAstCacheInput,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SlangLibraryPlanKey {
+    program: String,
+    roots: Vec<SlangNamedSourceCacheKey>,
+    top: Option<String>,
+    include_directories: Vec<PathBuf>,
+    defines: Vec<String>,
+    undefines: Vec<String>,
+    library_directories: Vec<PathBuf>,
+    library_extensions: Vec<String>,
+    scopes: Vec<String>,
+    directory_inventory: Vec<(PathBuf, Vec<PathBuf>)>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SlangAstCacheStats {
     pub hits: u64,
@@ -86,6 +100,8 @@ struct SlangAstCache {
     capacity: usize,
     entries: BTreeMap<SlangAstCacheKey, Arc<String>>,
     order: VecDeque<SlangAstCacheKey>,
+    library_plans: BTreeMap<SlangLibraryPlanKey, Vec<PathBuf>>,
+    library_plan_order: VecDeque<SlangLibraryPlanKey>,
     hits: u64,
     misses: u64,
     insertions: u64,
@@ -98,6 +114,8 @@ impl SlangAstCache {
             capacity,
             entries: BTreeMap::new(),
             order: VecDeque::new(),
+            library_plans: BTreeMap::new(),
+            library_plan_order: VecDeque::new(),
             hits: 0,
             misses: 0,
             insertions: 0,
@@ -139,6 +157,10 @@ impl SlangAstCache {
         }
     }
 
+    fn record_miss(&mut self) {
+        self.misses += 1;
+    }
+
     fn stats(&self) -> SlangAstCacheStats {
         SlangAstCacheStats {
             hits: self.hits,
@@ -146,6 +168,49 @@ impl SlangAstCache {
             insertions: self.insertions,
             evictions: self.evictions,
             entries: self.entries.len(),
+        }
+    }
+
+    fn library_plan(&mut self, key: &SlangLibraryPlanKey) -> Option<Vec<PathBuf>> {
+        let result = self.library_plans.get(key).cloned();
+        if result.is_some() {
+            if let Some(index) = self
+                .library_plan_order
+                .iter()
+                .position(|entry| entry == key)
+            {
+                let entry = self
+                    .library_plan_order
+                    .remove(index)
+                    .expect("checked library plan exists");
+                self.library_plan_order.push_back(entry);
+            }
+        }
+        result
+    }
+
+    fn insert_library_plan(&mut self, key: SlangLibraryPlanKey, files: Vec<PathBuf>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.library_plans.insert(key.clone(), files).is_none() {
+            self.library_plan_order.push_back(key);
+        } else if let Some(index) = self
+            .library_plan_order
+            .iter()
+            .position(|entry| *entry == key)
+        {
+            let entry = self
+                .library_plan_order
+                .remove(index)
+                .expect("checked library plan exists");
+            self.library_plan_order.push_back(entry);
+        }
+        while self.library_plans.len() > self.capacity {
+            let Some(oldest) = self.library_plan_order.pop_front() else {
+                break;
+            };
+            self.library_plans.remove(&oldest);
         }
     }
 }
@@ -470,7 +535,32 @@ impl SlangFrontend {
         scopes: &[String],
         options: &PreprocessOptions,
     ) -> Result<String, SlangFailure> {
-        let cache_key = self.named_file_cache_key(files, top, scopes, options);
+        let library_plan_key = if options.uses_libraries() {
+            self.library_plan_cache_key(files, top, scopes, options)
+        } else {
+            None
+        };
+        let planned_files = library_plan_key
+            .as_ref()
+            .map(|key| {
+                self.ast_cache
+                    .lock()
+                    .map(|mut cache| cache.library_plan(key))
+                    .map_err(|_| self.cache_poisoned_failure())
+            })
+            .transpose()?
+            .flatten();
+        if library_plan_key.is_some() && planned_files.is_none() {
+            self.ast_cache
+                .lock()
+                .map_err(|_| self.cache_poisoned_failure())?
+                .record_miss();
+        }
+        let cache_key = if let Some(files) = planned_files {
+            self.explicit_file_cache_key(&files, top, scopes, options)
+        } else {
+            self.named_file_cache_key(files, top, scopes, options)
+        };
         let cached_ast = cache_key
             .as_ref()
             .map(|key| {
@@ -485,8 +575,27 @@ impl SlangFrontend {
             return Ok((*json).clone());
         }
 
-        let json = self.ast_json_without_cache(files, top, scopes, options)?;
-        if let Some(key) = cache_key {
+        let (json, parsed_files) = self.ast_json_and_parsed_files(
+            files,
+            top,
+            scopes,
+            options,
+            library_plan_key.is_some(),
+        )?;
+        if let Some(plan_key) = library_plan_key {
+            if !parsed_files.is_empty() {
+                let mut selected_files = files.to_vec();
+                selected_files.extend(parsed_files);
+                if let Some(key) =
+                    self.explicit_file_cache_key(&selected_files, top, scopes, options)
+                {
+                    if let Ok(mut cache) = self.ast_cache.lock() {
+                        cache.insert_library_plan(plan_key, selected_files);
+                        cache.insert(key, Arc::new(json.clone()));
+                    }
+                }
+            }
+        } else if let Some(key) = cache_key {
             if let Ok(mut cache) = self.ast_cache.lock() {
                 cache.insert(key, Arc::new(json.clone()));
             }
@@ -501,6 +610,18 @@ impl SlangFrontend {
         scopes: &[String],
         options: &PreprocessOptions,
     ) -> Result<String, SlangFailure> {
+        self.ast_json_and_parsed_files(files, top, scopes, options, false)
+            .map(|(json, _)| json)
+    }
+
+    fn ast_json_and_parsed_files(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        scopes: &[String],
+        options: &PreprocessOptions,
+        show_parsed_files: bool,
+    ) -> Result<(String, Vec<PathBuf>), SlangFailure> {
         let mut command = self.command();
         if let Some(top) = top {
             command.arg("--top").arg(top);
@@ -508,6 +629,9 @@ impl SlangFrontend {
         command.arg("--ast-json").arg("-");
         command.arg("--ast-json-detailed-types");
         command.arg("--ast-json-source-info");
+        if show_parsed_files {
+            command.arg("--show-parsed-files");
+        }
         for scope in scopes {
             command.arg("--ast-json-scope").arg(scope);
         }
@@ -516,7 +640,12 @@ impl SlangFrontend {
         let output = self.run_capturing(command)?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         let start = text.find('{').unwrap_or(0);
-        Ok(text[start..].to_string())
+        let files = if show_parsed_files {
+            parsed_file_paths(&text[..start])
+        } else {
+            Vec::new()
+        };
+        Ok((text[start..].to_string(), files))
     }
 
     fn named_file_cache_key(
@@ -558,6 +687,85 @@ impl SlangFrontend {
             library_extensions: options.library_extensions.clone(),
             scopes: scopes.to_vec(),
             input: SlangAstCacheInput::NamedFiles(named_files),
+        })
+    }
+
+    fn explicit_file_cache_key(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        scopes: &[String],
+        options: &PreprocessOptions,
+    ) -> Option<SlangAstCacheKey> {
+        if options
+            .defines
+            .iter()
+            .chain(options.undefines.iter())
+            .any(|value| value.contains("`include"))
+        {
+            return None;
+        }
+        let mut unique_files = BTreeMap::new();
+        for path in files {
+            let content = std::fs::read_to_string(path).ok()?;
+            unique_files.insert(canonical_path(path), content);
+        }
+        let contents = unique_files.into_iter().collect::<Vec<_>>();
+        let dependencies = include_dependencies(&contents, &options.include_directories)?;
+        let mut named_files = contents
+            .into_iter()
+            .map(|(path, content)| SlangNamedSourceCacheKey { path, content })
+            .collect::<Vec<_>>();
+        named_files.extend(dependencies);
+        Some(SlangAstCacheKey {
+            program: self.program.to_string_lossy().into_owned(),
+            top: top.map(str::to_string),
+            include_directories: options.include_directories.clone(),
+            defines: options.defines.clone(),
+            undefines: options.undefines.clone(),
+            library_directories: options.library_directories.clone(),
+            library_extensions: options.library_extensions.clone(),
+            scopes: scopes.to_vec(),
+            input: SlangAstCacheInput::NamedFiles(named_files),
+        })
+    }
+
+    fn library_plan_cache_key(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        scopes: &[String],
+        options: &PreprocessOptions,
+    ) -> Option<SlangLibraryPlanKey> {
+        let mut roots = Vec::with_capacity(files.len());
+        for path in files {
+            roots.push(SlangNamedSourceCacheKey {
+                path: path.clone(),
+                content: std::fs::read_to_string(path).ok()?,
+            });
+        }
+        let mut directory_inventory = Vec::with_capacity(options.library_directories.len());
+        for directory in &options.library_directories {
+            let mut entries = Vec::new();
+            if let Ok(iterator) = std::fs::read_dir(directory) {
+                for entry in iterator.flatten() {
+                    entries.push(entry.path());
+                }
+            }
+            entries.sort();
+            directory_inventory.push((directory.clone(), entries));
+        }
+        Some(SlangLibraryPlanKey {
+            program: self.program.to_string_lossy().into_owned(),
+            roots,
+            top: top.map(str::to_string),
+            include_directories: options.include_directories.clone(),
+            defines: options.defines.clone(),
+            undefines: options.undefines.clone(),
+            library_directories: options.library_directories.clone(),
+            library_extensions: options.library_extensions.clone(),
+            scopes: scopes.to_vec(),
+            directory_inventory,
         })
     }
 
@@ -630,9 +838,9 @@ impl SlangFrontend {
     /// Compiles a fail-closed JSON project manifest.
     ///
     /// Manifest paths are resolved before this call, and slang's library
-    /// search options are forwarded unchanged. Library-aware inputs currently
-    /// bypass the AST cache because automatic module resolution dependencies
-    /// are not yet tracked.
+    /// search options are forwarded unchanged. Library-aware AST requests record
+    /// slang's selected-file plan and include selected library contents in the
+    /// cache key.
     pub fn compile_project_manifest(&self, manifest_path: &Path) -> Result<Design, String> {
         let manifest = SlangProjectManifest::parse_file(manifest_path)?;
         self.compile_files(
@@ -1239,6 +1447,21 @@ fn canonical_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn parsed_file_paths(prefix: &str) -> Vec<PathBuf> {
+    prefix
+        .lines()
+        .filter_map(|line| {
+            if !line.starts_with("Parsing ") || !line.ends_with("'.") {
+                return None;
+            }
+            let start = line.find("file '")? + "file '".len();
+            let end = line.len().saturating_sub(2);
+            let path = Path::new(&line[start..end]);
+            (start < end && !path.as_os_str().is_empty()).then(|| canonical_path(path))
+        })
+        .collect()
+}
+
 fn which(program: &str) -> Result<PathBuf, String> {
     let path = std::env::var_os("PATH").ok_or("PATH is not set")?;
     for directory in std::env::split_paths(&path) {
@@ -1399,6 +1622,24 @@ string s = "`include string.svh";
         );
         assert_eq!(dependencies[1].content, "parameter NESTED = 1;\n");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parsed_file_paths_extract_design_library_and_include_files() {
+        let paths = parsed_file_paths(
+            "Parsing design file '/tmp/top.sv'.\n\
+             Parsing include file '/tmp/inc/a.svh'.\n\
+             Back to file '/tmp/top.sv'.\n\
+             Parsing library file '/tmp/lib/child.sv'.\n",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                Path::new("/tmp/top.sv"),
+                Path::new("/tmp/inc/a.svh"),
+                Path::new("/tmp/lib/child.sv"),
+            ]
+        );
     }
 
     #[test]

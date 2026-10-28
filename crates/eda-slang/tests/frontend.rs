@@ -364,8 +364,64 @@ endmodule
         slang
             .ast_cache_stats()
             .expect("library project cache statistics"),
-        eda_slang::SlangAstCacheStats::default(),
-        "library-resolved dependency contents are not tracked yet"
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 1,
+            insertions: 1,
+            evictions: 0,
+            entries: 1,
+        },
+        "selected library file contents must participate in the AST cache key"
+    );
+
+    std::fs::write(
+        library.join("project_child.sv"),
+        r#"
+module project_child(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("change selected library module");
+    let changed = slang
+        .compile_project_manifest(&manifest_path)
+        .expect("compile after selected library module changed");
+    assert_eq!(changed.hierarchy.len(), design.hierarchy.len());
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("changed library project cache statistics"),
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 2,
+            insertions: 2,
+            evictions: 0,
+            entries: 2,
+        }
+    );
+
+    std::fs::write(
+        library.join("new_candidate.sv"),
+        r#"
+module new_candidate();
+endmodule
+"#,
+    )
+    .expect("add library candidate");
+    slang
+        .compile_project_manifest(&manifest_path)
+        .expect("compile after library inventory changed");
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("library inventory cache statistics"),
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 3,
+            insertions: 2,
+            evictions: 0,
+            entries: 2,
+        }
     );
 }
 
