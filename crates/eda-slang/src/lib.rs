@@ -315,6 +315,7 @@ impl SlangProjectManifest {
 pub struct SlangCachedDesign {
     pub design: Design,
     pub cache_hit: bool,
+    pub rebuilt_units: Vec<String>,
 }
 
 /// A persistent database of project records used to plan partial rebuilds.
@@ -373,6 +374,7 @@ struct SlangUnitArtifactRecord {
     source_path: PathBuf,
     file_name: String,
     sha256: String,
+    semantic_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -396,7 +398,7 @@ struct SlangProjectCacheRecord {
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 5;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 6;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
 
 fn parse_path_array(
@@ -543,7 +545,7 @@ fn project_unit_artifacts(
         })?;
         let mut body = find_definition_body(&document, &unit.name)?;
         prune_nested_instance_bodies(&mut body);
-        let artifact = serde_json::json!({
+        let mut artifact_value = serde_json::json!({
             "schema": 1,
             "name": unit.name,
             "kind": unit.kind,
@@ -552,8 +554,19 @@ fn project_unit_artifacts(
             "depends_on": unit.depends_on,
             "definition": definition,
             "body": body,
-        })
-        .to_string();
+        });
+        if let Some(body) = artifact_value.get_mut("body") {
+            prune_nested_instance_bodies(body);
+        }
+        let semantic = canonicalize_unit_artifact(&artifact_value);
+        let semantic_sha256 = sha256_hex(semantic.to_string().as_bytes());
+        if let Some(fields) = artifact_value.as_object_mut() {
+            fields.insert(
+                "semantic_sha256".into(),
+                serde_json::Value::String(semantic_sha256.clone()),
+            );
+        }
+        let artifact = artifact_value.to_string();
         let artifact_key = format!("{}\0{}", unit.name, unit.source_path.display());
         let file_name = format!("unit-{}.json", sha256_hex(artifact_key.as_bytes()));
         artifacts.push((
@@ -562,6 +575,7 @@ fn project_unit_artifacts(
                 source_path: unit.source_path.clone(),
                 file_name,
                 sha256: sha256_hex(artifact.as_bytes()),
+                semantic_sha256,
             },
             artifact,
         ));
@@ -603,6 +617,9 @@ fn find_definition_body(
 fn prune_nested_instance_bodies(value: &mut serde_json::Value) {
     let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
     let Some(fields) = value.as_object_mut() else {
+        if let Some(values) = value.as_array_mut() {
+            values.iter_mut().for_each(prune_nested_instance_bodies);
+        }
         return;
     };
     if is_instance {
@@ -620,6 +637,68 @@ fn prune_nested_instance_bodies(value: &mut serde_json::Value) {
     }
     for nested in fields.values_mut() {
         prune_nested_instance_bodies(nested);
+    }
+}
+
+fn canonicalize_unit_artifact(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
+            let nested_body = if is_instance {
+                value.get("body").map(|body| {
+                    serde_json::json!({
+                        "name": body.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "kind": body.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                        "definition": body
+                            .get("definition")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|definition| definition.split_whitespace().last())
+                            .map(|name| serde_json::Value::String(name.to_string()))
+                            .unwrap_or(serde_json::Value::Null),
+                    })
+                })
+            } else {
+                None
+            };
+            let mut normalized = serde_json::Map::new();
+            for (key, nested) in fields {
+                if key == "addr" || key == "semantic_sha256" {
+                    continue;
+                }
+                if key == "body" {
+                    if let Some(body) = &nested_body {
+                        normalized.insert(key.clone(), body.clone());
+                        continue;
+                    }
+                }
+                let nested = if let Some(text) = nested.as_str() {
+                    matches!(
+                        key.as_str(),
+                        "symbol" | "internalSymbol" | "definition" | "defaultNetType"
+                    )
+                    .then(|| {
+                        serde_json::Value::String(
+                            text.split_whitespace()
+                                .last()
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .unwrap_or_else(|| serde_json::Value::String(text.to_string()))
+                } else {
+                    canonicalize_unit_artifact(nested)
+                };
+                normalized.insert(key.clone(), nested);
+            }
+            serde_json::Value::Object(normalized)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(canonicalize_unit_artifact)
+                .collect::<Vec<_>>(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -676,6 +755,7 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
             "source_path": artifact.source_path,
             "file_name": artifact.file_name,
             "sha256": artifact.sha256,
+            "semantic_sha256": artifact.semantic_sha256,
         })).collect::<Vec<_>>(),
         "library_inventory": record.library_inventory.iter().map(|(directory, entries)| {
             serde_json::json!({"directory": directory, "entries": entries})
@@ -763,6 +843,7 @@ fn json_unit_artifacts(
                 source_path: json_path(entry, "source_path")?,
                 file_name: entry.get("file_name")?.as_str()?.to_string(),
                 sha256: entry.get("sha256")?.as_str()?.to_string(),
+                semantic_sha256: entry.get("semantic_sha256")?.as_str()?.to_string(),
             })
         })
         .collect()
@@ -877,18 +958,40 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
 fn save_project_cache(
     directory: &Path,
     record: &SlangProjectCacheRecord,
+    previous_record: Option<&SlangProjectCacheRecord>,
     unit_artifacts: &[(SlangUnitArtifactRecord, String)],
     ast: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let unit_directory = directory.join("units");
+    let mut rebuilt_units = Vec::new();
     for (artifact, contents) in unit_artifacts {
+        let reusable = previous_record.is_some_and(|previous| {
+            previous.unit_artifacts.iter().any(|old| {
+                old.name == artifact.name
+                    && old.source_path == artifact.source_path
+                    && old.file_name == artifact.file_name
+                    && old.semantic_sha256 == artifact.semantic_sha256
+                    && unit_artifact_has_valid_checksum(directory, old)
+            })
+        });
+        if reusable {
+            continue;
+        }
         atomic_write(&unit_directory.join(&artifact.file_name), contents)?;
+        rebuilt_units.push(artifact.name.clone());
     }
     atomic_write(
         &directory.join("record.json"),
         &project_cache_record_json(record),
     )?;
-    atomic_write(&directory.join("ast.json"), ast)
+    atomic_write(&directory.join("ast.json"), ast)?;
+    Ok(rebuilt_units)
+}
+
+fn unit_artifact_has_valid_checksum(directory: &Path, artifact: &SlangUnitArtifactRecord) -> bool {
+    std::fs::read_to_string(directory.join("units").join(&artifact.file_name))
+        .map(|contents| sha256_hex(contents.as_bytes()) == artifact.sha256)
+        .unwrap_or(false)
 }
 
 fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCacheRecord) -> bool {
@@ -904,10 +1007,20 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
                     let schema = value.get("schema")?.as_u64()?;
                     let name = value.get("name")?.as_str()?;
                     let source_path = value.get("source_path")?.as_str()?;
+                    let semantic_sha256 =
+                        sha256_hex(canonicalize_unit_artifact(&value).to_string().as_bytes());
                     Some(
                         schema == 1
                             && name == artifact.name
-                            && Path::new(source_path) == artifact.source_path,
+                            && Path::new(source_path) == artifact.source_path
+                            && value
+                                .get("semantic_sha256")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(semantic_sha256.as_str())
+                            && value
+                                .get("semantic_sha256")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(artifact.semantic_sha256.as_str()),
                     )
                 })
                 .unwrap_or(false)
@@ -1027,6 +1140,11 @@ fn splice_unit_bodies(
         .and_then(|definition| definition.split_whitespace().last())
         .map(str::to_string);
     let Some(fields) = value.as_object_mut() else {
+        if let Some(values) = value.as_array_mut() {
+            values
+                .iter_mut()
+                .try_for_each(|nested| splice_unit_bodies(nested, bodies, stack))?;
+        }
         return Ok(());
     };
     if is_instance {
@@ -1778,14 +1896,16 @@ impl SlangFrontend {
             return Ok(SlangCachedDesign {
                 design,
                 cache_hit: false,
+                rebuilt_units: Vec::new(),
             });
         };
         let roots = project_file_records(&manifest.sources)?;
         let library_inventory = project_library_inventory(&options.library_directories);
         let runtime_version = PINNED_SLANG_VERSION.to_string();
         let program = self.program.to_string_lossy().into_owned();
+        let previous_record = load_project_cache_record(&cache_directory.join("record.json"));
         {
-            if let Some(record) = load_project_cache_record(&cache_directory.join("record.json")) {
+            if let Some(record) = previous_record.clone() {
                 if project_cache_record_matches(
                     &record,
                     &program,
@@ -1806,6 +1926,7 @@ impl SlangFrontend {
                                 return Ok(SlangCachedDesign {
                                     design,
                                     cache_hit: true,
+                                    rebuilt_units: Vec::new(),
                                 });
                             }
                         }
@@ -1835,10 +1956,12 @@ impl SlangFrontend {
             return Ok(SlangCachedDesign {
                 design,
                 cache_hit: false,
+                rebuilt_units: Vec::new(),
             });
         }
 
         let design = self.lower_ast_json(&ast)?;
+        let rebuilt_units;
         {
             let root_paths = manifest
                 .sources
@@ -1854,16 +1977,31 @@ impl SlangFrontend {
                 return Ok(SlangCachedDesign {
                     design,
                     cache_hit: false,
+                    rebuilt_units: Vec::new(),
                 });
             };
-            let Some(unit_artifacts_with_contents) =
+            let Some(mut unit_artifacts_with_contents) =
                 project_unit_artifacts(&ast, &compilation_units)
             else {
                 return Ok(SlangCachedDesign {
                     design,
                     cache_hit: false,
+                    rebuilt_units: Vec::new(),
                 });
             };
+            if let Some(previous) = previous_record.as_ref() {
+                for (artifact, _) in &mut unit_artifacts_with_contents {
+                    if let Some(reusable) = previous.unit_artifacts.iter().find(|old| {
+                        old.name == artifact.name
+                            && old.source_path == artifact.source_path
+                            && old.file_name == artifact.file_name
+                            && old.semantic_sha256 == artifact.semantic_sha256
+                            && unit_artifact_has_valid_checksum(cache_directory, old)
+                    }) {
+                        *artifact = reusable.clone();
+                    }
+                }
+            }
             let unit_artifacts = unit_artifacts_with_contents
                 .iter()
                 .map(|(artifact, _)| artifact.clone())
@@ -1887,9 +2025,10 @@ impl SlangFrontend {
                 library_inventory,
                 ast_sha256: sha256_hex(ast.as_bytes()),
             };
-            save_project_cache(
+            rebuilt_units = save_project_cache(
                 cache_directory,
                 &record,
+                previous_record.as_ref(),
                 &unit_artifacts_with_contents,
                 &ast,
             )?;
@@ -1897,6 +2036,7 @@ impl SlangFrontend {
         Ok(SlangCachedDesign {
             design,
             cache_hit: false,
+            rebuilt_units,
         })
     }
 
@@ -2689,6 +2829,35 @@ fn write_temporary_source(source: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_nested_instance_bodies_removes_child_members() {
+        let mut value = serde_json::json!({
+            "kind": "InstanceBody",
+            "members": [{
+                "kind": "Instance",
+                "name": "child",
+                "body": {
+                    "kind": "InstanceBody",
+                    "name": "child_definition",
+                    "definition": "123 child_definition",
+                    "members": [{"kind": "Net", "name": "n"}]
+                }
+            }]
+        });
+        prune_nested_instance_bodies(&mut value);
+        let child = value
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()[0]
+            .get("body")
+            .unwrap();
+        assert!(child.get("members").is_none());
+        assert_eq!(
+            child.get("name").and_then(serde_json::Value::as_str),
+            Some("child_definition")
+        );
+    }
 
     #[test]
     fn sha256_matches_known_vectors() {

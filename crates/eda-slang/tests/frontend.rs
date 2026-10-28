@@ -472,6 +472,17 @@ endmodule
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("first persistent project compile");
     assert!(!first.cache_hit);
+    assert_eq!(
+        first
+            .rebuilt_units
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "persistent_child".to_string(),
+            "persistent_top".to_string(),
+        ])
+    );
     assert_eq!(first.design.name, "persistent_top");
     assert!(cache.join("record.json").is_file());
     assert!(cache.join("ast.json").is_file());
@@ -501,6 +512,43 @@ endmodule
             "persistent_top".to_string(),
         ])
     );
+    let child_artifact = unit_files
+        .iter()
+        .find(|path| {
+            let artifact = serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(path).expect("read child artifact candidate"),
+            )
+            .expect("parse child artifact candidate");
+            artifact.get("name").and_then(serde_json::Value::as_str) == Some("persistent_child")
+        })
+        .expect("persistent child artifact path");
+    let top_artifact = unit_files
+        .iter()
+        .find(|path| {
+            let artifact =
+                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap())
+                    .unwrap();
+            artifact.get("name").and_then(serde_json::Value::as_str) == Some("persistent_top")
+        })
+        .expect("persistent top artifact path");
+    let top_artifact =
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(top_artifact).unwrap())
+            .unwrap();
+    let nested_child = top_artifact
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|member| member.get("kind").and_then(serde_json::Value::as_str) == Some("Instance"))
+        .unwrap();
+    assert!(
+        nested_child
+            .get("body")
+            .and_then(|body| body.get("members"))
+            .is_none(),
+        "top unit artifact must prune nested child members"
+    );
 
     let second_frontend = discover_slang_for_tests().expect("rediscover pinned slang");
     let second = second_frontend
@@ -520,7 +568,7 @@ endmodule
     );
     assert_eq!(artifact_design.assigns.len(), first.design.assigns.len());
 
-    std::fs::write(&unit_files[0], r#"{"schema":1}"#).expect("corrupt persistent unit artifact");
+    std::fs::write(child_artifact, r#"{"schema":1}"#).expect("corrupt persistent unit artifact");
     let corrupt_artifact_error = second_frontend
         .compile_project_unit_artifacts(&cache)
         .expect_err("corrupt unit artifacts must not lower");
@@ -532,6 +580,7 @@ endmodule
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("recover from corrupted persistent unit artifact");
     assert!(!unit_recovered.cache_hit);
+    assert_eq!(unit_recovered.rebuilt_units, vec!["persistent_child"]);
     let unit_repaired = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile after persistent unit artifact repair");
@@ -557,12 +606,14 @@ endmodule
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile persistent project after dependency changed");
     assert!(!changed.cache_hit);
+    assert_eq!(changed.rebuilt_units, vec!["persistent_child"]);
 
     std::fs::write(cache.join("ast.json"), "{corrupted").expect("corrupt AST cache");
     let recovered = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("recover from corrupted persistent AST");
     assert!(!recovered.cache_hit);
+    assert!(recovered.rebuilt_units.is_empty());
     let repaired = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile after persistent cache repair");
@@ -580,6 +631,7 @@ endmodule
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile after persistent library inventory changed");
     assert!(!inventory_changed.cache_hit);
+    assert!(inventory_changed.rebuilt_units.is_empty());
 }
 
 #[test]
