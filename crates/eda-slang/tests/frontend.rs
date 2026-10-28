@@ -567,19 +567,30 @@ endmodule
         first.design.hierarchy.len()
     );
     assert_eq!(artifact_design.assigns.len(), first.design.assigns.len());
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("unit IR cache stats after composite miss"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 0,
+            misses: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
     let leaf_first = second_frontend
         .compile_leaf_unit_artifact(&cache, "persistent_child")
-        .expect("first leaf unit partial-IR lower");
-    assert!(!leaf_first.cache_hit);
+        .expect("reuse child partial IR lowered by composite relink");
+    assert!(leaf_first.cache_hit);
     assert_eq!(leaf_first.design.name, "persistent_child");
     assert_eq!(leaf_first.design.n_nets, 2);
     assert_eq!(leaf_first.design.assigns.len(), 1);
     assert_eq!(
         second_frontend
             .unit_ir_cache_stats()
-            .expect("leaf unit IR cache stats after miss"),
+            .expect("unit IR cache stats after leaf reuse"),
         eda_slang::SlangUnitIrCacheStats {
-            hits: 0,
+            hits: 1,
             misses: 1,
             evictions: 0,
             entries: 1,
@@ -600,7 +611,31 @@ endmodule
             .unit_ir_cache_stats()
             .expect("leaf unit IR cache stats after hit"),
         eda_slang::SlangUnitIrCacheStats {
-            hits: 1,
+            hits: 2,
+            misses: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+    let cached_composite = second_frontend
+        .compile_project_unit_artifacts(&cache)
+        .expect("composite relink reuses cached child partial IR");
+    assert_eq!(cached_composite.name, artifact_design.name);
+    assert_eq!(cached_composite.n_nets, artifact_design.n_nets);
+    assert_eq!(
+        cached_composite.hierarchy.len(),
+        artifact_design.hierarchy.len()
+    );
+    assert_eq!(
+        cached_composite.assigns.len(),
+        artifact_design.assigns.len()
+    );
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("unit IR cache stats after cached composite relink"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 3,
             misses: 1,
             evictions: 0,
             entries: 1,

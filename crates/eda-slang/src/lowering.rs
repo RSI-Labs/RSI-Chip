@@ -235,7 +235,14 @@ fn validate_instance_schema(instance: &serde_json::Value) -> Result<(), String> 
 }
 
 pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {
-    SlangAstLowerer::lower(root)
+    SlangAstLowerer::lower(root, None)
+}
+
+pub(crate) fn lower_root_with_unit_ir_cache(
+    root: &serde_json::Value,
+    cache: std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>,
+) -> Result<Design, String> {
+    SlangAstLowerer::lower_with_unit_ir_cache(root, cache)
 }
 
 fn collect_class_types(value: &serde_json::Value, classes: &mut Vec<serde_json::Value>) {
@@ -647,6 +654,7 @@ struct AstEnumType {
 
 pub(super) struct SlangAstLowerer {
     design: Design,
+    unit_ir_cache: Option<std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>>,
     symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     local_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     external_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
@@ -796,7 +804,10 @@ impl SlangAstLowerer {
         Ok(())
     }
 
-    pub(super) fn lower(root: &serde_json::Value) -> Result<Design, String> {
+    pub(super) fn lower(
+        root: &serde_json::Value,
+        unit_ir_cache: Option<std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>>,
+    ) -> Result<Design, String> {
         let body = root
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
@@ -819,6 +830,7 @@ impl SlangAstLowerer {
                 },
                 ..Design::default()
             },
+            unit_ir_cache,
             symbols: std::collections::BTreeMap::new(),
             local_symbols: std::collections::BTreeMap::new(),
             external_symbols: std::collections::BTreeMap::new(),
@@ -936,6 +948,13 @@ impl SlangAstLowerer {
         root.net_end = lowerer.design.n_nets;
         root.ports = top_ports;
         Ok(lowerer.design)
+    }
+
+    pub(super) fn lower_with_unit_ir_cache(
+        root: &serde_json::Value,
+        cache: std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>,
+    ) -> Result<Design, String> {
+        Self::lower(root, Some(cache))
     }
 
     fn lower_body(&mut self, body: &serde_json::Value) -> Result<(), String> {

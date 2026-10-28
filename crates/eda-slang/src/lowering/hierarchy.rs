@@ -1137,6 +1137,7 @@ impl super::SlangAstLowerer {
         let mut interface_memory_connections = Vec::new();
         let mut child = Self {
             design: Design::default(),
+            unit_ir_cache: self.unit_ir_cache.clone(),
             symbols: std::collections::BTreeMap::new(),
             local_symbols: std::collections::BTreeMap::new(),
             external_symbols: std::collections::BTreeMap::new(),
@@ -1331,6 +1332,7 @@ impl super::SlangAstLowerer {
             .unwrap_or(&empty_body_members)
             .iter()
             .any(|member| string_field(member, "kind").as_deref() == Some("Modport"));
+        child.design.name = definition_name.clone();
         if !is_interface {
             for (name, definition) in &self.type_aliases {
                 if name.contains('.') && !name.starts_with("__interface_instance_") {
@@ -1343,8 +1345,49 @@ impl super::SlangAstLowerer {
                 }
             }
         }
-        child.prepare_plusargs(body)?;
-        child.lower_body(body)?;
+        let cache_key = body
+            .get("eda_unit_ir_cache_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let has_nested_instance = body
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|member| string_field(member, "kind").as_deref() == Some("Instance"))
+            })
+            .unwrap_or(false);
+        let has_interface_connection = lowered_connections
+            .iter()
+            .any(|connection| connection.get("ifaceInstance").is_some());
+        let reusable_leaf = cache_key.is_some()
+            && !is_interface
+            && !has_nested_instance
+            && !has_interface_connection
+            && self.global_time_precision == -9;
+        let mut cached_leaf = false;
+        if let (Some(cache_key), Some(cache)) = (cache_key.clone(), self.unit_ir_cache.clone()) {
+            if reusable_leaf {
+                if let Ok(mut unit_cache) = cache.lock() {
+                    if let Some(design) = unit_cache.get(&cache_key) {
+                        child.design = (*design).clone();
+                        cached_leaf = true;
+                    }
+                }
+            }
+        }
+        if !cached_leaf {
+            child.prepare_plusargs(body)?;
+            child.lower_body(body)?;
+            if let (Some(cache_key), Some(cache)) = (cache_key, self.unit_ir_cache.clone()) {
+                if reusable_leaf {
+                    if let Ok(mut unit_cache) = cache.lock() {
+                        unit_cache.insert(cache_key, std::sync::Arc::new(child.design.clone()));
+                    }
+                }
+            }
+        }
 
         if is_interface {
             let instance_address = member

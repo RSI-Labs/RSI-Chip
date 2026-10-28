@@ -1114,6 +1114,10 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
     }) && record.unit_artifacts.len() == record.compilation_units.len()
 }
 
+fn unit_ir_cache_key(program: &str, semantic: &str) -> String {
+    sha256_hex(format!("{program}\0{semantic}").as_bytes())
+}
+
 fn load_project_unit_artifacts(
     directory: &Path,
     record: &SlangProjectCacheRecord,
@@ -1156,12 +1160,23 @@ fn load_project_unit_artifacts(
 fn reconstruct_ast_from_unit_artifacts(
     record: &SlangProjectCacheRecord,
     artifacts: &[serde_json::Value],
+    program: &str,
 ) -> Option<String> {
     let mut bodies = BTreeMap::new();
     let mut definitions = BTreeMap::new();
     for artifact in artifacts {
         let name = artifact.get("name")?.as_str()?.to_string();
-        bodies.insert(name.clone(), artifact.get("body")?.clone());
+        let semantic = artifact
+            .get("semantic_sha256")
+            .and_then(serde_json::Value::as_str)?;
+        let mut body = artifact.get("body")?.clone();
+        if let Some(fields) = body.as_object_mut() {
+            fields.insert(
+                "eda_unit_ir_cache_key".into(),
+                serde_json::Value::String(unit_ir_cache_key(program, semantic)),
+            );
+        }
+        bodies.insert(name.clone(), body);
         definitions.insert(name, artifact.get("definition")?.clone());
     }
 
@@ -2178,9 +2193,11 @@ impl SlangFrontend {
     /// incremental relinking.
     pub fn compile_project_unit_artifacts(&self, cache_directory: &Path) -> Result<Design, String> {
         let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
-        let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts)
+        let program = self.program.to_string_lossy().into_owned();
+        let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
             .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
-        self.lower_ast_json(&ast)
+        let root = parse_ast_root(&ast)?;
+        lowering::lower_root_with_unit_ir_cache(&root, self.unit_ir_cache.clone())
     }
 
     /// Lowers and caches a leaf unit artifact as a standalone partial IR design.
@@ -2227,7 +2244,7 @@ impl SlangFrontend {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("unit artifact '{unit_name}' has no semantic fingerprint"))?;
         let program = self.program.to_string_lossy().into_owned();
-        let cache_key = sha256_hex(format!("{program}\0{semantic}").as_bytes());
+        let cache_key = unit_ir_cache_key(&program, semantic);
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
             if let Some(design) = cache.get(&cache_key) {
                 return Ok(SlangCachedUnitDesign {
