@@ -567,6 +567,52 @@ endmodule
         first.design.hierarchy.len()
     );
     assert_eq!(artifact_design.assigns.len(), first.design.assigns.len());
+    let leaf_first = second_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("first leaf unit partial-IR lower");
+    assert!(!leaf_first.cache_hit);
+    assert_eq!(leaf_first.design.name, "persistent_child");
+    assert_eq!(leaf_first.design.n_nets, 2);
+    assert_eq!(leaf_first.design.assigns.len(), 1);
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("leaf unit IR cache stats after miss"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 0,
+            misses: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+    let leaf_second = second_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("second leaf unit partial-IR lower");
+    assert!(leaf_second.cache_hit);
+    assert_eq!(leaf_second.design.name, leaf_first.design.name);
+    assert_eq!(leaf_second.design.n_nets, leaf_first.design.n_nets);
+    assert_eq!(
+        leaf_second.design.assigns.len(),
+        leaf_first.design.assigns.len()
+    );
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("leaf unit IR cache stats after hit"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 1,
+            misses: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+    let composite_error = second_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_top")
+        .expect_err("composite leaf partial-IR lower must fail closed");
+    assert!(
+        composite_error.contains("partial IR merge is not implemented"),
+        "{composite_error}"
+    );
 
     std::fs::write(child_artifact, r#"{"schema":1}"#).expect("corrupt persistent unit artifact");
     let corrupt_artifact_error = second_frontend
@@ -602,11 +648,23 @@ endmodule
         stale_error.contains("stale for current project inputs"),
         "{stale_error}"
     );
+    let stale_leaf_error = second_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect_err("stale leaf partial IR must not lower");
+    assert!(
+        stale_leaf_error.contains("stale for current project inputs"),
+        "{stale_leaf_error}"
+    );
     let changed = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile persistent project after dependency changed");
     assert!(!changed.cache_hit);
     assert_eq!(changed.rebuilt_units, vec!["persistent_child"]);
+    let changed_leaf = second_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("lower rebuilt child partial IR");
+    assert!(!changed_leaf.cache_hit);
+    assert_eq!(changed_leaf.design.name, "persistent_child");
 
     std::fs::write(cache.join("ast.json"), "{corrupted").expect("corrupt AST cache");
     let recovered = second_frontend

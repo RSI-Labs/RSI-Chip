@@ -39,11 +39,13 @@ pub struct SlangFrontend {
     program: PathBuf,
     timeout: Duration,
     ast_cache: Arc<Mutex<SlangAstCache>>,
+    unit_ir_cache: Arc<Mutex<SlangUnitIrCache>>,
 }
 
 const PINNED_SLANG_VERSION: &str = "slang version 12.0.535+54c19b53";
 const DEFAULT_SLANG_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_AST_CACHE_ENTRIES: usize = 4;
+const DEFAULT_UNIT_IR_CACHE_ENTRIES: usize = 4;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SlangNamedSourceCacheKey {
@@ -107,6 +109,77 @@ struct SlangAstCache {
     misses: u64,
     insertions: u64,
     evictions: u64,
+}
+
+#[derive(Debug)]
+struct SlangUnitIrCache {
+    capacity: usize,
+    entries: BTreeMap<String, Arc<Design>>,
+    order: VecDeque<String>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl SlangUnitIrCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Arc<Design>> {
+        let result = self.entries.get(key).cloned();
+        if result.is_some() {
+            if let Some(index) = self.order.iter().position(|entry| entry == key) {
+                let entry = self
+                    .order
+                    .remove(index)
+                    .expect("checked unit IR entry exists");
+                self.order.push_back(entry);
+            }
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        result
+    }
+
+    fn insert(&mut self, key: String, design: Arc<Design>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.insert(key.clone(), design).is_none() {
+            self.order.push_back(key);
+        } else if let Some(index) = self.order.iter().position(|entry| *entry == key) {
+            let entry = self
+                .order
+                .remove(index)
+                .expect("checked unit IR entry exists");
+            self.order.push_back(entry);
+        }
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+            self.evictions += 1;
+        }
+    }
+
+    fn stats(&self) -> SlangUnitIrCacheStats {
+        SlangUnitIrCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+            entries: self.entries.len(),
+        }
+    }
 }
 
 impl SlangAstCache {
@@ -316,6 +389,20 @@ pub struct SlangCachedDesign {
     pub design: Design,
     pub cache_hit: bool,
     pub rebuilt_units: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlangCachedUnitDesign {
+    pub design: Arc<Design>,
+    pub cache_hit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlangUnitIrCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub entries: usize,
 }
 
 /// A persistent database of project records used to plan partial rebuilds.
@@ -1431,6 +1518,9 @@ impl SlangFrontend {
             ast_cache: Arc::new(Mutex::new(SlangAstCache::new(
                 ast_cache_capacity_from_env()?
             ))),
+            unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
+                DEFAULT_UNIT_IR_CACHE_ENTRIES,
+            ))),
         };
         let version = frontend.version()?;
         if !frontend.version_matches(&version) {
@@ -1472,6 +1562,13 @@ impl SlangFrontend {
             .lock()
             .map(|cache| cache.stats())
             .map_err(|_| "slang AST cache mutex poisoned".to_string())
+    }
+
+    pub fn unit_ir_cache_stats(&self) -> Result<SlangUnitIrCacheStats, String> {
+        self.unit_ir_cache
+            .lock()
+            .map(|cache| cache.stats())
+            .map_err(|_| "slang unit IR cache mutex poisoned".to_string())
     }
 
     fn version_matches(&self, version: &str) -> bool {
@@ -2040,13 +2137,10 @@ impl SlangFrontend {
         })
     }
 
-    /// Reconstructs and lowers a design from persistent unit AST artifacts.
-    ///
-    /// This path does not read the full `ast.json`; it validates the project
-    /// record and current source fingerprints, then splices clean unit bodies
-    /// into the selected root. It is the first executable step toward unit-level
-    /// incremental relinking.
-    pub fn compile_project_unit_artifacts(&self, cache_directory: &Path) -> Result<Design, String> {
+    fn validated_project_unit_artifacts(
+        &self,
+        cache_directory: &Path,
+    ) -> Result<(SlangProjectCacheRecord, Vec<serde_json::Value>), String> {
         let record = load_project_cache_record(&cache_directory.join("record.json"))
             .ok_or_else(|| "project cache has no valid record.json".to_string())?;
         if record.schema != SLANG_PROJECT_CACHE_SCHEMA {
@@ -2073,9 +2167,97 @@ impl SlangFrontend {
         }
         let artifacts = load_project_unit_artifacts(cache_directory, &record)
             .ok_or_else(|| "project unit artifact cache is invalid".to_string())?;
+        Ok((record, artifacts))
+    }
+
+    /// Reconstructs and lowers a design from persistent unit AST artifacts.
+    ///
+    /// This path does not read the full `ast.json`; it validates the project
+    /// record and current source fingerprints, then splices clean unit bodies
+    /// into the selected root. It is the first executable step toward unit-level
+    /// incremental relinking.
+    pub fn compile_project_unit_artifacts(&self, cache_directory: &Path) -> Result<Design, String> {
+        let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
         let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts)
             .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
         self.lower_ast_json(&ast)
+    }
+
+    /// Lowers and caches a leaf unit artifact as a standalone partial IR design.
+    ///
+    /// This is deliberately limited to units without nested child instances.
+    /// Composite units still use `compile_project_unit_artifacts` until partial
+    /// IR merge/relink is implemented. Cache keys include the slang program and
+    /// stable semantic unit fingerprint, so ephemeral slang addresses do not
+    /// invalidate an otherwise identical leaf.
+    pub fn compile_leaf_unit_artifact(
+        &self,
+        cache_directory: &Path,
+        unit_name: &str,
+    ) -> Result<SlangCachedUnitDesign, String> {
+        let (_record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == unit_name)
+            })
+            .ok_or_else(|| format!("project unit artifact '{unit_name}' was not found"))?;
+        let body = artifact
+            .get("body")
+            .ok_or_else(|| format!("unit artifact '{unit_name}' has no body"))?;
+        let has_nested_instance = body
+            .get("members")
+            .and_then(serde_json::Value::as_array)
+            .map(|members| {
+                members.iter().any(|member| {
+                    member.get("kind").and_then(serde_json::Value::as_str) == Some("Instance")
+                })
+            })
+            .unwrap_or(false);
+        if has_nested_instance {
+            return Err(format!(
+                "unit '{unit_name}' has nested instances; partial IR merge is not implemented"
+            ));
+        }
+        let semantic = artifact
+            .get("semantic_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("unit artifact '{unit_name}' has no semantic fingerprint"))?;
+        let program = self.program.to_string_lossy().into_owned();
+        let cache_key = sha256_hex(format!("{program}\0{semantic}").as_bytes());
+        if let Ok(mut cache) = self.unit_ir_cache.lock() {
+            if let Some(design) = cache.get(&cache_key) {
+                return Ok(SlangCachedUnitDesign {
+                    design,
+                    cache_hit: true,
+                });
+            }
+        }
+        let definition = artifact
+            .get("definition")
+            .ok_or_else(|| format!("unit artifact '{unit_name}' has no definition"))?;
+        let ast = serde_json::json!({
+            "name": unit_name,
+            "kind": "Instance",
+            "source_file": definition.get("source_file").cloned().unwrap_or(serde_json::Value::Null),
+            "source_line": definition.get("source_line").cloned().unwrap_or(serde_json::Value::Null),
+            "source_column": definition.get("source_column").cloned().unwrap_or(serde_json::Value::Null),
+            "addr": definition.get("addr").cloned().unwrap_or(serde_json::Value::Null),
+            "body": body,
+            "connections": [],
+        })
+        .to_string();
+        let design = Arc::new(self.lower_ast_json(&ast)?);
+        if let Ok(mut cache) = self.unit_ir_cache.lock() {
+            cache.insert(cache_key, Arc::clone(&design));
+        }
+        Ok(SlangCachedUnitDesign {
+            design,
+            cache_hit: false,
+        })
     }
 
     /// Compiles into a deterministic project cache slot and updates a shared database.
@@ -3062,6 +3244,9 @@ string s = "`include string.svh";
             program: PathBuf::from("slang"),
             timeout: DEFAULT_SLANG_TIMEOUT,
             ast_cache: Arc::new(Mutex::new(SlangAstCache::new(DEFAULT_AST_CACHE_ENTRIES))),
+            unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
+                DEFAULT_UNIT_IR_CACHE_ENTRIES,
+            ))),
         };
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53"));
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53\n"));
@@ -3076,6 +3261,9 @@ string s = "`include string.svh";
             program: PathBuf::from("/bin/sleep"),
             timeout: Duration::from_millis(50),
             ast_cache: Arc::new(Mutex::new(SlangAstCache::new(DEFAULT_AST_CACHE_ENTRIES))),
+            unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
+                DEFAULT_UNIT_IR_CACHE_ENTRIES,
+            ))),
         };
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
