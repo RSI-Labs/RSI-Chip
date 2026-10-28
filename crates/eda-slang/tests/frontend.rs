@@ -89,7 +89,7 @@ endmodule
         2
     );
 
-    let include_root = temporary_directory("ast-cache-include-bypass");
+    let include_root = temporary_directory("ast-cache-include-dependency");
     let include_path = include_root.join("cached_value.svh");
     std::fs::write(
         &include_path,
@@ -114,13 +114,31 @@ endmodule
         .expect("compile include-dependent source");
     slang
         .compile_source(include_source, Some("cached_top"), &include_options)
-        .expect("repeat include-dependent source without cache lookup");
+        .expect("repeat include-dependent source with dependency-aware hit");
     let include_stats = slang
         .ast_cache_stats()
-        .expect("read include-bypass cache statistics");
-    assert_eq!(include_stats.misses, 2);
-    assert_eq!(include_stats.hits, 1);
-    assert_eq!(include_stats.entries, 2);
+        .expect("read include-dependency cache statistics");
+    assert_eq!(include_stats.misses, 3);
+    assert_eq!(include_stats.hits, 2);
+    assert_eq!(include_stats.entries, 3);
+
+    std::fs::write(
+        &include_path,
+        r#"module cached_child(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("change include dependency content");
+    slang
+        .compile_source(include_source, Some("cached_top"), &include_options)
+        .expect("compile after include dependency changed");
+    let changed_include_stats = slang
+        .ast_cache_stats()
+        .expect("read changed include dependency statistics");
+    assert_eq!(changed_include_stats.misses, 4);
+    assert_eq!(changed_include_stats.insertions, 4);
+    assert_eq!(changed_include_stats.entries, 4);
 }
 
 #[test]
@@ -190,6 +208,83 @@ endmodule
     let stats = slang
         .ast_cache_stats()
         .expect("read changed named-file cache statistics");
+    assert_eq!(stats.misses, 2);
+    assert_eq!(stats.insertions, 2);
+    assert_eq!(stats.entries, 2);
+}
+
+#[test]
+fn slang_named_file_cache_tracks_include_dependencies() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("named-include-cache");
+    let include_directory = root.join("include");
+    std::fs::create_dir_all(&include_directory).expect("create include directory");
+    let header_path = include_directory.join("cached_include_child.svh");
+    std::fs::write(
+        &header_path,
+        r#"
+module cached_include_child(input logic a, output logic y);
+assign y = a;
+endmodule
+"#,
+    )
+    .expect("write included child");
+    let source_path = root.join("cached_include_top.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+`include "cached_include_child.svh"
+module cached_include_top(input logic a, output logic y);
+cached_include_child child(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write include top");
+    let options = PreprocessOptions {
+        include_directories: vec![include_directory],
+        ..PreprocessOptions::default()
+    };
+    let files = [source_path];
+
+    let first = slang
+        .compile_files(&files, Some("cached_include_top"), &options)
+        .expect("first include-dependent named-file compile");
+    let second = slang
+        .compile_files(&files, Some("cached_include_top"), &options)
+        .expect("second include-dependent named-file compile");
+    assert_eq!(first.name, second.name);
+    assert_eq!(first.hierarchy.len(), second.hierarchy.len());
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("read include dependency cache stats"),
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 1,
+            insertions: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+
+    std::fs::write(
+        &header_path,
+        r#"
+module cached_include_child(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("change included child content");
+    let changed = slang
+        .compile_files(&files, Some("cached_include_top"), &options)
+        .expect("compile after included dependency changed");
+    assert_eq!(changed.name, "cached_include_top");
+    let stats = slang
+        .ast_cache_stats()
+        .expect("read changed include dependency cache stats");
     assert_eq!(stats.misses, 2);
     assert_eq!(stats.insertions, 2);
     assert_eq!(stats.entries, 2);

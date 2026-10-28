@@ -8,7 +8,7 @@
 //! that the downstream bounded elaborator cannot represent.
 
 use eda_core::ir::Design;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,7 +52,10 @@ struct SlangNamedSourceCacheKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum SlangAstCacheInput {
-    Source(String),
+    Source {
+        source: String,
+        dependencies: Vec<SlangNamedSourceCacheKey>,
+    },
     NamedFiles(Vec<SlangNamedSourceCacheKey>),
 }
 
@@ -381,26 +384,25 @@ impl SlangFrontend {
         scopes: &[String],
         options: &PreprocessOptions,
     ) -> Option<SlangAstCacheKey> {
-        if !options.include_directories.is_empty()
-            || options
-                .defines
-                .iter()
-                .chain(options.undefines.iter())
-                .any(|value| value.contains("`include"))
+        if options
+            .defines
+            .iter()
+            .chain(options.undefines.iter())
+            .any(|value| value.contains("`include"))
         {
             return None;
         }
-        let mut named_files = Vec::with_capacity(files.len());
+        let mut contents = Vec::with_capacity(files.len());
         for path in files {
-            let content = std::fs::read_to_string(path).ok()?;
-            if content.contains("`include") {
-                return None;
-            }
-            named_files.push(SlangNamedSourceCacheKey {
-                path: path.clone(),
-                content,
-            });
+            contents.push((path.clone(), std::fs::read_to_string(path).ok()?));
         }
+        let dependencies = include_dependencies(&contents, &options.include_directories)?;
+
+        let mut named_files = Vec::with_capacity(files.len() + dependencies.len());
+        for (path, content) in contents {
+            named_files.push(SlangNamedSourceCacheKey { path, content });
+        }
+        named_files.extend(dependencies);
         Some(SlangAstCacheKey {
             program: self.program.to_string_lossy().into_owned(),
             top: top.map(str::to_string),
@@ -409,6 +411,39 @@ impl SlangFrontend {
             undefines: options.undefines.clone(),
             scopes: scopes.to_vec(),
             input: SlangAstCacheInput::NamedFiles(named_files),
+        })
+    }
+
+    fn source_cache_key(
+        &self,
+        source_path: &Path,
+        source: &str,
+        top: Option<&str>,
+        options: &PreprocessOptions,
+    ) -> Option<SlangAstCacheKey> {
+        if options
+            .defines
+            .iter()
+            .chain(options.undefines.iter())
+            .any(|value| value.contains("`include"))
+        {
+            return None;
+        }
+        let dependencies = include_dependencies(
+            &[(source_path.to_path_buf(), source.to_string())],
+            &options.include_directories,
+        )?;
+        Some(SlangAstCacheKey {
+            program: self.program.to_string_lossy().into_owned(),
+            top: top.map(str::to_string),
+            include_directories: options.include_directories.clone(),
+            defines: options.defines.clone(),
+            undefines: options.undefines.clone(),
+            scopes: Vec::new(),
+            input: SlangAstCacheInput::Source {
+                source: source.to_string(),
+                dependencies,
+            },
         })
     }
 
@@ -563,16 +598,8 @@ impl SlangFrontend {
         top: Option<&str>,
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
-        let cacheable = options.include_directories.is_empty() && !source.contains("`include");
-        let cache_key = cacheable.then(|| SlangAstCacheKey {
-            program: self.program.to_string_lossy().into_owned(),
-            top: top.map(str::to_string),
-            include_directories: options.include_directories.clone(),
-            defines: options.defines.clone(),
-            undefines: options.undefines.clone(),
-            scopes: Vec::new(),
-            input: SlangAstCacheInput::Source(source.to_string()),
-        });
+        let path = write_temporary_source(source)?;
+        let cache_key = self.source_cache_key(&path, source, top, options);
         let cached_ast = cache_key
             .as_ref()
             .map(|key| {
@@ -583,7 +610,6 @@ impl SlangFrontend {
             })
             .transpose()?
             .flatten();
-        let path = write_temporary_source(source)?;
         let result = if let Some(json) = cached_ast {
             self.lower_ast_json_with_interface_array_scopes(
                 &json,
@@ -812,6 +838,234 @@ fn parse_concatenated_json_objects(text: &str) -> Result<Vec<serde_json::Value>,
     Ok(objects)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SlangIncludeSpec {
+    filename: String,
+    angle: bool,
+}
+
+fn include_dependencies(
+    roots: &[(PathBuf, String)],
+    include_directories: &[PathBuf],
+) -> Option<Vec<SlangNamedSourceCacheKey>> {
+    let mut dependencies = BTreeMap::new();
+    let mut seen = roots
+        .iter()
+        .map(|(path, _)| canonical_path(path))
+        .collect::<BTreeSet<_>>();
+    for (path, content) in roots {
+        scan_include_content(
+            path,
+            content,
+            include_directories,
+            &mut dependencies,
+            &mut seen,
+        )?;
+    }
+    Some(
+        dependencies
+            .into_iter()
+            .map(|(path, content)| SlangNamedSourceCacheKey { path, content })
+            .collect(),
+    )
+}
+
+fn scan_include_content(
+    path: &Path,
+    content: &str,
+    include_directories: &[PathBuf],
+    dependencies: &mut BTreeMap<PathBuf, String>,
+    seen: &mut BTreeSet<PathBuf>,
+) -> Option<()> {
+    let specs = literal_include_specs(content)?;
+    for spec in specs {
+        let dependency_path = resolve_include_path(&spec, path.parent(), include_directories)?;
+        if !seen.insert(dependency_path.clone()) {
+            continue;
+        }
+        let dependency_content = std::fs::read_to_string(&dependency_path).ok()?;
+        dependencies.insert(dependency_path.clone(), dependency_content.clone());
+        scan_include_content(
+            &dependency_path,
+            &dependency_content,
+            include_directories,
+            dependencies,
+            seen,
+        )?;
+    }
+    Some(())
+}
+
+fn literal_include_specs(content: &str) -> Option<Vec<SlangIncludeSpec>> {
+    let characters = content.chars().collect::<Vec<_>>();
+    let mut specs = Vec::new();
+    let mut index = 0_usize;
+    while index < characters.len() {
+        match characters[index] {
+            '/' if index + 1 < characters.len() && characters[index + 1] == '/' => {
+                while index < characters.len() && characters[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if index + 1 < characters.len() && characters[index + 1] == '*' => {
+                index += 2;
+                loop {
+                    if index + 1 >= characters.len() {
+                        return None;
+                    }
+                    if characters[index] == '*' && characters[index + 1] == '/' {
+                        index += 2;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            '"' => {
+                index += 1;
+                while index < characters.len() {
+                    if characters[index] == '\\' {
+                        index += 2;
+                    } else if characters[index] == '"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            '`' => {
+                index += 1;
+                let start = index;
+                while index < characters.len()
+                    && (characters[index].is_ascii_alphanumeric() || characters[index] == '_')
+                {
+                    index += 1;
+                }
+                let directive = characters[start..index].iter().collect::<String>();
+                match directive.as_str() {
+                    "include" => {
+                        let (spec, next_index) = parse_include_argument(&characters, index)?;
+                        specs.push(spec);
+                        index = next_index;
+                    }
+                    "define"
+                    | "undef"
+                    | "undefineall"
+                    | "ifdef"
+                    | "ifndef"
+                    | "elsif"
+                    | "else"
+                    | "endif"
+                    | "timescale"
+                    | "default_nettype"
+                    | "resetall"
+                    | "celldefine"
+                    | "endcelldefine"
+                    | "unconnected_drive"
+                    | "nounconnected_drive"
+                    | "line"
+                    | "pragma"
+                    | "begin_keywords"
+                    | "end_keywords"
+                    | "protected"
+                    | "endprotected"
+                    | "__FILE__"
+                    | "__LINE__" => {}
+                    _ => return None,
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    Some(specs)
+}
+
+fn parse_include_argument(
+    characters: &[char],
+    mut index: usize,
+) -> Option<(SlangIncludeSpec, usize)> {
+    loop {
+        while index < characters.len() && characters[index].is_whitespace() {
+            index += 1;
+        }
+        if index + 1 < characters.len() && characters[index] == '/' && characters[index + 1] == '/'
+        {
+            while index < characters.len() && characters[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if index + 1 < characters.len() && characters[index] == '/' && characters[index + 1] == '*'
+        {
+            index += 2;
+            loop {
+                if index + 1 >= characters.len() {
+                    return None;
+                }
+                if characters[index] == '*' && characters[index + 1] == '/' {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        break;
+    }
+
+    let (delimiter, angle) = match characters.get(index)? {
+        '"' => ('"', false),
+        '<' => ('>', true),
+        _ => return None,
+    };
+    index += 1;
+    let start = index;
+    while index < characters.len() && characters[index] != delimiter {
+        if characters[index] == '\\' || characters[index] == '\n' {
+            return None;
+        }
+        index += 1;
+    }
+    if index >= characters.len() {
+        return None;
+    }
+    let filename = characters[start..index].iter().collect::<String>();
+    if filename.is_empty() {
+        return None;
+    }
+    Some((SlangIncludeSpec { filename, angle }, index + 1))
+}
+
+fn resolve_include_path(
+    spec: &SlangIncludeSpec,
+    current_directory: Option<&Path>,
+    include_directories: &[PathBuf],
+) -> Option<PathBuf> {
+    let filename = Path::new(&spec.filename);
+    if filename.is_absolute() {
+        return filename.is_file().then(|| canonical_path(filename));
+    }
+
+    let mut candidates = Vec::new();
+    if !spec.angle {
+        if let Some(directory) = current_directory {
+            candidates.push(directory.join(filename));
+        }
+    }
+    candidates.extend(include_directories.iter().map(|dir| dir.join(filename)));
+    if let Ok(directory) = std::env::current_dir() {
+        candidates.push(directory.join(filename));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| canonical_path(&candidate))
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn which(program: &str) -> Result<PathBuf, String> {
     let path = std::env::var_os("PATH").ok_or("PATH is not set")?;
     for directory in std::env::split_paths(&path) {
@@ -849,6 +1103,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn literal_include_scanner_ignores_non_directives_and_rejects_macros() {
+        let specs = literal_include_specs(
+            r#"
+// `include "commented.svh"
+/* `include "blocked.svh" */
+string s = "`include string.svh";
+`include "real.svh"
+`include <angle.svh>
+"#,
+        )
+        .expect("literal include directives are cacheable");
+        assert_eq!(
+            specs,
+            vec![
+                SlangIncludeSpec {
+                    filename: "real.svh".into(),
+                    angle: false,
+                },
+                SlangIncludeSpec {
+                    filename: "angle.svh".into(),
+                    angle: true,
+                },
+            ]
+        );
+
+        assert!(
+            literal_include_specs("`include INCLUDE_MACRO\n").is_none(),
+            "macro-expanded include names must bypass the cache"
+        );
+        assert!(
+            literal_include_specs("`UNKNOWN_MACRO\n").is_none(),
+            "unknown macro expansions must bypass the cache"
+        );
+    }
+
+    #[test]
+    fn include_dependencies_resolve_nested_literal_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "eda-slang-nested-includes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("create nested include directory");
+        let root = directory.join("root.sv");
+        let child = directory.join("child.svh");
+        let grandchild = directory.join("grandchild.svh");
+        std::fs::write(&root, "`include \"child.svh\"\n").expect("write root");
+        std::fs::write(&child, "`include \"grandchild.svh\"\n").expect("write child");
+        std::fs::write(&grandchild, "parameter NESTED = 1;\n").expect("write grandchild");
+
+        let dependencies = include_dependencies(
+            &[(root.clone(), std::fs::read_to_string(&root).unwrap())],
+            std::slice::from_ref(&directory),
+        )
+        .expect("resolve nested literal includes");
+        let paths = dependencies
+            .iter()
+            .map(|dependency| dependency.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                std::fs::canonicalize(&child).unwrap(),
+                std::fs::canonicalize(&grandchild).unwrap()
+            ]
+        );
+        assert_eq!(dependencies[1].content, "parameter NESTED = 1;\n");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn ast_cache_is_bounded_and_least_recently_used() {
         let key = |source: &str| SlangAstCacheKey {
             program: "slang".into(),
@@ -857,7 +1185,10 @@ mod tests {
             defines: Vec::new(),
             undefines: Vec::new(),
             scopes: Vec::new(),
-            input: SlangAstCacheInput::Source(source.into()),
+            input: SlangAstCacheInput::Source {
+                source: source.into(),
+                dependencies: Vec::new(),
+            },
         };
         let mut cache = SlangAstCache::new(2);
         let first = key("first");
