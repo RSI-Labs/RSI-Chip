@@ -7,6 +7,7 @@
 //! validated/preprocessed boundary explicit avoids silently accepting source
 //! that the downstream bounded elaborator cannot represent.
 
+use crate::ast_util::string_field;
 use eda_core::ir::Design;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
@@ -363,6 +364,7 @@ struct SlangCompilationUnitRecord {
     kind: String,
     source_path: PathBuf,
     sha256: String,
+    depends_on: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,7 +387,7 @@ struct SlangProjectCacheRecord {
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 3;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 4;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
 
 fn parse_path_array(
@@ -456,7 +458,7 @@ fn project_file_records(paths: &[PathBuf]) -> Result<Vec<SlangProjectFileRecord>
 fn project_compilation_units(ast: &str) -> Option<Vec<SlangCompilationUnitRecord>> {
     let document = serde_json::from_str::<serde_json::Value>(ast).ok()?;
     let definitions = document.get("definitions")?.as_array()?;
-    definitions
+    let mut units = definitions
         .iter()
         .map(|definition| {
             let name = definition.get("name")?.as_str()?.to_string();
@@ -475,9 +477,48 @@ fn project_compilation_units(ast: &str) -> Option<Vec<SlangCompilationUnitRecord
                 kind,
                 source_path,
                 sha256,
+                depends_on: Vec::new(),
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    collect_instance_dependencies(&document, &mut units);
+    units.iter_mut().for_each(|unit| unit.depends_on.sort());
+    Some(units)
+}
+
+fn collect_instance_dependencies(
+    value: &serde_json::Value,
+    units: &mut [SlangCompilationUnitRecord],
+) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Instance") {
+            let source_path =
+                string_field(value, "source_file").map(|source| canonical_path(Path::new(&source)));
+            let dependency = value
+                .get("body")
+                .and_then(|body| body.get("definition"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|definition| definition.split_whitespace().last())
+                .map(str::to_string);
+            if let (Some(source_path), Some(dependency)) = (source_path, dependency) {
+                if let Some(unit) = units
+                    .iter_mut()
+                    .find(|unit| unit.source_path == source_path)
+                {
+                    if unit.name != dependency && !unit.depends_on.contains(&dependency) {
+                        unit.depends_on.push(dependency);
+                    }
+                }
+            }
+        }
+        for nested in fields.values() {
+            collect_instance_dependencies(nested, units);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_instance_dependencies(nested, units);
+        }
+    }
 }
 
 fn canonical_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -526,6 +567,7 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
             "kind": unit.kind,
             "source_path": unit.source_path,
             "sha256": unit.sha256,
+            "depends_on": unit.depends_on,
         })).collect::<Vec<_>>(),
         "library_inventory": record.library_inventory.iter().map(|(directory, entries)| {
             serde_json::json!({"directory": directory, "entries": entries})
@@ -588,6 +630,12 @@ fn json_compilation_units(
                 kind: entry.get("kind")?.as_str()?.to_string(),
                 source_path: json_path(entry, "source_path")?,
                 sha256: entry.get("sha256")?.as_str()?.to_string(),
+                depends_on: entry
+                    .get("depends_on")?
+                    .as_array()?
+                    .iter()
+                    .map(|dependency| dependency.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?,
             })
         })
         .collect()
@@ -863,6 +911,28 @@ impl SlangProjectDependencyDatabase {
                 {
                     record_dirty_units.insert(unit.clone());
                 }
+            }
+            loop {
+                let dirty_names = record_dirty_units
+                    .iter()
+                    .map(|unit| unit.name.as_str())
+                    .collect::<BTreeSet<_>>();
+                let dependents = record
+                    .compilation_units
+                    .iter()
+                    .filter(|unit| {
+                        !dirty_names.contains(unit.name.as_str())
+                            && unit
+                                .depends_on
+                                .iter()
+                                .any(|dependency| dirty_names.contains(dependency.as_str()))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if dependents.is_empty() {
+                    break;
+                }
+                record_dirty_units.extend(dependents);
             }
             if (inventory_changed || manifest_changed)
                 && record_dirty_units.len() < record.compilation_units.len()

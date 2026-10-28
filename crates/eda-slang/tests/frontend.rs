@@ -613,12 +613,25 @@ endmodule
     assert_eq!(dirty.changed_files, vec![selected_dependencies[0].clone()]);
     assert_eq!(
         dirty.dirty_compilation_units,
-        vec![SlangCompilationUnit {
-            project_manifest: manifests[0].clone(),
-            name: "shared_child0".into(),
-            kind: "Module".into(),
-            source_path: selected_dependencies[0].clone(),
-        }]
+        vec![
+            SlangCompilationUnit {
+                project_manifest: manifests[0].clone(),
+                name: "shared_child0".into(),
+                kind: "Module".into(),
+                source_path: selected_dependencies[0].clone(),
+            },
+            SlangCompilationUnit {
+                project_manifest: manifests[0].clone(),
+                name: "shared_top0".into(),
+                kind: "Module".into(),
+                source_path: manifests[0]
+                    .parent()
+                    .unwrap()
+                    .join("shared_top0.sv")
+                    .canonicalize()
+                    .unwrap(),
+            },
+        ]
     );
 
     slang
