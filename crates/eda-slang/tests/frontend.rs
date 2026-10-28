@@ -1,6 +1,6 @@
 use eda_core::logic::{LogicValue, LogicWord};
 use eda_sim::Simulator;
-use eda_slang::{PreprocessOptions, SlangFrontend};
+use eda_slang::{PreprocessOptions, SlangFrontend, SlangProjectDependencyDatabase};
 use std::path::{Path, PathBuf};
 
 fn temporary_directory(name: &str) -> PathBuf {
@@ -518,6 +518,105 @@ endmodule
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile after persistent library inventory changed");
     assert!(!inventory_changed.cache_hit);
+}
+
+#[test]
+fn slang_shared_project_database_plans_partial_recompilation() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("shared-project-database");
+    let cache_root = root.join("caches");
+    let database_path = root.join("projects.json");
+    let mut manifests = Vec::new();
+    let mut selected_dependencies = Vec::new();
+    for index in 0..2 {
+        let project = root.join(format!("project{index}"));
+        let library = project.join("lib");
+        std::fs::create_dir_all(&library).expect("create shared-database project library");
+        let child = library.join(format!("shared_child{index}.sv"));
+        std::fs::write(
+            &child,
+            format!(
+                r#"
+module shared_child{index}(input logic a, output logic y);
+assign y = a;
+endmodule
+"#
+            ),
+        )
+        .expect("write shared-database child");
+        let source = project.join(format!("shared_top{index}.sv"));
+        std::fs::write(
+            &source,
+            format!(
+                r#"
+module shared_top{index}(input logic a, output logic y);
+shared_child{index} child(.a(a), .y(y));
+endmodule
+"#
+            ),
+        )
+        .expect("write shared-database top");
+        let manifest = project.join("project.json");
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"
+{{
+  "top": "shared_top{index}",
+  "sources": ["shared_top{index}.sv"],
+  "library_directories": ["lib"],
+  "library_extensions": [".sv"]
+}}
+"#
+            ),
+        )
+        .expect("write shared-database manifest");
+        slang
+            .compile_project_manifest_with_shared_cache(&manifest, &cache_root, &database_path)
+            .expect("compile shared-database project");
+        manifests.push(std::fs::canonicalize(&manifest).unwrap());
+        selected_dependencies.push(std::fs::canonicalize(child).unwrap());
+    }
+
+    let database =
+        SlangProjectDependencyDatabase::load(&database_path).expect("load shared project database");
+    let clean = database.partial_recompilation_plan();
+    assert_eq!(clean.clean_projects, manifests);
+    assert!(clean.dirty_projects.is_empty());
+    assert!(clean.changed_files.is_empty());
+    assert!(clean.missing_files.is_empty());
+
+    let reverse = database.reverse_dependencies();
+    let first = reverse
+        .iter()
+        .find(|entry| entry.file == selected_dependencies[0])
+        .expect("first project dependency index");
+    assert_eq!(first.projects, vec![manifests[0].clone()]);
+
+    std::fs::write(
+        &selected_dependencies[0],
+        r#"
+module shared_child0(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("change one shared-database dependency");
+    let dirty = database.partial_recompilation_plan();
+    assert_eq!(dirty.dirty_projects, vec![manifests[0].clone()]);
+    assert_eq!(dirty.clean_projects, vec![manifests[1].clone()]);
+    assert_eq!(dirty.changed_files, vec![selected_dependencies[0].clone()]);
+
+    slang
+        .compile_project_manifest_with_shared_cache(&manifests[0], &cache_root, &database_path)
+        .expect("recompile dirty project and refresh database");
+    let repaired = SlangProjectDependencyDatabase::load(&database_path)
+        .expect("reload repaired shared database")
+        .partial_recompilation_plan();
+    assert!(repaired.dirty_projects.is_empty());
+    assert_eq!(repaired.clean_projects.len(), 2);
 }
 
 #[test]

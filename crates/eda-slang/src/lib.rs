@@ -316,6 +316,32 @@ pub struct SlangCachedDesign {
     pub cache_hit: bool,
 }
 
+/// A persistent database of project records used to plan partial rebuilds.
+///
+/// The database intentionally stores fingerprints rather than source or AST
+/// contents. Per-project AST bytes remain in their own project cache
+/// directories; this database owns the cross-project dependency index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangProjectDependencyDatabase {
+    path: PathBuf,
+    schema: u32,
+    projects: BTreeMap<PathBuf, SlangProjectCacheRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangPartialRecompilationPlan {
+    pub clean_projects: Vec<PathBuf>,
+    pub dirty_projects: Vec<PathBuf>,
+    pub changed_files: Vec<PathBuf>,
+    pub missing_files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlangReverseDependency {
+    pub file: PathBuf,
+    pub projects: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SlangProjectFileRecord {
     path: PathBuf,
@@ -328,6 +354,7 @@ struct SlangProjectCacheRecord {
     program: String,
     runtime_version: String,
     manifest_path: PathBuf,
+    manifest_sha256: String,
     top: Option<String>,
     include_directories: Vec<PathBuf>,
     defines: Vec<String>,
@@ -340,7 +367,8 @@ struct SlangProjectCacheRecord {
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 1;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 2;
+const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
 
 fn parse_path_array(
     value: &serde_json::Value,
@@ -433,6 +461,7 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
         "program": record.program,
         "runtime_version": record.runtime_version,
         "manifest_path": record.manifest_path,
+        "manifest_sha256": record.manifest_sha256,
         "top": record.top,
         "include_directories": record.include_directories,
         "defines": record.defines,
@@ -514,24 +543,29 @@ fn json_library_inventory(
 fn load_project_cache_record(path: &Path) -> Option<SlangProjectCacheRecord> {
     let text = std::fs::read_to_string(path).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    parse_project_cache_record(&value)
+}
+
+fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectCacheRecord> {
     Some(SlangProjectCacheRecord {
         schema: value.get("schema")?.as_u64()?.try_into().ok()?,
         program: value.get("program")?.as_str()?.to_string(),
         runtime_version: value.get("runtime_version")?.as_str()?.to_string(),
-        manifest_path: json_path(&value, "manifest_path")?,
+        manifest_path: json_path(value, "manifest_path")?,
+        manifest_sha256: value.get("manifest_sha256")?.as_str()?.to_string(),
         top: match value.get("top")? {
             serde_json::Value::Null => None,
             serde_json::Value::String(top) => Some(top.to_string()),
             _ => return None,
         },
-        include_directories: json_path_array(&value, "include_directories")?,
-        defines: json_string_array_value(&value, "defines")?,
-        undefines: json_string_array_value(&value, "undefines")?,
-        library_directories: json_path_array(&value, "library_directories")?,
-        library_extensions: json_string_array_value(&value, "library_extensions")?,
-        roots: json_file_records(&value, "roots")?,
-        dependencies: json_file_records(&value, "dependencies")?,
-        library_inventory: json_library_inventory(&value, "library_inventory")?,
+        include_directories: json_path_array(value, "include_directories")?,
+        defines: json_string_array_value(value, "defines")?,
+        undefines: json_string_array_value(value, "undefines")?,
+        library_directories: json_path_array(value, "library_directories")?,
+        library_extensions: json_string_array_value(value, "library_extensions")?,
+        roots: json_file_records(value, "roots")?,
+        dependencies: json_file_records(value, "dependencies")?,
+        library_inventory: json_library_inventory(value, "library_inventory")?,
         ast_sha256: value.get("ast_sha256")?.as_str()?.to_string(),
     })
 }
@@ -549,6 +583,8 @@ fn project_cache_record_matches(
         && record.program == program
         && record.runtime_version == runtime_version
         && record.manifest_path == canonical_path(manifest_path)
+        && project_file_record(manifest_path)
+            .is_ok_and(|manifest| manifest.sha256 == record.manifest_sha256)
         && record.top == manifest.top
         && record.include_directories == canonical_paths(&manifest.include_directories)
         && record.defines == manifest.defines
@@ -601,6 +637,172 @@ fn save_project_cache(
         &project_cache_record_json(record),
     )?;
     atomic_write(&directory.join("ast.json"), ast)
+}
+
+impl SlangProjectDependencyDatabase {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self {
+                path: path.to_path_buf(),
+                schema: SLANG_PROJECT_DATABASE_SCHEMA,
+                projects: BTreeMap::new(),
+            });
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read project database {}: {error}", path.display()))?;
+        let value = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| format!("invalid project database {}: {error}", path.display()))?;
+        let schema = value
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|schema| u32::try_from(schema).ok())
+            .ok_or_else(|| format!("project database {} has no valid schema", path.display()))?;
+        if schema != SLANG_PROJECT_DATABASE_SCHEMA {
+            return Err(format!(
+                "unsupported project database schema {schema} in {}; expected {SLANG_PROJECT_DATABASE_SCHEMA}",
+                path.display()
+            ));
+        }
+        let entries = value
+            .get("projects")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("project database {} has no projects array", path.display()))?;
+        let mut projects = BTreeMap::new();
+        for entry in entries {
+            let record = parse_project_cache_record(entry).ok_or_else(|| {
+                format!(
+                    "project database {} contains an invalid project record",
+                    path.display()
+                )
+            })?;
+            if record.schema != SLANG_PROJECT_CACHE_SCHEMA {
+                return Err(format!(
+                    "project database {} contains project cache schema {}; expected {SLANG_PROJECT_CACHE_SCHEMA}",
+                    path.display(),
+                    record.schema
+                ));
+            }
+            projects.insert(record.manifest_path.clone(), record);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            schema,
+            projects,
+        })
+    }
+
+    pub fn record_project_cache(&mut self, cache_directory: &Path) -> Result<(), String> {
+        let record =
+            load_project_cache_record(&cache_directory.join("record.json")).ok_or_else(|| {
+                format!(
+                    "project cache {} has no valid record.json",
+                    cache_directory.display()
+                )
+            })?;
+        if record.schema != SLANG_PROJECT_CACHE_SCHEMA {
+            return Err(format!(
+                "project cache schema {} does not match supported schema {SLANG_PROJECT_CACHE_SCHEMA}",
+                record.schema
+            ));
+        }
+        let ast = std::fs::read_to_string(cache_directory.join("ast.json")).map_err(|error| {
+            format!(
+                "cannot read project AST {}: {error}",
+                cache_directory.join("ast.json").display()
+            )
+        })?;
+        if sha256_hex(ast.as_bytes()) != record.ast_sha256 {
+            return Err(format!(
+                "project AST checksum mismatch in {}",
+                cache_directory.display()
+            ));
+        }
+        self.projects.insert(record.manifest_path.clone(), record);
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let projects = self
+            .projects
+            .values()
+            .map(|record| {
+                serde_json::from_str::<serde_json::Value>(&project_cache_record_json(record))
+                    .map_err(|error| format!("cannot serialize project record: {error}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let text = serde_json::json!({
+            "schema": self.schema,
+            "projects": projects,
+        })
+        .to_string();
+        atomic_write(&self.path, &text)
+    }
+
+    pub fn project_manifests(&self) -> Vec<PathBuf> {
+        self.projects.keys().cloned().collect()
+    }
+
+    pub fn partial_recompilation_plan(&self) -> SlangPartialRecompilationPlan {
+        let mut clean_projects = Vec::new();
+        let mut dirty_projects = Vec::new();
+        let mut changed_files = BTreeSet::new();
+        let mut missing_files = BTreeSet::new();
+        for record in self.projects.values() {
+            let mut dirty = false;
+            for file in record.roots.iter().chain(record.dependencies.iter()) {
+                match project_file_record(&file.path) {
+                    Ok(current) => {
+                        if current.sha256 != file.sha256 {
+                            changed_files.insert(file.path.clone());
+                            dirty = true;
+                        }
+                    }
+                    Err(_) => {
+                        missing_files.insert(file.path.clone());
+                        dirty = true;
+                    }
+                }
+            }
+            let current_inventory = project_library_inventory(&record.library_directories);
+            if current_inventory != record.library_inventory {
+                dirty = true;
+            }
+            if project_file_record(&record.manifest_path)
+                .map(|manifest| manifest.sha256 != record.manifest_sha256)
+                .unwrap_or(true)
+            {
+                changed_files.insert(record.manifest_path.clone());
+                dirty = true;
+            }
+            if dirty {
+                dirty_projects.push(record.manifest_path.clone());
+            } else {
+                clean_projects.push(record.manifest_path.clone());
+            }
+        }
+        SlangPartialRecompilationPlan {
+            clean_projects,
+            dirty_projects,
+            changed_files: changed_files.into_iter().collect(),
+            missing_files: missing_files.into_iter().collect(),
+        }
+    }
+
+    pub fn reverse_dependencies(&self) -> Vec<SlangReverseDependency> {
+        let mut dependencies = BTreeMap::new();
+        for record in self.projects.values() {
+            for file in record.roots.iter().chain(record.dependencies.iter()) {
+                dependencies
+                    .entry(file.path.clone())
+                    .or_insert_with(Vec::new)
+                    .push(record.manifest_path.clone());
+            }
+        }
+        dependencies
+            .into_iter()
+            .map(|(file, projects)| SlangReverseDependency { file, projects })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1179,6 +1381,7 @@ impl SlangFrontend {
                 program,
                 runtime_version,
                 manifest_path: canonical_path(manifest_path),
+                manifest_sha256: project_file_record(manifest_path)?.sha256,
                 top: manifest.top.clone(),
                 include_directories: canonical_paths(&manifest.include_directories),
                 defines: manifest.defines.clone(),
@@ -1196,6 +1399,28 @@ impl SlangFrontend {
             design,
             cache_hit: false,
         })
+    }
+
+    /// Compiles into a deterministic project cache slot and updates a shared database.
+    ///
+    /// The shared database stores fingerprints and reverse dependencies only;
+    /// AST bytes stay in the project's own cache directory. This allows many
+    /// project manifests to share one partial-recompilation index without
+    /// duplicating their ASTs.
+    pub fn compile_project_manifest_with_shared_cache(
+        &self,
+        manifest_path: &Path,
+        cache_root: &Path,
+        database_path: &Path,
+    ) -> Result<SlangCachedDesign, String> {
+        let manifest_key = sha256_hex(canonical_path(manifest_path).as_os_str().as_encoded_bytes());
+        let cache_directory = cache_root.join(format!("project-{manifest_key}"));
+        let cached =
+            self.compile_project_manifest_with_cache(manifest_path, Some(&cache_directory))?;
+        let mut database = SlangProjectDependencyDatabase::load(database_path)?;
+        database.record_project_cache(&cache_directory)?;
+        database.save()?;
+        Ok(cached)
     }
 
     /// Checks source with slang, preprocesses it, and lowers the result through
