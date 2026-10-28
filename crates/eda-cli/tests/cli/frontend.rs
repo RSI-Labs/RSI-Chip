@@ -261,8 +261,9 @@ endmodule
     );
     let policy = TempFile::new(
         "lint-policy.txt",
-        "waive UnusedName unused reviewed dead logic\nseverity WidthMismatch Error\n",
+        "waive UnusedName unused owner=reviewer expires=2030-01-31 reason=reviewed dead logic\nseverity WidthMismatch Error\n",
     );
+    let audit = TempFile::new("lint-audit.jsonl", "");
     let (success, output) = run_edu(&[
         "slang-info",
         input.path(),
@@ -270,6 +271,10 @@ endmodule
         "lint_policy",
         "--lint-policy",
         policy.path(),
+        "--lint-as-of",
+        "2030-01-01",
+        "--write-lint-audit",
+        audit.path(),
     ]);
     assert!(success, "unexpected CLI output: {output}");
     assert!(
@@ -281,8 +286,27 @@ endmodule
         "{output}"
     );
     assert!(
-        output.contains("Waived UnusedName: 'unused' reason: reviewed dead logic"),
+        output.contains(
+            "Waived UnusedName: 'unused' owner: reviewer expiration: 2030-01-31 reason: reviewed dead logic"
+        ),
         "{output}"
+    );
+    let audit_text = std::fs::read_to_string(audit.path()).expect("read lint audit");
+    assert!(
+        audit_text.starts_with(
+            "{\"action\":\"AuditHeader\",\"design\":\"lint_policy\",\"top\":\"lint_policy\",\"policy\":"
+        ),
+        "{audit_text}"
+    );
+    assert!(
+        audit_text.contains(
+            "\"owner\":\"reviewer\",\"expiration\":\"2030-01-31\",\"reason\":\"reviewed dead logic\""
+        ),
+        "{audit_text}"
+    );
+    assert!(
+        audit_text.contains("\"asOf\":\"2030-01-01\""),
+        "{audit_text}"
     );
 
     let missing_value = run_edu(&[
@@ -296,6 +320,50 @@ endmodule
         !missing_value.0,
         "missing policy path must fail: {}",
         missing_value.1
+    );
+
+    let missing_audit_value = run_edu(&[
+        "slang-info",
+        input.path(),
+        "--top",
+        "lint_policy",
+        "--write-lint-audit",
+    ]);
+    assert!(
+        !missing_audit_value.0,
+        "missing audit path must fail: {}",
+        missing_audit_value.1
+    );
+
+    let expired = run_edu(&[
+        "slang-info",
+        input.path(),
+        "--top",
+        "lint_policy",
+        "--lint-policy",
+        policy.path(),
+        "--lint-as-of",
+        "2030-02-01",
+    ]);
+    assert!(expired.0, "unexpected expired-waiver output: {}", expired.1);
+    assert!(
+        expired.1.contains("lint findings: 2") && !expired.1.contains("lint waived:"),
+        "{}",
+        expired.1
+    );
+
+    let invalid_date = run_edu(&[
+        "slang-info",
+        input.path(),
+        "--top",
+        "lint_policy",
+        "--lint-as-of",
+        "2030-02-30",
+    ]);
+    assert!(
+        !invalid_date.0,
+        "invalid lint as-of date must fail: {}",
+        invalid_date.1
     );
 }
 

@@ -1073,6 +1073,8 @@ impl LintSeverity {
 pub struct LintWaiver {
     pub rule: LintIssueKind,
     pub selector: String,
+    pub owner: String,
+    pub expiration: Option<String>,
     pub reason: String,
 }
 
@@ -1093,6 +1095,7 @@ pub struct LintPolicy {
     pub waivers: Vec<LintWaiver>,
     pub severities: std::collections::BTreeMap<LintIssueKind, LintSeverity>,
     pub disabled: std::collections::BTreeSet<LintIssueKind>,
+    pub as_of: Option<String>,
 }
 
 impl LintPolicy {
@@ -1108,6 +1111,21 @@ impl LintPolicy {
                 .next()
                 .ok_or_else(|| format!("line {}: empty policy command", index + 1))?;
             match command {
+                "as-of" => {
+                    let date = fields
+                        .next()
+                        .ok_or_else(|| format!("line {}: as-of requires a date", index + 1))?;
+                    if fields.next().is_some() {
+                        return Err(format!("line {}: as-of has trailing fields", index + 1));
+                    }
+                    if policy.as_of.is_some() {
+                        return Err(format!("line {}: as-of may only be set once", index + 1));
+                    }
+                    Self::validate_expiration(date).map_err(|error| {
+                        format!("line {}: invalid as-of date: {error}", index + 1)
+                    })?;
+                    policy.as_of = Some(date.to_string());
+                }
                 "waive" => {
                     let rule = fields
                         .next()
@@ -1115,7 +1133,43 @@ impl LintPolicy {
                     let selector = fields.next().ok_or_else(|| {
                         format!("line {}: waive requires a net selector", index + 1)
                     })?;
-                    let reason = fields.collect::<Vec<_>>().join(" ");
+                    let metadata = fields.collect::<Vec<_>>();
+                    let owner = metadata
+                        .first()
+                        .and_then(|value| value.strip_prefix("owner="))
+                        .filter(|owner| !owner.is_empty())
+                        .ok_or_else(|| {
+                            format!("line {}: waive requires owner=<owner-id>", index + 1)
+                        })?
+                        .to_string();
+                    let mut metadata_index = 1;
+                    let mut next = metadata.get(metadata_index).ok_or_else(|| {
+                        format!("line {}: waive requires reason=<text>", index + 1)
+                    })?;
+                    let mut expiration = None;
+                    if let Some(expiration_value) = next.strip_prefix("expires=") {
+                        Self::validate_expiration(expiration_value).map_err(|error| {
+                            format!("line {}: invalid waiver expiration: {error}", index + 1)
+                        })?;
+                        expiration = Some(expiration_value.to_string());
+                        metadata_index += 1;
+                        next = metadata.get(metadata_index).ok_or_else(|| {
+                            format!("line {}: waive requires reason=<text>", index + 1)
+                        })?;
+                    }
+                    let reason_first = next
+                        .strip_prefix("reason=")
+                        .ok_or_else(|| format!("line {}: waive requires reason=<text>", index + 1))?
+                        .to_string();
+                    let mut reason_parts = vec![reason_first];
+                    reason_parts.extend(
+                        metadata
+                            .get(metadata_index + 1..)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|part| (*part).to_string()),
+                    );
+                    let reason = reason_parts.join(" ");
                     if reason.is_empty() {
                         return Err(format!("line {}: waive requires a reason", index + 1));
                     }
@@ -1123,6 +1177,8 @@ impl LintPolicy {
                         rule: LintIssueKind::parse_rule(rule)
                             .map_err(|error| format!("line {}: {error}", index + 1))?,
                         selector: selector.to_string(),
+                        owner,
+                        expiration,
                         reason,
                     });
                 }
@@ -1174,15 +1230,37 @@ impl LintPolicy {
             .unwrap_or(LintSeverity::Warning)
     }
 
+    pub fn with_as_of(mut self, date: &str) -> Result<Self, String> {
+        Self::validate_expiration(date).map_err(|error| format!("invalid as-of date: {error}"))?;
+        self.as_of = Some(date.to_string());
+        Ok(self)
+    }
+
     pub fn apply(&self, issues: Vec<LintIssue>) -> LintReport {
-        let mut report = LintReport::default();
+        let mut report = LintReport {
+            as_of: self.as_of.clone(),
+            ..Default::default()
+        };
         for issue in issues {
             if self.disabled.contains(&issue.kind) {
                 continue;
             }
-            if let Some(waiver) = self.waivers.iter().find(|waiver| waiver.matches(&issue)) {
+            let waiver_expired = |waiver: &LintWaiver| {
+                waiver
+                    .expiration
+                    .as_deref()
+                    .zip(self.as_of.as_deref())
+                    .is_some_and(|(expiration, as_of)| expiration < as_of)
+            };
+            if let Some(waiver) = self
+                .waivers
+                .iter()
+                .find(|waiver| waiver.matches(&issue) && !waiver_expired(waiver))
+            {
                 report.waived.push(WaivedLintIssue {
                     issue,
+                    owner: waiver.owner.clone(),
+                    expiration: waiver.expiration.clone(),
                     reason: waiver.reason.clone(),
                 });
                 continue;
@@ -1192,6 +1270,70 @@ impl LintPolicy {
         }
         report
     }
+
+    fn validate_expiration(value: &str) -> Result<(), String> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+            return Err("expected YYYY-MM-DD".into());
+        }
+        let digit = |slice: &[u8]| {
+            slice.iter().all(|byte| byte.is_ascii_digit()).then(|| {
+                slice
+                    .iter()
+                    .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0'))
+            })
+        };
+        let Some(year) = digit(&bytes[0..4]) else {
+            return Err("year must contain four digits".into());
+        };
+        let Some(month) = digit(&bytes[5..7]) else {
+            return Err("month must contain two digits".into());
+        };
+        let Some(day) = digit(&bytes[8..10]) else {
+            return Err("day must contain two digits".into());
+        };
+        if !(1..=12).contains(&month) {
+            return Err("month must be in 01..=12".into());
+        }
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let maximum_day = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => unreachable!(),
+        };
+        if !(1..=maximum_day).contains(&day) {
+            return Err(format!("day must be in 01..={maximum_day}"));
+        }
+        Ok(())
+    }
+}
+
+fn lint_json_string(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                output.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn lint_json_optional_string(value: Option<&str>) -> String {
+    value.map(lint_json_string).unwrap_or_else(|| "null".into())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1209,6 +1351,8 @@ impl ActiveLintIssue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WaivedLintIssue {
     pub issue: LintIssue,
+    pub owner: String,
+    pub expiration: Option<String>,
     pub reason: String,
 }
 
@@ -1216,6 +1360,51 @@ pub struct WaivedLintIssue {
 pub struct LintReport {
     pub active: Vec<ActiveLintIssue>,
     pub waived: Vec<WaivedLintIssue>,
+    pub as_of: Option<String>,
+}
+
+impl LintReport {
+    pub fn audit_json_lines(
+        &self,
+        design_name: &str,
+        top: Option<&str>,
+        policy_path: Option<&str>,
+    ) -> String {
+        let severity = |severity: LintSeverity| match severity {
+            LintSeverity::Error => "Error",
+            LintSeverity::Warning => "Warning",
+            LintSeverity::Info => "Info",
+        };
+        let rule = |rule: LintIssueKind| format!("{rule:?}");
+        let mut lines = vec![format!(
+            "{{\"action\":\"AuditHeader\",\"design\":{},\"top\":{},\"policy\":{},\"asOf\":{}}}",
+            lint_json_string(design_name),
+            lint_json_optional_string(top),
+            lint_json_optional_string(policy_path),
+            lint_json_optional_string(self.as_of.as_deref()),
+        )];
+        for active in &self.active {
+            lines.push(format!(
+                "{{\"action\":\"Active\",\"rule\":{},\"net\":{},\"count\":{},\"severity\":\"{}\",\"owner\":null,\"expiration\":null,\"reason\":null}}",
+                lint_json_string(&rule(active.issue.kind)),
+                lint_json_string(&active.issue.net),
+                active.issue.count,
+                severity(active.severity),
+            ));
+        }
+        for waived in &self.waived {
+            lines.push(format!(
+                "{{\"action\":\"Waived\",\"rule\":{},\"net\":{},\"count\":{},\"severity\":\"PolicyWaiver\",\"owner\":{},\"expiration\":{},\"reason\":{}}}",
+                lint_json_string(&rule(waived.issue.kind)),
+                lint_json_string(&waived.issue.net),
+                waived.issue.count,
+                lint_json_string(&waived.owner),
+                lint_json_optional_string(waived.expiration.as_deref()),
+                lint_json_string(&waived.reason),
+            ));
+        }
+        lines.join("\n") + "\n"
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3024,8 +3213,9 @@ mod tests {
         let policy = LintPolicy::parse(
             [
                 "# Reviewed frontend exceptions",
-                "waive UnusedName unused reviewed dead logic",
-                "waive SignednessMismatch child.* intentional port conversion",
+                "as-of 2030-01-01",
+                "waive UnusedName unused owner=reviewer expires=2030-01-31 reason=reviewed dead logic",
+                "waive SignednessMismatch child.* owner=verification reason=intentional port conversion",
                 "severity WidthMismatch Error",
                 "disable LatchRisk",
             ]
@@ -3064,18 +3254,59 @@ mod tests {
             vec![
                 WaivedLintIssue {
                     issue: issue(LintIssueKind::UnusedName, "unused"),
+                    owner: "reviewer".into(),
+                    expiration: Some("2030-01-31".into()),
                     reason: "reviewed dead logic".into(),
                 },
                 WaivedLintIssue {
                     issue: issue(LintIssueKind::SignednessMismatch, "child.x"),
+                    owner: "verification".into(),
+                    expiration: None,
                     reason: "intentional port conversion".into(),
                 },
             ]
         );
 
-        let error = LintPolicy::parse("waive UnknownRule net reason")
+        let error = LintPolicy::parse("waive UnknownRule net owner=reviewer reason=invalid")
             .expect_err("unknown rules must fail closed");
         assert!(error.contains("unknown lint rule"), "{error}");
+        let expiration = LintPolicy::parse(
+            "waive UnusedName unused owner=reviewer expires=2030-02-30 reason=bad date",
+        )
+        .expect_err("invalid expiration must fail closed");
+        assert!(
+            expiration.contains("invalid waiver expiration"),
+            "{expiration}"
+        );
+        let audit = report.audit_json_lines(
+            "signedness_mismatch",
+            Some("signedness_mismatch"),
+            Some("lint-policy.txt"),
+        );
+        assert!(
+            audit.starts_with(
+                "{\"action\":\"AuditHeader\",\"design\":\"signedness_mismatch\",\"top\":\"signedness_mismatch\",\"policy\":\"lint-policy.txt\",\"asOf\":\"2030-01-01\"}"
+            ),
+            "{audit}"
+        );
+        let expired = policy
+            .with_as_of("2030-02-01")
+            .expect("update lint as-of date");
+        let expired_report = expired.apply(vec![issue(LintIssueKind::UnusedName, "unused")]);
+        assert_eq!(
+            expired_report.active,
+            vec![ActiveLintIssue {
+                issue: issue(LintIssueKind::UnusedName, "unused"),
+                severity: LintSeverity::Warning,
+            }]
+        );
+        assert!(expired_report.waived.is_empty());
+        assert!(
+            audit.contains(
+                "\"owner\":\"reviewer\",\"expiration\":\"2030-01-31\",\"reason\":\"reviewed dead logic\""
+            ),
+            "{audit}"
+        );
     }
 
     #[test]

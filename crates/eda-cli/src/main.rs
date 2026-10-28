@@ -31,8 +31,10 @@
 //! hierarchy metadata is available.
 //! Hold paths: `--hold-paths <count>` appends min-delay path details.
 //! Async reset: `--reset-paths <count>` appends recovery/removal paths.
-//! RTL lint policy: `slang-info --lint-policy <file>` applies waiver,
-//! disable, and severity directives with recorded waiver reasons.
+//! RTL lint policy: `slang-info --lint-policy <file>` applies owner/expiry/reason
+//! waivers, disable, and severity directives; `--lint-as-of <date>` expires
+//! dated waivers reproducibly, and `--write-lint-audit <file>` emits persistent
+//! JSONL active/waived audit evidence.
 //! Timing waivers: `--waivers <file>` filters timing violations and
 //! `--waiver-audit <file>` restores audited waiver lifecycle state.
 //! Waiver export: `--write-waivers` and `--write-waiver-audit` serialize the
@@ -154,6 +156,32 @@ fn main() -> ExitCode {
             } else {
                 None
             };
+        let lint_audit_path = if let Some(index) = args
+            .iter()
+            .position(|argument| argument == "--write-lint-audit")
+        {
+            match args.get(index + 1) {
+                Some(path) => Some(path.clone()),
+                None => {
+                    eprintln!("error: --write-lint-audit requires an output file");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            None
+        };
+        let lint_as_of =
+            if let Some(index) = args.iter().position(|argument| argument == "--lint-as-of") {
+                match args.get(index + 1) {
+                    Some(date) => Some(date.clone()),
+                    None => {
+                        eprintln!("error: --lint-as-of requires a YYYY-MM-DD date");
+                        return ExitCode::from(2);
+                    }
+                }
+            } else {
+                None
+            };
         let lint_policy = match policy_path.as_deref().map(std::fs::read_to_string) {
             Some(Ok(text)) => match eda_core::ir::LintPolicy::parse(&text) {
                 Ok(policy) => policy,
@@ -175,6 +203,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             None => eda_core::ir::LintPolicy::default(),
+        };
+        let lint_policy = match lint_as_of.as_deref() {
+            Some(date) => match lint_policy.with_as_of(date) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    eprintln!("error: invalid --lint-as-of value: {error}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => lint_policy,
         };
         return match eda_slang::SlangFrontend::discover() {
             Ok(frontend) => match frontend.compile_files(
@@ -246,9 +284,27 @@ fn main() -> ExitCode {
                     }
                     for waived in &lint_report.waived {
                         println!(
-                            "    Waived {:?}: '{}' reason: {}",
-                            waived.issue.kind, waived.issue.net, waived.reason
+                            "    Waived {:?}: '{}' owner: {} expiration: {} reason: {}",
+                            waived.issue.kind,
+                            waived.issue.net,
+                            waived.owner,
+                            waived.expiration.as_deref().unwrap_or("none"),
+                            waived.reason
                         );
+                    }
+                    if let Some(path) = lint_audit_path.as_deref() {
+                        let audit = lint_report.audit_json_lines(
+                            &design.name,
+                            top.as_deref(),
+                            policy_path.as_deref(),
+                        );
+                        match std::fs::write(path, audit) {
+                            Ok(()) => println!("  lint audit: {path}"),
+                            Err(error) => {
+                                eprintln!("error: cannot write lint audit {path}: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
                     }
                     ExitCode::SUCCESS
                 }
