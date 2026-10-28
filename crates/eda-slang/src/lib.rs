@@ -368,6 +368,14 @@ struct SlangCompilationUnitRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SlangUnitArtifactRecord {
+    name: String,
+    source_path: PathBuf,
+    file_name: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SlangProjectCacheRecord {
     schema: u32,
     program: String,
@@ -383,11 +391,12 @@ struct SlangProjectCacheRecord {
     roots: Vec<SlangProjectFileRecord>,
     dependencies: Vec<SlangProjectFileRecord>,
     compilation_units: Vec<SlangCompilationUnitRecord>,
+    unit_artifacts: Vec<SlangUnitArtifactRecord>,
     library_inventory: Vec<(PathBuf, Vec<PathBuf>)>,
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 4;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 5;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
 
 fn parse_path_array(
@@ -521,6 +530,99 @@ fn collect_instance_dependencies(
     }
 }
 
+fn project_unit_artifacts(
+    ast: &str,
+    units: &[SlangCompilationUnitRecord],
+) -> Option<Vec<(SlangUnitArtifactRecord, String)>> {
+    let document = serde_json::from_str::<serde_json::Value>(ast).ok()?;
+    let definitions = document.get("definitions")?.as_array()?;
+    let mut artifacts = Vec::with_capacity(units.len());
+    for unit in units {
+        let definition = definitions.iter().find(|definition| {
+            definition.get("name").and_then(serde_json::Value::as_str) == Some(unit.name.as_str())
+        })?;
+        let mut body = find_definition_body(&document, &unit.name)?;
+        prune_nested_instance_bodies(&mut body);
+        let artifact = serde_json::json!({
+            "schema": 1,
+            "name": unit.name,
+            "kind": unit.kind,
+            "source_path": unit.source_path,
+            "source_sha256": unit.sha256,
+            "depends_on": unit.depends_on,
+            "definition": definition,
+            "body": body,
+        })
+        .to_string();
+        let artifact_key = format!("{}\0{}", unit.name, unit.source_path.display());
+        let file_name = format!("unit-{}.json", sha256_hex(artifact_key.as_bytes()));
+        artifacts.push((
+            SlangUnitArtifactRecord {
+                name: unit.name.clone(),
+                source_path: unit.source_path.clone(),
+                file_name,
+                sha256: sha256_hex(artifact.as_bytes()),
+            },
+            artifact,
+        ));
+    }
+    Some(artifacts)
+}
+
+fn find_definition_body(
+    value: &serde_json::Value,
+    definition_name: &str,
+) -> Option<serde_json::Value> {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("InstanceBody") {
+            let body_name = string_field(value, "name");
+            let definition = value
+                .get("definition")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|definition| definition.split_whitespace().last());
+            if body_name.as_deref() == Some(definition_name) || definition == Some(definition_name)
+            {
+                return Some(value.clone());
+            }
+        }
+        for nested in fields.values() {
+            if let Some(body) = find_definition_body(nested, definition_name) {
+                return Some(body);
+            }
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            if let Some(body) = find_definition_body(nested, definition_name) {
+                return Some(body);
+            }
+        }
+    }
+    None
+}
+
+fn prune_nested_instance_bodies(value: &mut serde_json::Value) {
+    let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
+    let Some(fields) = value.as_object_mut() else {
+        return;
+    };
+    if is_instance {
+        if let Some(body) = fields.get_mut("body") {
+            let metadata = serde_json::json!({
+                "name": body.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                "kind": body.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                "definition": body
+                    .get("definition")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            *body = metadata;
+        }
+    }
+    for nested in fields.values_mut() {
+        prune_nested_instance_bodies(nested);
+    }
+}
+
 fn canonical_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().map(|path| canonical_path(path)).collect()
 }
@@ -568,6 +670,12 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
             "source_path": unit.source_path,
             "sha256": unit.sha256,
             "depends_on": unit.depends_on,
+        })).collect::<Vec<_>>(),
+        "unit_artifacts": record.unit_artifacts.iter().map(|artifact| serde_json::json!({
+            "name": artifact.name,
+            "source_path": artifact.source_path,
+            "file_name": artifact.file_name,
+            "sha256": artifact.sha256,
         })).collect::<Vec<_>>(),
         "library_inventory": record.library_inventory.iter().map(|(directory, entries)| {
             serde_json::json!({"directory": directory, "entries": entries})
@@ -641,6 +749,25 @@ fn json_compilation_units(
         .collect()
 }
 
+fn json_unit_artifacts(
+    value: &serde_json::Value,
+    field: &str,
+) -> Option<Vec<SlangUnitArtifactRecord>> {
+    value
+        .get(field)?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some(SlangUnitArtifactRecord {
+                name: entry.get("name")?.as_str()?.to_string(),
+                source_path: json_path(entry, "source_path")?,
+                file_name: entry.get("file_name")?.as_str()?.to_string(),
+                sha256: entry.get("sha256")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn json_library_inventory(
     value: &serde_json::Value,
     field: &str,
@@ -684,6 +811,7 @@ fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectC
         roots: json_file_records(value, "roots")?,
         dependencies: json_file_records(value, "dependencies")?,
         compilation_units: json_compilation_units(value, "compilation_units")?,
+        unit_artifacts: json_unit_artifacts(value, "unit_artifacts")?,
         library_inventory: json_library_inventory(value, "library_inventory")?,
         ast_sha256: value.get("ast_sha256")?.as_str()?.to_string(),
     })
@@ -749,13 +877,41 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
 fn save_project_cache(
     directory: &Path,
     record: &SlangProjectCacheRecord,
+    unit_artifacts: &[(SlangUnitArtifactRecord, String)],
     ast: &str,
 ) -> Result<(), String> {
+    let unit_directory = directory.join("units");
+    for (artifact, contents) in unit_artifacts {
+        atomic_write(&unit_directory.join(&artifact.file_name), contents)?;
+    }
     atomic_write(
         &directory.join("record.json"),
         &project_cache_record_json(record),
     )?;
     atomic_write(&directory.join("ast.json"), ast)
+}
+
+fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCacheRecord) -> bool {
+    record.unit_artifacts.iter().all(|artifact| {
+        let path = directory.join("units").join(&artifact.file_name);
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        sha256_hex(contents.as_bytes()) == artifact.sha256
+            && serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|value| {
+                    let schema = value.get("schema")?.as_u64()?;
+                    let name = value.get("name")?.as_str()?;
+                    let source_path = value.get("source_path")?.as_str()?;
+                    Some(
+                        schema == 1
+                            && name == artifact.name
+                            && Path::new(source_path) == artifact.source_path,
+                    )
+                })
+                .unwrap_or(false)
+    }) && record.unit_artifacts.len() == record.compilation_units.len()
 }
 
 impl SlangProjectDependencyDatabase {
@@ -1505,6 +1661,7 @@ impl SlangFrontend {
                     {
                         if project_compilation_units(&ast).as_ref()
                             == Some(&record.compilation_units)
+                            && project_unit_artifacts_are_valid(cache_directory, &record)
                         {
                             if let Ok(design) = self.lower_ast_json(&ast) {
                                 return Ok(SlangCachedDesign {
@@ -1560,6 +1717,18 @@ impl SlangFrontend {
                     cache_hit: false,
                 });
             };
+            let Some(unit_artifacts_with_contents) =
+                project_unit_artifacts(&ast, &compilation_units)
+            else {
+                return Ok(SlangCachedDesign {
+                    design,
+                    cache_hit: false,
+                });
+            };
+            let unit_artifacts = unit_artifacts_with_contents
+                .iter()
+                .map(|(artifact, _)| artifact.clone())
+                .collect::<Vec<_>>();
             let record = SlangProjectCacheRecord {
                 schema: SLANG_PROJECT_CACHE_SCHEMA,
                 program,
@@ -1575,10 +1744,16 @@ impl SlangFrontend {
                 roots,
                 dependencies,
                 compilation_units,
+                unit_artifacts,
                 library_inventory,
                 ast_sha256: sha256_hex(ast.as_bytes()),
             };
-            save_project_cache(cache_directory, &record, &ast)?;
+            save_project_cache(
+                cache_directory,
+                &record,
+                &unit_artifacts_with_contents,
+                &ast,
+            )?;
         }
         Ok(SlangCachedDesign {
             design,

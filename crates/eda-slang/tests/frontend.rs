@@ -475,6 +475,32 @@ endmodule
     assert_eq!(first.design.name, "persistent_top");
     assert!(cache.join("record.json").is_file());
     assert!(cache.join("ast.json").is_file());
+    let unit_files = std::fs::read_dir(cache.join("units"))
+        .expect("persistent unit cache directory exists")
+        .map(|entry| entry.expect("read persistent unit artifact").path())
+        .collect::<Vec<_>>();
+    assert_eq!(unit_files.len(), 2, "{unit_files:?}");
+    let unit_names = unit_files
+        .iter()
+        .map(|path| {
+            let artifact = serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(path).expect("read persistent unit artifact"),
+            )
+            .expect("parse persistent unit artifact");
+            artifact
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .expect("persistent unit name")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unit_names,
+        std::collections::BTreeSet::from([
+            "persistent_child".to_string(),
+            "persistent_top".to_string(),
+        ])
+    );
 
     let second_frontend = discover_slang_for_tests().expect("rediscover pinned slang");
     let second = second_frontend
@@ -483,6 +509,16 @@ endmodule
     assert!(second.cache_hit);
     assert_eq!(second.design.name, first.design.name);
     assert_eq!(second.design.hierarchy.len(), first.design.hierarchy.len());
+
+    std::fs::write(&unit_files[0], r#"{"schema":1}"#).expect("corrupt persistent unit artifact");
+    let unit_recovered = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("recover from corrupted persistent unit artifact");
+    assert!(!unit_recovered.cache_hit);
+    let unit_repaired = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("compile after persistent unit artifact repair");
+    assert!(unit_repaired.cache_hit);
 
     std::fs::write(
         library.join("persistent_child.sv"),
