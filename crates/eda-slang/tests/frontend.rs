@@ -291,6 +291,85 @@ endmodule
 }
 
 #[test]
+fn slang_project_manifest_compiles_library_resolved_modules() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("project-manifest");
+    let library = root.join("lib");
+    std::fs::create_dir_all(&library).expect("create project library");
+    std::fs::write(
+        library.join("project_child.sv"),
+        r#"
+module project_child(input logic a, output logic y);
+assign y = a;
+endmodule
+"#,
+    )
+    .expect("write library module");
+    std::fs::write(
+        root.join("project_top.sv"),
+        r#"
+module project_top(input logic a, output logic y);
+project_child child(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write project top");
+    std::fs::write(
+        library.join("unused_helper.sv"),
+        r#"
+module unused_helper();
+endmodule
+"#,
+    )
+    .expect("write unselected library module");
+    let manifest_path = root.join("project.json");
+    std::fs::write(
+        &manifest_path,
+        r#"
+{
+  "top": "project_top",
+  "sources": ["project_top.sv"],
+  "library_directories": ["lib"],
+  "library_extensions": [".sv"]
+}
+"#,
+    )
+    .expect("write project manifest");
+
+    let design = slang
+        .compile_project_manifest(&manifest_path)
+        .expect("compile library-aware project manifest");
+    assert_eq!(design.name, "project_top");
+    assert_eq!(design.hierarchy.len(), 2);
+    assert!(
+        design
+            .hierarchy
+            .iter()
+            .any(|instance| instance.module == "project_child"),
+        "library child was not flattened: {:?}",
+        design
+            .hierarchy
+            .iter()
+            .map(|instance| instance.module.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let second = slang
+        .compile_project_manifest(&manifest_path)
+        .expect("repeat library-aware project compilation");
+    assert_eq!(second.hierarchy.len(), design.hierarchy.len());
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("library project cache statistics"),
+        eda_slang::SlangAstCacheStats::default(),
+        "library-resolved dependency contents are not tracked yet"
+    );
+}
+
+#[test]
 fn slang_ast_lowering_enforces_the_schema_contract() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -19043,6 +19122,8 @@ fn slang_directly_lowers_and_runs_a_minimal_class_derived_from_official_uvm() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-direct-{}-{}.sv",
@@ -19108,6 +19189,8 @@ fn slang_direct_run_test_bootstraps_a_minimal_official_uvm_class() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-run-test-{}-{}.sv",
@@ -19251,6 +19334,8 @@ fn slang_direct_run_test_executes_a_minimal_phase_schedule() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-phases-{}-{}.sv",
@@ -19355,6 +19440,8 @@ fn slang_direct_official_uvm_reports_literal_messages() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-{}-{}.sv",
@@ -19444,6 +19531,8 @@ fn slang_direct_official_uvm_queries_report_controls() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-query-{}-{}.sv",
@@ -19557,6 +19646,8 @@ fn slang_direct_official_uvm_report_hooks_can_suppress_messages() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-hooks-{}-{}.sv",
@@ -19655,6 +19746,8 @@ fn slang_direct_official_uvm_log_action_uses_default_stdout_suppression() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-log-action-{}-{}.sv",
@@ -19729,6 +19822,8 @@ fn slang_direct_official_uvm_report_catcher_can_catch_messages() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-catcher-{}-{}.sv",
@@ -19820,6 +19915,8 @@ fn slang_direct_official_uvm_report_catcher_modifies_messages() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-mod-{}-{}.sv",
@@ -19914,6 +20011,8 @@ fn slang_direct_official_uvm_report_catcher_scopes_to_context_object() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-scoped-report-catcher-{}-{}.sv",
@@ -20028,6 +20127,8 @@ fn slang_direct_official_uvm_report_catcher_delete_unregisters() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-catcher-delete-{}-{}.sv",
@@ -20114,6 +20215,8 @@ fn slang_direct_official_uvm_object_callbacks_execute_derived_methods() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-object-callback-{}-{}.sv",
@@ -20244,6 +20347,8 @@ fn slang_direct_official_uvm_typewide_callbacks_execute_for_matching_targets() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-typewide-callback-{}-{}.sv",
@@ -20332,6 +20437,8 @@ fn slang_direct_official_uvm_analysis_port_broadcasts_to_subscribers() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-analysis-port-{}-{}.sv",
@@ -20435,6 +20542,8 @@ fn slang_direct_official_uvm_analysis_export_cycles_fail_closed() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-analysis-cycle-{}-{}.sv",
@@ -20508,6 +20617,8 @@ fn slang_direct_official_uvm_tlm_fifo_try_operations_execute_in_order() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-fifo-{}-{}.sv",
@@ -20625,6 +20736,8 @@ fn slang_direct_official_uvm_tlm_fifo_expression_side_effects_fail_closed() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-fifo-expression-{}-{}.sv",
@@ -20692,6 +20805,8 @@ fn slang_direct_official_uvm_tlm_ports_route_to_bounded_fifos() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-ports-{}-{}.sv",
@@ -20797,6 +20912,8 @@ fn slang_direct_official_uvm_tlm_port_export_mismatches_fail_closed() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-port-mismatch-{}-{}.sv",
@@ -20868,6 +20985,8 @@ fn slang_direct_official_uvm_tlm_export_chains_route_to_fifos() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-export-chain-{}-{}.sv",
@@ -20974,6 +21093,8 @@ fn slang_direct_official_uvm_tlm_export_cycles_fail_closed() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-export-cycle-{}-{}.sv",
@@ -21050,6 +21171,8 @@ fn slang_direct_official_uvm_tlm_blocking_ports_handshake_through_fifo() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-tlm-blocking-{}-{}.sv",
@@ -21168,6 +21291,8 @@ fn slang_direct_official_uvm_sequence_sequencer_driver_handshake() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-sequence-{}-{}.sv",
@@ -21320,6 +21445,8 @@ fn slang_direct_official_uvm_integrated_phases_config_tlm_and_sequence() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-integrated-{}-{}.sv",
@@ -21524,6 +21651,8 @@ fn slang_direct_official_upstream_uvm_hello_fixture_compiles_and_runs() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let design = slang
         .compile_files(&[source, fixture], Some("top"), &options)
@@ -21572,6 +21701,8 @@ fn slang_direct_official_upstream_uvm_compatibility_fixture_compiles_with_versio
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let design = slang
         .compile_files(&[source, fixture], Some("test"), &options)
@@ -21624,6 +21755,8 @@ fn slang_direct_official_upstream_uvm_plusargs_fixture_executes_both_branches() 
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string(), "BAR".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let design = slang
         .compile_files(&[source, fixture], Some("top"), &options)
@@ -21717,6 +21850,8 @@ fn slang_direct_official_upstream_uvm_toolargs_fixture_executes_conjoined_plusar
             "BAR".to_string(),
         ],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let design = slang
         .compile_files(&[source, fixture], Some("top"), &options)
@@ -21799,6 +21934,8 @@ fn slang_direct_official_upstream_uvm_error_fixture_counts_three_errors() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let design = slang
         .compile_files(&[source, fixture], Some("top"), &options)
@@ -21871,6 +22008,8 @@ fn slang_direct_official_upstream_uvm_compile_failure_fixture_fails_closed() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let error = slang
         .compile_files(&[source, fixture], Some("top"), &options)
@@ -21897,6 +22036,8 @@ fn slang_direct_run_test_selects_classes_from_runtime_uvm_testname() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-runtime-selection-{}-{}.sv",
@@ -22025,6 +22166,8 @@ fn slang_direct_official_uvm_sequence_response_queue_reaches_depth_eight() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-response-queue-{}-{}.sv",
@@ -22183,6 +22326,8 @@ fn slang_direct_official_uvm_sequence_selects_response_by_transaction_id() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-selective-response-{}-{}.sv",
@@ -22342,6 +22487,8 @@ fn slang_direct_official_uvm_report_catcher_callback_mode_can_disable() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-catcher-mode-{}-{}.sv",
@@ -22427,6 +22574,8 @@ fn slang_direct_official_uvm_report_catcher_delete_by_name_unregisters() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-catcher-delete-by-name-{}-{}.sv",
@@ -22527,6 +22676,8 @@ fn slang_direct_official_uvm_report_count_exits_at_max() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-report-count-exit-{}-{}.sv",
@@ -22591,6 +22742,8 @@ fn slang_direct_run_test_fails_closed_on_undrained_objections() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-objection-{}-{}.sv",
@@ -22653,6 +22806,8 @@ fn slang_direct_run_test_waits_for_asynchronous_objection_drain() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-drain-{}-{}.sv",
@@ -22722,6 +22877,8 @@ fn slang_direct_run_test_honors_configured_objection_timeout() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-custom-timeout-{}-{}.sv",
@@ -22786,6 +22943,8 @@ fn slang_direct_config_db_sets_and_gets_literals() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-{}-{}.sv",
@@ -22910,6 +23069,8 @@ fn slang_direct_config_db_matches_wildcards_and_precedence() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-priority-{}-{}.sv",
@@ -23131,6 +23292,8 @@ fn slang_direct_resource_db_sets_and_reads_literals() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-resource-db-{}-{}.sv",
@@ -23628,6 +23791,8 @@ fn slang_direct_config_db_exists_checks_scoped_resources() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-exists-{}-{}.sv",
@@ -23747,6 +23912,8 @@ fn slang_direct_config_db_wait_modified_wakes_on_matching_set() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-wait-{}-{}.sv",
@@ -23840,6 +24007,8 @@ fn slang_direct_config_db_missing_entry_runs_the_failure_branch() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-missing-{}-{}.sv",
@@ -23928,6 +24097,8 @@ fn slang_direct_config_db_fails_closed_on_unsupported_forms() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let nonliteral = std::env::temp_dir().join(format!(
         "eda-official-uvm-config-db-nonliteral-{}-{}.sv",
@@ -24314,6 +24485,8 @@ fn slang_direct_run_test_applies_a_name_based_factory_override() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-factory-{}-{}.sv",
@@ -24391,6 +24564,8 @@ fn slang_direct_run_test_applies_a_factory_override_to_runtime_selection() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-runtime-factory-{}-{}.sv",
@@ -24482,6 +24657,8 @@ fn slang_direct_run_test_selects_a_package_class_from_runtime_uvm_testname() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-package-runtime-{}-{}.sv",
@@ -24568,6 +24745,8 @@ fn slang_direct_run_test_resolves_a_runtime_factory_type_alias() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-runtime-type-alias-{}-{}.sv",
@@ -24680,6 +24859,8 @@ fn slang_direct_run_test_applies_a_type_based_factory_override() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-type-factory-{}-{}.sv",
@@ -24800,6 +24981,8 @@ fn slang_direct_run_test_resolves_factory_type_aliases() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-type-alias-{}-{}.sv",
@@ -24889,6 +25072,8 @@ fn slang_direct_factory_creates_components_by_name() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-component-by-name-{}-{}.sv",
@@ -25008,6 +25193,8 @@ fn slang_direct_factory_creates_objects_by_name() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-object-by-name-{}-{}.sv",
@@ -25122,6 +25309,8 @@ fn slang_direct_factory_creates_components_and_objects_by_type() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-create-by-type-{}-{}.sv",
@@ -25285,6 +25474,8 @@ fn slang_direct_component_registry_applies_instance_overrides() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-instance-factory-{}-{}.sv",
@@ -25451,6 +25642,8 @@ fn slang_direct_component_registry_creates_a_component() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-create-component-{}-{}.sv",
@@ -25540,6 +25733,8 @@ fn slang_direct_component_registry_applies_factory_overrides() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-component-override-{}-{}.sv",
@@ -25645,6 +25840,8 @@ fn slang_direct_component_registry_preserves_component_names() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-component-name-{}-{}.sv",
@@ -25958,6 +26155,8 @@ fn slang_direct_component_registry_rejects_duplicate_child_names() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-duplicate-child-{}-{}.sv",
@@ -26036,6 +26235,8 @@ fn slang_direct_object_registry_applies_factory_overrides() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-object-override-{}-{}.sv",
@@ -26137,6 +26338,8 @@ fn slang_direct_run_test_rejects_incompatible_factory_override() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-bad-factory-{}-{}.sv",
@@ -26207,6 +26410,8 @@ fn slang_direct_run_test_tracks_objections_by_owner() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-owner-{}-{}.sv",
@@ -26278,6 +26483,8 @@ fn slang_direct_run_test_selects_objection_owners_by_runtime_identity() {
         include_directories: vec![root.join("src")],
         defines: vec!["UVM_NO_DPI".to_string()],
         undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
     };
     let wrapper = std::env::temp_dir().join(format!(
         "eda-official-uvm-runtime-owner-{}-{}.sv",

@@ -66,6 +66,8 @@ struct SlangAstCacheKey {
     include_directories: Vec<PathBuf>,
     defines: Vec<String>,
     undefines: Vec<String>,
+    library_directories: Vec<PathBuf>,
+    library_extensions: Vec<String>,
     scopes: Vec<String>,
     input: SlangAstCacheInput,
 }
@@ -153,6 +155,146 @@ pub struct PreprocessOptions {
     pub include_directories: Vec<PathBuf>,
     pub defines: Vec<String>,
     pub undefines: Vec<String>,
+    pub library_directories: Vec<PathBuf>,
+    pub library_extensions: Vec<String>,
+}
+
+impl PreprocessOptions {
+    fn uses_libraries(&self) -> bool {
+        !self.library_directories.is_empty() || !self.library_extensions.is_empty()
+    }
+}
+
+/// A fail-closed JSON project manifest for a small file-list/library subset.
+///
+/// Paths are interpreted relative to the manifest file. Unknown fields,
+/// heterogeneous arrays, empty paths, and extensions without a leading dot are
+/// rejected rather than silently ignored.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlangProjectManifest {
+    pub top: Option<String>,
+    pub sources: Vec<PathBuf>,
+    pub include_directories: Vec<PathBuf>,
+    pub defines: Vec<String>,
+    pub undefines: Vec<String>,
+    pub library_directories: Vec<PathBuf>,
+    pub library_extensions: Vec<String>,
+}
+
+impl SlangProjectManifest {
+    pub fn parse_file(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read project manifest {}: {error}", path.display()))?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        Self::parse(&text, base)
+    }
+
+    pub fn parse(text: &str, base_directory: &Path) -> Result<Self, String> {
+        let root = serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|error| format!("invalid project manifest JSON: {error}"))?;
+        let object = root
+            .as_object()
+            .ok_or("project manifest must be an object")?;
+        let mut manifest = Self::default();
+        let mut recognized = std::collections::BTreeSet::new();
+        for (name, value) in object {
+            match name.as_str() {
+                "top" => {
+                    manifest.top = match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(top) => Some(top.clone()),
+                        _ => return Err("project top must be a string or null".into()),
+                    };
+                    if manifest.top.as_deref() == Some("") {
+                        return Err("project top must not be empty".into());
+                    }
+                }
+                "sources" => manifest.sources = parse_path_array(value, base_directory, "sources")?,
+                "include_directories" => {
+                    manifest.include_directories =
+                        parse_path_array(value, base_directory, "include_directories")?
+                }
+                "defines" => manifest.defines = parse_string_array(value, "defines", false)?,
+                "undefines" => manifest.undefines = parse_string_array(value, "undefines", false)?,
+                "library_directories" => {
+                    manifest.library_directories =
+                        parse_path_array(value, base_directory, "library_directories")?
+                }
+                "library_extensions" => {
+                    manifest.library_extensions =
+                        parse_string_array(value, "library_extensions", true)?
+                }
+                other => return Err(format!("unknown project manifest field '{other}'")),
+            }
+            recognized.insert(name.clone());
+        }
+        if !recognized.contains("sources") || manifest.sources.is_empty() {
+            return Err("project manifest requires a nonempty sources array".into());
+        }
+        Ok(manifest)
+    }
+
+    pub fn preprocess_options(&self) -> PreprocessOptions {
+        PreprocessOptions {
+            include_directories: self.include_directories.clone(),
+            defines: self.defines.clone(),
+            undefines: self.undefines.clone(),
+            library_directories: self.library_directories.clone(),
+            library_extensions: self.library_extensions.clone(),
+        }
+    }
+}
+
+fn parse_path_array(
+    value: &serde_json::Value,
+    base_directory: &Path,
+    field: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| format!("{field} entries must be strings"))?;
+            if text.is_empty() {
+                return Err(format!("{field} entries must not be empty"));
+            }
+            let path = Path::new(text);
+            Ok(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base_directory.join(path)
+            })
+        })
+        .collect()
+}
+
+fn parse_string_array(
+    value: &serde_json::Value,
+    field: &str,
+    require_leading_dot: bool,
+) -> Result<Vec<String>, String> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| format!("{field} entries must be strings"))?;
+            if text.is_empty() {
+                return Err(format!("{field} entries must not be empty"));
+            }
+            if require_leading_dot && !text.starts_with('.') {
+                return Err(format!("{field} entries must begin with '.'"));
+            }
+            Ok(text.to_string())
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -384,6 +526,9 @@ impl SlangFrontend {
         scopes: &[String],
         options: &PreprocessOptions,
     ) -> Option<SlangAstCacheKey> {
+        if options.uses_libraries() {
+            return None;
+        }
         if options
             .defines
             .iter()
@@ -409,6 +554,8 @@ impl SlangFrontend {
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
             undefines: options.undefines.clone(),
+            library_directories: options.library_directories.clone(),
+            library_extensions: options.library_extensions.clone(),
             scopes: scopes.to_vec(),
             input: SlangAstCacheInput::NamedFiles(named_files),
         })
@@ -421,6 +568,9 @@ impl SlangFrontend {
         top: Option<&str>,
         options: &PreprocessOptions,
     ) -> Option<SlangAstCacheKey> {
+        if options.uses_libraries() {
+            return None;
+        }
         if options
             .defines
             .iter()
@@ -439,6 +589,8 @@ impl SlangFrontend {
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
             undefines: options.undefines.clone(),
+            library_directories: options.library_directories.clone(),
+            library_extensions: options.library_extensions.clone(),
             scopes: Vec::new(),
             input: SlangAstCacheInput::Source {
                 source: source.to_string(),
@@ -473,6 +625,21 @@ impl SlangFrontend {
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
         self.compile_files_via_ast(files, top, options)
+    }
+
+    /// Compiles a fail-closed JSON project manifest.
+    ///
+    /// Manifest paths are resolved before this call, and slang's library
+    /// search options are forwarded unchanged. Library-aware inputs currently
+    /// bypass the AST cache because automatic module resolution dependencies
+    /// are not yet tracked.
+    pub fn compile_project_manifest(&self, manifest_path: &Path) -> Result<Design, String> {
+        let manifest = SlangProjectManifest::parse_file(manifest_path)?;
+        self.compile_files(
+            &manifest.sources,
+            manifest.top.as_deref(),
+            &manifest.preprocess_options(),
+        )
     }
 
     /// Checks source with slang, preprocesses it, and lowers the result through
@@ -787,6 +954,12 @@ fn add_preprocessor_options(command: &mut Command, options: &PreprocessOptions) 
     }
     for undefine in &options.undefines {
         command.arg("-U").arg(undefine);
+    }
+    for directory in &options.library_directories {
+        command.arg("-y").arg(directory);
+    }
+    for extension in &options.library_extensions {
+        command.arg("-Y").arg(extension);
     }
 }
 
@@ -1103,6 +1276,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_manifest_parses_and_fails_closed() {
+        let manifest = SlangProjectManifest::parse(
+            r#"
+{
+  "top": "top",
+  "sources": ["rtl/top.sv", "/absolute/pkg.sv"],
+  "include_directories": ["include"],
+  "defines": ["FOO=1"],
+  "undefines": ["BAR"],
+  "library_directories": ["lib"],
+  "library_extensions": [".sv"]
+}
+"#,
+            Path::new("/project"),
+        )
+        .expect("parse valid project manifest");
+        assert_eq!(manifest.top.as_deref(), Some("top"));
+        assert_eq!(
+            manifest.sources,
+            vec![
+                Path::new("/project/rtl/top.sv"),
+                Path::new("/absolute/pkg.sv")
+            ]
+        );
+        assert_eq!(
+            manifest.include_directories,
+            vec![Path::new("/project/include")]
+        );
+        assert_eq!(
+            manifest.library_directories,
+            vec![Path::new("/project/lib")]
+        );
+        assert_eq!(manifest.defines, vec!["FOO=1"]);
+        assert_eq!(manifest.library_extensions, vec![".sv"]);
+
+        let error = SlangProjectManifest::parse(
+            r#"{"sources":["a.sv"],"unknown":1}"#,
+            Path::new("/project"),
+        )
+        .expect_err("unknown fields must fail closed");
+        assert!(error.contains("unknown project manifest field"), "{error}");
+        assert!(
+            SlangProjectManifest::parse(
+                r#"{"sources":["a.sv"],"library_extensions":["sv"]}"#,
+                Path::new("/project")
+            )
+            .is_err(),
+            "library extensions must begin with a dot"
+        );
+    }
+
+    #[test]
     fn literal_include_scanner_ignores_non_directives_and_rejects_macros() {
         let specs = literal_include_specs(
             r#"
@@ -1184,6 +1409,8 @@ string s = "`include string.svh";
             include_directories: Vec::new(),
             defines: Vec::new(),
             undefines: Vec::new(),
+            library_directories: Vec::new(),
+            library_extensions: Vec::new(),
             scopes: Vec::new(),
             input: SlangAstCacheInput::Source {
                 source: source.into(),
