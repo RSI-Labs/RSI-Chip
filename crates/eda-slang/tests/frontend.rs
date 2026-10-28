@@ -426,6 +426,101 @@ endmodule
 }
 
 #[test]
+fn slang_project_manifest_reuses_and_invalidates_persistent_cache() {
+    let Some(initial_frontend) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("persistent-project-cache");
+    let library = root.join("lib");
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&library).expect("create persistent project library");
+    std::fs::write(
+        library.join("persistent_child.sv"),
+        r#"
+module persistent_child(input logic a, output logic y);
+assign y = a;
+endmodule
+"#,
+    )
+    .expect("write persistent library child");
+    std::fs::write(
+        root.join("persistent_top.sv"),
+        r#"
+module persistent_top(input logic a, output logic y);
+persistent_child child(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write persistent top");
+    let manifest_path = root.join("project.json");
+    std::fs::write(
+        &manifest_path,
+        r#"
+{
+  "top": "persistent_top",
+  "sources": ["persistent_top.sv"],
+  "library_directories": ["lib"],
+  "library_extensions": [".sv"]
+}
+"#,
+    )
+    .expect("write persistent project manifest");
+
+    let first = initial_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("first persistent project compile");
+    assert!(!first.cache_hit);
+    assert_eq!(first.design.name, "persistent_top");
+    assert!(cache.join("record.json").is_file());
+    assert!(cache.join("ast.json").is_file());
+
+    let second_frontend = discover_slang_for_tests().expect("rediscover pinned slang");
+    let second = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("second persistent project compile");
+    assert!(second.cache_hit);
+    assert_eq!(second.design.name, first.design.name);
+    assert_eq!(second.design.hierarchy.len(), first.design.hierarchy.len());
+
+    std::fs::write(
+        library.join("persistent_child.sv"),
+        r#"
+module persistent_child(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("change selected persistent dependency");
+    let changed = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("compile persistent project after dependency changed");
+    assert!(!changed.cache_hit);
+
+    std::fs::write(cache.join("ast.json"), "{corrupted").expect("corrupt AST cache");
+    let recovered = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("recover from corrupted persistent AST");
+    assert!(!recovered.cache_hit);
+    let repaired = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("compile after persistent cache repair");
+    assert!(repaired.cache_hit);
+
+    std::fs::write(
+        library.join("new_persistent_candidate.sv"),
+        r#"
+module new_persistent_candidate();
+endmodule
+"#,
+    )
+    .expect("add persistent library candidate");
+    let inventory_changed = second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("compile after persistent library inventory changed");
+    assert!(!inventory_changed.cache_hit);
+}
+
+#[test]
 fn slang_ast_lowering_enforces_the_schema_contract() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
