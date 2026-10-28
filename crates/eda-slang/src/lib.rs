@@ -8,9 +8,11 @@
 //! that the downstream bounded elaborator cannot represent.
 
 use eda_core::ir::Design;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod ast_util;
@@ -35,10 +37,100 @@ pub use summary::{
 pub struct SlangFrontend {
     program: PathBuf,
     timeout: Duration,
+    ast_cache: Arc<Mutex<SlangAstCache>>,
 }
 
 const PINNED_SLANG_VERSION: &str = "slang version 12.0.535+54c19b53";
 const DEFAULT_SLANG_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_AST_CACHE_ENTRIES: usize = 4;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SlangSourceCacheKey {
+    program: String,
+    source: String,
+    top: Option<String>,
+    include_directories: Vec<PathBuf>,
+    defines: Vec<String>,
+    undefines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlangAstCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub insertions: u64,
+    pub evictions: u64,
+    pub entries: usize,
+}
+
+#[derive(Debug)]
+struct SlangAstCache {
+    capacity: usize,
+    entries: BTreeMap<SlangSourceCacheKey, Arc<String>>,
+    order: VecDeque<SlangSourceCacheKey>,
+    hits: u64,
+    misses: u64,
+    insertions: u64,
+    evictions: u64,
+}
+
+impl SlangAstCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            insertions: 0,
+            evictions: 0,
+        }
+    }
+
+    fn get(&mut self, key: &SlangSourceCacheKey) -> Option<Arc<String>> {
+        let result = self.entries.get(key).cloned();
+        if result.is_some() {
+            if let Some(index) = self.order.iter().position(|entry| entry == key) {
+                let entry = self.order.remove(index).expect("checked LRU entry exists");
+                self.order.push_back(entry);
+            }
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
+        result
+    }
+
+    fn insert(&mut self, key: SlangSourceCacheKey, value: Arc<String>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+            self.insertions += 1;
+        } else if let Some(index) = self.order.iter().position(|entry| *entry == key) {
+            let entry = self.order.remove(index).expect("checked LRU entry exists");
+            self.order.push_back(entry);
+        }
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+            self.evictions += 1;
+        }
+    }
+
+    fn stats(&self) -> SlangAstCacheStats {
+        SlangAstCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            insertions: self.insertions,
+            evictions: self.evictions,
+            entries: self.entries.len(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct PreprocessOptions {
@@ -83,6 +175,9 @@ impl SlangFrontend {
         let frontend = Self {
             program,
             timeout: timeout_from_env()?,
+            ast_cache: Arc::new(Mutex::new(SlangAstCache::new(
+                ast_cache_capacity_from_env()?
+            ))),
         };
         let version = frontend.version()?;
         if !frontend.version_matches(&version) {
@@ -117,6 +212,13 @@ impl SlangFrontend {
                 self.program.display()
             ))
         }
+    }
+
+    pub fn ast_cache_stats(&self) -> Result<SlangAstCacheStats, String> {
+        self.ast_cache
+            .lock()
+            .map(|cache| cache.stats())
+            .map_err(|_| "slang AST cache mutex poisoned".to_string())
     }
 
     fn version_matches(&self, version: &str) -> bool {
@@ -371,8 +473,57 @@ impl SlangFrontend {
         top: Option<&str>,
         options: &PreprocessOptions,
     ) -> Result<Design, String> {
+        let cacheable = options.include_directories.is_empty() && !source.contains("`include");
+        let cache_key = cacheable.then(|| SlangSourceCacheKey {
+            program: self.program.to_string_lossy().into_owned(),
+            source: source.to_string(),
+            top: top.map(str::to_string),
+            include_directories: options.include_directories.clone(),
+            defines: options.defines.clone(),
+            undefines: options.undefines.clone(),
+        });
+        let cached_ast = cache_key
+            .as_ref()
+            .map(|key| {
+                self.ast_cache
+                    .lock()
+                    .map(|mut cache| cache.get(key))
+                    .map_err(|_| "slang AST cache mutex poisoned".to_string())
+            })
+            .transpose()?
+            .flatten();
         let path = write_temporary_source(source)?;
-        let result = self.compile_files(std::slice::from_ref(&path), top, options);
+        let result = if let Some(json) = cached_ast {
+            self.lower_ast_json_with_interface_array_scopes(
+                &json,
+                std::slice::from_ref(&path),
+                top,
+                options,
+            )
+        } else {
+            let json = self
+                .ast_json_with_options(std::slice::from_ref(&path), top, &[], options)
+                .map_err(|error| error.to_string());
+            let json = match json {
+                Ok(json) => Arc::new(json),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+            };
+            if let Some(key) = cache_key {
+                self.ast_cache
+                    .lock()
+                    .map_err(|_| "slang AST cache mutex poisoned".to_string())?
+                    .insert(key, Arc::clone(&json));
+            }
+            self.lower_ast_json_with_interface_array_scopes(
+                &json,
+                std::slice::from_ref(&path),
+                top,
+                options,
+            )
+        };
         let _ = std::fs::remove_file(&path);
         result
     }
@@ -498,6 +649,18 @@ fn timeout_from_env() -> Result<Duration, String> {
     }
     Ok(Duration::from_secs(seconds))
 }
+
+fn ast_cache_capacity_from_env() -> Result<usize, String> {
+    let Some(value) = std::env::var_os("SLANG_AST_CACHE_ENTRIES") else {
+        return Ok(DEFAULT_AST_CACHE_ENTRIES);
+    };
+    let capacity = value
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|_| "SLANG_AST_CACHE_ENTRIES must be a nonnegative integer".to_string())?;
+    Ok(capacity)
+}
+
 fn add_preprocessor_options(command: &mut Command, options: &PreprocessOptions) {
     for directory in &options.include_directories {
         command.arg("-I").arg(directory);
@@ -595,10 +758,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ast_cache_is_bounded_and_least_recently_used() {
+        let key = |source: &str| SlangSourceCacheKey {
+            program: "slang".into(),
+            source: source.into(),
+            top: Some("top".into()),
+            include_directories: Vec::new(),
+            defines: Vec::new(),
+            undefines: Vec::new(),
+        };
+        let mut cache = SlangAstCache::new(2);
+        let first = key("first");
+        let second = key("second");
+        let third = key("third");
+
+        cache.insert(first.clone(), Arc::new("one".into()));
+        cache.insert(second.clone(), Arc::new("two".into()));
+        assert!(cache.get(&first).is_some());
+        cache.insert(third.clone(), Arc::new("three".into()));
+
+        assert!(cache.entries.contains_key(&first));
+        assert!(!cache.entries.contains_key(&second));
+        assert!(cache.entries.contains_key(&third));
+        assert_eq!(
+            cache.stats(),
+            SlangAstCacheStats {
+                hits: 1,
+                misses: 0,
+                insertions: 3,
+                evictions: 1,
+                entries: 2,
+            }
+        );
+    }
+
+    #[test]
     fn slang_version_matching_is_exact() {
         let frontend = SlangFrontend {
             program: PathBuf::from("slang"),
             timeout: DEFAULT_SLANG_TIMEOUT,
+            ast_cache: Arc::new(Mutex::new(SlangAstCache::new(DEFAULT_AST_CACHE_ENTRIES))),
         };
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53"));
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53\n"));
@@ -612,6 +811,7 @@ mod tests {
         let frontend = SlangFrontend {
             program: PathBuf::from("/bin/sleep"),
             timeout: Duration::from_millis(50),
+            ast_cache: Arc::new(Mutex::new(SlangAstCache::new(DEFAULT_AST_CACHE_ENTRIES))),
         };
         let mut command = Command::new("/bin/sleep");
         command.arg("30");

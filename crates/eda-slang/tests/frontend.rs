@@ -44,6 +44,86 @@ fn slang_discovery_requires_the_pinned_runtime_version() {
 }
 
 #[test]
+fn slang_compile_source_reuses_a_bounded_ast_cache() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let source = r#"
+module cached_top(output logic y);
+assign y = 1'b1;
+endmodule
+"#;
+
+    let first = slang
+        .compile_source(source, Some("cached_top"), &PreprocessOptions::default())
+        .expect("compile source for first AST cache miss");
+    let second = slang
+        .compile_source(source, Some("cached_top"), &PreprocessOptions::default())
+        .expect("compile source for first AST cache hit");
+    assert_eq!(first.name, second.name);
+    assert_eq!(first.n_nets, second.n_nets);
+    assert_eq!(first.assigns.len(), second.assigns.len());
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("read slang AST cache statistics"),
+        eda_slang::SlangAstCacheStats {
+            hits: 1,
+            misses: 1,
+            insertions: 1,
+            evictions: 0,
+            entries: 1,
+        }
+    );
+
+    let changed = source.replace("1'b1", "1'b0");
+    let third = slang
+        .compile_source(&changed, Some("cached_top"), &PreprocessOptions::default())
+        .expect("compile changed source for a new cache key");
+    assert_eq!(third.name, "cached_top");
+    assert_eq!(
+        slang
+            .ast_cache_stats()
+            .expect("read changed slang AST cache statistics")
+            .misses,
+        2
+    );
+
+    let include_root = temporary_directory("ast-cache-include-bypass");
+    let include_path = include_root.join("cached_value.svh");
+    std::fs::write(
+        &include_path,
+        r#"module cached_child(input logic a, output logic y);
+assign y = a;
+endmodule
+"#,
+    )
+    .expect("write cache include dependency");
+    let include_options = PreprocessOptions {
+        include_directories: vec![include_root],
+        ..PreprocessOptions::default()
+    };
+    let include_source = r#"
+`include "cached_value.svh"
+module cached_top(input logic a, output logic y);
+cached_child child(.a(a), .y(y));
+endmodule
+"#;
+    slang
+        .compile_source(include_source, Some("cached_top"), &include_options)
+        .expect("compile include-dependent source");
+    slang
+        .compile_source(include_source, Some("cached_top"), &include_options)
+        .expect("repeat include-dependent source without cache lookup");
+    let include_stats = slang
+        .ast_cache_stats()
+        .expect("read include-bypass cache statistics");
+    assert_eq!(include_stats.misses, 2);
+    assert_eq!(include_stats.hits, 1);
+    assert_eq!(include_stats.entries, 2);
+}
+
+#[test]
 fn slang_ast_lowering_enforces_the_schema_contract() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
