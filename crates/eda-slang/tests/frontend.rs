@@ -509,8 +509,25 @@ endmodule
     assert!(second.cache_hit);
     assert_eq!(second.design.name, first.design.name);
     assert_eq!(second.design.hierarchy.len(), first.design.hierarchy.len());
+    let artifact_design = second_frontend
+        .compile_project_unit_artifacts(&cache)
+        .expect("lower reconstructed unit-artifact AST");
+    assert_eq!(artifact_design.name, first.design.name);
+    assert_eq!(artifact_design.n_nets, first.design.n_nets);
+    assert_eq!(
+        artifact_design.hierarchy.len(),
+        first.design.hierarchy.len()
+    );
+    assert_eq!(artifact_design.assigns.len(), first.design.assigns.len());
 
     std::fs::write(&unit_files[0], r#"{"schema":1}"#).expect("corrupt persistent unit artifact");
+    let corrupt_artifact_error = second_frontend
+        .compile_project_unit_artifacts(&cache)
+        .expect_err("corrupt unit artifacts must not lower");
+    assert!(
+        corrupt_artifact_error.contains("unit artifact cache is invalid"),
+        "{corrupt_artifact_error}"
+    );
     let unit_recovered = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("recover from corrupted persistent unit artifact");
@@ -529,6 +546,13 @@ endmodule
 "#,
     )
     .expect("change selected persistent dependency");
+    let stale_error = second_frontend
+        .compile_project_unit_artifacts(&cache)
+        .expect_err("stale unit artifacts must not lower");
+    assert!(
+        stale_error.contains("stale for current project inputs"),
+        "{stale_error}"
+    );
     let changed = second_frontend
         .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
         .expect("compile persistent project after dependency changed");

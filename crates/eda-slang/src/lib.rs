@@ -914,6 +914,145 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
     }) && record.unit_artifacts.len() == record.compilation_units.len()
 }
 
+fn load_project_unit_artifacts(
+    directory: &Path,
+    record: &SlangProjectCacheRecord,
+) -> Option<Vec<serde_json::Value>> {
+    if !project_unit_artifacts_are_valid(directory, record) {
+        return None;
+    }
+    let mut artifacts = Vec::with_capacity(record.unit_artifacts.len());
+    for artifact in &record.unit_artifacts {
+        let path = directory.join("units").join(&artifact.file_name);
+        let text = std::fs::read_to_string(path).ok()?;
+        let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+        let dependencies = serde_json::Value::Array(
+            record
+                .compilation_units
+                .iter()
+                .find(|unit| unit.name == artifact.name)?
+                .depends_on
+                .iter()
+                .map(|name| serde_json::Value::String(name.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let unit_matches = record.compilation_units.iter().any(|unit| {
+            unit.name == artifact.name
+                && unit.source_path == artifact.source_path
+                && value
+                    .get("source_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(unit.sha256.as_str())
+                && value.get("depends_on") == Some(&dependencies)
+        });
+        if !unit_matches {
+            return None;
+        }
+        artifacts.push(value);
+    }
+    Some(artifacts)
+}
+
+fn reconstruct_ast_from_unit_artifacts(
+    record: &SlangProjectCacheRecord,
+    artifacts: &[serde_json::Value],
+) -> Option<String> {
+    let mut bodies = BTreeMap::new();
+    let mut definitions = BTreeMap::new();
+    for artifact in artifacts {
+        let name = artifact.get("name")?.as_str()?.to_string();
+        bodies.insert(name.clone(), artifact.get("body")?.clone());
+        definitions.insert(name, artifact.get("definition")?.clone());
+    }
+
+    let mut depended_on = BTreeSet::new();
+    for body in bodies.values() {
+        collect_definition_references(body, &mut depended_on);
+    }
+    let top_name = record.top.clone().or_else(|| {
+        let candidates = bodies
+            .keys()
+            .filter(|name| !depended_on.contains(*name))
+            .collect::<Vec<_>>();
+        (candidates.len() == 1).then(|| candidates[0].clone())
+    })?;
+    let definition = definitions.get(&top_name)?.clone();
+    let mut body = bodies.get(&top_name)?.clone();
+    splice_unit_bodies(&mut body, &bodies, &mut vec![top_name.clone()]).ok()?;
+    let root = serde_json::json!({
+        "name": top_name,
+        "kind": "Instance",
+        "source_file": definition.get("source_file").cloned().unwrap_or(serde_json::Value::Null),
+        "source_line": definition.get("source_line").cloned().unwrap_or(serde_json::Value::Null),
+        "source_column": definition.get("source_column").cloned().unwrap_or(serde_json::Value::Null),
+        "addr": definition.get("addr").cloned().unwrap_or(serde_json::Value::Null),
+        "body": body,
+        "connections": [],
+    });
+    Some(root.to_string())
+}
+
+fn collect_definition_references(value: &serde_json::Value, dependencies: &mut BTreeSet<String>) {
+    if let Some(fields) = value.as_object() {
+        if string_field(value, "kind").as_deref() == Some("Instance") {
+            if let Some(dependency) = value
+                .get("body")
+                .and_then(|body| body.get("definition"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|definition| definition.split_whitespace().last())
+            {
+                dependencies.insert(dependency.to_string());
+            }
+        }
+        for nested in fields.values() {
+            collect_definition_references(nested, dependencies);
+        }
+    } else if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_definition_references(nested, dependencies);
+        }
+    }
+}
+
+fn splice_unit_bodies(
+    value: &mut serde_json::Value,
+    bodies: &BTreeMap<String, serde_json::Value>,
+    stack: &mut Vec<String>,
+) -> Result<(), String> {
+    let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
+    let dependency = value
+        .get("body")
+        .and_then(|body| body.get("definition"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|definition| definition.split_whitespace().last())
+        .map(str::to_string);
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if is_instance {
+        if let Some(dependency) = dependency {
+            if stack.contains(&dependency) {
+                return Err(format!(
+                    "cycle in unit artifact dependency graph: {} -> {dependency}",
+                    stack.last().unwrap_or(&dependency)
+                ));
+            }
+            let mut nested_body = bodies
+                .get(&dependency)
+                .cloned()
+                .ok_or_else(|| format!("unit artifact cache is missing body '{dependency}'"))?;
+            stack.push(dependency);
+            splice_unit_bodies(&mut nested_body, bodies, stack)?;
+            stack.pop();
+            fields.insert("body".into(), nested_body);
+        }
+    }
+    for nested in fields.values_mut() {
+        splice_unit_bodies(nested, bodies, stack)?;
+    }
+    Ok(())
+}
+
 impl SlangProjectDependencyDatabase {
     pub fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
@@ -1759,6 +1898,44 @@ impl SlangFrontend {
             design,
             cache_hit: false,
         })
+    }
+
+    /// Reconstructs and lowers a design from persistent unit AST artifacts.
+    ///
+    /// This path does not read the full `ast.json`; it validates the project
+    /// record and current source fingerprints, then splices clean unit bodies
+    /// into the selected root. It is the first executable step toward unit-level
+    /// incremental relinking.
+    pub fn compile_project_unit_artifacts(&self, cache_directory: &Path) -> Result<Design, String> {
+        let record = load_project_cache_record(&cache_directory.join("record.json"))
+            .ok_or_else(|| "project cache has no valid record.json".to_string())?;
+        if record.schema != SLANG_PROJECT_CACHE_SCHEMA {
+            return Err(format!(
+                "project cache schema {} does not match supported schema {SLANG_PROJECT_CACHE_SCHEMA}",
+                record.schema
+            ));
+        }
+        let manifest = SlangProjectManifest::parse_file(&record.manifest_path)?;
+        let options = manifest.preprocess_options();
+        let roots = project_file_records(&manifest.sources)?;
+        let library_inventory = project_library_inventory(&options.library_directories);
+        let program = self.program.to_string_lossy().into_owned();
+        if !project_cache_record_matches(
+            &record,
+            &program,
+            PINNED_SLANG_VERSION,
+            &record.manifest_path,
+            &manifest,
+            &roots,
+            &library_inventory,
+        ) {
+            return Err("project unit artifacts are stale for current project inputs".into());
+        }
+        let artifacts = load_project_unit_artifacts(cache_directory, &record)
+            .ok_or_else(|| "project unit artifact cache is invalid".to_string())?;
+        let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts)
+            .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
+        self.lower_ast_json(&ast)
     }
 
     /// Compiles into a deterministic project cache slot and updates a shared database.
