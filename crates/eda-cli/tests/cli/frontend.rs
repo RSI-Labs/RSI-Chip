@@ -144,3 +144,41 @@ endmodule
         "{output}"
     );
 }
+
+#[test]
+fn slang_info_reports_assignment_width_mismatches() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "width-mismatch.sv",
+        r#"
+module width_mismatch(output [3:0] y, output [3:0] z);
+wire one_bit = 1'b1;
+assign y = one_bit;
+assign z = 4'b0000;
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "width_mismatch"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("WidthMismatch: 'y' destination/source widths differ by 3 bit(s)"),
+        "{output}"
+    );
+
+    let explicit = TempFile::new(
+        "explicit-width.sv",
+        r#"
+module explicit_width(output [3:0] y, input logic one_bit);
+assign y = 4'(one_bit);
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", explicit.path(), "--top", "explicit_width"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        !output.contains("WidthMismatch: 'y'"),
+        "explicit cast was reported as implicit: {output}"
+    );
+}

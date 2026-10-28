@@ -1023,6 +1023,7 @@ pub enum LintIssueKind {
     IncompleteCase,
     CombinationalLoop,
     MultipleContinuousDrivers,
+    WidthMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1035,6 +1036,12 @@ pub struct LintIssue {
 #[derive(Clone, Debug, Default)]
 pub struct Design {
     pub name: String,
+    /// Width changes observed before lowering normalized assignment context.
+    ///
+    /// Slang's AST makes implicit truncation/extension explicit with conversion
+    /// nodes. Once those nodes are lowered, the original source width is gone,
+    /// so direct lowering records the diagnostic here.
+    pub recorded_width_mismatches: Vec<LintIssue>,
     /// Canonical simulator tick precision as a decimal second exponent.
     pub time_scale: TimeScale,
     /// First-class top-level sparse-memory port contracts.
@@ -1803,6 +1810,43 @@ impl Design {
                     kind: LintIssueKind::MultipleContinuousDrivers,
                     net,
                     count: driver_count,
+                });
+        }
+        issues.into_values().collect()
+    }
+
+    /// Report continuous assignments whose destination and source widths differ.
+    ///
+    /// SystemVerilog defines implicit truncation and extension, but commercial
+    /// port and assignment reviews normally surface the size change explicitly.
+    /// This diagnostic reports the magnitude without changing execution semantics.
+    pub fn lint_width_mismatches(&self) -> Vec<LintIssue> {
+        let mut issues: std::collections::BTreeMap<String, LintIssue> = self
+            .recorded_width_mismatches
+            .iter()
+            .map(|issue| (issue.net.clone(), issue.clone()))
+            .collect();
+        for assignment in &self.assigns {
+            let destination_width = assignment.lv.range.width();
+            let source_width = assignment.e.width();
+            let difference = destination_width.abs_diff(source_width);
+            if difference == 0 {
+                continue;
+            }
+
+            let first_bit = lint_lvalue_bits(&assignment.lv)
+                .first()
+                .copied()
+                .unwrap_or(assignment.lv.net);
+            let bit_name = self.net_name(first_bit);
+            let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
+            issues
+                .entry(net.clone())
+                .and_modify(|issue| issue.count = issue.count.max(difference))
+                .or_insert(LintIssue {
+                    kind: LintIssueKind::WidthMismatch,
+                    net,
+                    count: difference,
                 });
         }
         issues.into_values().collect()
@@ -2659,6 +2703,52 @@ mod tests {
                 kind: LintIssueKind::MultipleContinuousDrivers,
                 net: "bus".into(),
                 count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn lint_reports_assignment_width_mismatches_only() {
+        let mut design = Design {
+            name: "widths".into(),
+            ..Default::default()
+        };
+        for name in ["narrow", "wide"] {
+            let base = design.n_nets;
+            design.net_decls.push(NetDecl {
+                name: name.into(),
+                width: 4,
+                is_reg: false,
+                is_signed: false,
+                base,
+            });
+            design.n_nets += 4;
+        }
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 0,
+                decl_width: 4,
+                range: Range::Span { msb: 3, lsb: 0 },
+            },
+            e: Expr::Const(LogicWord::from_u64(1, 1)),
+            delay: 0,
+        });
+        design.assigns.push(Assign {
+            lv: LValue {
+                net: 4,
+                decl_width: 4,
+                range: Range::Span { msb: 3, lsb: 0 },
+            },
+            e: Expr::Const(LogicWord::from_u64(4, 0)),
+            delay: 0,
+        });
+
+        assert_eq!(
+            design.lint_width_mismatches(),
+            vec![LintIssue {
+                kind: LintIssueKind::WidthMismatch,
+                net: "narrow".into(),
+                count: 3,
             }]
         );
     }

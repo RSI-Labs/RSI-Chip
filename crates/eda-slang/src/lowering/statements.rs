@@ -256,10 +256,72 @@ impl SlangAstLowerer {
             return Ok(());
         }
         let lv = self.lower_lvalue(left)?;
+        self.record_implicit_width_mismatch(&lv, right)?;
         let rhs = self.lower_expression(right)?;
         self.design
             .assigns
             .push(eda_core::ir::Assign { lv, e: rhs, delay });
+        Ok(())
+    }
+
+    fn record_implicit_width_mismatch(
+        &mut self,
+        lvalue: &eda_core::ir::LValue,
+        expression: &Value,
+    ) -> Result<(), String> {
+        if string_field(expression, "kind").as_deref() != Some("Conversion") {
+            return Ok(());
+        }
+        let Some(operand) = expression.get("operand") else {
+            return Ok(());
+        };
+
+        // slang gives an implicit assignment conversion the same source span as
+        // its operand. An explicit cast starts at the cast operator instead.
+        let implicit_conversion = [
+            "source_file_start",
+            "source_line_start",
+            "source_column_start",
+            "source_file_end",
+            "source_line_end",
+            "source_column_end",
+        ]
+        .iter()
+        .all(|field| expression.get(field) == operand.get(field));
+        if !implicit_conversion {
+            return Ok(());
+        }
+
+        let target_type = string_field(expression, "type").unwrap_or_default();
+        let source_type = string_field(operand, "type").unwrap_or_default();
+        let (target_shape, _, _) = self.net_type(&target_type)?;
+        let (source_shape, _, _) = self.net_type(&source_type)?;
+        let difference = target_shape.width.abs_diff(source_shape.width);
+        if difference == 0 {
+            return Ok(());
+        }
+
+        let first_bit = match lvalue.range {
+            eda_core::ir::Range::Bit(bit) => lvalue.net + bit,
+            eda_core::ir::Range::Span { msb, lsb } => lvalue.net + lsb.min(msb),
+        };
+        let bit_name = self.design.net_name(first_bit);
+        let net = bit_name.split('[').next().unwrap_or(&bit_name).to_string();
+        let issue = eda_core::ir::LintIssue {
+            kind: eda_core::ir::LintIssueKind::WidthMismatch,
+            net,
+            count: difference,
+        };
+        if let Some(existing) = self
+            .design
+            .recorded_width_mismatches
+            .iter_mut()
+            .find(|existing| existing.net == issue.net)
+        {
+            existing.count = existing.count.max(issue.count);
+        } else {
+            self.design.recorded_width_mismatches.push(issue);
+        }
         Ok(())
     }
 

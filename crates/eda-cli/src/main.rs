@@ -159,6 +159,7 @@ fn main() -> ExitCode {
                         design.initials.len()
                     );
                     let mut lint_issues = design.lint_multiple_continuous_drivers();
+                    lint_issues.extend(design.lint_width_mismatches());
                     lint_issues.extend(design.lint_combinational_loops());
                     lint_issues.extend(design.lint_incomplete_cases());
                     lint_issues.extend(design.lint_latch_risks());
@@ -184,6 +185,10 @@ fn main() -> ExitCode {
                             ),
                             eda_core::ir::LintIssueKind::UnusedName => println!(
                                 "    {:?}: '{}' declares {} unused bit(s)",
+                                issue.kind, issue.net, issue.count
+                            ),
+                            eda_core::ir::LintIssueKind::WidthMismatch => println!(
+                                "    {:?}: '{}' destination/source widths differ by {} bit(s)",
                                 issue.kind, issue.net, issue.count
                             ),
                         }

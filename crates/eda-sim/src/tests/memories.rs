@@ -21,6 +21,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
 
     Design {
         name: "sparse_memory".into(),
+        recorded_width_mismatches: Vec::new(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
         array_ports: Vec::new(),
@@ -96,6 +97,7 @@ fn ordinary_array_design() -> Design {
     };
     Design {
         name: "ordinary_array".into(),
+        recorded_width_mismatches: Vec::new(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
         array_ports: Vec::new(),
