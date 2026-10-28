@@ -120,3 +120,27 @@ endmodule
         "{output}"
     );
 }
+
+#[test]
+fn slang_info_reports_process_combinational_loops() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "process-loop.sv",
+        r#"
+module process_loop(output reg a, output reg b);
+always @* begin
+  a = b;
+  b = a;
+end
+endmodule
+"#,
+    );
+    let (success, output) = run_edu(&["slang-info", input.path(), "--top", "process_loop"]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("CombinationalLoop: 'b' has 1 nodes in a continuous cycle"),
+        "{output}"
+    );
+}

@@ -1154,6 +1154,102 @@ fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
     }
 }
 
+type LintDependencyValues = std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>;
+
+fn lint_expression_dependencies(
+    expression: &Expr,
+    values: &LintDependencyValues,
+) -> std::collections::BTreeSet<usize> {
+    let mut references = Vec::new();
+    lint_expression_nets(expression, &mut references);
+    references
+        .into_iter()
+        .flat_map(|reference| {
+            values
+                .get(&reference)
+                .cloned()
+                .unwrap_or_else(|| std::collections::BTreeSet::from([reference]))
+        })
+        .collect()
+}
+
+fn lint_merge_dependency_values(left: &mut LintDependencyValues, right: LintDependencyValues) {
+    for (bit, right_dependencies) in right {
+        left.entry(bit).or_default().extend(right_dependencies);
+    }
+}
+
+fn lint_execute_dependency_statement(statement: &Stmt, values: &mut LintDependencyValues) {
+    match statement {
+        Stmt::Block(statements) => statements
+            .iter()
+            .for_each(|nested| lint_execute_dependency_statement(nested, values)),
+        Stmt::Scope(body) => lint_execute_dependency_statement(body, values),
+        Stmt::Bl { lv, e } | Stmt::NBl { lv, e } => {
+            let dependencies = lint_expression_dependencies(e, values);
+            for bit in lint_lvalue_bits(lv) {
+                values.insert(bit, dependencies.clone());
+            }
+        }
+        Stmt::If { c, t, f } => {
+            let condition = lint_expression_dependencies(c, values);
+            let entry = values.clone();
+
+            let mut true_values = entry.clone();
+            lint_execute_dependency_statement(t, &mut true_values);
+            for bit in lint_guaranteed_assignment_bits(t) {
+                true_values
+                    .entry(bit)
+                    .or_default()
+                    .extend(condition.iter().copied());
+            }
+
+            let mut false_values = entry;
+            if let Some(f) = f {
+                lint_execute_dependency_statement(f, &mut false_values);
+                for bit in lint_guaranteed_assignment_bits(f) {
+                    false_values
+                        .entry(bit)
+                        .or_default()
+                        .extend(condition.iter().copied());
+                }
+            }
+
+            lint_merge_dependency_values(values, true_values);
+            lint_merge_dependency_values(values, false_values);
+        }
+        Stmt::Case { e, arms, dflt } => {
+            let selector = lint_expression_dependencies(e, values);
+            let entry = values.clone();
+            let mut merged = entry.clone();
+            for (_, body) in arms {
+                let mut branch = entry.clone();
+                lint_execute_dependency_statement(body, &mut branch);
+                for bit in lint_guaranteed_assignment_bits(body) {
+                    branch
+                        .entry(bit)
+                        .or_default()
+                        .extend(selector.iter().copied());
+                }
+                lint_merge_dependency_values(&mut merged, branch);
+            }
+            if let Some(body) = dflt {
+                let mut branch = entry;
+                lint_execute_dependency_statement(body, &mut branch);
+                for bit in lint_guaranteed_assignment_bits(body) {
+                    branch
+                        .entry(bit)
+                        .or_default()
+                        .extend(selector.iter().copied());
+                }
+                lint_merge_dependency_values(&mut merged, branch);
+            }
+            *values = merged;
+        }
+        _ => {}
+    }
+}
+
 fn lint_visit_loop_node(
     node: usize,
     graph: &std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
@@ -1714,9 +1810,9 @@ impl Design {
 
     /// Report cycles among zero-delay continuous assignments.
     ///
-    /// This lint is deliberately scoped to `Design.assigns`; event-driven,
-    /// delayed, and nonblocking process semantics remain the simulator's
-    /// responsibility.
+    /// The graph also includes simple guaranteed assignments from combinational
+    /// processes. Event-driven, delayed, and unsupported process constructs are
+    /// deliberately ignored rather than guessed.
     pub fn lint_combinational_loops(&self) -> Vec<LintIssue> {
         let mut graph: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
             std::collections::BTreeMap::new();
@@ -1735,6 +1831,23 @@ impl Design {
             }
             for write in writes {
                 graph.entry(write).or_default();
+            }
+        }
+        for process in &self.processes {
+            if !matches!(process.sens, Sens::Comb) {
+                continue;
+            }
+            let mut values = (0..self.n_nets)
+                .map(|bit| (bit, std::collections::BTreeSet::from([bit])))
+                .collect::<LintDependencyValues>();
+            lint_execute_dependency_statement(&process.body, &mut values);
+            for bit in lint_guaranteed_assignment_bits(&process.body) {
+                graph.entry(bit).or_default();
+                if let Some(dependencies) = values.get(&bit) {
+                    for dependency in dependencies {
+                        graph.entry(*dependency).or_default().insert(bit);
+                    }
+                }
             }
         }
 
@@ -2595,6 +2708,65 @@ mod tests {
                 count: 3,
             }]
         );
+    }
+
+    #[test]
+    fn lint_reports_process_combinational_cycles_without_feedthrough_false_positive() {
+        let make_design = |body: Stmt| {
+            let mut design = Design {
+                name: "process_loop".into(),
+                ..Default::default()
+            };
+            for name in ["a", "b"] {
+                let base = design.n_nets;
+                design.net_decls.push(NetDecl {
+                    name: name.into(),
+                    width: 1,
+                    is_reg: true,
+                    is_signed: false,
+                    base,
+                });
+                design.n_nets += 1;
+            }
+            design.processes.push(Process {
+                sens: Sens::Comb,
+                body,
+            });
+            design
+        };
+        let reference = |net: usize| Expr::Ref {
+            net,
+            decl_width: 1,
+            range: Range::Bit(0),
+            signed: false,
+        };
+        let assignment = |target: usize, source: Expr| Stmt::Bl {
+            lv: LValue {
+                net: target,
+                decl_width: 1,
+                range: Range::Bit(0),
+            },
+            e: source,
+        };
+
+        let cyclic = make_design(Stmt::Block(vec![
+            assignment(0, reference(1)),
+            assignment(1, reference(0)),
+        ]));
+        assert_eq!(
+            cyclic.lint_combinational_loops(),
+            vec![LintIssue {
+                kind: LintIssueKind::CombinationalLoop,
+                net: "b".into(),
+                count: 1,
+            }]
+        );
+
+        let feedthrough = make_design(Stmt::Block(vec![
+            assignment(0, reference(1)),
+            assignment(1, Expr::Const(LogicWord::from_u64(1, 0))),
+        ]));
+        assert!(feedthrough.lint_combinational_loops().is_empty());
     }
 
     #[test]
