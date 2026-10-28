@@ -1118,6 +1118,98 @@ fn unit_ir_cache_key(program: &str, semantic: &str) -> String {
     sha256_hex(format!("{program}\0{semantic}").as_bytes())
 }
 
+fn composite_unit_ir_cache_key(
+    record: &SlangProjectCacheRecord,
+    artifacts: &[serde_json::Value],
+    program: &str,
+) -> Result<String, String> {
+    let mut semantics = BTreeMap::new();
+    let mut dependencies = BTreeMap::new();
+    let mut depended_on = BTreeSet::new();
+    for artifact in artifacts {
+        let name = artifact
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("unit artifact has no name")?;
+        let semantic = artifact
+            .get("semantic_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("unit artifact '{name}' has no semantic fingerprint"))?;
+        let depends_on = artifact
+            .get("depends_on")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("unit artifact '{name}' has no dependency list"))?;
+        let depends_on = depends_on
+            .iter()
+            .map(|dependency| {
+                dependency
+                    .as_str()
+                    .ok_or_else(|| format!("unit artifact '{name}' has a non-string dependency"))
+                    .map(str::to_string)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        depended_on.extend(depends_on.iter().cloned());
+        dependencies.insert(name.to_string(), depends_on);
+        semantics.insert(name.to_string(), semantic.to_string());
+    }
+
+    let top_name = match record.top.clone() {
+        Some(top) => top,
+        None => {
+            let candidates = semantics
+                .keys()
+                .filter(|name| !depended_on.contains(*name))
+                .collect::<Vec<_>>();
+            if candidates.len() == 1 {
+                candidates[0].clone()
+            } else {
+                String::new()
+            }
+        }
+    };
+    if top_name.is_empty() || !semantics.contains_key(&top_name) {
+        return Err("project unit artifacts have no unique root unit".into());
+    }
+
+    fn visit_unit(
+        unit: &str,
+        dependencies: &BTreeMap<String, Vec<String>>,
+        visited: &mut BTreeSet<String>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if visited.contains(unit) {
+            return Ok(());
+        }
+        if stack.iter().any(|visited| visited == unit) {
+            return Err(format!(
+                "cycle in unit artifact dependency graph at '{unit}'"
+            ));
+        }
+        stack.push(unit.to_string());
+        for dependency in dependencies
+            .get(unit)
+            .ok_or_else(|| format!("unit artifact '{unit}' is missing from the closure"))?
+        {
+            visit_unit(dependency, dependencies, visited, stack)?;
+        }
+        stack.pop();
+        visited.insert(unit.to_string());
+        Ok(())
+    }
+
+    let mut closure = BTreeSet::new();
+    visit_unit(&top_name, &dependencies, &mut closure, &mut Vec::new())?;
+
+    let mut identity = format!("composite-unit-ir-v1\0{program}\0{top_name}");
+    for unit in closure {
+        let semantic = semantics
+            .get(&unit)
+            .ok_or_else(|| format!("unit artifact '{unit}' has no semantic fingerprint"))?;
+        identity.push_str(&format!("\0{unit}:{semantic}"));
+    }
+    Ok(sha256_hex(identity.as_bytes()))
+}
+
 fn load_project_unit_artifacts(
     directory: &Path,
     record: &SlangProjectCacheRecord,
@@ -2192,12 +2284,45 @@ impl SlangFrontend {
     /// into the selected root. It is the first executable step toward unit-level
     /// incremental relinking.
     pub fn compile_project_unit_artifacts(&self, cache_directory: &Path) -> Result<Design, String> {
+        self.compile_project_unit_artifacts_cached(cache_directory)
+            .map(|cached| (*cached.design).clone())
+    }
+
+    /// Reconstructs and lowers a design, reporting whole-composite IR reuse.
+    ///
+    /// The composite key includes the selected root and the semantic
+    /// fingerprints of every transitively instantiated unit. A child source
+    /// change therefore changes the composite key even when the parent artifact
+    /// is semantically clean and can be retained.
+    pub fn compile_project_unit_artifacts_cached(
+        &self,
+        cache_directory: &Path,
+    ) -> Result<SlangCachedUnitDesign, String> {
         let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
         let program = self.program.to_string_lossy().into_owned();
+        let cache_key = composite_unit_ir_cache_key(&record, &artifacts, &program)?;
+        if let Ok(mut cache) = self.unit_ir_cache.lock() {
+            if let Some(design) = cache.get(&cache_key) {
+                return Ok(SlangCachedUnitDesign {
+                    design,
+                    cache_hit: true,
+                });
+            }
+        }
         let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
             .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
         let root = parse_ast_root(&ast)?;
-        lowering::lower_root_with_unit_ir_cache(&root, self.unit_ir_cache.clone())
+        let design = Arc::new(lowering::lower_root_with_unit_ir_cache(
+            &root,
+            self.unit_ir_cache.clone(),
+        )?);
+        if let Ok(mut cache) = self.unit_ir_cache.lock() {
+            cache.insert(cache_key, Arc::clone(&design));
+        }
+        Ok(SlangCachedUnitDesign {
+            design,
+            cache_hit: false,
+        })
     }
 
     /// Lowers and caches a leaf unit artifact as a standalone partial IR design.
@@ -2267,7 +2392,11 @@ impl SlangFrontend {
             "connections": [],
         })
         .to_string();
-        let design = Arc::new(self.lower_ast_json(&ast)?);
+        let mut partial_design = self.lower_ast_json(&ast)?;
+        // Standalone root metadata belongs to the composite relink context;
+        // cached child fragments contain only their own declarations and body.
+        partial_design.hierarchy.clear();
+        let design = Arc::new(partial_design);
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
             cache.insert(cache_key, Arc::clone(&design));
         }

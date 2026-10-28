@@ -557,9 +557,11 @@ endmodule
     assert!(second.cache_hit);
     assert_eq!(second.design.name, first.design.name);
     assert_eq!(second.design.hierarchy.len(), first.design.hierarchy.len());
-    let artifact_design = second_frontend
-        .compile_project_unit_artifacts(&cache)
+    let artifact_cached = second_frontend
+        .compile_project_unit_artifacts_cached(&cache)
         .expect("lower reconstructed unit-artifact AST");
+    assert!(!artifact_cached.cache_hit);
+    let artifact_design = (*artifact_cached.design).clone();
     assert_eq!(artifact_design.name, first.design.name);
     assert_eq!(artifact_design.n_nets, first.design.n_nets);
     assert_eq!(
@@ -573,9 +575,9 @@ endmodule
             .expect("unit IR cache stats after composite miss"),
         eda_slang::SlangUnitIrCacheStats {
             hits: 0,
-            misses: 1,
+            misses: 2,
             evictions: 0,
-            entries: 1,
+            entries: 2,
         }
     );
     let leaf_first = second_frontend
@@ -591,9 +593,9 @@ endmodule
             .expect("unit IR cache stats after leaf reuse"),
         eda_slang::SlangUnitIrCacheStats {
             hits: 1,
-            misses: 1,
+            misses: 2,
             evictions: 0,
-            entries: 1,
+            entries: 2,
         }
     );
     let leaf_second = second_frontend
@@ -612,22 +614,23 @@ endmodule
             .expect("leaf unit IR cache stats after hit"),
         eda_slang::SlangUnitIrCacheStats {
             hits: 2,
-            misses: 1,
+            misses: 2,
             evictions: 0,
-            entries: 1,
+            entries: 2,
         }
     );
     let cached_composite = second_frontend
-        .compile_project_unit_artifacts(&cache)
+        .compile_project_unit_artifacts_cached(&cache)
         .expect("composite relink reuses cached child partial IR");
-    assert_eq!(cached_composite.name, artifact_design.name);
-    assert_eq!(cached_composite.n_nets, artifact_design.n_nets);
+    assert!(cached_composite.cache_hit);
+    assert_eq!(cached_composite.design.name, artifact_design.name);
+    assert_eq!(cached_composite.design.n_nets, artifact_design.n_nets);
     assert_eq!(
-        cached_composite.hierarchy.len(),
+        cached_composite.design.hierarchy.len(),
         artifact_design.hierarchy.len()
     );
     assert_eq!(
-        cached_composite.assigns.len(),
+        cached_composite.design.assigns.len(),
         artifact_design.assigns.len()
     );
     assert_eq!(
@@ -636,9 +639,9 @@ endmodule
             .expect("unit IR cache stats after cached composite relink"),
         eda_slang::SlangUnitIrCacheStats {
             hits: 3,
-            misses: 1,
+            misses: 2,
             evictions: 0,
-            entries: 1,
+            entries: 2,
         }
     );
     let composite_error = second_frontend
@@ -700,6 +703,15 @@ endmodule
         .expect("lower rebuilt child partial IR");
     assert!(!changed_leaf.cache_hit);
     assert_eq!(changed_leaf.design.name, "persistent_child");
+    let changed_composite = second_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("lower rebuilt composite after child change");
+    assert!(!changed_composite.cache_hit);
+    assert_eq!(changed_composite.design.name, first.design.name);
+    assert_eq!(
+        changed_composite.design.hierarchy.len(),
+        first.design.hierarchy.len()
+    );
 
     std::fs::write(cache.join("ast.json"), "{corrupted").expect("corrupt AST cache");
     let recovered = second_frontend
