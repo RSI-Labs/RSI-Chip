@@ -1,6 +1,6 @@
 //! # eda — command-line interface
 //!
-//! Usage: `eda <command> <file.v> [--top <module>]`
+//! Usage: `eda <command> <file.v> [--top <module>]`; `slang-info` also accepts `--lint-policy <file>`
 //! Commands: info | slang-info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
 //! Library: `--lib <file.lib>` imports a Liberty subset.
 //! Activity: `--vcd <file.vcd>` drives `eda power` and `eda assert`.
@@ -31,6 +31,8 @@
 //! hierarchy metadata is available.
 //! Hold paths: `--hold-paths <count>` appends min-delay path details.
 //! Async reset: `--reset-paths <count>` appends recovery/removal paths.
+//! RTL lint policy: `slang-info --lint-policy <file>` applies waiver,
+//! disable, and severity directives with recorded waiver reasons.
 //! Timing waivers: `--waivers <file>` filters timing violations and
 //! `--waiver-audit <file>` restores audited waiver lifecycle state.
 //! Waiver export: `--write-waivers` and `--write-waiver-audit` serialize the
@@ -140,6 +142,40 @@ fn main() -> ExitCode {
             .position(|argument| argument == "--top")
             .and_then(|index| args.get(index + 1))
             .cloned();
+        let policy_path =
+            if let Some(index) = args.iter().position(|argument| argument == "--lint-policy") {
+                match args.get(index + 1) {
+                    Some(path) => Some(path.clone()),
+                    None => {
+                        eprintln!("error: --lint-policy requires a policy file");
+                        return ExitCode::from(2);
+                    }
+                }
+            } else {
+                None
+            };
+        let lint_policy = match policy_path.as_deref().map(std::fs::read_to_string) {
+            Some(Ok(text)) => match eda_core::ir::LintPolicy::parse(&text) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    eprintln!(
+                        "error: invalid lint policy {}: {}",
+                        policy_path.unwrap_or_default(),
+                        error
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
+            Some(Err(error)) => {
+                eprintln!(
+                    "error: cannot read {}: {}",
+                    policy_path.unwrap_or_default(),
+                    error
+                );
+                return ExitCode::FAILURE;
+            }
+            None => eda_core::ir::LintPolicy::default(),
+        };
         return match eda_slang::SlangFrontend::discover() {
             Ok(frontend) => match frontend.compile_files(
                 &[std::path::PathBuf::from(&file)],
@@ -165,38 +201,49 @@ fn main() -> ExitCode {
                     lint_issues.extend(design.lint_incomplete_cases());
                     lint_issues.extend(design.lint_latch_risks());
                     lint_issues.extend(design.lint_unused_names());
-                    println!("  lint findings: {}", lint_issues.len());
-                    for issue in lint_issues {
+                    let lint_report = lint_policy.apply(lint_issues);
+                    println!("  lint findings: {}", lint_report.active.len());
+                    if !lint_report.waived.is_empty() {
+                        println!("  lint waived: {}", lint_report.waived.len());
+                    }
+                    for active in &lint_report.active {
+                        let issue = &active.issue;
                         match issue.kind {
                             eda_core::ir::LintIssueKind::MultipleContinuousDrivers => println!(
-                                "    {:?}: '{}' has {} continuous drivers",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' has {} continuous drivers",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::CombinationalLoop => println!(
-                                "    {:?}: '{}' has {} nodes in a continuous cycle",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' has {} nodes in a continuous cycle",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::IncompleteCase => println!(
-                                "    {:?}: '{}' leaves {} selector value(s) unhandled",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' leaves {} selector value(s) unhandled",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::LatchRisk => println!(
-                                "    {:?}: '{}' has {} conditionally assigned bit(s)",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' has {} conditionally assigned bit(s)",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::UnusedName => println!(
-                                "    {:?}: '{}' declares {} unused bit(s)",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' declares {} unused bit(s)",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::WidthMismatch => println!(
-                                "    {:?}: '{}' destination/source widths differ by {} bit(s)",
-                                issue.kind, issue.net, issue.count
+                                "    [{:?}] {:?}: '{}' destination/source widths differ by {} bit(s)",
+                                active.severity, issue.kind, issue.net, issue.count
                             ),
                             eda_core::ir::LintIssueKind::SignednessMismatch => println!(
-                                "    {:?}: '{}' destination/source signedness differs",
-                                issue.kind, issue.net
+                                "    [{:?}] {:?}: '{}' destination/source signedness differs",
+                                active.severity, issue.kind, issue.net
                             ),
                         }
+                    }
+                    for waived in &lint_report.waived {
+                        println!(
+                            "    Waived {:?}: '{}' reason: {}",
+                            waived.issue.kind, waived.issue.net, waived.reason
+                        );
                     }
                     ExitCode::SUCCESS
                 }

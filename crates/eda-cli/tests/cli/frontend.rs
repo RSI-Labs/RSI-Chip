@@ -243,3 +243,58 @@ endmodule
         "explicit signed cast was reported as implicit: {output}"
     );
 }
+
+#[test]
+fn slang_info_applies_lint_policy_waivers_and_severities() {
+    if std::env::var_os("SLANG_BIN").is_none() {
+        return;
+    }
+    let input = TempFile::new(
+        "lint-policy.sv",
+        r#"
+module lint_policy(output [3:0] y);
+wire unused;
+wire one_bit = 1'b1;
+assign y = one_bit;
+endmodule
+"#,
+    );
+    let policy = TempFile::new(
+        "lint-policy.txt",
+        "waive UnusedName unused reviewed dead logic\nseverity WidthMismatch Error\n",
+    );
+    let (success, output) = run_edu(&[
+        "slang-info",
+        input.path(),
+        "--top",
+        "lint_policy",
+        "--lint-policy",
+        policy.path(),
+    ]);
+    assert!(success, "unexpected CLI output: {output}");
+    assert!(
+        output.contains("lint findings: 1") && output.contains("lint waived: 1"),
+        "{output}"
+    );
+    assert!(
+        output.contains("[Error] WidthMismatch: 'y' destination/source widths differ by 3 bit(s)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Waived UnusedName: 'unused' reason: reviewed dead logic"),
+        "{output}"
+    );
+
+    let missing_value = run_edu(&[
+        "slang-info",
+        input.path(),
+        "--top",
+        "lint_policy",
+        "--lint-policy",
+    ]);
+    assert!(
+        !missing_value.0,
+        "missing policy path must fail: {}",
+        missing_value.1
+    );
+}

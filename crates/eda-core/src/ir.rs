@@ -1016,7 +1016,7 @@ pub struct Assign {
     pub delay: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum LintIssueKind {
     UnusedName,
     LatchRisk,
@@ -1027,11 +1027,193 @@ pub enum LintIssueKind {
     SignednessMismatch,
 }
 
+impl LintIssueKind {
+    fn parse_rule(value: &str) -> Result<Self, String> {
+        match value {
+            "UnusedName" => Ok(Self::UnusedName),
+            "LatchRisk" => Ok(Self::LatchRisk),
+            "IncompleteCase" => Ok(Self::IncompleteCase),
+            "CombinationalLoop" => Ok(Self::CombinationalLoop),
+            "MultipleContinuousDrivers" => Ok(Self::MultipleContinuousDrivers),
+            "WidthMismatch" => Ok(Self::WidthMismatch),
+            "SignednessMismatch" => Ok(Self::SignednessMismatch),
+            other => Err(format!("unknown lint rule '{other}'")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LintIssue {
     pub kind: LintIssueKind,
     pub net: String,
     pub count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LintSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl LintSeverity {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "Error" => Ok(Self::Error),
+            "Warning" => Ok(Self::Warning),
+            "Info" => Ok(Self::Info),
+            other => Err(format!("unknown lint severity '{other}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LintWaiver {
+    pub rule: LintIssueKind,
+    pub selector: String,
+    pub reason: String,
+}
+
+impl LintWaiver {
+    fn matches(&self, issue: &LintIssue) -> bool {
+        issue.kind == self.rule
+            && (self.selector == "*"
+                || self.selector == issue.net
+                || (self.selector.ends_with(".*")
+                    && issue
+                        .net
+                        .starts_with(&self.selector[..self.selector.len() - 1])))
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LintPolicy {
+    pub waivers: Vec<LintWaiver>,
+    pub severities: std::collections::BTreeMap<LintIssueKind, LintSeverity>,
+    pub disabled: std::collections::BTreeSet<LintIssueKind>,
+}
+
+impl LintPolicy {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut policy = Self::default();
+        for (index, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let command = fields
+                .next()
+                .ok_or_else(|| format!("line {}: empty policy command", index + 1))?;
+            match command {
+                "waive" => {
+                    let rule = fields
+                        .next()
+                        .ok_or_else(|| format!("line {}: waive requires a rule", index + 1))?;
+                    let selector = fields.next().ok_or_else(|| {
+                        format!("line {}: waive requires a net selector", index + 1)
+                    })?;
+                    let reason = fields.collect::<Vec<_>>().join(" ");
+                    if reason.is_empty() {
+                        return Err(format!("line {}: waive requires a reason", index + 1));
+                    }
+                    policy.waivers.push(LintWaiver {
+                        rule: LintIssueKind::parse_rule(rule)
+                            .map_err(|error| format!("line {}: {error}", index + 1))?,
+                        selector: selector.to_string(),
+                        reason,
+                    });
+                }
+                "severity" => {
+                    let rule = fields
+                        .next()
+                        .ok_or_else(|| format!("line {}: severity requires a rule", index + 1))?;
+                    let severity = fields.next().ok_or_else(|| {
+                        format!("line {}: severity requires a severity", index + 1)
+                    })?;
+                    if fields.next().is_some() {
+                        return Err(format!("line {}: severity has trailing fields", index + 1));
+                    }
+                    let rule = LintIssueKind::parse_rule(rule)
+                        .map_err(|error| format!("line {}: {error}", index + 1))?;
+                    policy.severities.insert(
+                        rule,
+                        LintSeverity::parse(severity)
+                            .map_err(|error| format!("line {}: {error}", index + 1))?,
+                    );
+                }
+                "disable" => {
+                    let rule = fields
+                        .next()
+                        .ok_or_else(|| format!("line {}: disable requires a rule", index + 1))?;
+                    if fields.next().is_some() {
+                        return Err(format!("line {}: disable has trailing fields", index + 1));
+                    }
+                    policy.disabled.insert(
+                        LintIssueKind::parse_rule(rule)
+                            .map_err(|error| format!("line {}: {error}", index + 1))?,
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "line {}: unknown policy command '{other}'",
+                        index + 1
+                    ))
+                }
+            }
+        }
+        Ok(policy)
+    }
+
+    pub fn severity(&self, rule: LintIssueKind) -> LintSeverity {
+        self.severities
+            .get(&rule)
+            .copied()
+            .unwrap_or(LintSeverity::Warning)
+    }
+
+    pub fn apply(&self, issues: Vec<LintIssue>) -> LintReport {
+        let mut report = LintReport::default();
+        for issue in issues {
+            if self.disabled.contains(&issue.kind) {
+                continue;
+            }
+            if let Some(waiver) = self.waivers.iter().find(|waiver| waiver.matches(&issue)) {
+                report.waived.push(WaivedLintIssue {
+                    issue,
+                    reason: waiver.reason.clone(),
+                });
+                continue;
+            }
+            let severity = self.severity(issue.kind);
+            report.active.push(ActiveLintIssue::new(issue, severity));
+        }
+        report
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveLintIssue {
+    pub issue: LintIssue,
+    pub severity: LintSeverity,
+}
+
+impl ActiveLintIssue {
+    fn new(issue: LintIssue, severity: LintSeverity) -> Self {
+        Self { issue, severity }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaivedLintIssue {
+    pub issue: LintIssue,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LintReport {
+    pub active: Vec<ActiveLintIssue>,
+    pub waived: Vec<WaivedLintIssue>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2782,6 +2964,65 @@ mod tests {
                 count: 1,
             }]
         );
+    }
+
+    #[test]
+    fn lint_policy_waives_disables_and_reseverities_findings() {
+        let policy = LintPolicy::parse(
+            [
+                "# Reviewed frontend exceptions",
+                "waive UnusedName unused reviewed dead logic",
+                "waive SignednessMismatch child.* intentional port conversion",
+                "severity WidthMismatch Error",
+                "disable LatchRisk",
+            ]
+            .join("\n")
+            .as_str(),
+        )
+        .expect("parse lint policy");
+        let issue = |kind: LintIssueKind, net: &str| LintIssue {
+            kind,
+            net: net.into(),
+            count: 1,
+        };
+        let report = policy.apply(vec![
+            issue(LintIssueKind::UnusedName, "unused"),
+            issue(LintIssueKind::UnusedName, "used"),
+            issue(LintIssueKind::SignednessMismatch, "child.x"),
+            issue(LintIssueKind::WidthMismatch, "y"),
+            issue(LintIssueKind::LatchRisk, "q"),
+        ]);
+
+        assert_eq!(
+            report.active,
+            vec![
+                ActiveLintIssue {
+                    issue: issue(LintIssueKind::UnusedName, "used"),
+                    severity: LintSeverity::Warning,
+                },
+                ActiveLintIssue {
+                    issue: issue(LintIssueKind::WidthMismatch, "y"),
+                    severity: LintSeverity::Error,
+                },
+            ]
+        );
+        assert_eq!(
+            report.waived,
+            vec![
+                WaivedLintIssue {
+                    issue: issue(LintIssueKind::UnusedName, "unused"),
+                    reason: "reviewed dead logic".into(),
+                },
+                WaivedLintIssue {
+                    issue: issue(LintIssueKind::SignednessMismatch, "child.x"),
+                    reason: "intentional port conversion".into(),
+                },
+            ]
+        );
+
+        let error = LintPolicy::parse("waive UnknownRule net reason")
+            .expect_err("unknown rules must fail closed");
+        assert!(error.contains("unknown lint rule"), "{error}");
     }
 
     #[test]
