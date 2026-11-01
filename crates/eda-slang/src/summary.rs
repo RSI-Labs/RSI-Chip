@@ -289,6 +289,157 @@ fn collect_package_parameters(
     }
 }
 
+fn collect_global_parameters(
+    document: &Value,
+    parameters: &mut Vec<SlangParameterSummary>,
+) -> Result<(), String> {
+    let root = document.get("design").unwrap_or(document);
+    let Some(members) = root.get("members").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(nested_members) = member.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        for nested in nested_members {
+            if string_field(nested, "kind").as_deref() != Some("Parameter") {
+                continue;
+            }
+            let mut parameter = nested.clone();
+            normalize_detailed_types(&mut parameter);
+            parameters.push(parameter_summary(&parameter)?);
+        }
+    }
+    Ok(())
+}
+
+fn collect_explicitly_imported_parameters(
+    document: &Value,
+    addresses: &std::collections::BTreeSet<u64>,
+    parameters: &mut Vec<SlangParameterSummary>,
+) -> Result<(), String> {
+    let design = document.get("design").unwrap_or(document);
+    let Some(members) = design.get("members").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(packages) = member.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        for package in packages {
+            if string_field(package, "kind").as_deref() != Some("Package") {
+                continue;
+            }
+            let empty_definitions = Vec::new();
+            let definitions = package
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_definitions);
+            for definition in definitions {
+                if string_field(definition, "kind").as_deref() != Some("Parameter") {
+                    continue;
+                }
+                let Some(address) = definition.get("addr").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if !addresses.contains(&address) {
+                    continue;
+                }
+                let mut parameter = definition.clone();
+                normalize_detailed_types(&mut parameter);
+                let summarized = parameter_summary(&parameter)?;
+                if !parameters
+                    .iter()
+                    .any(|existing| existing.name == summarized.name)
+                {
+                    parameters.push(summarized);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_global_variables(
+    document: &Value,
+    declarations: &mut Vec<SlangDeclarationSummary>,
+    continuous_targets: &mut Vec<SlangContinuousTarget>,
+    source_spans: &mut std::collections::BTreeMap<String, SlangSourceSpan>,
+) {
+    let root = document.get("design").unwrap_or(document);
+    let Some(members) = root.get("members").and_then(Value::as_array) else {
+        return;
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(nested_members) = member.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        for nested in nested_members {
+            let kind = string_field(nested, "kind").unwrap_or_default();
+            if kind != "Variable" && kind != "Net" {
+                continue;
+            }
+            let Some(name) = string_field(nested, "name").filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let mut variable = nested.clone();
+            normalize_detailed_types(&mut variable);
+            let type_name = string_field(&variable, "type").unwrap_or_default();
+            declarations.push(SlangDeclarationSummary {
+                name: name.clone(),
+                kind,
+                type_name: type_name.clone(),
+                width: simple_type_width(&type_name),
+            });
+            if let Some(initializer) = variable.get("initializer") {
+                continuous_targets.push(SlangContinuousTarget {
+                    name: name.clone(),
+                    source: "Initializer".into(),
+                    rhs: expression_summary(initializer),
+                });
+            }
+            if let Some(span) = source_span(nested) {
+                source_spans.insert(format!("declaration:{name}"), span.clone());
+                source_spans.insert(format!("continuous:{name}:0"), span);
+            }
+        }
+    }
+}
+
+fn normalize_enum_parameter_types(
+    parameters: &mut [SlangParameterSummary],
+    enums: &std::collections::BTreeMap<String, Vec<SlangEnumTypeSummary>>,
+) {
+    for parameter in parameters {
+        if simple_type_width(&parameter.type_name).is_some() {
+            continue;
+        }
+        let Some(type_name) = parameter
+            .type_name
+            .split_whitespace()
+            .next_back()
+            .map(|name| name.rsplit(['.', '#', ':']).next().unwrap_or(name))
+        else {
+            continue;
+        };
+        if let Some(definitions) = enums.get(type_name) {
+            if definitions.len() == 1 {
+                parameter.type_name = definitions[0].base_type_name.clone();
+            }
+        }
+    }
+}
+
 fn collect_visible_package_imports(value: &Value, imports: &mut SlangPackageImports) {
     if let Some(fields) = value.as_object() {
         let kind = string_field(value, "kind");
@@ -363,6 +514,79 @@ fn collect_imported_package_type_aliases_from_document(
         }
     }
     Ok(())
+}
+
+fn explicit_import_addresses(root: &Value) -> std::collections::BTreeSet<u64> {
+    root.get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|member| string_field(member, "kind").as_deref() == Some("ExplicitImport"))
+                .filter_map(|member| string_field(member, "import"))
+                .filter_map(|symbol| symbol.split_whitespace().next()?.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_explicitly_imported_type_aliases(
+    document: &Value,
+    addresses: &std::collections::BTreeSet<u64>,
+    aliases: &mut std::collections::BTreeMap<String, Value>,
+    unqualified_owners: &mut std::collections::BTreeMap<String, String>,
+) {
+    let design = document.get("design").unwrap_or(document);
+    let Some(members) = design.get("members").and_then(Value::as_array) else {
+        return;
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(packages) = member.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        for package in packages {
+            if string_field(package, "kind").as_deref() != Some("Package") {
+                continue;
+            }
+            let Some(package_name) = string_field(package, "name") else {
+                continue;
+            };
+            let empty_definitions = Vec::new();
+            let definitions = package
+                .get("members")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_definitions);
+            for definition in definitions {
+                if string_field(definition, "kind").as_deref() != Some("TypeAlias") {
+                    continue;
+                }
+                let Some(address) = definition.get("addr").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if !addresses.contains(&address) {
+                    continue;
+                }
+                let Some(name) = string_field(definition, "name") else {
+                    continue;
+                };
+                let qualified_name = format!("{package_name}::{name}");
+                match unqualified_owners.get(&name) {
+                    Some(existing) if existing != &qualified_name => continue,
+                    None => {
+                        unqualified_owners.insert(name.clone(), qualified_name.clone());
+                    }
+                    _ => {}
+                }
+                let mut alias = definition.clone();
+                normalize_detailed_types(&mut alias);
+                aliases.entry(qualified_name).or_insert(alias);
+            }
+        }
+    }
 }
 
 fn collect_imported_package_type_aliases(
@@ -1079,10 +1303,14 @@ fn type_layout_summary(
             .and_then(Value::as_u64)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no bit offset"))?;
+        let field_type = field
+            .get("type")
+            .ok_or_else(|| format!("packed type field '{name}.{field_name}' has no type"))?;
         let type_name = string_field(field, "type").unwrap_or_default();
-        let Some(width) = crate::types::simple_type_width(&type_name).or_else(|| {
-            lookup_type_layout(&type_name, existing).map(|layout| layout.element_width)
-        }) else {
+        let Some(width) = crate::types::simple_type_width(&type_name)
+            .or_else(|| lookup_type_layout(&type_name, existing).map(|layout| layout.element_width))
+            .or_else(|| detailed_type_layout_width(field_type))
+        else {
             return Ok(None);
         };
         fields.push(SlangFieldLayoutSummary {
@@ -1102,6 +1330,43 @@ fn type_layout_summary(
             fields,
         },
     )))
+}
+
+fn detailed_type_layout_width(type_value: &Value) -> Option<usize> {
+    match string_field(type_value, "kind").as_deref()? {
+        "ScalarType" => Some(1),
+        "PredefinedIntegerType" | "FloatingType" => {
+            simple_type_width(&string_field(type_value, "name").unwrap_or_default())
+        }
+        "PackedArrayType" => {
+            let range = string_field(type_value, "range")?
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            let (left, right) = range.split_once(':')?;
+            let left = left.trim().parse::<i128>().ok()?;
+            let right = right.trim().parse::<i128>().ok()?;
+            let length = usize::try_from(left.abs_diff(right) + 1).ok()?;
+            length.checked_mul(detailed_type_layout_width(type_value.get("elementType")?)?)
+        }
+        "PackedStructType" | "PackedUnionType" | "UnpackedStructType" | "UnpackedUnionType" => {
+            let members = type_value.get("members")?.as_array()?;
+            members
+                .iter()
+                .map(|field| {
+                    let offset = field
+                        .get("bitOffset")
+                        .and_then(Value::as_u64)
+                        .and_then(|offset| usize::try_from(offset).ok())?;
+                    let width = detailed_type_layout_width(field.get("type")?)?;
+                    offset.checked_add(width)
+                })
+                .max()
+                .flatten()
+        }
+        _ => None,
+    }
 }
 
 fn type_layout_alias_key(type_name: &str) -> Option<&str> {
@@ -1124,10 +1389,59 @@ fn collect_type_alias_members(value: &Value, aliases: &mut Vec<Value>) {
     }
 }
 
+fn collect_global_type_aliases(document: &Value, aliases: &mut Vec<Value>) {
+    let root = document.get("design").unwrap_or(document);
+    let Some(members) = root.get("members").and_then(Value::as_array) else {
+        return;
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(nested_members) = member.get("members").and_then(Value::as_array) else {
+            aliases.push(member.clone());
+            continue;
+        };
+        for nested in nested_members {
+            if string_field(nested, "kind").as_deref() == Some("TypeAlias") {
+                aliases.push(nested.clone());
+            }
+        }
+    }
+}
+
+fn collect_global_enum_type_summaries(
+    document: &Value,
+    aliases: &SlangTypeAliasIndex,
+    enums: &mut std::collections::BTreeMap<String, Vec<SlangEnumTypeSummary>>,
+) -> Result<(), String> {
+    let root = document.get("design").unwrap_or(document);
+    let Some(members) = root.get("members").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for member in members {
+        if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
+            continue;
+        }
+        let Some(nested_members) = member.get("members").and_then(Value::as_array) else {
+            continue;
+        };
+        for nested in nested_members {
+            if string_field(nested, "kind").as_deref() == Some("EnumType") {
+                let definition = enum_type_summary(nested, aliases)?;
+                enums.entry(definition.0).or_default().push(definition.1);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct SimpleTypeAliasWidths {
     by_address: std::collections::BTreeMap<u64, usize>,
     by_name: std::collections::BTreeMap<String, Vec<usize>>,
+    signed_by_address: std::collections::BTreeMap<u64, bool>,
+    signed_by_name: std::collections::BTreeMap<String, Vec<bool>>,
 }
 
 fn collect_simple_type_alias_widths(aliases: &[Value], widths: &mut SimpleTypeAliasWidths) {
@@ -1155,11 +1469,15 @@ fn collect_simple_type_alias_widths(aliases: &[Value], widths: &mut SimpleTypeAl
             };
             let width = simple_type_width(&target_name)
                 .or_else(|| lookup_simple_type_alias_width(&target_name, widths));
-            let Some(width) = width else {
+            let signed = simple_type_signed(&target_name)
+                .or_else(|| lookup_simple_type_alias_signed(&target_name, widths));
+            let Some((width, signed)) = width.zip(signed) else {
                 return true;
             };
             if widths.by_address.insert(address, width).is_none() {
-                widths.by_name.entry(name).or_default().push(width);
+                widths.by_name.entry(name.clone()).or_default().push(width);
+                widths.signed_by_address.insert(address, signed);
+                widths.signed_by_name.entry(name).or_default().push(signed);
                 changed = true;
             }
             false
@@ -1184,6 +1502,23 @@ fn lookup_simple_type_alias_width(
     (matches.len() == 1).then(|| matches[0])
 }
 
+fn lookup_simple_type_alias_signed(
+    type_name: &str,
+    widths: &SimpleTypeAliasWidths,
+) -> Option<bool> {
+    let (address, name) = type_name.split_once(' ')?;
+    if let Some(signed) = address
+        .parse::<u64>()
+        .ok()
+        .and_then(|address| widths.signed_by_address.get(&address))
+    {
+        return Some(*signed);
+    }
+    let name = name.rsplit(['.', '#', ':']).next()?;
+    let matches = widths.signed_by_name.get(name)?;
+    (matches.len() == 1).then(|| matches[0])
+}
+
 fn annotate_simple_type_alias_widths(
     expression: &mut SlangExpressionSummary,
     widths: &SimpleTypeAliasWidths,
@@ -1192,6 +1527,12 @@ fn annotate_simple_type_alias_widths(
         let base_type = expression.type_name.split('$').next().unwrap_or_default();
         if let Some(width) = lookup_simple_type_alias_width(base_type, widths) {
             expression.type_width = Some(width);
+        }
+    }
+    if expression.type_signed.is_none() {
+        let base_type = expression.type_name.split('$').next().unwrap_or_default();
+        if let Some(signed) = lookup_simple_type_alias_signed(base_type, widths) {
+            expression.type_signed = Some(signed);
         }
     }
     for operand in &mut expression.operands {
@@ -2062,6 +2403,7 @@ impl SlangAstSummary {
             .or_else(|| string_field(body, "name"))
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
         let time_unit_exponent = summary_time_unit_exponent(&document, body);
+        let global_time_precision_exponent = summary_global_time_precision(&document);
         let mut source_spans = std::collections::BTreeMap::new();
         if let Some(span) = source_span(root_ref) {
             source_spans.insert("top".to_string(), span);
@@ -2076,8 +2418,14 @@ impl SlangAstSummary {
         collect_class_static_property_symbols(&document, &mut class_handles);
         let mut type_aliases = SlangTypeAliasIndex::default();
         collect_type_alias_targets(root_ref, &mut type_aliases);
+        let mut global_type_aliases = Vec::new();
+        collect_global_type_aliases(&document, &mut global_type_aliases);
+        for alias in &global_type_aliases {
+            collect_type_alias_targets(alias, &mut type_aliases);
+        }
         let mut enum_types = std::collections::BTreeMap::<String, Vec<SlangEnumTypeSummary>>::new();
         collect_enum_type_summaries(root_ref, &type_aliases, &mut enum_types)?;
+        collect_global_enum_type_summaries(&document, &type_aliases, &mut enum_types)?;
         let mut ports = Vec::new();
         let mut declarations = Vec::new();
         let mut parameters = Vec::new();
@@ -2097,6 +2445,13 @@ impl SlangAstSummary {
             &mut imported_type_aliases,
             &mut imported_type_alias_owners,
         )?;
+        let explicit_addresses = explicit_import_addresses(root_ref);
+        collect_explicitly_imported_type_aliases(
+            &document,
+            &explicit_addresses,
+            &mut imported_type_aliases,
+            &mut imported_type_alias_owners,
+        );
         let mut type_alias_members = members
             .iter()
             .filter(|member| string_field(member, "kind").as_deref() == Some("TypeAlias"))
@@ -2110,6 +2465,7 @@ impl SlangAstSummary {
             })
             .collect::<Vec<_>>();
         type_alias_members.extend(imported_type_aliases.into_values());
+        collect_global_type_aliases(&document, &mut type_alias_members);
         collect_type_alias_members(root_ref, &mut type_alias_members);
         let mut simple_type_alias_widths = SimpleTypeAliasWidths::default();
         collect_simple_type_alias_widths(&type_alias_members, &mut simple_type_alias_widths);
@@ -2284,6 +2640,12 @@ impl SlangAstSummary {
                 _ => {}
             }
         }
+        collect_global_variables(
+            &document,
+            &mut declarations,
+            &mut continuous_targets,
+            &mut source_spans,
+        );
         if let Some(members) = root
             .get("eda_compilation_unit_members")
             .and_then(serde_json::Value::as_array)
@@ -2296,6 +2658,13 @@ impl SlangAstSummary {
         }
         let mut package_parameters = Vec::new();
         collect_package_parameters(&document, None, &package_imports, &mut package_parameters);
+        collect_global_parameters(&document, &mut package_parameters)?;
+        collect_explicitly_imported_parameters(
+            &document,
+            &explicit_addresses,
+            &mut package_parameters,
+        )?;
+        normalize_enum_parameter_types(&mut package_parameters, &enum_types);
         let visible_parameter_names = parameters
             .iter()
             .map(|parameter| parameter.name.clone())
@@ -2311,7 +2680,11 @@ impl SlangAstSummary {
         collect_instance_member_paths(root, root, &mut interface_members);
         for target in &mut continuous_targets {
             annotate_simple_type_alias_widths(&mut target.rhs, &simple_type_alias_widths);
-            annotate_simulation_time_units(&mut target.rhs, time_unit_exponent);
+            annotate_simulation_time_units(
+                &mut target.rhs,
+                time_unit_exponent,
+                global_time_precision_exponent,
+            );
             annotate_enum_name_calls(&mut target.rhs, &enum_types);
             annotate_memory_element_shapes(&mut target.rhs, &type_layouts);
             let _ = annotate_packed_member_shapes(&mut target.rhs, &type_layouts);
@@ -2321,7 +2694,11 @@ impl SlangAstSummary {
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
                 annotate_simple_type_alias_widths(&mut assignment.rhs, &simple_type_alias_widths);
-                annotate_simulation_time_units(&mut assignment.rhs, time_unit_exponent);
+                annotate_simulation_time_units(
+                    &mut assignment.rhs,
+                    time_unit_exponent,
+                    global_time_precision_exponent,
+                );
                 annotate_enum_name_calls(&mut assignment.rhs, &enum_types);
                 annotate_memory_element_shapes(&mut assignment.rhs, &type_layouts);
                 let _ = annotate_packed_member_shapes(&mut assignment.rhs, &type_layouts);
@@ -2356,12 +2733,25 @@ impl SlangAstSummary {
     }
 }
 
-fn annotate_simulation_time_units(expression: &mut SlangExpressionSummary, exponent: i8) {
-    if expression.kind == "Call" && matches!(expression.operator.as_str(), "$time" | "$stime") {
-        expression.simulation_time_unit = Some(exponent);
+fn annotate_simulation_time_units(
+    expression: &mut SlangExpressionSummary,
+    unit_exponent: i8,
+    precision_exponent: i8,
+) {
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$time" | "$stime" | "$realtime" | "$timeunit" | "$timeprecision"
+        )
+    {
+        expression.simulation_time_unit = Some(if expression.operator == "$timeprecision" {
+            precision_exponent
+        } else {
+            unit_exponent
+        });
     }
     for operand in &mut expression.operands {
-        annotate_simulation_time_units(operand, exponent);
+        annotate_simulation_time_units(operand, unit_exponent, precision_exponent);
     }
 }
 
@@ -2423,4 +2813,63 @@ fn summary_time_unit_exponent(document: &Value, body: &Value) -> i8 {
         _ => 0,
     };
     exponent.saturating_add(trailing_zeros)
+}
+
+fn summary_global_time_precision(document: &Value) -> i8 {
+    if let Some(exponent) = document
+        .get("eda_global_time_precision")
+        .and_then(Value::as_i64)
+        .and_then(|value| i8::try_from(value).ok())
+    {
+        return exponent;
+    }
+    document
+        .get("definitions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|definition| string_field(definition, "timeScale"))
+        .filter_map(|scale| {
+            let precision = scale.split_once('/')?.1.trim();
+            let digits_end = precision
+                .find(|character: char| !character.is_ascii_digit())
+                .unwrap_or(precision.len());
+            let magnitude = precision.get(..digits_end)?.parse::<u64>().ok()?;
+            let exponent: i8 = match precision.get(digits_end..)?.trim() {
+                "s" | "sec" | "seconds" => 0,
+                "ms" | "millisecond" | "milliseconds" => -3,
+                "us" | "microsecond" | "microseconds" => -6,
+                "ns" | "nanosecond" | "nanoseconds" => -9,
+                "ps" | "picosecond" | "picoseconds" => -12,
+                "fs" | "femtosecond" | "femtoseconds" => -15,
+                _ => return None,
+            };
+            let trailing_zeros = match magnitude {
+                1 => 0,
+                10 => 1,
+                100 => 2,
+                _ => return None,
+            };
+            exponent.checked_add(trailing_zeros)
+        })
+        .min()
+        .unwrap_or(-9)
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn global_time_precision_uses_the_most_precise_definition() {
+        let document = serde_json::json!({
+            "definitions": [
+                {"name": "leaf", "timeScale": "100ns / 1ns"},
+                {"name": "top", "timeScale": "10ns / 1ps"}
+            ]
+        });
+        assert_eq!(summary_global_time_precision(&document), -12);
+        let annotated_root = serde_json::json!({"eda_global_time_precision": -12});
+        assert_eq!(summary_global_time_precision(&annotated_root), -12);
+    }
 }

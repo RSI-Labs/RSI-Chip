@@ -2,8 +2,10 @@
 
 use super::statements::event_array_condition;
 use super::{declaration_name, SlangAstLowerer};
-use crate::ast_util::{bool_field, expression_symbol, string_field, string_literal};
-use crate::types::simple_type_shape;
+use crate::ast_util::{
+    bool_field, expression_symbol, string_field, string_literal, unwrap_conversion,
+};
+use crate::types::{memory_type, simple_type_shape};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -66,7 +68,10 @@ impl SlangAstLowerer {
                 signed: false,
             });
         }
-        if matches!(function_name, "$time" | "$stime") {
+        if matches!(
+            function_name,
+            "$time" | "$stime" | "$realtime" | "$timeunit" | "$timeprecision"
+        ) {
             let empty_arguments = Vec::new();
             let arguments = value
                 .get("arguments")
@@ -75,18 +80,231 @@ impl SlangAstLowerer {
             if !arguments.is_empty() {
                 return Err(format!("{function_name} does not take arguments"));
             }
-            return Ok(if function_name == "$time" {
-                eda_core::ir::Expr::SimulationTime {
+            if function_name == "$time" {
+                return Ok(eda_core::ir::Expr::SimulationTime {
                     width: 64,
                     signed: true,
                     unit_exponent: self.time_scale.normalized_unit_exponent(),
-                }
-            } else {
-                eda_core::ir::Expr::SimulationTime {
+                });
+            }
+            if function_name == "$stime" {
+                return Ok(eda_core::ir::Expr::SimulationTime {
                     width: 32,
                     signed: false,
                     unit_exponent: self.time_scale.normalized_unit_exponent(),
+                });
+            }
+            if function_name == "$realtime" {
+                return Ok(eda_core::ir::Expr::RealTime {
+                    unit_exponent: self.time_scale.normalized_unit_exponent(),
+                });
+            }
+            if function_name == "$timeunit" {
+                return Ok(signed_time_exponent_const(
+                    self.time_scale.normalized_unit_exponent(),
+                ));
+            }
+            return Ok(signed_time_exponent_const(self.global_time_precision));
+        }
+        if matches!(function_name, "$random" | "$urandom" | "$urandom_range") {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            let expected_count = if function_name == "$urandom_range" {
+                if arguments.len() != 1 && arguments.len() != 2 {
+                    return Err("$urandom_range requires one or two arguments".to_string());
                 }
+                arguments.len()
+            } else if arguments.is_empty() {
+                0
+            } else {
+                return Err(format!(
+                    "seeded '{function_name}' is not supported because its inout seed update is not modeled"
+                ));
+            };
+            let args = arguments
+                .iter()
+                .map(|argument| self.lower_expression(argument))
+                .collect::<Result<Vec<_>, String>>()?;
+            debug_assert_eq!(args.len(), expected_count);
+            return Ok(eda_core::ir::Expr::Random {
+                function: match function_name {
+                    "$random" => eda_core::ir::RandomFunction::Random,
+                    "$urandom" => eda_core::ir::RandomFunction::Urandom,
+                    _ => eda_core::ir::RandomFunction::UrandomRange,
+                },
+                args,
+                width: 32,
+                signed: function_name == "$random",
+            });
+        }
+        if function_name == "$sformatf" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            let Some(format_source) = arguments.first() else {
+                return Err("$sformatf requires a format string".into());
+            };
+            let format = string_literal(unwrap_conversion(format_source))
+                .ok_or_else(|| "$sformatf format must be a string literal".to_string())?;
+            let value_arguments = &arguments[1..];
+            // Raw `%u/%z` are valid in a string result: the simulator removes
+            // NUL bytes while packing the bounded string.
+            let parts = parse_display_format(
+                &format,
+                value_arguments.len(),
+                true,
+                &self.current_format_hierarchy_path(),
+                &self.current_format_library_scope(),
+                value_arguments,
+            )?;
+            let args = self.lower_display_arguments(&parts, value_arguments)?;
+            return Ok(eda_core::ir::Expr::StringFormat {
+                format,
+                parts,
+                args,
+            });
+        }
+        if function_name == "$fopen" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 2 {
+                return Err("$fopen requires a path and read/write/append mode".to_string());
+            }
+            let literal_path = string_literal(unwrap_conversion(&arguments[0]));
+            let literal_mode = string_literal(unwrap_conversion(&arguments[1]));
+            if let (Some(path), Some(mode)) = (literal_path, literal_mode) {
+                let path = if path.is_empty() {
+                    return Err("$fopen paths must be nonempty strings".to_string());
+                } else {
+                    path
+                };
+                let (append, read, truncate) = match mode.as_str() {
+                    "r" | "rb" => (false, true, false),
+                    "r+" | "r+b" | "rb+" => (true, true, false),
+                    "w" | "wb" => (false, false, true),
+                    "w+" | "w+b" | "wb+" => (false, true, true),
+                    "a" | "ab" => (true, false, false),
+                    "a+" | "a+b" | "ab+" => (true, true, true),
+                    other => {
+                        return Err(format!(
+                            "$fopen mode '{other}' is unsupported; only checked text/binary fopen modes execute"
+                        ));
+                    }
+                };
+                return Ok(eda_core::ir::Expr::FileOpen {
+                    path,
+                    append,
+                    read,
+                    truncate,
+                });
+            }
+            let path = self.lower_expression(&arguments[0])?;
+            let mode = self.lower_expression(&arguments[1])?;
+            if path.width() != crate::types::STRING_WIDTH
+                || mode.width() != crate::types::STRING_WIDTH
+            {
+                return Err(
+                    "dynamic $fopen path and mode must be 512-bit string expressions".to_string(),
+                );
+            }
+            return Ok(eda_core::ir::Expr::FileOpenDynamic {
+                path: Box::new(path),
+                mode: Box::new(mode),
+            });
+        }
+        if function_name == "$fgetc" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$fgetc requires exactly one file descriptor".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileGetc {
+                fd: Box::new(self.lower_expression(&arguments[0])?),
+            });
+        }
+        if function_name == "$ungetc" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 2 {
+                return Err("$ungetc requires a byte value and file descriptor".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileUngetc {
+                value: Box::new(self.lower_expression(&arguments[0])?),
+                fd: Box::new(self.lower_expression(&arguments[1])?),
+            });
+        }
+        if function_name == "$feof" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$feof requires exactly one file descriptor".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileEof {
+                fd: Box::new(self.lower_expression(&arguments[0])?),
+            });
+        }
+        if function_name == "$ftell" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$ftell requires exactly one file descriptor".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileTell {
+                fd: Box::new(self.lower_expression(&arguments[0])?),
+            });
+        }
+        if function_name == "$fseek" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 3 {
+                return Err("$fseek requires descriptor, offset, and whence".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileSeek {
+                fd: Box::new(self.lower_expression(&arguments[0])?),
+                offset: Box::new(self.lower_expression(&arguments[1])?),
+                whence: Box::new(self.lower_expression(&arguments[2])?),
+            });
+        }
+        if function_name == "$rewind" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$rewind requires exactly one file descriptor".to_string());
+            }
+            return Ok(eda_core::ir::Expr::FileSeek {
+                fd: Box::new(self.lower_expression(&arguments[0])?),
+                offset: Box::new(eda_core::ir::Expr::Const(eda_core::logic::LogicWord::zero(
+                    32,
+                ))),
+                whence: Box::new(eda_core::ir::Expr::Const(eda_core::logic::LogicWord::zero(
+                    32,
+                ))),
             });
         }
         if function_name == "$size" {
@@ -307,6 +525,39 @@ impl SlangAstLowerer {
         if task_name == "$finish" {
             return Ok(Some(eda_core::ir::Stmt::Finish));
         }
+        if task_name == "$stop" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err("argument-bearing '$stop' is not supported".into());
+            }
+            return Ok(Some(eda_core::ir::Stmt::Stop));
+        }
+        if matches!(
+            task_name.as_str(),
+            "$asserton" | "$assertoff" | "$assertkill"
+        ) {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err(format!(
+                    "argument-scoped '{task_name}' is not supported; use the no-argument global form"
+                ));
+            }
+            return Ok(Some(eda_core::ir::Stmt::AssertControl(
+                match task_name.as_str() {
+                    "$asserton" => eda_core::ir::AssertControl::On,
+                    "$assertoff" => eda_core::ir::AssertControl::Off,
+                    _ => eda_core::ir::AssertControl::Kill,
+                },
+            )));
+        }
         if task_name == "$cast" {
             return self.lower_class_cast_call(value);
         }
@@ -370,17 +621,67 @@ impl SlangAstLowerer {
         if let Some(statement) = self.lower_uvm_sequence_response_call(value, &task_name)? {
             return Ok(Some(statement));
         }
+        if task_name == "$fclose" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$fclose requires exactly one file descriptor".to_string());
+            }
+            return Ok(Some(eda_core::ir::Stmt::FileClose {
+                fd: self.lower_expression(&arguments[0])?,
+            }));
+        }
+        if task_name == "$fflush" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$fflush requires exactly one file descriptor".to_string());
+            }
+            return Ok(Some(eda_core::ir::Stmt::FileFlush {
+                fd: self.lower_expression(&arguments[0])?,
+            }));
+        }
+        if matches!(
+            task_name.as_str(),
+            "$fdisplay"
+                | "$fdisplayo"
+                | "$fdisplayb"
+                | "$fdisplayh"
+                | "$fwrite"
+                | "$fwriteo"
+                | "$fwriteb"
+                | "$fwriteh"
+                | "$fstrobe"
+                | "$fstrobeo"
+                | "$fstrobeb"
+                | "$fstrobeh"
+        ) {
+            return self.lower_file_display_call(value, &task_name).map(Some);
+        }
         if matches!(
             task_name.as_str(),
             "$display"
+                | "$displayo"
                 | "$displayb"
                 | "$displayh"
                 | "$write"
+                | "$writeo"
                 | "$writeb"
                 | "$writeh"
                 | "$monitor"
+                | "$monitoro"
                 | "$monitorb"
                 | "$monitorh"
+                | "$strobe"
+                | "$strobeo"
+                | "$strobeb"
+                | "$strobeh"
         ) {
             return self.lower_display_call(value, &task_name).map(Some);
         }
@@ -407,6 +708,7 @@ impl SlangAstLowerer {
                 ))],
                 args: Vec::new(),
                 monitor: false,
+                strobe: false,
             }));
         }
         if task_name == "putc" {
@@ -429,18 +731,34 @@ impl SlangAstLowerer {
         let Some(definition) = self.subroutines.get(&task_name) else {
             return Ok(None);
         };
-        if string_field(definition, "subroutineKind").as_deref() != Some("Task") {
+        let return_type = definition.get("returnType");
+        let returns_void = return_type
+            .and_then(Value::as_str)
+            .is_some_and(|type_name| type_name == "void")
+            || return_type
+                .and_then(|type_name| type_name.get("kind"))
+                .and_then(Value::as_str)
+                == Some("VoidType");
+        let is_task = string_field(definition, "subroutineKind").as_deref() == Some("Task");
+        let is_void_function = string_field(definition, "subroutineKind").as_deref()
+            == Some("Function")
+            && returns_void;
+        if !is_task && !is_void_function {
             return Ok(None);
         }
 
         let arguments = value
             .get("arguments")
             .and_then(Value::as_array)
-            .ok_or_else(|| format!("task call '{task_name}' has no arguments"))?;
+            .cloned()
+            .unwrap_or_default();
+        let arguments = arguments.as_slice();
         let formals = definition
             .get("arguments")
             .and_then(Value::as_array)
-            .ok_or_else(|| format!("task '{task_name}' has no formal arguments"))?;
+            .cloned()
+            .unwrap_or_default();
+        let formals = formals.as_slice();
         if arguments.len() != formals.len() {
             return Err(format!(
                 "task '{}' expects {} arguments, found {}",
@@ -538,14 +856,74 @@ impl SlangAstLowerer {
         result.map(|statement| Some(eda_core::ir::Stmt::Scope(Box::new(statement))))
     }
 
+    fn lower_file_display_call(
+        &self,
+        value: &Value,
+        task_name: &str,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let default_spec = match task_name {
+            "$fdisplayo" | "$fwriteo" | "$fstrobeo" => 'o',
+            "$fdisplayb" | "$fwriteb" | "$fstrobeb" => 'b',
+            "$fdisplayh" | "$fwriteh" | "$fstrobeh" => 'h',
+            _ => 'd',
+        };
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.is_empty() {
+            return Err(format!("{task_name} requires a file descriptor"));
+        }
+        let fd = self.lower_expression(&arguments[0])?;
+        let value_arguments = &arguments[1..];
+        let mut literal = String::new();
+        let has_format_literal = value_arguments
+            .first()
+            .and_then(|first| string_field(first, "literal"))
+            .is_some_and(|format| {
+                literal = format.to_string();
+                true
+            });
+        let value_arguments = if has_format_literal {
+            &value_arguments[1..]
+        } else {
+            value_arguments
+        };
+        if !has_format_literal && !value_arguments.is_empty() {
+            literal = value_arguments
+                .iter()
+                .map(|_| format!("%{default_spec}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        let parts = parse_display_format(
+            &literal,
+            value_arguments.len(),
+            true,
+            &self.current_format_hierarchy_path(),
+            &self.current_format_library_scope(),
+            value_arguments,
+        )?;
+        let args = self.lower_display_arguments(&parts, value_arguments)?;
+        Ok(eda_core::ir::Stmt::FileDisplay {
+            fd,
+            parts,
+            args,
+            newline: !task_name.starts_with("$fwrite"),
+            strobe: task_name.starts_with("$fstrobe"),
+        })
+    }
+
     fn lower_display_call(
         &self,
         value: &Value,
         task_name: &str,
     ) -> Result<eda_core::ir::Stmt, String> {
         let default_spec = match task_name {
-            "$displayb" | "$writeb" | "$monitorb" => 'b',
-            "$displayh" | "$writeh" | "$monitorh" => 'h',
+            "$displayo" | "$writeo" | "$monitoro" | "$strobeo" => 'o',
+            "$displayb" | "$writeb" | "$monitorb" | "$strobeb" => 'b',
+            "$displayh" | "$writeh" | "$monitorh" | "$strobeh" => 'h',
             _ => 'd',
         };
         let empty_arguments = Vec::new();
@@ -576,16 +954,313 @@ impl SlangAstLowerer {
         if !task_name.starts_with("$write") && !task_name.starts_with("$monitor") {
             literal.push('\n');
         }
-        let parts = parse_display_format(&literal, value_arguments.len())?;
-        let args = value_arguments
-            .iter()
-            .map(|argument| self.lower_expression(argument))
-            .collect::<Result<Vec<_>, String>>()?;
+        let parts = parse_display_format(
+            &literal,
+            value_arguments.len(),
+            false,
+            &self.current_format_hierarchy_path(),
+            &self.current_format_library_scope(),
+            value_arguments,
+        )?;
+        let args = self.lower_display_arguments(&parts, value_arguments)?;
         Ok(eda_core::ir::Stmt::Display {
             parts,
             args,
             monitor: task_name.starts_with("$monitor"),
+            strobe: task_name.starts_with("$strobe"),
         })
+    }
+
+    fn lower_display_arguments(
+        &self,
+        parts: &[eda_core::ir::DispPart],
+        sources: &[Value],
+    ) -> Result<Vec<eda_core::ir::Expr>, String> {
+        sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let pattern_spec = parts.iter().find_map(|part| {
+                    if let eda_core::ir::DispPart::Arg(part_index, spec) = part {
+                        (*part_index == index).then_some(*spec)
+                    } else if let eda_core::ir::DispPart::FormattedArg {
+                        index: part_index,
+                        spec,
+                        ..
+                    } = part
+                    {
+                        (*part_index == index).then_some(*spec)
+                    } else {
+                        None
+                    }
+                });
+                if matches!(pattern_spec, Some('r' | 'R')) {
+                    self.lower_memory_pattern(source, pattern_spec == Some('R'))
+                } else if matches!(pattern_spec, Some('p' | 'P' | 'e' | 'E' | 'f' | 'g'))
+                    && is_real_value(source)
+                {
+                    if string_field(unwrap_conversion(source), "kind").as_deref()
+                        == Some("RealLiteral")
+                    {
+                        self.lower_real_pattern(source)
+                    } else {
+                        self.lower_expression(source)
+                    }
+                } else if matches!(pattern_spec, Some('e' | 'E')) {
+                    let type_name =
+                        string_field(unwrap_conversion(source), "type").unwrap_or_default();
+                    if let Some(definition) = self.type_alias_definition(&type_name) {
+                        if definition.is_union && !definition.is_unpacked {
+                            return self.lower_expression(source);
+                        }
+                        self.lower_struct_pattern(source, pattern_spec == Some('E'))
+                    } else {
+                        self.lower_enum_pattern(source)
+                    }
+                } else {
+                    self.lower_expression(source)
+                }
+            })
+            .collect()
+    }
+
+    fn lower_memory_pattern(
+        &self,
+        source: &Value,
+        abbreviated: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let source = unwrap_conversion(source);
+        let Some(name) = expression_symbol(source) else {
+            return Err("%p array arguments must name a whole fixed array".into());
+        };
+        let Some(symbol) = self.symbols.get(&name) else {
+            return Err(format!("unknown %p array argument '{name}'"));
+        };
+        let Some(memory) = symbol.memory else {
+            return Err(format!("'{name}' is not an unpacked array"));
+        };
+        let declaration = &self.design.memories[memory];
+        let runtime_sized = declaration.dynamic || declaration.queue;
+        if declaration.flat_length > 4096 {
+            return Err("%p arrays are currently limited to 4,096 elements".into());
+        }
+        if runtime_sized && declaration.dimensions.len() != 1 {
+            return Err("%p dynamic arrays and queues must be one-dimensional".into());
+        }
+        if declaration.associative
+            && (declaration.dimensions.len() != 1
+                || declaration.index_width == 0
+                || declaration.index_width > 64)
+        {
+            return Err(
+                "%p associative arrays must be one-dimensional with scalar integral keys up to 64 bits"
+                    .into(),
+            );
+        }
+        let mut shape_length = 1_u64;
+        for dimension in &declaration.dimensions {
+            shape_length = shape_length
+                .checked_mul(dimension.length as u64)
+                .ok_or_else(|| "%p fixed-array shape is too large".to_string())?;
+        }
+        if shape_length != declaration.flat_length {
+            return Err(format!(
+                "%p fixed-array shape length {shape_length} does not match memory length {}",
+                declaration.flat_length
+            ));
+        }
+        let type_name = string_field(source, "type").unwrap_or_default();
+        let element_type_name = type_name
+            .split('$')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let element = if let Some(definition) = self.type_alias_definition(&element_type_name) {
+            if !definition.flat_pattern
+                || definition.fields.is_empty()
+                || definition.width != declaration.element_width
+            {
+                return Err(
+                    "%p aggregate-array elements must be flat structs/unions with matching width"
+                        .into(),
+                );
+            }
+            if definition.is_union && !definition.is_unpacked {
+                eda_core::ir::MemoryPatternElement::PackedUnion {
+                    signed: definition.signed,
+                }
+            } else if definition.is_union {
+                eda_core::ir::MemoryPatternElement::UnpackedUnion {
+                    fields: self.lower_struct_pattern_fields(definition, 0)?,
+                }
+            } else {
+                eda_core::ir::MemoryPatternElement::Struct {
+                    fields: self.lower_struct_pattern_fields(definition, 0)?,
+                }
+            }
+        } else {
+            if declaration.element_width == 0 || declaration.element_width > 64 {
+                return Err("%p array elements must be scalar integrals up to 64 bits".into());
+            }
+            eda_core::ir::MemoryPatternElement::Scalar {
+                signed: symbol.signed,
+            }
+        };
+        Ok(eda_core::ir::Expr::MemoryPattern {
+            memory,
+            element,
+            abbreviated,
+        })
+    }
+
+    pub(super) fn lower_real_pattern(&self, source: &Value) -> Result<eda_core::ir::Expr, String> {
+        let source = unwrap_conversion(source);
+        let real = source
+            .get("value")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| "real %p literal has no numeric value".to_string())?;
+        if !real.is_finite() {
+            return Err("real %p literals must be finite".into());
+        }
+        Ok(eda_core::ir::Expr::RealConst(real))
+    }
+
+    fn lower_enum_pattern(&self, source: &Value) -> Result<eda_core::ir::Expr, String> {
+        let type_name = string_field(unwrap_conversion(source), "type").unwrap_or_default();
+        let enum_name = type_name
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .rsplit(['.', '#', ':'])
+            .next()
+            .unwrap_or_default();
+        let definition = self.type_enums.get(enum_name).ok_or_else(|| {
+            format!("$sformatf/display %p argument has unsupported non-enum type '{type_name}'")
+        })?;
+        let value = self.lower_expression(source)?;
+        if value.width() != definition.width {
+            return Err(format!(
+                "enum %p argument width {} does not match enum '{enum_name}' width {}",
+                value.width(),
+                definition.width
+            ));
+        }
+        Ok(eda_core::ir::Expr::EnumPattern {
+            value: Box::new(value),
+            values: definition.values.clone(),
+            names: definition.names.clone(),
+        })
+    }
+
+    fn lower_struct_pattern(
+        &self,
+        source: &Value,
+        abbreviated: bool,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let type_name = string_field(unwrap_conversion(source), "type").unwrap_or_default();
+        let definition = self.type_alias_definition(&type_name).ok_or_else(|| {
+            format!("$sformatf/display %p argument has unsupported non-struct type '{type_name}'")
+        })?;
+        if definition.is_union && !definition.is_unpacked {
+            let value = self.lower_expression(source)?;
+            if value.width() != definition.width {
+                return Err(format!(
+                    "union %p argument width {} does not match type width {}",
+                    value.width(),
+                    definition.width
+                ));
+            }
+            return Ok(value);
+        }
+        if !definition.flat_pattern {
+            return Err(
+                "$sformatf/display %p currently supports flat packed/unpacked structs, scalar-field unpacked unions, and scalar packed unions"
+                    .into(),
+            );
+        }
+        let value = self.lower_expression(source)?;
+        if value.width() != definition.width {
+            return Err(format!(
+                "struct %p argument width {} does not match type width {}",
+                value.width(),
+                definition.width
+            ));
+        }
+        let fields = self.lower_struct_pattern_fields(definition, 0)?;
+        Ok(eda_core::ir::Expr::StructPattern {
+            value: Box::new(value),
+            fields,
+            abbreviated,
+        })
+    }
+
+    fn lower_struct_pattern_fields(
+        &self,
+        definition: &crate::lowering::AstStructType,
+        base_offset: usize,
+    ) -> Result<Vec<eda_core::ir::StructPatternField>, String> {
+        let mut fields = definition
+            .fields
+            .iter()
+            .map(|(name, field)| {
+                (
+                    field.field_index,
+                    name.clone(),
+                    field,
+                    base_offset.checked_add(field.offset),
+                )
+            })
+            .collect::<Vec<_>>();
+        fields.sort_by_key(|(index, _, _, _)| *index);
+        fields
+            .into_iter()
+            .map(|(_, name, field, offset)| {
+                let offset = offset.ok_or_else(|| {
+                    format!("struct %p field '{name}' has an invalid physical offset")
+                })?;
+                let value = if let Some(nested_type) = &field.nested_type {
+                    let nested = match nested_type {
+                        crate::lowering::AstNestedStruct::Alias(type_name) => {
+                            self.type_alias_definition(type_name).ok_or_else(|| {
+                                format!("struct %p field '{name}' has unknown nested type")
+                            })?
+                        }
+                        crate::lowering::AstNestedStruct::Inline(definition) => definition,
+                    };
+                    if !nested.flat_pattern {
+                        return Err(format!(
+                            "struct %p field '{name}' has an unsupported nested aggregate"
+                        ));
+                    }
+                    if nested.width != field.width {
+                        return Err(format!(
+                            "struct %p field '{name}' width {} does not match nested type width {}",
+                            field.width, nested.width
+                        ));
+                    }
+                    if nested.is_union && !nested.is_unpacked {
+                        eda_core::ir::StructPatternValue::Scalar {
+                            signed: nested.signed,
+                        }
+                    } else {
+                        eda_core::ir::StructPatternValue::Struct {
+                            fields: self.lower_struct_pattern_fields(nested, offset)?,
+                        }
+                    }
+                } else {
+                    eda_core::ir::StructPatternValue::Scalar {
+                        signed: field.signed,
+                    }
+                };
+                Ok(eda_core::ir::StructPatternField {
+                    name,
+                    offset,
+                    width: field.width,
+                    value,
+                })
+            })
+            .collect()
     }
 
     fn lower_timeformat_call(&self, value: &Value) -> Result<eda_core::ir::Stmt, String> {
@@ -1273,7 +1948,7 @@ impl SlangAstLowerer {
         if !self.design.memories[memory].queue {
             return Ok(None);
         }
-        let value = self.lower_expression(pushed)?;
+        let value = self.lower_queue_element_value(pushed)?;
         Ok(Some(eda_core::ir::Stmt::QueuePush {
             memory,
             value,
@@ -1306,12 +1981,23 @@ impl SlangAstLowerer {
         if index.width() > u64::BITS as usize {
             return Err("queue insert index exceeds 64 bits".into());
         }
-        let value = self.lower_expression(inserted)?;
+        let value = self.lower_queue_element_value(inserted)?;
         Ok(Some(eda_core::ir::Stmt::QueueInsert {
             memory,
             index,
             value,
         }))
+    }
+
+    fn lower_queue_element_value(&self, value: &Value) -> Result<eda_core::ir::Expr, String> {
+        let type_name = string_field(value, "type").unwrap_or_default();
+        if super::expressions::type_is_realtime_compatible(&type_name) {
+            return self.lower_real_arithmetic_operand(value);
+        }
+        if type_name.trim() == "shortreal" {
+            return self.lower_shortreal_arithmetic_operand(value);
+        }
+        self.lower_expression(value)
     }
 
     fn lower_queue_delete(&self, value: &Value) -> Result<Option<eda_core::ir::Stmt>, String> {
@@ -2280,6 +2966,10 @@ fn json_contains_named_value(value: &Value, name: &str) -> bool {
 fn parse_display_format(
     format: &str,
     argument_count: usize,
+    allow_raw_binary: bool,
+    hierarchy_path: &str,
+    library_scope: &str,
+    value_arguments: &[Value],
 ) -> Result<Vec<eda_core::ir::DispPart>, String> {
     let mut parts = Vec::new();
     let mut literal = String::new();
@@ -2295,42 +2985,251 @@ fn parse_display_format(
             literal.push('%');
             continue;
         }
-        let mut specifier = characters
+        let mut left_justify = false;
+        let mut zero_modifier = false;
+        loop {
+            match characters.peek() {
+                Some('-') if !left_justify => {
+                    left_justify = true;
+                    characters.next();
+                }
+                Some('0') if !zero_modifier => {
+                    zero_modifier = true;
+                    characters.next();
+                }
+                _ => break,
+            }
+        }
+        let mut width_text = String::new();
+        while matches!(characters.peek(), Some(c) if c.is_ascii_digit()) {
+            width_text.push(characters.next().expect("peeked width digit"));
+        }
+        let mut precision_text = String::new();
+        if characters.peek() == Some(&'.') {
+            characters.next();
+            while matches!(characters.peek(), Some(c) if c.is_ascii_digit()) {
+                precision_text.push(characters.next().expect("peeked precision digit"));
+            }
+            if precision_text.is_empty() {
+                return Err("display format precision requires at least one digit".into());
+            }
+        }
+        let precision = if precision_text.is_empty() {
+            None
+        } else {
+            let precision = precision_text
+                .parse::<usize>()
+                .map_err(|_| "display format precision is too large".to_string())?;
+            if precision > 512 {
+                return Err("display format precision must be at most 512".into());
+            }
+            Some(precision)
+        };
+        let explicit_width = if width_text.is_empty() {
+            None
+        } else {
+            let width = width_text
+                .parse::<usize>()
+                .map_err(|_| "display format width is too large".to_string())?;
+            if width == 0 {
+                return Err("display format width must be positive".into());
+            }
+            if width > 512 {
+                return Err("display format width must be at most 512".into());
+            }
+            Some(width)
+        };
+        let specifier = characters
             .next()
             .ok_or_else(|| "display format has a trailing '%'".to_string())?;
-        if specifier == '0' {
-            // `%0d` requests the minimum natural width (no leading padding).
-            // The current formatter already emits natural-width decimal, hex,
-            // binary, and ASCII values, so consume the zero-width modifier and
-            // preserve the conversion specifier.
-            specifier = characters
-                .next()
-                .ok_or_else(|| "display format has a trailing '%0'".to_string())?;
+        if allow_raw_binary
+            && matches!(specifier, 'u' | 'U' | 'z' | 'Z')
+            && (left_justify || zero_modifier || explicit_width.is_some())
+        {
+            return Err("raw binary file-output specifiers cannot take a width modifier".into());
         }
+        if matches!(specifier, 'v' | 'V')
+            && (left_justify || zero_modifier || explicit_width.is_some())
+        {
+            return Err("display strength specifier '%v' cannot take a width modifier".into());
+        }
+        if matches!(specifier, 'm' | 'M')
+            && (left_justify || zero_modifier || explicit_width.is_some())
+        {
+            return Err("display hierarchy specifier '%m' cannot take a width modifier".into());
+        }
+        if matches!(specifier, 'l' | 'L')
+            && (left_justify || zero_modifier || explicit_width.is_some())
+        {
+            return Err("display library specifier '%l' cannot take a width modifier".into());
+        }
+        if matches!(specifier, 'p' | 'P') && (left_justify || explicit_width.is_some()) {
+            return Err("display pattern specifier '%p' cannot take a width modifier".into());
+        }
+        let is_real_format = matches!(specifier, 'e' | 'E' | 'f' | 'F' | 'g' | 'G');
+        if is_real_format {
+            let Some(argument) = value_arguments.get(specifiers) else {
+                return Err("display real format specifier has no argument".into());
+            };
+            if !is_real_value(argument) {
+                return Err("display real formats require a real argument".into());
+            }
+        } else if precision.is_some() {
+            return Err("display format precision is supported only for real formats".into());
+        }
+        let formatted_width = explicit_width;
         match specifier {
             'b' | 'B' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'b'));
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'b',
+                    formatted_width,
+                    None,
+                    left_justify,
+                );
                 specifiers += 1;
             }
             'd' | 'D' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'd'));
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'd',
+                    formatted_width,
+                    None,
+                    left_justify,
+                );
                 specifiers += 1;
             }
             'h' | 'H' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'h'));
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'h',
+                    formatted_width,
+                    None,
+                    left_justify,
+                );
+                specifiers += 1;
+            }
+            'o' | 'O' => {
+                push_display_literal(&mut parts, &mut literal);
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'o',
+                    formatted_width,
+                    None,
+                    left_justify,
+                );
                 specifiers += 1;
             }
             's' | 'S' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Arg(specifiers, 's'));
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    's',
+                    formatted_width,
+                    None,
+                    left_justify,
+                );
+                specifiers += 1;
+            }
+            'e' | 'E' => {
+                push_display_literal(&mut parts, &mut literal);
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'e',
+                    formatted_width,
+                    precision,
+                    left_justify,
+                );
+                specifiers += 1;
+            }
+            'f' | 'F' => {
+                push_display_literal(&mut parts, &mut literal);
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'f',
+                    formatted_width,
+                    precision,
+                    left_justify,
+                );
+                specifiers += 1;
+            }
+            'g' | 'G' => {
+                push_display_literal(&mut parts, &mut literal);
+                push_display_argument(
+                    &mut parts,
+                    specifiers,
+                    'g',
+                    formatted_width,
+                    precision,
+                    left_justify,
+                );
                 specifiers += 1;
             }
             't' | 'T' => {
                 push_display_literal(&mut parts, &mut literal);
-                parts.push(eda_core::ir::DispPart::Time(specifiers));
+                if let Some(width) = formatted_width {
+                    parts.push(eda_core::ir::DispPart::FormattedArg {
+                        index: specifiers,
+                        spec: 't',
+                        width,
+                        precision: None,
+                        left_justify,
+                    });
+                } else {
+                    parts.push(eda_core::ir::DispPart::Time(specifiers));
+                }
+                specifiers += 1;
+            }
+            'c' | 'C' if formatted_width.is_none() && !left_justify && !zero_modifier => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'c'));
+                specifiers += 1;
+            }
+            'v' | 'V' => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, 'v'));
+                specifiers += 1;
+            }
+            'm' | 'M' => {
+                push_display_literal(&mut parts, &mut literal);
+                if !hierarchy_path.is_empty() {
+                    parts.push(eda_core::ir::DispPart::Str(hierarchy_path.to_string()));
+                }
+            }
+            'l' | 'L' => {
+                push_display_literal(&mut parts, &mut literal);
+                if !library_scope.is_empty() {
+                    parts.push(eda_core::ir::DispPart::Str(library_scope.to_string()));
+                }
+            }
+            'p' | 'P' => {
+                let Some(argument) = value_arguments.get(specifiers) else {
+                    return Err("display pattern specifier '%p' has no argument".into());
+                };
+                let mut pattern_spec = pattern_argument_specifier(argument)?;
+                if zero_modifier && matches!(pattern_spec, 'r' | 'e') {
+                    pattern_spec = if pattern_spec == 'r' { 'R' } else { 'E' };
+                }
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(specifiers, pattern_spec));
+                specifiers += 1;
+            }
+            'u' | 'U' | 'z' | 'Z' if allow_raw_binary => {
+                push_display_literal(&mut parts, &mut literal);
+                parts.push(eda_core::ir::DispPart::Arg(
+                    specifiers,
+                    specifier.to_ascii_lowercase(),
+                ));
                 specifiers += 1;
             }
             other => {
@@ -2349,6 +3248,80 @@ fn parse_display_format(
         ));
     }
     Ok(parts)
+}
+
+fn is_real_value(value: &Value) -> bool {
+    let value = unwrap_conversion(value);
+    string_field(value, "kind").as_deref() == Some("RealLiteral")
+        || string_field(value, "type")
+            .as_deref()
+            .is_some_and(|type_name| matches!(type_name.trim(), "real" | "realtime" | "shortreal"))
+}
+
+fn push_display_argument(
+    parts: &mut Vec<eda_core::ir::DispPart>,
+    index: usize,
+    spec: char,
+    width: Option<usize>,
+    precision: Option<usize>,
+    left_justify: bool,
+) {
+    if width.is_some() || precision.is_some() {
+        parts.push(eda_core::ir::DispPart::FormattedArg {
+            index,
+            spec,
+            width: width.unwrap_or(0),
+            precision,
+            left_justify,
+        });
+    } else {
+        parts.push(eda_core::ir::DispPart::Arg(index, spec));
+    }
+}
+
+fn pattern_argument_specifier(argument: &Value) -> Result<char, String> {
+    let argument = unwrap_conversion(argument);
+    let type_name = string_field(argument, "type").unwrap_or_default();
+    if string_field(argument, "kind").as_deref() == Some("StringLiteral")
+        || type_name.trim() == "string"
+    {
+        return Ok('q');
+    }
+    if string_field(argument, "kind").as_deref() == Some("RealLiteral") {
+        return Ok('p');
+    }
+    if let Some(memory) = memory_type(&type_name) {
+        if !memory.dynamic && !memory.queue && !memory.associative && memory.element_width <= 64 {
+            return Ok('r');
+        }
+    }
+    if crate::types::is_dynamic_container_type(&type_name) {
+        return Ok('r');
+    }
+    if type_name.contains('$') {
+        return Ok('r');
+    }
+    if crate::types::simple_type_width(&type_name).is_some_and(|width| width <= 64) {
+        return Ok('p');
+    }
+    if matches!(
+        string_field(argument, "kind").as_deref(),
+        Some(
+            "FixedSizeUnpackedArrayType"
+                | "DynamicArrayType"
+                | "QueueType"
+                | "AssociativeArrayType"
+        )
+    ) {
+        return Ok('r');
+    }
+    if !type_name.trim().is_empty() {
+        return Ok('e');
+    }
+    Err(
+        "$sformatf/display %p currently supports bounded strings, scalar integrals up to 64 bits, multidimensional fixed integral arrays, one-dimensional dynamic arrays, queues, and scalar-key associative arrays"
+            .into(),
+    )
 }
 
 fn push_display_literal(parts: &mut Vec<eda_core::ir::DispPart>, literal: &mut String) {
@@ -2469,6 +3442,16 @@ fn constant_ast_i64(value: &Value) -> Result<i64, String> {
                 .and_then(constant_ast_i64)
         }
         _ => Err("expression is not an inline integer constant".into()),
+    }
+}
+
+fn signed_time_exponent_const(exponent: i8) -> eda_core::ir::Expr {
+    let bits = u64::from(i32::from(exponent) as u32);
+    eda_core::ir::Expr::Signed {
+        e: Box::new(eda_core::ir::Expr::Const(
+            eda_core::logic::LogicWord::from_u64(32, bits),
+        )),
+        signed: true,
     }
 }
 

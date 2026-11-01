@@ -36,10 +36,31 @@ pub(super) fn rewrite_hierarchy_path(path: &str, prefix: &str) -> String {
     if path.is_empty() {
         return prefix.to_string();
     }
-    if path.starts_with('.') {
-        format!("{prefix}{path}")
+    // A child fragment stores descendant paths relative to its definition, as
+    // in `middle.u`. When merged under `top.u`, SystemVerilog's instance path
+    // must not repeat the module name: the result is `top.u.u`.
+    let suffix = path
+        .strip_prefix('.')
+        .unwrap_or(path)
+        .split_once('.')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or("");
+    if suffix.is_empty() {
+        prefix.to_string()
     } else {
-        format!("{prefix}.{path}")
+        format!("{prefix}.{suffix}")
+    }
+}
+
+/// Conservatively reject reusable unit fragments when a source string mentions
+/// `%m`. Such a format bakes in the selected instance's hierarchical path, so
+/// one cached Design cannot be shared by sibling instances.
+fn value_contains_hierarchy_format(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains("%m") || text.contains("%M"),
+        serde_json::Value::Array(values) => values.iter().any(value_contains_hierarchy_format),
+        serde_json::Value::Object(fields) => fields.values().any(value_contains_hierarchy_format),
+        _ => false,
     }
 }
 
@@ -302,8 +323,30 @@ pub(super) fn remap_assignment(assignment: &mut eda_core::ir::Assign, offset: us
 pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usize) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
         Expr::Ref { net, .. } => *net += offset,
+        Expr::RealRef { net, .. } => *net += offset,
+        Expr::ShortRealRef { net } => *net += offset,
+        Expr::RealBinary { left, right, .. } => {
+            remap_expression(left, offset);
+            remap_expression(right, offset);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            remap_expression(left, offset);
+            remap_expression(right, offset);
+        }
+        Expr::RealNeg(operand) => remap_expression(operand, offset),
+        Expr::ShortRealBinary { left, right, .. } => {
+            remap_expression(left, offset);
+            remap_expression(right, offset);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => remap_expression(operand, offset),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            remap_expression(value, offset)
+        }
+        Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => remap_expression(a, offset),
         Expr::Bin { a, b, .. } => {
             remap_expression(a, offset);
@@ -340,6 +383,10 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
             remap_expression(left, offset);
             remap_expression(right, offset);
         }
+        Expr::StringFormat { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| remap_expression(argument, offset));
+        }
         Expr::StringGetByte { e, index } => {
             remap_expression(e, offset);
             remap_expression(index, offset);
@@ -361,7 +408,34 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
         }
         Expr::StringToRadix { e, .. } => remap_expression(e, offset),
         Expr::StringFromRadix { value, .. } => remap_expression(value, offset),
+        Expr::MemoryPattern { memory, .. } => *memory += offset,
+        Expr::EnumPattern { value, .. } => remap_expression(value, offset),
+        Expr::StructPattern { value, .. } => remap_expression(value, offset),
         Expr::EventTriggered { net } => *net += offset,
+        Expr::Random { args, .. } => args
+            .iter_mut()
+            .for_each(|argument| remap_expression(argument, offset)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            remap_expression(path, offset);
+            remap_expression(mode, offset);
+        }
+        Expr::FileGetc { fd } => remap_expression(fd, offset),
+        Expr::FileUngetc { value, fd } => {
+            remap_expression(value, offset);
+            remap_expression(fd, offset);
+        }
+        Expr::FileEof { fd } => remap_expression(fd, offset),
+        Expr::FileTell { fd } => remap_expression(fd, offset),
+        Expr::FileSeek {
+            fd,
+            offset: seek_offset,
+            whence,
+        } => {
+            remap_expression(fd, offset);
+            remap_expression(seek_offset, offset);
+            remap_expression(whence, offset);
+        }
     }
 }
 
@@ -483,7 +557,89 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             remap_expression(e, offset);
         }
         Stmt::Release { lv } => lv.net += offset,
+        Stmt::ProceduralAssign { lv, e } => {
+            lv.net += offset;
+            remap_expression(e, offset);
+        }
+        Stmt::ProceduralDeassign { lv } => lv.net += offset,
         Stmt::Display { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| remap_expression(argument, offset));
+        }
+        Stmt::FileClose { fd } => remap_expression(fd, offset),
+        Stmt::FileFlush { fd } => remap_expression(fd, offset),
+        Stmt::FileGets { fd, string, status } => {
+            remap_expression(fd, offset);
+            string.net += offset;
+            status.net += offset;
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            remap_expression(fd, offset);
+            message.net += offset;
+            status.net += offset;
+        }
+        Stmt::FileRead { fd, target, status } => {
+            remap_expression(fd, offset);
+            target.net += offset;
+            status.net += offset;
+        }
+        Stmt::FileReadMemory {
+            fd,
+            start,
+            count,
+            status,
+            ..
+        } => {
+            remap_expression(fd, offset);
+            if let Some(start) = start {
+                remap_expression(start, offset);
+            }
+            if let Some(count) = count {
+                remap_expression(count, offset);
+            }
+            status.net += offset;
+        }
+        Stmt::FileScan {
+            fd,
+            targets,
+            status,
+            ..
+        } => {
+            remap_expression(fd, offset);
+            for target in targets {
+                target.net += offset;
+            }
+            status.net += offset;
+        }
+        Stmt::StringScan {
+            source,
+            targets,
+            status,
+            ..
+        } => {
+            remap_expression(source, offset);
+            for target in targets {
+                target.net += offset;
+            }
+            status.net += offset;
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            remap_expression(cond, offset);
+            for action in pass_action.iter_mut().chain(fail_action.iter_mut()) {
+                remap_statement(action, offset);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            remap_expression(fd, offset);
             args.iter_mut()
                 .for_each(|argument| remap_expression(argument, offset));
         }
@@ -498,7 +654,11 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
                 remap_expression(finish, offset);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::RandomSeeded { seed, destination } => {
+            seed.net += offset;
+            destination.net += offset;
+        }
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -539,8 +699,30 @@ fn rewrite_lvalue_nets(lvalue: &mut eda_core::ir::LValue, rewrites: &[NetRewrite
 fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetRewrite]) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
         Expr::Ref { net, .. } => *net = rewrite_net(*net, rewrites),
+        Expr::RealRef { net, .. } => *net = rewrite_net(*net, rewrites),
+        Expr::ShortRealRef { net } => *net = rewrite_net(*net, rewrites),
+        Expr::RealBinary { left, right, .. } => {
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::RealNeg(operand) => rewrite_expression_nets(operand, rewrites),
+        Expr::ShortRealBinary { left, right, .. } => {
+            rewrite_expression_nets(left, rewrites);
+            rewrite_expression_nets(right, rewrites);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => rewrite_expression_nets(operand, rewrites),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            rewrite_expression_nets(value, rewrites)
+        }
+        Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => rewrite_expression_nets(a, rewrites),
         Expr::Bin { a, b, .. } => {
             rewrite_expression_nets(a, rewrites);
@@ -575,6 +757,10 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
             rewrite_expression_nets(left, rewrites);
             rewrite_expression_nets(right, rewrites);
         }
+        Expr::StringFormat { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| rewrite_expression_nets(argument, rewrites));
+        }
         Expr::StringGetByte { e, index } => {
             rewrite_expression_nets(e, rewrites);
             rewrite_expression_nets(index, rewrites);
@@ -596,7 +782,34 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
         }
         Expr::StringToRadix { e, .. } => rewrite_expression_nets(e, rewrites),
         Expr::StringFromRadix { value, .. } => rewrite_expression_nets(value, rewrites),
+        Expr::MemoryPattern { .. } => {}
+        Expr::EnumPattern { value, .. } => rewrite_expression_nets(value, rewrites),
+        Expr::StructPattern { value, .. } => rewrite_expression_nets(value, rewrites),
         Expr::EventTriggered { net } => *net = rewrite_net(*net, rewrites),
+        Expr::Random { args, .. } => args
+            .iter_mut()
+            .for_each(|argument| rewrite_expression_nets(argument, rewrites)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            rewrite_expression_nets(path, rewrites);
+            rewrite_expression_nets(mode, rewrites);
+        }
+        Expr::FileGetc { fd } => rewrite_expression_nets(fd, rewrites),
+        Expr::FileUngetc { value, fd } => {
+            rewrite_expression_nets(value, rewrites);
+            rewrite_expression_nets(fd, rewrites);
+        }
+        Expr::FileEof { fd } => rewrite_expression_nets(fd, rewrites),
+        Expr::FileTell { fd } => rewrite_expression_nets(fd, rewrites),
+        Expr::FileSeek {
+            fd,
+            offset: seek_offset,
+            whence,
+        } => {
+            rewrite_expression_nets(fd, rewrites);
+            rewrite_expression_nets(seek_offset, rewrites);
+            rewrite_expression_nets(whence, rewrites);
+        }
     }
 }
 
@@ -722,9 +935,91 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
             rewrite_expression_nets(e, rewrites);
         }
         Stmt::Release { lv } => rewrite_lvalue_nets(lv, rewrites),
+        Stmt::ProceduralAssign { lv, e } => {
+            rewrite_lvalue_nets(lv, rewrites);
+            rewrite_expression_nets(e, rewrites);
+        }
+        Stmt::ProceduralDeassign { lv } => rewrite_lvalue_nets(lv, rewrites),
         Stmt::Display { args, .. } => args
             .iter_mut()
             .for_each(|argument| rewrite_expression_nets(argument, rewrites)),
+        Stmt::FileClose { fd } => rewrite_expression_nets(fd, rewrites),
+        Stmt::FileFlush { fd } => rewrite_expression_nets(fd, rewrites),
+        Stmt::FileGets { fd, string, status } => {
+            rewrite_expression_nets(fd, rewrites);
+            rewrite_lvalue_nets(string, rewrites);
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            rewrite_expression_nets(fd, rewrites);
+            rewrite_lvalue_nets(message, rewrites);
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::FileRead { fd, target, status } => {
+            rewrite_expression_nets(fd, rewrites);
+            rewrite_lvalue_nets(target, rewrites);
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::FileReadMemory {
+            fd,
+            start,
+            count,
+            status,
+            ..
+        } => {
+            rewrite_expression_nets(fd, rewrites);
+            if let Some(start) = start {
+                rewrite_expression_nets(start, rewrites);
+            }
+            if let Some(count) = count {
+                rewrite_expression_nets(count, rewrites);
+            }
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::FileScan {
+            fd,
+            targets,
+            status,
+            ..
+        } => {
+            rewrite_expression_nets(fd, rewrites);
+            for target in targets {
+                rewrite_lvalue_nets(target, rewrites);
+            }
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::StringScan {
+            source,
+            targets,
+            status,
+            ..
+        } => {
+            rewrite_expression_nets(source, rewrites);
+            for target in targets {
+                rewrite_lvalue_nets(target, rewrites);
+            }
+            rewrite_lvalue_nets(status, rewrites);
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            rewrite_expression_nets(cond, rewrites);
+            for action in pass_action.iter_mut().chain(fail_action.iter_mut()) {
+                rewrite_statement_nets(action, rewrites);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            rewrite_expression_nets(fd, rewrites);
+            args.iter_mut()
+                .for_each(|argument| rewrite_expression_nets(argument, rewrites));
+        }
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             rewrite_expression_nets(cond, rewrites)
         }
@@ -736,7 +1031,11 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
                 rewrite_expression_nets(finish, rewrites);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::RandomSeeded { seed, destination } => {
+            rewrite_lvalue_nets(seed, rewrites);
+            rewrite_lvalue_nets(destination, rewrites);
+        }
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -760,8 +1059,32 @@ fn rewrite_process_nets(process: &mut eda_core::ir::Process, rewrites: &[NetRewr
 pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, offset: usize) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) => {}
-        Expr::Ref { .. } => {}
+        Expr::Const(_)
+        | Expr::RealConst(_)
+        | Expr::ShortRealConst(_)
+        | Expr::Ref { .. }
+        | Expr::RealRef { .. }
+        | Expr::ShortRealRef { .. } => {}
+        Expr::RealBinary { left, right, .. } => {
+            remap_expression_memory_ids(left, offset);
+            remap_expression_memory_ids(right, offset);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            remap_expression_memory_ids(left, offset);
+            remap_expression_memory_ids(right, offset);
+        }
+        Expr::RealNeg(operand) => remap_expression_memory_ids(operand, offset),
+        Expr::ShortRealBinary { left, right, .. } => {
+            remap_expression_memory_ids(left, offset);
+            remap_expression_memory_ids(right, offset);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => remap_expression_memory_ids(operand, offset),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            remap_expression_memory_ids(value, offset)
+        }
+        Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => remap_expression_memory_ids(a, offset),
         Expr::Bin { a, b, .. } => {
             remap_expression_memory_ids(a, offset);
@@ -807,6 +1130,10 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
             remap_expression_memory_ids(left, offset);
             remap_expression_memory_ids(right, offset);
         }
+        Expr::StringFormat { args, .. } => {
+            args.iter_mut()
+                .for_each(|argument| remap_expression_memory_ids(argument, offset));
+        }
         Expr::StringGetByte { e, index } => {
             remap_expression_memory_ids(e, offset);
             remap_expression_memory_ids(index, offset);
@@ -828,7 +1155,34 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         }
         Expr::StringToRadix { e, .. } => remap_expression_memory_ids(e, offset),
         Expr::StringFromRadix { value, .. } => remap_expression_memory_ids(value, offset),
+        Expr::MemoryPattern { memory, .. } => *memory += offset,
+        Expr::EnumPattern { value, .. } => remap_expression_memory_ids(value, offset),
+        Expr::StructPattern { value, .. } => remap_expression_memory_ids(value, offset),
         Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
+        Expr::Random { args, .. } => args
+            .iter_mut()
+            .for_each(|argument| remap_expression_memory_ids(argument, offset)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            remap_expression_memory_ids(path, offset);
+            remap_expression_memory_ids(mode, offset);
+        }
+        Expr::FileGetc { fd } => remap_expression_memory_ids(fd, offset),
+        Expr::FileUngetc { value, fd } => {
+            remap_expression_memory_ids(value, offset);
+            remap_expression_memory_ids(fd, offset);
+        }
+        Expr::FileEof { fd } => remap_expression_memory_ids(fd, offset),
+        Expr::FileTell { fd } => remap_expression_memory_ids(fd, offset),
+        Expr::FileSeek {
+            fd,
+            offset: seek_offset,
+            whence,
+        } => {
+            remap_expression_memory_ids(fd, offset);
+            remap_expression_memory_ids(seek_offset, offset);
+            remap_expression_memory_ids(whence, offset);
+        }
     }
 }
 
@@ -975,9 +1329,51 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
         }
         Stmt::Force { e, .. } => remap_expression_memory_ids(e, offset),
         Stmt::Release { .. } => {}
+        Stmt::ProceduralAssign { e, .. } => remap_expression_memory_ids(e, offset),
+        Stmt::ProceduralDeassign { .. } => {}
         Stmt::Display { args, .. } => {
             args.iter_mut()
                 .for_each(|argument| remap_expression_memory_ids(argument, offset));
+        }
+        Stmt::FileClose { fd } => remap_expression_memory_ids(fd, offset),
+        Stmt::FileFlush { fd } => remap_expression_memory_ids(fd, offset),
+        Stmt::FileGets { fd, .. } | Stmt::FileError { fd, .. } | Stmt::FileRead { fd, .. } => {
+            remap_expression_memory_ids(fd, offset)
+        }
+        Stmt::FileReadMemory {
+            fd,
+            memory,
+            start,
+            count,
+            ..
+        } => {
+            remap_expression_memory_ids(fd, offset);
+            *memory += offset;
+            if let Some(start) = start {
+                remap_expression_memory_ids(start, offset);
+            }
+            if let Some(count) = count {
+                remap_expression_memory_ids(count, offset);
+            }
+        }
+        Stmt::FileScan { fd, .. } => remap_expression_memory_ids(fd, offset),
+        Stmt::StringScan { source, .. } => remap_expression_memory_ids(source, offset),
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            remap_expression_memory_ids(cond, offset);
+            for action in pass_action.iter_mut().chain(fail_action.iter_mut()) {
+                remap_statement_memory_ids(action, offset);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            remap_expression_memory_ids(fd, offset);
+            args.iter_mut().for_each(|argument| {
+                remap_expression_memory_ids(argument, offset);
+            });
         }
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             remap_expression_memory_ids(cond, offset)
@@ -996,7 +1392,8 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
                 remap_expression_memory_ids(finish, offset);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::RandomSeeded { .. } => {}
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -1127,10 +1524,21 @@ impl super::SlangAstLowerer {
             .cloned()
             .collect::<Vec<_>>()
             .join(".");
+        let parent_scope_path = self.current_format_hierarchy_path();
+        let child_scope_path = if parent_scope_path.is_empty() {
+            instance_name.clone()
+        } else {
+            format!("{parent_scope_path}.{instance_name}")
+        };
         let body = member
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
         let definition_name = string_field(body, "name").unwrap_or_default();
+        let format_library_scope = self
+            .library_scopes
+            .get(&definition_name)
+            .cloned()
+            .unwrap_or_else(|| definition_name.clone());
         let child_offset = self.design.n_nets;
         let memory_offset = self.design.memories.len();
         let mut interface_proxy_connections = Vec::new();
@@ -1146,7 +1554,8 @@ impl super::SlangAstLowerer {
             local_blocks: std::collections::BTreeMap::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
-            type_aliases: std::collections::BTreeMap::new(),
+            type_aliases: self.package_type_aliases.clone(),
+            package_type_aliases: self.package_type_aliases.clone(),
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
@@ -1217,6 +1626,9 @@ impl super::SlangAstLowerer {
             global_time_precision: self.global_time_precision,
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
+            scope_path: child_scope_path,
+            library_scopes: self.library_scopes.clone(),
+            format_library_scope,
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
         let empty_connections = Vec::new();
@@ -1349,39 +1761,34 @@ impl super::SlangAstLowerer {
             .get("eda_unit_ir_cache_key")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let has_nested_instance = body
-            .get("members")
-            .and_then(serde_json::Value::as_array)
-            .map(|members| {
-                members
-                    .iter()
-                    .any(|member| string_field(member, "kind").as_deref() == Some("Instance"))
-            })
-            .unwrap_or(false);
         let has_interface_connection = lowered_connections
             .iter()
             .any(|connection| connection.get("ifaceInstance").is_some());
-        let reusable_leaf = cache_key.is_some()
+        let uses_hierarchy_format = value_contains_hierarchy_format(body);
+        let reusable_unit = cache_key.is_some()
             && !is_interface
-            && !has_nested_instance
             && !has_interface_connection
-            && self.global_time_precision == -9;
-        let mut cached_leaf = false;
+            && self.global_time_precision == -9
+            && !uses_hierarchy_format;
+        let mut cached_unit = false;
         if let (Some(cache_key), Some(cache)) = (cache_key.clone(), self.unit_ir_cache.clone()) {
-            if reusable_leaf {
+            if reusable_unit {
                 if let Ok(mut unit_cache) = cache.lock() {
                     if let Some(design) = unit_cache.get(&cache_key) {
                         child.design = (*design).clone();
-                        cached_leaf = true;
+                        cached_unit = true;
                     }
                 }
             }
         }
-        if !cached_leaf {
+        if !cached_unit {
             child.prepare_plusargs(body)?;
             child.lower_body(body)?;
             if let (Some(cache_key), Some(cache)) = (cache_key, self.unit_ir_cache.clone()) {
-                if reusable_leaf {
+                // Class-static initializer counts live in the lowerer rather
+                // than Design. Do not cache a fragment until those statements
+                // have a design-native ownership marker.
+                if reusable_unit && child.class_static_initializer_count == 0 {
                     if let Ok(mut unit_cache) = cache.lock() {
                         unit_cache.insert(cache_key, std::sync::Arc::new(child.design.clone()));
                     }

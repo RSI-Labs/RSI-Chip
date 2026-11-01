@@ -416,6 +416,27 @@ pub enum BinOp {
     CaseNe,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum RandomFunction {
+    Random,
+    Urandom,
+    UrandomRange,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum AssertControl {
+    On,
+    Off,
+    Kill,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ImmediateAssertionKind {
+    Assert,
+    Assume,
+    Cover,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     Const(LogicWord),
@@ -527,12 +548,74 @@ pub enum Expr {
         signed: bool,
         unit_exponent: i8,
     },
+    /// Deterministic simulator-owned stochastic source. Seeded `$random(seed)`
+    /// is deliberately rejected by the frontend because inout seed update is
+    /// not representable in the current expression IR.
+    Random {
+        function: RandomFunction,
+        args: Vec<Expr>,
+        width: usize,
+        signed: bool,
+    },
+    /// Opens a literal write/append file at evaluation time and returns a
+    /// simulator-owned 32-bit file descriptor. A failed open evaluates to zero.
+    /// `append && read` represents a mixed read/write mode: `"r+"` when
+    /// `truncate` is false and `"a+"` when it is true. `read && !append &&
+    /// truncate` represents `"w+"`.
+    FileOpen {
+        path: String,
+        append: bool,
+        read: bool,
+        truncate: bool,
+    },
+    /// Opens a runtime-selected string path with a runtime-selected literal
+    /// `"r"`, `"w"`, or `"a"` mode.
+    FileOpenDynamic {
+        path: Box<Expr>,
+        mode: Box<Expr>,
+    },
+    /// Reads the next byte from a simulator-owned read-mode file descriptor.
+    /// EOF and unusable descriptors evaluate to 32-bit signed `-1`.
+    FileGetc {
+        fd: Box<Expr>,
+    },
+    /// Pushes one byte back onto a read-mode descriptor and returns that byte,
+    /// or signed `-1` if no pushback slot is available.
+    FileUngetc {
+        value: Box<Expr>,
+        fd: Box<Expr>,
+    },
+    /// Returns nonzero only after a read-mode descriptor has reached EOF.
+    /// Closed, write-mode, and unknown descriptors return zero.
+    FileEof {
+        fd: Box<Expr>,
+    },
+    /// Returns the current byte position of a simulator-owned descriptor, or
+    /// signed `-1` for an unusable descriptor/position.
+    FileTell {
+        fd: Box<Expr>,
+    },
+    /// Repositions a descriptor and returns zero on success or signed `-1` on
+    /// failure.
+    FileSeek {
+        fd: Box<Expr>,
+        offset: Box<Expr>,
+        whence: Box<Expr>,
+    },
     /// Updates one byte in a bounded string. This is used only as the RHS of
     /// a whole-string assignment when lowering the void `putc()` method.
     StringPutc {
         e: Box<Expr>,
         index: Box<Expr>,
         value: Box<Expr>,
+    },
+    /// Formats checked runtime display arguments into a bounded 512-bit
+    /// string. Overflow of the 63-data-byte bounded-string model is represented
+    /// by an all-X string rather than silently truncating.
+    StringFormat {
+        format: String,
+        parts: Vec<DispPart>,
+        args: Vec<Expr>,
     },
     /// Returns the inclusive bounded-string substring `[left, right]`, or an
     /// empty string for invalid bounds.
@@ -551,6 +634,92 @@ pub enum Expr {
     StringFromRadix {
         value: Box<Expr>,
         radix: u32,
+    },
+    /// Whole fixed-array, dynamic-array, queue, or associative-array argument
+    /// used only by `%p`/`%0p` formatting. Runtime evaluation outside a
+    /// formatter is an all-X placeholder; the display formatter reads and
+    /// renders the memory directly.
+    MemoryPattern {
+        memory: usize,
+        element: MemoryPatternElement,
+        abbreviated: bool,
+    },
+    /// Enum-typed `%p` argument plus its elaborated value/name table. The
+    /// formatter prints the matching member name, or falls back to the scalar
+    /// pattern when the runtime value is not an explicitly named constant.
+    EnumPattern {
+        value: Box<Expr>,
+        values: Vec<LogicWord>,
+        names: Vec<String>,
+    },
+    /// Packed/unpacked struct `%p` operand. Fields store physical offsets into
+    /// the whole runtime value in declaration order; nested struct fields carry
+    /// recursively renderable metadata.
+    StructPattern {
+        value: Box<Expr>,
+        fields: Vec<StructPatternField>,
+        abbreviated: bool,
+    },
+    /// Finite real literal retained for display-only formatting. General real
+    /// arithmetic/variable semantics are not implied by this operand.
+    RealConst(f64),
+    /// Runtime read of a 64-bit `real` variable stored as its IEEE-754 bit
+    /// pattern. The display formatter interprets the bits as `f64`.
+    RealRef {
+        net: usize,
+        decl_width: usize,
+    },
+    /// Runtime read of a 32-bit `shortreal` variable stored as its IEEE-754
+    /// binary32 bit pattern.
+    ShortRealRef {
+        net: usize,
+    },
+    /// Floating-point arithmetic on real operands. Comparison operators are
+    /// intentionally excluded until their one-bit result semantics are modeled.
+    RealBinary {
+        op: BinOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Floating-point comparison. Unlike real arithmetic, the result is one
+    /// unsigned bit and follows four-state unknown propagation.
+    RealCompare {
+        op: BinOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Numeric negation of a real operand.
+    RealNeg(Box<Expr>),
+    /// Finite `shortreal` literal retained as an IEEE-754 binary32 value.
+    ShortRealConst(f32),
+    /// Binary32 arithmetic on `shortreal` operands.
+    ShortRealBinary {
+        op: BinOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Numeric negation of a `shortreal` operand.
+    ShortRealNeg(Box<Expr>),
+    /// Widen a binary32 value to the repository's binary64 real model.
+    ShortRealToReal(Box<Expr>),
+    /// Round a binary64 real value to IEEE-754 binary32.
+    RealToShortReal(Box<Expr>),
+    /// Convert a real operand to a packed integer representation.
+    RealToInt {
+        value: Box<Expr>,
+        width: usize,
+        signed: bool,
+    },
+    /// Convert a packed integer operand to `f64`.
+    IntToReal {
+        value: Box<Expr>,
+        width: usize,
+        signed: bool,
+    },
+    /// `$realtime` value in the current module's time unit, retaining the
+    /// fractional part enabled by the global simulation precision.
+    RealTime {
+        unit_exponent: i8,
     },
 }
 
@@ -597,10 +766,36 @@ impl Expr {
             Expr::StringCompare { .. } => 32,
             Expr::EventTriggered { .. } => 1,
             Expr::SimulationTime { width, .. } => *width,
+            Expr::Random { width, .. } => *width,
+            Expr::FileOpen { .. } => 32,
+            Expr::FileOpenDynamic { .. } => 32,
+            Expr::FileGetc { .. } => 32,
+            Expr::FileUngetc { .. } => 32,
+            Expr::FileEof { .. } => 32,
+            Expr::FileTell { .. } => 32,
+            Expr::FileSeek { .. } => 32,
             Expr::StringPutc { e, .. } => e.width(),
+            Expr::StringFormat { .. } => 512,
             Expr::StringSubstr { e, .. } => e.width(),
             Expr::StringToRadix { .. } => 32,
             Expr::StringFromRadix { .. } => 512,
+            Expr::MemoryPattern { .. } => 32,
+            Expr::EnumPattern { value, .. } => value.width(),
+            Expr::StructPattern { value, .. } => value.width(),
+            Expr::RealConst(_) => 64,
+            Expr::RealRef { decl_width, .. } => *decl_width,
+            Expr::ShortRealRef { .. } => 32,
+            Expr::RealBinary { .. } => 64,
+            Expr::RealCompare { .. } => 1,
+            Expr::RealNeg(_) => 64,
+            Expr::ShortRealConst(_) => 32,
+            Expr::ShortRealBinary { .. } => 32,
+            Expr::ShortRealNeg(_) => 32,
+            Expr::ShortRealToReal(_) => 64,
+            Expr::RealToShortReal(_) => 32,
+            Expr::RealToInt { width, .. } => *width,
+            Expr::IntToReal { .. } => 64,
+            Expr::RealTime { .. } => 64,
         }
     }
 
@@ -644,10 +839,36 @@ impl Expr {
             Expr::StringCompare { .. } => true,
             Expr::EventTriggered { .. } => false,
             Expr::SimulationTime { signed, .. } => *signed,
+            Expr::Random { signed, .. } => *signed,
+            Expr::FileOpen { .. } => false,
+            Expr::FileOpenDynamic { .. } => false,
+            Expr::FileGetc { .. } => true,
+            Expr::FileUngetc { .. } => true,
+            Expr::FileEof { .. } => true,
+            Expr::FileTell { .. } => true,
+            Expr::FileSeek { .. } => true,
             Expr::StringPutc { .. } => false,
+            Expr::StringFormat { .. } => false,
             Expr::StringSubstr { .. } => false,
             Expr::StringToRadix { .. } => true,
             Expr::StringFromRadix { .. } => false,
+            Expr::MemoryPattern { .. } => false,
+            Expr::EnumPattern { value, .. } => value.is_signed(),
+            Expr::StructPattern { value, .. } => value.is_signed(),
+            Expr::RealConst(_) => true,
+            Expr::RealRef { .. } => true,
+            Expr::ShortRealRef { .. } => true,
+            Expr::RealBinary { .. } => true,
+            Expr::RealCompare { .. } => false,
+            Expr::RealNeg(_) => true,
+            Expr::ShortRealConst(_) => true,
+            Expr::ShortRealBinary { .. } => true,
+            Expr::ShortRealNeg(_) => true,
+            Expr::ShortRealToReal(_) => true,
+            Expr::RealToShortReal(_) => true,
+            Expr::RealToInt { signed, .. } => *signed,
+            Expr::IntToReal { .. } => true,
+            Expr::RealTime { .. } => true,
         }
     }
 }
@@ -665,8 +886,42 @@ pub enum DispPart {
     Str(String),
     /// Index into `Stmt::Display::args`.
     Arg(usize, char), // char is the conversion specifier: b/d/h
+    /// An argument with an explicit field width and/or real-format precision.
+    /// Width zero means no explicit width. Radix fields pad with zeroes,
+    /// decimal/time fields pad with spaces, and `-` left-justifies.
+    FormattedArg {
+        index: usize,
+        spec: char,
+        width: usize,
+        precision: Option<usize>,
+        left_justify: bool,
+    },
     /// A time-typed display argument, indexed into `Stmt::Display::args`.
     Time(usize),
+}
+
+/// One struct field consumed by `%p` formatting.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StructPatternField {
+    pub name: String,
+    pub offset: usize,
+    pub width: usize,
+    pub value: StructPatternValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StructPatternValue {
+    Scalar { signed: bool },
+    Struct { fields: Vec<StructPatternField> },
+}
+
+/// One memory element consumed by aggregate `%p` formatting.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MemoryPatternElement {
+    Scalar { signed: bool },
+    Struct { fields: Vec<StructPatternField> },
+    PackedUnion { signed: bool },
+    UnpackedUnion { fields: Vec<StructPatternField> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -868,6 +1123,18 @@ pub enum Stmt {
     Release {
         lv: LValue,
     },
+    /// Procedural continuous `assign lv = e`; unlike `Force`, a later
+    /// `Deassign` retains the last driven value instead of restoring the
+    /// pre-force value.
+    ProceduralAssign {
+        lv: LValue,
+        e: Expr,
+    },
+    /// End a procedural continuous assignment without restoring its pre-assign
+    /// value.
+    ProceduralDeassign {
+        lv: LValue,
+    },
     /// Exit the nearest runtime loop.
     Break,
     /// Start the next iteration of the nearest runtime loop.
@@ -884,6 +1151,8 @@ pub enum Stmt {
         args: Vec<Expr>,
         /// `$monitor`: re-print whenever an argument changes.
         monitor: bool,
+        /// `$strobe`: print once after all active and NBA updates at this time.
+        strobe: bool,
     },
     /// Configure `%t` formatting for subsequent display tasks.
     TimeFormat {
@@ -892,6 +1161,12 @@ pub enum Stmt {
         precision: u8,
         suffix: String,
         min_width: usize,
+    },
+    /// Executes seeded `$random(seed)` atomically: assign the signed 32-bit
+    /// return value to `destination` and update the inout `seed`.
+    RandomSeeded {
+        seed: LValue,
+        destination: LValue,
     },
     /// Immediate procedural assertion; a false/X/Z condition is an error.
     Assert {
@@ -916,6 +1191,89 @@ pub enum Stmt {
         memory: usize,
         start: Option<Expr>,
         finish: Option<Expr>,
+    },
+    /// Global no-argument `$asserton` / `$assertoff` / `$assertkill`.
+    /// Kill is explicit in IR even though the current immediate/property model
+    /// has no separately resident attempt to abort.
+    AssertControl(AssertControl),
+    /// Suspends simulation without executing final procedures. The current
+    /// simulator models `$stop` as a terminal pause rather than interactive
+    /// step/debug resume.
+    Stop,
+    /// Non-deferred immediate assertion with optional pass/fail action blocks.
+    /// An explicit fail action replaces the default assertion error for
+    /// Assert/Assume; an absent action retains the existing fail-closed result.
+    ImmediateAssertion {
+        kind: ImmediateAssertionKind,
+        cond: Expr,
+        pass_action: Option<Box<Stmt>>,
+        fail_action: Option<Box<Stmt>>,
+    },
+    /// Closes a descriptor returned by `Expr::FileOpen`.
+    FileClose {
+        fd: Expr,
+    },
+    /// Flushes a simulator-owned read/write descriptor.
+    FileFlush {
+        fd: Expr,
+    },
+    /// Reads one bounded line into `string`, then assigns the returned count to
+    /// `status`.
+    FileGets {
+        fd: Expr,
+        string: LValue,
+        status: LValue,
+    },
+    /// Queries a descriptor's persistent error state into a bounded string and
+    /// status value.
+    FileError {
+        fd: Expr,
+        message: LValue,
+        status: LValue,
+    },
+    /// Reads packed binary bytes into an integral target and assigns the byte
+    /// count to `status`.
+    FileRead {
+        fd: Expr,
+        target: LValue,
+        status: LValue,
+    },
+    /// Reads packed binary bytes into consecutive elements of a fixed
+    /// one-dimensional unpacked array, assigning the byte count to `status`.
+    FileReadMemory {
+        fd: Expr,
+        memory: usize,
+        /// Logical index of the first destination element.
+        start: Option<Expr>,
+        /// Maximum number of destination elements. `None` reads through the
+        /// final logical element in the single declared dimension.
+        count: Option<Expr>,
+        status: LValue,
+    },
+    /// Scans literal text from a read-mode descriptor using the checked
+    /// integer-only format subset, assigning converted fields and a return code.
+    FileScan {
+        fd: Expr,
+        format: String,
+        targets: Vec<LValue>,
+        status: LValue,
+    },
+    /// Scans literal text from a bounded runtime string using the checked
+    /// formatted-input subset, assigning converted fields and a return code.
+    StringScan {
+        source: Expr,
+        format: String,
+        targets: Vec<LValue>,
+        status: LValue,
+    },
+    /// Writes formatted output to a simulator-owned literal-file descriptor.
+    FileDisplay {
+        fd: Expr,
+        parts: Vec<DispPart>,
+        args: Vec<Expr>,
+        newline: bool,
+        /// `$fstrobe`: write after all active and NBA updates at this time.
+        strobe: bool,
     },
     Finish,
 }
@@ -1479,7 +1837,33 @@ fn lint_lvalue_bits(lvalue: &LValue) -> Vec<usize> {
 
 fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
     match expression {
-        Expr::Const(_) | Expr::SimulationTime { .. } | Expr::MemorySize { .. } => {}
+        Expr::Const(_)
+        | Expr::RealConst(_)
+        | Expr::SimulationTime { .. }
+        | Expr::MemorySize { .. } => {}
+        Expr::RealRef { net, decl_width } => output.extend(*net..*net + decl_width),
+        Expr::ShortRealRef { net } => output.extend(*net..*net + 32),
+        Expr::RealBinary { left, right, .. } => {
+            lint_expression_nets(left, output);
+            lint_expression_nets(right, output);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            lint_expression_nets(left, output);
+            lint_expression_nets(right, output);
+        }
+        Expr::RealNeg(operand) => lint_expression_nets(operand, output),
+        Expr::ShortRealConst(_) => {}
+        Expr::ShortRealBinary { left, right, .. } => {
+            lint_expression_nets(left, output);
+            lint_expression_nets(right, output);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => lint_expression_nets(operand, output),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            lint_expression_nets(value, output)
+        }
+        Expr::RealTime { .. } => {}
         Expr::Ref { net, range, .. } => match range {
             Range::Bit(bit) => output.push(net + bit),
             Range::Span { msb, lsb } => output.extend((*lsb..=*msb).map(|bit| net + bit)),
@@ -1530,13 +1914,41 @@ fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
             lint_expression_nets(index, output);
             lint_expression_nets(value, output);
         }
+        Expr::StringFormat { args, .. } => {
+            for argument in args {
+                lint_expression_nets(argument, output);
+            }
+        }
         Expr::StringSubstr { e, left, right } => {
             lint_expression_nets(e, output);
             lint_expression_nets(left, output);
             lint_expression_nets(right, output);
         }
         Expr::StringFromRadix { value, .. } => lint_expression_nets(value, output),
+        Expr::MemoryPattern { .. } => {}
+        Expr::EnumPattern { value, .. } => lint_expression_nets(value, output),
+        Expr::StructPattern { value, .. } => lint_expression_nets(value, output),
         Expr::EventTriggered { net } => output.push(*net),
+        Expr::Random { args, .. } => args
+            .iter()
+            .for_each(|argument| lint_expression_nets(argument, output)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            lint_expression_nets(path, output);
+            lint_expression_nets(mode, output);
+        }
+        Expr::FileGetc { fd } => lint_expression_nets(fd, output),
+        Expr::FileUngetc { value, fd } => {
+            lint_expression_nets(value, output);
+            lint_expression_nets(fd, output);
+        }
+        Expr::FileEof { fd } => lint_expression_nets(fd, output),
+        Expr::FileTell { fd } => lint_expression_nets(fd, output),
+        Expr::FileSeek { fd, offset, whence } => {
+            lint_expression_nets(fd, output);
+            lint_expression_nets(offset, output);
+            lint_expression_nets(whence, output);
+        }
     }
 }
 
@@ -2077,6 +2489,13 @@ fn lint_statement_touched_nets(statement: &Stmt, touched: &mut std::collections:
             touched.extend(bits);
         }
         Stmt::Release { lv } => touched.extend(lint_lvalue_bits(lv)),
+        Stmt::ProceduralAssign { lv, e } => {
+            touched.extend(lint_lvalue_bits(lv));
+            let mut bits = Vec::new();
+            lint_expression_nets(e, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::ProceduralDeassign { lv } => touched.extend(lint_lvalue_bits(lv)),
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Display { args, .. } => {
             for argument in args {
@@ -2085,7 +2504,112 @@ fn lint_statement_touched_nets(statement: &Stmt, touched: &mut std::collections:
                 touched.extend(bits);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::FileDisplay { fd, args, .. } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+            for argument in args {
+                let mut bits = Vec::new();
+                lint_expression_nets(argument, &mut bits);
+                touched.extend(bits);
+            }
+        }
+        Stmt::FileClose { fd } | Stmt::FileFlush { fd } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+        }
+        Stmt::FileGets { fd, string, status } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+            touched.extend(lint_lvalue_bits(string));
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+            touched.extend(lint_lvalue_bits(message));
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::FileRead { fd, target, status } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+            touched.extend(lint_lvalue_bits(target));
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::FileReadMemory {
+            fd,
+            start,
+            count,
+            status,
+            ..
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits.drain(..));
+            if let Some(start) = start {
+                lint_expression_nets(start, &mut bits);
+                touched.extend(bits.drain(..));
+            }
+            if let Some(count) = count {
+                lint_expression_nets(count, &mut bits);
+                touched.extend(bits.drain(..));
+            }
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::FileScan {
+            fd,
+            targets,
+            status,
+            ..
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(fd, &mut bits);
+            touched.extend(bits);
+            for target in targets {
+                touched.extend(lint_lvalue_bits(target));
+            }
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::StringScan {
+            source,
+            targets,
+            status,
+            ..
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(source, &mut bits);
+            touched.extend(bits);
+            for target in targets {
+                touched.extend(lint_lvalue_bits(target));
+            }
+            touched.extend(lint_lvalue_bits(status));
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            let mut bits = Vec::new();
+            lint_expression_nets(cond, &mut bits);
+            touched.extend(bits);
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                lint_statement_touched_nets(action, touched);
+            }
+        }
+        Stmt::RandomSeeded { seed, destination } => {
+            touched.extend(lint_lvalue_bits(seed));
+            touched.extend(lint_lvalue_bits(destination));
+        }
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             let mut bits = Vec::new();
             lint_expression_nets(cond, &mut bits);
@@ -2804,6 +3328,10 @@ fn collect_memory_accesses(
         }
         Stmt::Force { e, .. } => collect_memory_expr_reads(e, synchronous, false, accesses),
         Stmt::Release { .. } => {}
+        Stmt::ProceduralAssign { e, .. } => {
+            collect_memory_expr_reads(e, synchronous, false, accesses)
+        }
+        Stmt::ProceduralDeassign { .. } => {}
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, false, accesses);
@@ -2942,7 +3470,68 @@ fn collect_memory_accesses(
                 collect_memory_expr_reads(argument, synchronous, false, accesses);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::WriteMem { .. } | Stmt::Finish => {}
+        Stmt::FileDisplay { fd, args, .. } => {
+            collect_memory_expr_reads(fd, synchronous, false, accesses);
+            for argument in args {
+                collect_memory_expr_reads(argument, synchronous, false, accesses);
+            }
+        }
+        Stmt::FileClose { fd } | Stmt::FileFlush { fd } => {
+            collect_memory_expr_reads(fd, synchronous, false, accesses)
+        }
+        Stmt::FileGets { fd, .. }
+        | Stmt::FileError { fd, .. }
+        | Stmt::FileRead { fd, .. }
+        | Stmt::FileScan { fd, .. } => collect_memory_expr_reads(fd, synchronous, false, accesses),
+        Stmt::StringScan { source, .. } => {
+            collect_memory_expr_reads(source, synchronous, false, accesses)
+        }
+        Stmt::FileReadMemory {
+            fd,
+            memory,
+            start,
+            count,
+            status: _,
+        } => {
+            collect_memory_expr_reads(fd, synchronous, false, accesses);
+            if let Some(start) = start {
+                collect_memory_expr_reads(start, synchronous, false, accesses);
+            }
+            if let Some(count) = count {
+                collect_memory_expr_reads(count, synchronous, false, accesses);
+            }
+            if synchronous {
+                accesses.sync_writes.insert(*memory);
+            } else {
+                accesses.async_writes.insert(*memory);
+            }
+            accesses
+                .write_observations
+                .entry(*memory)
+                .or_default()
+                .push(MemoryWriteObservation {
+                    start: None,
+                    width: memory_widths.get(*memory).copied().unwrap_or(0),
+                    ascending: true,
+                });
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            collect_memory_expr_reads(cond, synchronous, false, accesses);
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                collect_memory_accesses(action, synchronous, memory_widths, accesses);
+            }
+        }
+        Stmt::TimeFormat { .. }
+        | Stmt::WriteMem { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
+        Stmt::RandomSeeded { .. } => {}
     }
 }
 
@@ -3037,6 +3626,11 @@ fn collect_memory_expr_reads(
             collect_memory_expr_reads(index, synchronous, continuous, accesses);
             collect_memory_expr_reads(value, synchronous, continuous, accesses);
         }
+        Expr::StringFormat { args, .. } => {
+            for argument in args {
+                collect_memory_expr_reads(argument, synchronous, continuous, accesses);
+            }
+        }
         Expr::StringSubstr { e, left, right } => {
             collect_memory_expr_reads(e, synchronous, continuous, accesses);
             collect_memory_expr_reads(left, synchronous, continuous, accesses);
@@ -3047,6 +3641,70 @@ fn collect_memory_expr_reads(
         }
         Expr::StringFromRadix { value, .. } => {
             collect_memory_expr_reads(value, synchronous, continuous, accesses);
+        }
+        Expr::MemoryPattern { memory, .. } => {
+            if continuous {
+                accesses.continuous_reads.insert(*memory);
+            } else if synchronous {
+                accesses.sync_reads.insert(*memory);
+            } else {
+                accesses.async_reads.insert(*memory);
+            }
+        }
+        Expr::EnumPattern { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
+        }
+        Expr::StructPattern { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
+        }
+        Expr::RealConst(_) => {}
+        Expr::RealRef { .. } => {}
+        Expr::ShortRealConst(_) | Expr::ShortRealRef { .. } => {}
+        Expr::RealBinary { left, right, .. } => {
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
+        }
+        Expr::RealNeg(operand) => {
+            collect_memory_expr_reads(operand, synchronous, continuous, accesses)
+        }
+        Expr::ShortRealBinary { left, right, .. } => {
+            collect_memory_expr_reads(left, synchronous, continuous, accesses);
+            collect_memory_expr_reads(right, synchronous, continuous, accesses);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => {
+            collect_memory_expr_reads(operand, synchronous, continuous, accesses)
+        }
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses)
+        }
+        Expr::RealTime { .. } => {}
+        Expr::Random { args, .. } => {
+            for argument in args {
+                collect_memory_expr_reads(argument, synchronous, continuous, accesses);
+            }
+        }
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            collect_memory_expr_reads(path, synchronous, continuous, accesses);
+            collect_memory_expr_reads(mode, synchronous, continuous, accesses);
+        }
+        Expr::FileGetc { fd } => collect_memory_expr_reads(fd, synchronous, continuous, accesses),
+        Expr::FileUngetc { value, fd } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
+            collect_memory_expr_reads(fd, synchronous, continuous, accesses);
+        }
+        Expr::FileEof { fd } => collect_memory_expr_reads(fd, synchronous, continuous, accesses),
+        Expr::FileTell { fd } => collect_memory_expr_reads(fd, synchronous, continuous, accesses),
+        Expr::FileSeek { fd, offset, whence } => {
+            collect_memory_expr_reads(fd, synchronous, continuous, accesses);
+            collect_memory_expr_reads(offset, synchronous, continuous, accesses);
+            collect_memory_expr_reads(whence, synchronous, continuous, accesses);
         }
     }
 }

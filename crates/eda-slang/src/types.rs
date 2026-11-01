@@ -58,11 +58,22 @@ pub(super) fn simple_type_signed(type_name: &str) -> Option<bool> {
         } else if tokens.contains(&"unsigned") {
             false
         } else {
-            // byte, shortint, int, integer, longint, and time are signed by
-            // definition; logic, reg, and bit are unsigned.
+            // byte, shortint, int, integer, longint, time, real, realtime,
+            // and shortreal are
+            // signed by definition; logic, reg, and bit are unsigned.
             matches!(
                 tokens.last().copied(),
-                Some("byte" | "shortint" | "int" | "integer" | "longint" | "time")
+                Some(
+                    "byte"
+                        | "shortint"
+                        | "int"
+                        | "integer"
+                        | "longint"
+                        | "time"
+                        | "real"
+                        | "realtime"
+                        | "shortreal"
+                )
             )
         }
     })
@@ -319,6 +330,9 @@ pub(super) fn simple_type_shape(type_name: &str) -> Option<AstTypeShape> {
             "int" | "integer" => 32,
             "longint" => 64,
             "time" => 64,
+            "real" => 64,
+            "realtime" => 64,
+            "shortreal" => 32,
             _ => return None,
         }
     };

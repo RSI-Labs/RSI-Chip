@@ -123,6 +123,10 @@ impl SlangAstLowerer {
                 |address| format!("{address} {}.{}", self.design.name, name),
             )
         };
+        if string_field(member, "eda_package_scope").is_some() {
+            self.package_type_aliases
+                .insert(name.clone(), definition.clone());
+        }
         self.type_aliases.insert(scoped_name, definition.clone());
         self.type_aliases.insert(name, definition);
     }
@@ -246,6 +250,7 @@ impl SlangAstLowerer {
                         fields: std::collections::BTreeMap::new(),
                         is_union: false,
                         is_unpacked: false,
+                        flat_pattern: true,
                     },
                 );
                 return Ok(());
@@ -276,11 +281,14 @@ impl SlangAstLowerer {
                 simple_type_shape(&target_type)
             };
             let (width, signed) = match shape {
-                Some(shape) => (
-                    shape.width,
-                    simple_type_signed(&target_type)
-                        .ok_or_else(|| format!("type alias '{name}' has unknown signedness"))?,
-                ),
+                Some(shape) => {
+                    let signed = target
+                        .get("isSigned")
+                        .and_then(serde_json::Value::as_bool)
+                        .map_or_else(|| simple_type_signed(&target_type), Some)
+                        .ok_or_else(|| format!("type alias '{name}' has unknown signedness"))?;
+                    (shape.width, signed)
+                }
                 None => (detailed_type_width(target)?, detailed_type_signed(target)),
             };
             self.insert_type_alias(
@@ -292,6 +300,7 @@ impl SlangAstLowerer {
                     fields: std::collections::BTreeMap::new(),
                     is_union: false,
                     is_unpacked: false,
+                    flat_pattern: true,
                 },
             );
             return Ok(());
@@ -313,6 +322,7 @@ impl SlangAstLowerer {
             .ok_or_else(|| format!("packed aggregate type '{name}' has no fields"))?;
         let mut struct_fields = std::collections::BTreeMap::new();
         let mut width = 0_usize;
+        let mut flat_pattern = true;
         for field in fields {
             let field_name = field
                 .get("name")
@@ -347,6 +357,26 @@ impl SlangAstLowerer {
                 };
                 shape.0.width
             };
+            let field_is_scalar_integral = if field_type.is_object() {
+                matches!(
+                    string_field(field_type, "kind").as_deref(),
+                    Some("ScalarType" | "PredefinedIntegerType" | "PackedArrayType")
+                ) && detailed_type_width(field_type).is_ok_and(|width| width <= 64)
+            } else {
+                let type_name = string_field(field, "type").unwrap_or_default();
+                self.net_type(&type_name)
+                    .is_ok_and(|_| simple_type_width(&type_name).is_some())
+            };
+            let nested_type = self.nested_struct_pattern_type(field_type);
+            flat_pattern &= field_is_scalar_integral || nested_type.is_some();
+            let field_signed = if field_type.is_object() {
+                detailed_type_signed(field_type)
+            } else {
+                let type_name = string_field(field, "type").unwrap_or_default();
+                self.net_type(&type_name)
+                    .map(|(_, signed, _)| signed)
+                    .unwrap_or_default()
+            };
             width = width.max(offset.saturating_add(field_width));
             if is_union && offset != 0 {
                 return Err(format!(
@@ -359,6 +389,8 @@ impl SlangAstLowerer {
                     offset,
                     width: field_width,
                     field_index,
+                    signed: field_signed,
+                    nested_type,
                 },
             );
         }
@@ -373,9 +405,103 @@ impl SlangAstLowerer {
             fields: struct_fields,
             is_union,
             is_unpacked,
+            flat_pattern,
         };
         self.insert_type_alias(name, member, definition);
         Ok(())
+    }
+
+    fn inline_struct_pattern_type(&self, target: &serde_json::Value) -> Option<AstStructType> {
+        let target_kind = string_field(target, "kind")?;
+        if !matches!(
+            target_kind.as_str(),
+            "PackedStructType" | "UnpackedStructType" | "PackedUnionType" | "UnpackedUnionType"
+        ) || bool_field(target, "isTagged")
+        {
+            return None;
+        }
+        let fields = target.get("members")?.as_array()?;
+        let mut struct_fields = std::collections::BTreeMap::new();
+        let mut width = 0_usize;
+        let mut flat_pattern = true;
+        for field in fields {
+            let field_name = string_field(field, "name")?;
+            let offset = field
+                .get("bitOffset")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|offset| usize::try_from(offset).ok())?;
+            let field_index = field
+                .get("fieldIndex")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())?;
+            let field_type = field.get("type")?;
+            let field_width = if field_type.is_object() {
+                detailed_type_width(field_type).ok()?
+            } else {
+                let type_name = field_type.as_str()?;
+                self.net_type(type_name).ok()?.0.width
+            };
+            let field_is_scalar_integral = if field_type.is_object() {
+                matches!(
+                    string_field(field_type, "kind").as_deref(),
+                    Some("ScalarType" | "PredefinedIntegerType" | "PackedArrayType")
+                ) && detailed_type_width(field_type).is_ok_and(|width| width <= 64)
+            } else {
+                let type_name = field_type.as_str()?;
+                self.net_type(type_name)
+                    .is_ok_and(|_| simple_type_width(type_name).is_some())
+            };
+            let nested_type = self.nested_struct_pattern_type(field_type);
+            flat_pattern &= field_is_scalar_integral || nested_type.is_some();
+            let field_signed = if field_type.is_object() {
+                detailed_type_signed(field_type)
+            } else {
+                let type_name = field_type.as_str()?;
+                self.net_type(type_name)
+                    .map(|(_, signed, _)| signed)
+                    .unwrap_or_default()
+            };
+            width = width.max(offset.saturating_add(field_width));
+            struct_fields.insert(
+                field_name.to_string(),
+                AstStructField {
+                    offset,
+                    width: field_width,
+                    field_index,
+                    signed: field_signed,
+                    nested_type,
+                },
+            );
+        }
+        let is_union = target_kind.ends_with("UnionType");
+        if is_union && !target_kind.starts_with("Unpacked") {
+            let widths_match = struct_fields.values().all(|field| field.width == width);
+            if !widths_match {
+                return None;
+            }
+        }
+        Some(AstStructType {
+            width,
+            signed: bool_field(target, "isSigned"),
+            fields: struct_fields,
+            is_union,
+            is_unpacked: target_kind == "UnpackedStructType",
+            flat_pattern,
+        })
+    }
+
+    fn nested_struct_pattern_type(
+        &self,
+        field_type: &serde_json::Value,
+    ) -> Option<crate::lowering::AstNestedStruct> {
+        if field_type.is_object() {
+            let inline = self.inline_struct_pattern_type(field_type)?;
+            return Some(crate::lowering::AstNestedStruct::Inline(Box::new(inline)));
+        }
+        let type_name = field_type.as_str()?;
+        self.type_alias_definition(type_name)
+            .filter(|definition| !definition.fields.is_empty() && definition.flat_pattern)
+            .map(|_| crate::lowering::AstNestedStruct::Alias(type_name.to_string()))
     }
 
     pub(super) fn collect_enum_type(&mut self, member: &serde_json::Value) -> Result<(), String> {
@@ -477,6 +603,46 @@ impl SlangAstLowerer {
         Err(format!("direct lowering cannot resolve type '{type_name}'"))
     }
 
+    fn aggregate_container_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
+        let separator = type_name.find('$')?;
+        let element_type = type_name[..separator].trim();
+        let (shape, signed, _) = self.net_type(element_type).ok()?;
+        let element_msb = i64::try_from(shape.width.saturating_sub(1)).ok()?;
+        let bounds = shape.bounds.unwrap_or((element_msb, 0));
+        let dimension = type_name[separator + 1..].trim();
+
+        let (capacity, queue, associative, index_width, index_signed) = if dimension == "[]" {
+            (256_usize, false, false, 0_usize, false)
+        } else if dimension == "queue[$]" {
+            (256_usize, true, false, 0_usize, false)
+        } else if let Some(bound) = dimension.strip_prefix("queue[$:") {
+            let bound = bound.strip_suffix(']')?.parse::<usize>().ok()?;
+            (bound.checked_add(1)?, true, false, 0_usize, false)
+        } else if let Some(index_type) = dimension.strip_prefix("assoc[") {
+            let index_type = index_type.strip_suffix(']')?.trim();
+            let index_width = simple_type_width(index_type)?;
+            let index_signed = simple_type_signed(index_type)?;
+            (256_usize, false, true, index_width, index_signed)
+        } else {
+            return None;
+        };
+
+        let capacity_msb = i64::try_from(capacity.checked_sub(1)?).ok()?;
+        let fixed_type_name = format!("{element_type}$[0:{capacity_msb}]");
+        let mut memory = memory_type_with_element(&fixed_type_name, shape.width, bounds, signed)?;
+        memory.dynamic = true;
+        memory.queue = queue;
+        memory.queue_bound = if queue && dimension != "queue[$]" {
+            capacity.checked_sub(1)
+        } else {
+            None
+        };
+        memory.associative = associative;
+        memory.index_width = index_width;
+        memory.index_signed = index_signed;
+        Some(memory)
+    }
+
     pub(super) fn declared_memory_type(&self, type_name: &str) -> Option<AstMemoryType> {
         if let Some(memory) = associative_memory_type(type_name) {
             return Some(memory);
@@ -488,6 +654,9 @@ impl SlangAstLowerer {
             return Some(memory);
         }
         if let Some(memory) = memory_type(type_name) {
+            return Some(memory);
+        }
+        if let Some(memory) = self.aggregate_container_memory_type(type_name) {
             return Some(memory);
         }
         let separator = type_name.find('$')?;
@@ -635,7 +804,7 @@ impl SlangAstLowerer {
         }
         let symbol = self.declare_net(member, &name, &kind)?;
         if let Some(initializer) = member.get("initializer") {
-            let rhs = self.lower_expression(initializer)?;
+            let rhs = self.lower_real_assignment_expression(member, initializer)?;
             let _ = symbol;
             self.push_assignment(name, rhs);
         }
@@ -812,6 +981,14 @@ fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> 
     match string_field(type_value, "kind").as_deref() {
         Some("ScalarType") => Ok(1),
         Some("StringType") => Ok(STRING_WIDTH),
+        Some("FloatingType") => {
+            let type_name = string_field(type_value, "name").unwrap_or_default();
+            match type_name.trim() {
+                "real" | "realtime" => Ok(64),
+                "shortreal" => Ok(32),
+                other => Err(format!("unsupported floating type '{other}'")),
+            }
+        }
         Some("PredefinedIntegerType") => {
             let type_name = string_field(type_value, "name").unwrap_or_default();
             simple_type_width(&type_name)
@@ -868,6 +1045,12 @@ fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> 
 }
 
 fn detailed_type_signed(type_value: &serde_json::Value) -> bool {
+    if let Some(is_signed) = type_value
+        .get("isSigned")
+        .and_then(serde_json::Value::as_bool)
+    {
+        return is_signed;
+    }
     match string_field(type_value, "kind").as_deref() {
         Some("PackedArrayType") => type_value
             .get("elementType")
@@ -877,6 +1060,7 @@ fn detailed_type_signed(type_value: &serde_json::Value) -> bool {
             string_field(type_value, "name").as_deref(),
             Some("byte unsigned" | "shortint unsigned" | "int unsigned" | "longint unsigned")
         ),
+        Some("FloatingType") => true,
         _ => bool_field(type_value, "isSigned"),
     }
 }

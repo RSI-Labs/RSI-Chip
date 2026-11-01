@@ -416,16 +416,21 @@ fn parse_format(
                 'b' | 'B' => 'b',
                 'd' | 'D' => 'd',
                 'h' | 'H' => 'h',
+                'o' | 'O' => 'o',
                 's' | 'S' => 's',
                 't' | 'T' => {
-                    parts.push(DispPartSrc::Str(std::mem::take(&mut lit)));
+                    if !lit.is_empty() {
+                        parts.push(DispPartSrc::Str(std::mem::take(&mut lit)));
+                    }
                     parts.push(DispPartSrc::Time);
                     argi += 1;
                     continue;
                 }
                 _ => default_spec,
             };
-            parts.push(DispPartSrc::Str(std::mem::take(&mut lit)));
+            if !lit.is_empty() {
+                parts.push(DispPartSrc::Str(std::mem::take(&mut lit)));
+            }
             parts.push(DispPartSrc::Arg(spec));
             argi += 1;
         } else {

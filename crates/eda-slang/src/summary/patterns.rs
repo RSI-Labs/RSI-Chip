@@ -246,7 +246,15 @@ fn packed_struct_assignment_pattern(
             if elements.len() != fields.len() {
                 return None;
             }
-            fields.iter().cloned().zip(elements).collect::<Vec<_>>()
+            let positional_fields = layout.fields.clone();
+            let mut elements_by_offset = std::collections::BTreeMap::new();
+            for (field, element) in positional_fields.iter().zip(elements) {
+                elements_by_offset.insert(field.offset, element.clone());
+            }
+            fields
+                .iter()
+                .map(|field| Some((field.clone(), elements_by_offset.remove(&field.offset)?)))
+                .collect::<Option<Vec<_>>>()?
         }
         Some("StructuredAssignmentPattern") => {
             let setters = value.get("memberSetters")?.as_array()?;
@@ -263,7 +271,7 @@ fn packed_struct_assignment_pattern(
             }
             let mut elements = Vec::with_capacity(fields.len());
             for field in &fields {
-                elements.push((field.clone(), elements_by_name.get(&field.name).cloned()?));
+                elements.push((field.clone(), (*elements_by_name.get(&field.name)?).clone()));
             }
             elements
         }

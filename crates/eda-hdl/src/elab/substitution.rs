@@ -913,12 +913,19 @@ pub(super) fn subst_stmt(stmt: &ast::Stmt, var: &str, value: i64) -> ast::Stmt {
             ns: *ns,
             body: Box::new(subst_stmt(body, var, value)),
         },
-        ast::Stmt::Display { fmt, args, monitor } => ast::Stmt::Display {
+        ast::Stmt::Display {
+            fmt,
+            args,
+            monitor,
+            strobe,
+        } => ast::Stmt::Display {
             fmt: fmt.clone(),
             args: args.iter().map(|arg| subst_expr(arg, var, value)).collect(),
             monitor: *monitor,
+            strobe: *strobe,
         },
         ast::Stmt::Finish => ast::Stmt::Finish,
+        ast::Stmt::Stop => ast::Stmt::Stop,
         ast::Stmt::ReadMem {
             radix,
             path,

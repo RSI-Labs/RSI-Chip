@@ -12,4 +12,5 @@ regex = "1.13.1"
 
 [dev-dependencies]
 eda-core = { path = "../eda-core" }
+eda-synth = { path = "../eda-synth" }
 eda-sim = { path = "../eda-sim" }

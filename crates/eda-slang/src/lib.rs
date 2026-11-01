@@ -40,9 +40,11 @@ pub struct SlangFrontend {
     timeout: Duration,
     ast_cache: Arc<Mutex<SlangAstCache>>,
     unit_ir_cache: Arc<Mutex<SlangUnitIrCache>>,
+    unit_ir_persistence_lock: Arc<Mutex<()>>,
 }
 
 const PINNED_SLANG_VERSION: &str = "slang version 12.0.535+54c19b53";
+const SLANG_LANGUAGE_STANDARD: &str = "1800-2023";
 const DEFAULT_SLANG_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_AST_CACHE_ENTRIES: usize = 4;
 const DEFAULT_UNIT_IR_CACHE_ENTRIES: usize = 4;
@@ -65,6 +67,7 @@ enum SlangAstCacheInput {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SlangAstCacheKey {
     program: String,
+    language_standard: String,
     top: Option<String>,
     include_directories: Vec<PathBuf>,
     defines: Vec<String>,
@@ -78,6 +81,7 @@ struct SlangAstCacheKey {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SlangLibraryPlanKey {
     program: String,
+    language_standard: String,
     roots: Vec<SlangNamedSourceCacheKey>,
     top: Option<String>,
     include_directories: Vec<PathBuf>,
@@ -116,6 +120,10 @@ struct SlangUnitIrCache {
     capacity: usize,
     entries: BTreeMap<String, Arc<Design>>,
     order: VecDeque<String>,
+    persist_directory: Option<PathBuf>,
+    persist_keys: BTreeSet<String>,
+    persisted_keys: BTreeSet<String>,
+    persist_errors: Vec<String>,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -127,10 +135,21 @@ impl SlangUnitIrCache {
             capacity,
             entries: BTreeMap::new(),
             order: VecDeque::new(),
+            persist_directory: None,
+            persist_keys: BTreeSet::new(),
+            persisted_keys: BTreeSet::new(),
+            persist_errors: Vec::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
         }
+    }
+
+    fn configure_persistence(&mut self, directory: Option<&Path>, keys: BTreeSet<String>) {
+        self.persist_directory = directory.map(Path::to_path_buf);
+        self.persist_keys = keys;
+        self.persisted_keys.clear();
+        self.persist_errors.clear();
     }
 
     fn get(&mut self, key: &str) -> Option<Arc<Design>> {
@@ -151,6 +170,17 @@ impl SlangUnitIrCache {
     }
 
     fn insert(&mut self, key: String, design: Arc<Design>) {
+        if let Some(directory) = self.persist_directory.clone() {
+            if self.persist_keys.contains(&key) && !self.persisted_keys.contains(&key) {
+                let path = directory.join("ir").join(format!("{key}.json"));
+                match save_leaf_ir_artifact(&path, &key, &design) {
+                    Ok(()) => {
+                        self.persisted_keys.insert(key.clone());
+                    }
+                    Err(error) => self.persist_errors.push(error),
+                }
+            }
+        }
         if self.capacity == 0 {
             return;
         }
@@ -179,6 +209,10 @@ impl SlangUnitIrCache {
             evictions: self.evictions,
             entries: self.entries.len(),
         }
+    }
+
+    fn take_persist_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.persist_errors)
     }
 }
 
@@ -468,6 +502,7 @@ struct SlangUnitArtifactRecord {
 struct SlangProjectCacheRecord {
     schema: u32,
     program: String,
+    language_standard: String,
     runtime_version: String,
     manifest_path: PathBuf,
     manifest_sha256: String,
@@ -485,9 +520,10 @@ struct SlangProjectCacheRecord {
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 6;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 8;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
-const SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA: u32 = 1;
+const SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA: u32 = 32;
+const SLANG_LEAF_IR_ARTIFACT_SCHEMA: u32 = 32;
 
 fn parse_path_array(
     value: &serde_json::Value,
@@ -712,15 +748,21 @@ fn prune_nested_instance_bodies(value: &mut serde_json::Value) {
     };
     if is_instance {
         if let Some(body) = fields.get_mut("body") {
-            let metadata = serde_json::json!({
-                "name": body.get("name").cloned().unwrap_or(serde_json::Value::Null),
-                "kind": body.get("kind").cloned().unwrap_or(serde_json::Value::Null),
-                "definition": body
-                    .get("definition")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            });
-            *body = metadata;
+            // slang serializes repeated instance bodies as symbol-reference
+            // strings after the first full object. Keep those references intact:
+            // parse_ast_root's normalization resolves them after unit bodies are
+            // spliced back together.
+            if body.as_str().is_none() {
+                let metadata = serde_json::json!({
+                    "name": body.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "kind": body.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    "definition": body
+                        .get("definition")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                });
+                *body = metadata;
+            }
         }
     }
     for nested in fields.values_mut() {
@@ -734,6 +776,17 @@ fn canonicalize_unit_artifact(value: &serde_json::Value) -> serde_json::Value {
             let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
             let nested_body = if is_instance {
                 value.get("body").map(|body| {
+                    if let Some(reference) = body.as_str() {
+                        return serde_json::json!({
+                            "name": serde_json::Value::Null,
+                            "kind": serde_json::Value::Null,
+                            "definition": reference
+                                .split_whitespace()
+                                .next_back()
+                                .map(|name| serde_json::Value::String(name.to_string()))
+                                .unwrap_or(serde_json::Value::Null),
+                        });
+                    }
                     serde_json::json!({
                         "name": body.get("name").cloned().unwrap_or(serde_json::Value::Null),
                         "kind": body.get("kind").cloned().unwrap_or(serde_json::Value::Null),
@@ -814,6 +867,7 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
     serde_json::json!({
         "schema": record.schema,
         "program": record.program,
+        "language_standard": record.language_standard,
         "runtime_version": record.runtime_version,
         "manifest_path": record.manifest_path,
         "manifest_sha256": record.manifest_sha256,
@@ -964,6 +1018,7 @@ fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectC
     Some(SlangProjectCacheRecord {
         schema: value.get("schema")?.as_u64()?.try_into().ok()?,
         program: value.get("program")?.as_str()?.to_string(),
+        language_standard: value.get("language_standard")?.as_str()?.to_string(),
         runtime_version: value.get("runtime_version")?.as_str()?.to_string(),
         manifest_path: json_path(value, "manifest_path")?,
         manifest_sha256: value.get("manifest_sha256")?.as_str()?.to_string(),
@@ -988,16 +1043,16 @@ fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectC
 
 fn project_cache_record_matches(
     record: &SlangProjectCacheRecord,
-    program: &str,
-    runtime_version: &str,
+    runtime: ProjectCacheRuntime<'_>,
     manifest_path: &Path,
     manifest: &SlangProjectManifest,
     roots: &[SlangProjectFileRecord],
     library_inventory: &[(PathBuf, Vec<PathBuf>)],
 ) -> bool {
     record.schema == SLANG_PROJECT_CACHE_SCHEMA
-        && record.program == program
-        && record.runtime_version == runtime_version
+        && record.program == runtime.program
+        && record.language_standard == runtime.language_standard
+        && record.runtime_version == runtime.runtime_version
         && record.manifest_path == canonical_path(manifest_path)
         && project_file_record(manifest_path)
             .is_ok_and(|manifest| manifest.sha256 == record.manifest_sha256)
@@ -1013,6 +1068,12 @@ fn project_cache_record_matches(
             project_file_record(&dependency.path)
                 .is_ok_and(|current| current.sha256 == dependency.sha256)
         })
+}
+
+struct ProjectCacheRuntime<'a> {
+    program: &'a str,
+    language_standard: &'a str,
+    runtime_version: &'a str,
 }
 
 fn load_project_cache_ast(path: &Path, record: &SlangProjectCacheRecord) -> Option<String> {
@@ -1116,7 +1177,7 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
 }
 
 fn unit_ir_cache_key(program: &str, semantic: &str) -> String {
-    sha256_hex(format!("{program}\0{semantic}").as_bytes())
+    sha256_hex(format!("{program}\0{SLANG_LANGUAGE_STANDARD}\0{semantic}").as_bytes())
 }
 
 fn save_composite_ir_artifact(path: &Path, cache_key: &str, design: &Design) -> Result<(), String> {
@@ -1129,6 +1190,160 @@ fn save_composite_ir_artifact(path: &Path, cache_key: &str, design: &Design) -> 
         "design": design,
     });
     atomic_write(path, &artifact.to_string())
+}
+
+fn save_leaf_ir_artifact(path: &Path, cache_key: &str, design: &Design) -> Result<(), String> {
+    let design = serde_json::to_value(design)
+        .map_err(|error| format!("cannot serialize leaf IR: {error}"))?;
+    let artifact = serde_json::json!({
+        "schema": SLANG_LEAF_IR_ARTIFACT_SCHEMA,
+        "cache_key": cache_key,
+        "design_sha256": sha256_hex(design.to_string().as_bytes()),
+        "design": design,
+    });
+    atomic_write(path, &artifact.to_string())
+}
+
+fn load_unit_ir_artifact(
+    path: &Path,
+    cache_key: &str,
+    require_leaf_hierarchy: bool,
+) -> Option<Design> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    if value.get("schema").and_then(serde_json::Value::as_u64)?
+        != u64::from(SLANG_LEAF_IR_ARTIFACT_SCHEMA)
+    {
+        return None;
+    }
+    if value.get("cache_key").and_then(serde_json::Value::as_str) != Some(cache_key) {
+        return None;
+    }
+    let design = value.get("design")?.clone();
+    let expected = value.get("design_sha256")?.as_str()?;
+    if sha256_hex(design.to_string().as_bytes()) != expected {
+        return None;
+    }
+    let design: Design = serde_json::from_value(design).ok()?;
+    if !require_leaf_hierarchy || design.hierarchy.is_empty() {
+        Some(design)
+    } else {
+        None
+    }
+}
+
+fn load_leaf_ir_artifact(path: &Path, cache_key: &str) -> Option<Design> {
+    load_unit_ir_artifact(path, cache_key, true)
+}
+
+fn load_composite_fragment_ir_artifact(path: &Path, cache_key: &str) -> Option<Design> {
+    load_unit_ir_artifact(path, cache_key, false)
+}
+
+fn unit_artifact_is_standalone_leaf(artifact: &serde_json::Value) -> bool {
+    let Some(members) = artifact
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    !members.iter().any(|member| {
+        matches!(
+            member.get("kind").and_then(serde_json::Value::as_str),
+            Some("Instance" | "InstanceArray" | "Modport")
+        ) || json_contains_instance_hierarchy(member)
+    })
+}
+
+fn json_contains_interface_connection(value: &serde_json::Value) -> bool {
+    if value.get("ifaceInstance").is_some() {
+        return true;
+    }
+    value
+        .as_object()
+        .map(|fields| fields.values().any(json_contains_interface_connection))
+        .unwrap_or_else(|| {
+            value
+                .as_array()
+                .is_some_and(|values| values.iter().any(json_contains_interface_connection))
+        })
+}
+
+fn json_contains_instance_hierarchy(value: &serde_json::Value) -> bool {
+    if matches!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("Instance" | "InstanceArray")
+    ) {
+        return true;
+    }
+    value
+        .as_object()
+        .map(|fields| fields.values().any(json_contains_instance_hierarchy))
+        .unwrap_or_else(|| {
+            value
+                .as_array()
+                .is_some_and(|values| values.iter().any(json_contains_instance_hierarchy))
+        })
+}
+
+fn unit_artifact_is_cacheable_composite(artifact: &serde_json::Value) -> bool {
+    let Some(members) = artifact
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    for member in members {
+        if let Some("Modport" | "InterfacePort") =
+            member.get("kind").and_then(serde_json::Value::as_str)
+        {
+            return false;
+        }
+    }
+    members.iter().any(json_contains_instance_hierarchy)
+        && !json_contains_interface_connection(artifact)
+}
+
+fn cacheable_child_ir_keys(
+    program: &str,
+    artifacts: &[serde_json::Value],
+    root_name: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut keys = BTreeSet::new();
+    for artifact in artifacts {
+        let name = artifact
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("unit artifact has no name")?;
+        if name == root_name {
+            continue;
+        }
+        if let Some(key) = unit_artifact_ir_key(name, artifact, artifacts, program)? {
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
+
+fn unit_artifact_ir_key(
+    name: &str,
+    artifact: &serde_json::Value,
+    artifacts: &[serde_json::Value],
+    program: &str,
+) -> Result<Option<String>, String> {
+    if unit_artifact_is_standalone_leaf(artifact) {
+        let semantic = artifact
+            .get("semantic_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("unit artifact '{name}' has no semantic fingerprint"))?;
+        Ok(Some(unit_ir_cache_key(program, semantic)))
+    } else if unit_artifact_is_cacheable_composite(artifact) {
+        unit_closure_ir_cache_key(name, artifacts, program).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn load_composite_ir_artifact(path: &Path, cache_key: &str) -> Option<Design> {
@@ -1155,9 +1370,56 @@ fn composite_unit_ir_cache_key(
     artifacts: &[serde_json::Value],
     program: &str,
 ) -> Result<String, String> {
-    let mut semantics = BTreeMap::new();
-    let mut dependencies = BTreeMap::new();
+    let root_name = project_root_unit_name(record, artifacts)?;
+    unit_closure_ir_cache_key(&root_name, artifacts, program)
+}
+
+fn project_root_unit_name(
+    record: &SlangProjectCacheRecord,
+    artifacts: &[serde_json::Value],
+) -> Result<String, String> {
+    let mut semantics = BTreeSet::new();
     let mut depended_on = BTreeSet::new();
+    for artifact in artifacts {
+        let name = artifact
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("unit artifact has no name")?;
+        let depends_on = artifact
+            .get("depends_on")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("unit artifact '{name}' has no dependency list"))?;
+        for dependency in depends_on {
+            depended_on.insert(
+                dependency
+                    .as_str()
+                    .ok_or_else(|| format!("unit artifact '{name}' has a non-string dependency"))?
+                    .to_string(),
+            );
+        }
+        semantics.insert(name.to_string());
+    }
+
+    let top_name = record
+        .top
+        .clone()
+        .or_else(|| {
+            let candidates = semantics
+                .iter()
+                .filter(|name| !depended_on.contains(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            (candidates.len() == 1).then(|| candidates[0].clone())
+        })
+        .ok_or("project unit artifacts have no unique root unit")?;
+    if !semantics.contains(&top_name) {
+        return Err("project unit artifacts have no unique root unit".into());
+    }
+    Ok(top_name)
+}
+
+fn artifact_semantics(artifacts: &[serde_json::Value]) -> Result<BTreeMap<String, String>, String> {
+    let mut semantics = BTreeMap::new();
     for artifact in artifacts {
         let name = artifact
             .get("name")
@@ -1167,6 +1429,20 @@ fn composite_unit_ir_cache_key(
             .get("semantic_sha256")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("unit artifact '{name}' has no semantic fingerprint"))?;
+        semantics.insert(name.to_string(), semantic.to_string());
+    }
+    Ok(semantics)
+}
+
+fn artifact_dependencies(
+    artifacts: &[serde_json::Value],
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut dependencies = BTreeMap::new();
+    for artifact in artifacts {
+        let name = artifact
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("unit artifact has no name")?;
         let depends_on = artifact
             .get("depends_on")
             .and_then(serde_json::Value::as_array)
@@ -1180,59 +1456,53 @@ fn composite_unit_ir_cache_key(
                     .map(str::to_string)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        depended_on.extend(depends_on.iter().cloned());
         dependencies.insert(name.to_string(), depends_on);
-        semantics.insert(name.to_string(), semantic.to_string());
     }
+    Ok(dependencies)
+}
 
-    let top_name = match record.top.clone() {
-        Some(top) => top,
-        None => {
-            let candidates = semantics
-                .keys()
-                .filter(|name| !depended_on.contains(*name))
-                .collect::<Vec<_>>();
-            if candidates.len() == 1 {
-                candidates[0].clone()
-            } else {
-                String::new()
-            }
-        }
-    };
-    if top_name.is_empty() || !semantics.contains_key(&top_name) {
-        return Err("project unit artifacts have no unique root unit".into());
+fn visit_unit_dependencies(
+    unit: &str,
+    dependencies: &BTreeMap<String, Vec<String>>,
+    visited: &mut BTreeSet<String>,
+    stack: &mut Vec<String>,
+) -> Result<(), String> {
+    if visited.contains(unit) {
+        return Ok(());
     }
+    if stack.iter().any(|visited| visited == unit) {
+        return Err(format!(
+            "cycle in unit artifact dependency graph at '{unit}'"
+        ));
+    }
+    stack.push(unit.to_string());
+    for dependency in dependencies
+        .get(unit)
+        .ok_or_else(|| format!("unit artifact '{unit}' is missing from the closure"))?
+    {
+        visit_unit_dependencies(dependency, dependencies, visited, stack)?;
+    }
+    stack.pop();
+    visited.insert(unit.to_string());
+    Ok(())
+}
 
-    fn visit_unit(
-        unit: &str,
-        dependencies: &BTreeMap<String, Vec<String>>,
-        visited: &mut BTreeSet<String>,
-        stack: &mut Vec<String>,
-    ) -> Result<(), String> {
-        if visited.contains(unit) {
-            return Ok(());
-        }
-        if stack.iter().any(|visited| visited == unit) {
-            return Err(format!(
-                "cycle in unit artifact dependency graph at '{unit}'"
-            ));
-        }
-        stack.push(unit.to_string());
-        for dependency in dependencies
-            .get(unit)
-            .ok_or_else(|| format!("unit artifact '{unit}' is missing from the closure"))?
-        {
-            visit_unit(dependency, dependencies, visited, stack)?;
-        }
-        stack.pop();
-        visited.insert(unit.to_string());
-        Ok(())
+fn unit_closure_ir_cache_key(
+    root_name: &str,
+    artifacts: &[serde_json::Value],
+    program: &str,
+) -> Result<String, String> {
+    let semantics = artifact_semantics(artifacts)?;
+    let dependencies = artifact_dependencies(artifacts)?;
+    if !semantics.contains_key(root_name) {
+        return Err(format!(
+            "unit artifact '{root_name}' is missing from the closure"
+        ));
     }
 
     let mut closure = BTreeSet::new();
-    visit_unit(&top_name, &dependencies, &mut closure, &mut Vec::new())?;
-
-    let mut identity = format!("composite-unit-ir-v1\0{program}\0{top_name}");
+    visit_unit_dependencies(root_name, &dependencies, &mut closure, &mut Vec::new())?;
+    let mut identity = format!("composite-unit-ir-v1\0{program}\0{root_name}");
     for unit in closure {
         let semantic = semantics
             .get(&unit)
@@ -1290,15 +1560,26 @@ fn reconstruct_ast_from_unit_artifacts(
     let mut definitions = BTreeMap::new();
     for artifact in artifacts {
         let name = artifact.get("name")?.as_str()?.to_string();
-        let semantic = artifact
-            .get("semantic_sha256")
-            .and_then(serde_json::Value::as_str)?;
+        let cache_key = if unit_artifact_is_standalone_leaf(artifact) {
+            let semantic = artifact
+                .get("semantic_sha256")
+                .and_then(serde_json::Value::as_str)?;
+            Some(unit_ir_cache_key(program, semantic))
+        } else if unit_artifact_is_cacheable_composite(artifact) {
+            unit_closure_ir_cache_key(&name, artifacts, program)
+                .ok()
+                .map(Some)?
+        } else {
+            None
+        };
         let mut body = artifact.get("body")?.clone();
         if let Some(fields) = body.as_object_mut() {
-            fields.insert(
-                "eda_unit_ir_cache_key".into(),
-                serde_json::Value::String(unit_ir_cache_key(program, semantic)),
-            );
+            if let Some(cache_key) = cache_key {
+                fields.insert(
+                    "eda_unit_ir_cache_key".into(),
+                    serde_json::Value::String(cache_key),
+                );
+            }
         }
         bodies.insert(name.clone(), body);
         definitions.insert(name, artifact.get("definition")?.clone());
@@ -1334,13 +1615,8 @@ fn reconstruct_ast_from_unit_artifacts(
 fn collect_definition_references(value: &serde_json::Value, dependencies: &mut BTreeSet<String>) {
     if let Some(fields) = value.as_object() {
         if string_field(value, "kind").as_deref() == Some("Instance") {
-            if let Some(dependency) = value
-                .get("body")
-                .and_then(|body| body.get("definition"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|definition| definition.split_whitespace().last())
-            {
-                dependencies.insert(dependency.to_string());
+            if let Some(dependency) = instance_body_dependency(value) {
+                dependencies.insert(dependency);
             }
         }
         for nested in fields.values() {
@@ -1353,18 +1629,26 @@ fn collect_definition_references(value: &serde_json::Value, dependencies: &mut B
     }
 }
 
+fn instance_body_dependency(value: &serde_json::Value) -> Option<String> {
+    let body = value.get("body")?;
+    let definition = if let Some(reference) = body.as_str() {
+        reference
+    } else {
+        body.get("definition")?.as_str()?
+    };
+    definition
+        .split_whitespace()
+        .next_back()
+        .map(str::to_string)
+}
+
 fn splice_unit_bodies(
     value: &mut serde_json::Value,
     bodies: &BTreeMap<String, serde_json::Value>,
     stack: &mut Vec<String>,
 ) -> Result<(), String> {
     let is_instance = string_field(value, "kind").as_deref() == Some("Instance");
-    let dependency = value
-        .get("body")
-        .and_then(|body| body.get("definition"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|definition| definition.split_whitespace().last())
-        .map(str::to_string);
+    let dependency = instance_body_dependency(value);
     let Some(fields) = value.as_object_mut() else {
         if let Some(values) = value.as_array_mut() {
             values
@@ -1660,6 +1944,7 @@ impl SlangFrontend {
             unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
                 DEFAULT_UNIT_IR_CACHE_ENTRIES,
             ))),
+            unit_ir_persistence_lock: Arc::new(Mutex::new(())),
         };
         let version = frontend.version()?;
         if !frontend.version_matches(&version) {
@@ -1717,6 +2002,7 @@ impl SlangFrontend {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.arg("--quiet");
+        command.arg("--std").arg(SLANG_LANGUAGE_STANDARD);
         command
     }
 }
@@ -1906,12 +2192,13 @@ impl SlangFrontend {
         let output = self.run_capturing(command)?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         let start = text.find('{').unwrap_or(0);
-        let files = if show_parsed_files {
+        let selected_files = if show_parsed_files {
             parsed_file_paths(&text[..start])
         } else {
             Vec::new()
         };
-        Ok((text[start..].to_string(), files))
+        let json = annotate_unsigned_integer_type_addresses(&text[start..], files)?;
+        Ok((json, selected_files))
     }
 
     fn named_file_cache_key(
@@ -1945,6 +2232,7 @@ impl SlangFrontend {
         named_files.extend(dependencies);
         Some(SlangAstCacheKey {
             program: self.program.to_string_lossy().into_owned(),
+            language_standard: SLANG_LANGUAGE_STANDARD.to_string(),
             top: top.map(str::to_string),
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
@@ -1985,6 +2273,7 @@ impl SlangFrontend {
         named_files.extend(dependencies);
         Some(SlangAstCacheKey {
             program: self.program.to_string_lossy().into_owned(),
+            language_standard: SLANG_LANGUAGE_STANDARD.to_string(),
             top: top.map(str::to_string),
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
@@ -2023,6 +2312,7 @@ impl SlangFrontend {
         }
         Some(SlangLibraryPlanKey {
             program: self.program.to_string_lossy().into_owned(),
+            language_standard: SLANG_LANGUAGE_STANDARD.to_string(),
             roots,
             top: top.map(str::to_string),
             include_directories: options.include_directories.clone(),
@@ -2059,6 +2349,7 @@ impl SlangFrontend {
         )?;
         Some(SlangAstCacheKey {
             program: self.program.to_string_lossy().into_owned(),
+            language_standard: SLANG_LANGUAGE_STANDARD.to_string(),
             top: top.map(str::to_string),
             include_directories: options.include_directories.clone(),
             defines: options.defines.clone(),
@@ -2138,14 +2429,18 @@ impl SlangFrontend {
         let roots = project_file_records(&manifest.sources)?;
         let library_inventory = project_library_inventory(&options.library_directories);
         let runtime_version = PINNED_SLANG_VERSION.to_string();
+        let language_standard = SLANG_LANGUAGE_STANDARD.to_string();
         let program = self.program.to_string_lossy().into_owned();
         let previous_record = load_project_cache_record(&cache_directory.join("record.json"));
         {
             if let Some(record) = previous_record.clone() {
                 if project_cache_record_matches(
                     &record,
-                    &program,
-                    &runtime_version,
+                    ProjectCacheRuntime {
+                        program: &program,
+                        language_standard: &language_standard,
+                        runtime_version: &runtime_version,
+                    },
                     manifest_path,
                     &manifest,
                     &roots,
@@ -2245,6 +2540,7 @@ impl SlangFrontend {
             let record = SlangProjectCacheRecord {
                 schema: SLANG_PROJECT_CACHE_SCHEMA,
                 program,
+                language_standard,
                 runtime_version,
                 manifest_path: canonical_path(manifest_path),
                 manifest_sha256: project_file_record(manifest_path)?.sha256,
@@ -2295,8 +2591,11 @@ impl SlangFrontend {
         let program = self.program.to_string_lossy().into_owned();
         if !project_cache_record_matches(
             &record,
-            &program,
-            PINNED_SLANG_VERSION,
+            ProjectCacheRuntime {
+                program: &program,
+                language_standard: SLANG_LANGUAGE_STANDARD,
+                runtime_version: PINNED_SLANG_VERSION,
+            },
             &record.manifest_path,
             &manifest,
             &roots,
@@ -2332,6 +2631,7 @@ impl SlangFrontend {
     ) -> Result<SlangCachedUnitDesign, String> {
         let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
         let program = self.program.to_string_lossy().into_owned();
+        let root_name = project_root_unit_name(&record, &artifacts)?;
         let cache_key = composite_unit_ir_cache_key(&record, &artifacts, &program)?;
         let ir_artifact_path = cache_directory.join("composite-ir.json");
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
@@ -2352,21 +2652,81 @@ impl SlangFrontend {
                 cache_hit: true,
             });
         }
-        let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
-            .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
-        let root = parse_ast_root(&ast)?;
-        let design = Arc::new(lowering::lower_root_with_unit_ir_cache(
-            &root,
-            self.unit_ir_cache.clone(),
-        )?);
-        if let Ok(mut cache) = self.unit_ir_cache.lock() {
-            cache.insert(cache_key.clone(), Arc::clone(&design));
+        let mut preload_cache = self
+            .unit_ir_cache
+            .lock()
+            .map_err(|_| "slang unit IR cache lock is poisoned".to_string())?;
+        for artifact in &artifacts {
+            let name = artifact
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("unit artifact has no name")?;
+            if name == root_name {
+                continue;
+            }
+            let Some(key) = unit_artifact_ir_key(name, artifact, &artifacts, &program)? else {
+                continue;
+            };
+            if preload_cache.entries.contains_key(&key) {
+                continue;
+            }
+            let path = cache_directory.join("ir").join(format!("{key}.json"));
+            let design = if unit_artifact_is_standalone_leaf(artifact) {
+                load_leaf_ir_artifact(&path, &key)
+            } else {
+                load_composite_fragment_ir_artifact(&path, &key)
+            };
+            if let Some(design) = design.filter(|design| design.name == name) {
+                preload_cache.insert(key, Arc::new(design));
+            }
         }
-        save_composite_ir_artifact(&ir_artifact_path, &cache_key, &design)?;
-        Ok(SlangCachedUnitDesign {
-            design,
-            cache_hit: false,
-        })
+        drop(preload_cache);
+        let persistence_guard = self
+            .unit_ir_persistence_lock
+            .lock()
+            .map_err(|_| "slang unit IR persistence lock is poisoned".to_string())?;
+        let persistence_keys = cacheable_child_ir_keys(&program, &artifacts, &root_name)?;
+        let lower_result = (|| {
+            let mut cache = self
+                .unit_ir_cache
+                .lock()
+                .map_err(|_| "slang unit IR cache lock is poisoned".to_string())?;
+            cache.configure_persistence(Some(cache_directory), persistence_keys);
+            drop(cache);
+
+            let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
+                .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
+            let root = parse_ast_root(&ast)?;
+            let design = Arc::new(lowering::lower_root_with_unit_ir_cache(
+                &root,
+                self.unit_ir_cache.clone(),
+            )?);
+            let mut cache = self
+                .unit_ir_cache
+                .lock()
+                .map_err(|_| "slang unit IR cache lock is poisoned".to_string())?;
+            let persistence_errors = cache.take_persist_errors();
+            if let Some(error) = persistence_errors.into_iter().next() {
+                return Err(error);
+            }
+            cache.insert(cache_key.clone(), Arc::clone(&design));
+            drop(cache);
+
+            save_composite_ir_artifact(&ir_artifact_path, &cache_key, &design)?;
+            Ok(SlangCachedUnitDesign {
+                design,
+                cache_hit: false,
+            })
+        })();
+        let reset_result = self
+            .unit_ir_cache
+            .lock()
+            .map_err(|_| "slang unit IR cache lock is poisoned".to_string())
+            .map(|mut cache| cache.configure_persistence(None, BTreeSet::new()));
+        drop(persistence_guard);
+        let cached = lower_result?;
+        reset_result?;
+        Ok(cached)
     }
 
     /// Lowers and caches a leaf unit artifact as a standalone partial IR design.
@@ -2422,6 +2782,17 @@ impl SlangFrontend {
                 });
             }
         }
+        let leaf_artifact_path = cache_directory.join("ir").join(format!("{cache_key}.json"));
+        if let Some(design) = load_leaf_ir_artifact(&leaf_artifact_path, &cache_key) {
+            let design = Arc::new(design);
+            if let Ok(mut cache) = self.unit_ir_cache.lock() {
+                cache.insert(cache_key, Arc::clone(&design));
+            }
+            return Ok(SlangCachedUnitDesign {
+                design,
+                cache_hit: true,
+            });
+        }
         let definition = artifact
             .get("definition")
             .ok_or_else(|| format!("unit artifact '{unit_name}' has no definition"))?;
@@ -2442,8 +2813,9 @@ impl SlangFrontend {
         partial_design.hierarchy.clear();
         let design = Arc::new(partial_design);
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
-            cache.insert(cache_key, Arc::clone(&design));
+            cache.insert(cache_key.clone(), Arc::clone(&design));
         }
+        save_leaf_ir_artifact(&leaf_artifact_path, &cache_key, &design)?;
         Ok(SlangCachedUnitDesign {
             design,
             cache_hit: false,
@@ -3151,6 +3523,279 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
+fn unsigned_annotation_failure(message: String) -> SlangFailure {
+    SlangFailure {
+        status: None,
+        stdout: String::new(),
+        stderr: format!("cannot annotate unsigned integer types: {message}"),
+    }
+}
+
+fn annotate_unsigned_integer_type_addresses(
+    json: &str,
+    files: &[PathBuf],
+) -> Result<String, SlangFailure> {
+    let mut document = serde_json::from_str::<serde_json::Value>(json).map_err(|error| {
+        unsigned_annotation_failure(format!("invalid detailed AST JSON: {error}"))
+    })?;
+    let mut source_lines = BTreeMap::new();
+    for path in files {
+        let contents = std::fs::read_to_string(path).map_err(|error| {
+            unsigned_annotation_failure(format!(
+                "cannot read source '{}' for unsigned type annotation: {error}",
+                path.display()
+            ))
+        })?;
+        source_lines.insert(canonical_path(path), contents);
+    }
+    let mut unsigned_addresses = BTreeSet::new();
+    let mut port_internal_symbols = BTreeSet::new();
+    collect_port_internal_symbols(&document, &mut port_internal_symbols);
+    collect_unsigned_integer_addresses(
+        &document,
+        &mut source_lines,
+        &mut unsigned_addresses,
+        &port_internal_symbols,
+    )
+    .map_err(unsigned_annotation_failure)?;
+    if unsigned_addresses.is_empty() {
+        return Ok(document.to_string());
+    }
+    insert_unsigned_type_markers(&mut document, &unsigned_addresses);
+    Ok(document.to_string())
+}
+
+fn collect_unsigned_integer_addresses(
+    value: &serde_json::Value,
+    source_lines: &mut BTreeMap<PathBuf, String>,
+    addresses: &mut BTreeSet<u64>,
+    port_internal_symbols: &BTreeSet<String>,
+) -> Result<(), String> {
+    if let Some(values) = value.as_array() {
+        for nested in values {
+            collect_unsigned_integer_addresses(
+                nested,
+                source_lines,
+                addresses,
+                port_internal_symbols,
+            )?;
+        }
+        return Ok(());
+    }
+    let Some(fields) = value.as_object() else {
+        return Ok(());
+    };
+    let kind = fields
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if matches!(kind, "Variable" | "Net" | "Port" | "TypeAlias") {
+        let name = fields.get("name").and_then(serde_json::Value::as_str);
+        let type_value = if kind == "TypeAlias" {
+            fields.get("target")
+        } else {
+            fields.get("type")
+        };
+        let is_predefined_integer = type_value.is_some_and(|type_value| {
+            type_value.get("kind").and_then(serde_json::Value::as_str)
+                == Some("PredefinedIntegerType")
+                && type_value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        matches!(name, "byte" | "shortint" | "int" | "integer" | "longint")
+                    })
+        });
+        let source_file = fields
+            .get("source_file")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| canonical_path(Path::new(path)));
+        let source_line = fields
+            .get("source_line")
+            .and_then(serde_json::Value::as_u64);
+        let source_column = fields
+            .get("source_column")
+            .and_then(serde_json::Value::as_u64);
+        if is_predefined_integer {
+            let (
+                Some(name),
+                Some(source_file),
+                Some(source_line),
+                Some(source_column),
+                Some(type_value),
+            ) = (name, source_file, source_line, source_column, type_value)
+            else {
+                return Err(format!(
+                    "predefined-integer '{kind}' declaration has incomplete source or type metadata"
+                ));
+            };
+            let symbol_address = fields
+                .get("addr")
+                .and_then(serde_json::Value::as_u64)
+                .map(|address| format!("{address} {name}"));
+            let port_like = matches!(kind, "Port" | "Net")
+                || symbol_address
+                    .as_deref()
+                    .is_some_and(|symbol| port_internal_symbols.contains(symbol));
+            let contents = match source_lines.get(&source_file) {
+                Some(contents) => contents,
+                None => {
+                    let contents = std::fs::read_to_string(&source_file).map_err(|error| {
+                        format!(
+                            "cannot read source '{}' for unsigned type annotation: {error}",
+                            source_file.display()
+                        )
+                    })?;
+                    source_lines.insert(source_file.clone(), contents);
+                    source_lines
+                        .get(&source_file)
+                        .expect("just-inserted unsigned source")
+                }
+            };
+            let declaration =
+                candidate_declaration_snippet(contents, source_line, source_column, port_like);
+            if declares_unsigned_integer(&declaration, name) {
+                if let Some(address) = type_value.get("addr").and_then(serde_json::Value::as_u64) {
+                    addresses.insert(address);
+                }
+            }
+        }
+    }
+    for nested in fields.values() {
+        collect_unsigned_integer_addresses(nested, source_lines, addresses, port_internal_symbols)?;
+    }
+    Ok(())
+}
+
+fn collect_port_internal_symbols(value: &serde_json::Value, symbols: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if fields.get("kind").and_then(serde_json::Value::as_str) == Some("Port") {
+                if let Some(symbol) = fields
+                    .get("internalSymbol")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    symbols.insert(symbol.to_string());
+                }
+            }
+            for nested in fields.values() {
+                collect_port_internal_symbols(nested, symbols);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                collect_port_internal_symbols(nested, symbols);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn declaration_snippet(contents: &str, source_line: u64) -> String {
+    let mut snippet = String::new();
+    for (offset, line) in contents
+        .lines()
+        .enumerate()
+        .skip(source_line.saturating_sub(1) as usize)
+        .take(64)
+    {
+        snippet.push_str(line);
+        snippet.push(' ');
+        if line.contains(';') || line.contains(')') {
+            break;
+        }
+        if offset >= 64 {
+            break;
+        }
+    }
+    snippet
+}
+
+fn candidate_declaration_snippet(
+    contents: &str,
+    source_line: u64,
+    source_column: u64,
+    port_like: bool,
+) -> String {
+    if !port_like {
+        return declaration_snippet(contents, source_line);
+    }
+    let Some(line) = contents.lines().nth(source_line.saturating_sub(1) as usize) else {
+        return declaration_snippet(contents, source_line);
+    };
+    let column = source_column.max(1) as usize;
+    let Some(byte_index) = line.char_indices().nth(column - 1).map(|(index, _)| index) else {
+        return declaration_snippet(contents, source_line);
+    };
+    // A parenthesized module/function declaration list can contain several
+    // differently typed names on one source line. Isolate the candidate's
+    // comma-delimited field so an earlier unsigned declaration cannot leak onto
+    // its signed sibling. Ordinary declarations keep the full semicolon
+    // statement so `int unsigned a, b;` marks both declarators.
+    let prefix_end = [',', ';', '(']
+        .iter()
+        .filter_map(|delimiter| line[..byte_index].rfind(*delimiter))
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let suffix_end = [',', ';', ')']
+        .iter()
+        .filter_map(|delimiter| line[byte_index..].find(*delimiter))
+        .map(|offset| byte_index + offset)
+        .min()
+        .unwrap_or(line.len());
+    line[prefix_end..suffix_end].to_string()
+}
+
+fn declares_unsigned_integer(declaration: &str, name: &str) -> bool {
+    declaration
+        .split(';')
+        .any(|declaration| declaration_segment_declares_unsigned(declaration, name))
+}
+
+fn declaration_segment_declares_unsigned(declaration: &str, name: &str) -> bool {
+    let tokens = declaration
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let name = name.to_ascii_lowercase();
+    tokens.windows(2).any(|window| {
+        matches!(
+            window[0].as_str(),
+            "byte" | "shortint" | "int" | "integer" | "longint"
+        ) && window[1] == "unsigned"
+            && tokens
+                .iter()
+                .skip_while(|token| token.as_str() != window[1].as_str())
+                .skip(1)
+                .any(|token| *token == name)
+    })
+}
+
+fn insert_unsigned_type_markers(value: &mut serde_json::Value, addresses: &BTreeSet<u64>) {
+    if let Some(values) = value.as_array_mut() {
+        for nested in values {
+            insert_unsigned_type_markers(nested, addresses);
+        }
+        return;
+    }
+    let Some(fields) = value.as_object_mut() else {
+        return;
+    };
+    if fields.get("kind").and_then(serde_json::Value::as_str) == Some("PredefinedIntegerType")
+        && fields
+            .get("addr")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|address| addresses.contains(&address))
+    {
+        fields.insert("isSigned".into(), serde_json::Value::Bool(false));
+    }
+    for nested in fields.values_mut() {
+        insert_unsigned_type_markers(nested, addresses);
+    }
+}
+
 fn parsed_file_paths(prefix: &str) -> Vec<PathBuf> {
     prefix
         .lines()
@@ -3391,6 +4036,7 @@ string s = "`include string.svh";
     fn ast_cache_is_bounded_and_least_recently_used() {
         let key = |source: &str| SlangAstCacheKey {
             program: "slang".into(),
+            language_standard: SLANG_LANGUAGE_STANDARD.to_string(),
             top: Some("top".into()),
             include_directories: Vec::new(),
             defines: Vec::new(),
@@ -3437,6 +4083,7 @@ string s = "`include string.svh";
             unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
                 DEFAULT_UNIT_IR_CACHE_ENTRIES,
             ))),
+            unit_ir_persistence_lock: Arc::new(Mutex::new(())),
         };
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53"));
         assert!(frontend.version_matches("slang version 12.0.535+54c19b53\n"));
@@ -3454,6 +4101,7 @@ string s = "`include string.svh";
             unit_ir_cache: Arc::new(Mutex::new(SlangUnitIrCache::new(
                 DEFAULT_UNIT_IR_CACHE_ENTRIES,
             ))),
+            unit_ir_persistence_lock: Arc::new(Mutex::new(())),
         };
         let mut command = Command::new("/bin/sleep");
         command.arg("30");

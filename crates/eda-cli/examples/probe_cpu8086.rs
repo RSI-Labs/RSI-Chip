@@ -7,6 +7,28 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         | Expr::SimulationTime { .. }
         | Expr::MemorySize { .. }
         | Expr::AssocExists { .. } => {}
+        Expr::RealConst(_)
+        | Expr::RealRef { .. }
+        | Expr::ShortRealConst(_)
+        | Expr::ShortRealRef { .. } => {}
+        Expr::RealBinary { left, right, .. } => {
+            expr_nets(left, out);
+            expr_nets(right, out);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            expr_nets(left, out);
+            expr_nets(right, out);
+        }
+        Expr::RealNeg(operand) => expr_nets(operand, out),
+        Expr::ShortRealBinary { left, right, .. } => {
+            expr_nets(left, out);
+            expr_nets(right, out);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => expr_nets(operand, out),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => expr_nets(value, out),
+        Expr::RealTime { .. } => {}
         Expr::AssocRead { index, .. } => expr_nets(index, out),
         Expr::Ref { net, .. } => {
             out.insert(*net);
@@ -30,6 +52,9 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
             expr_nets(left, out);
             expr_nets(right, out);
         }
+        Expr::StringFormat { args, .. } => {
+            args.iter().for_each(|argument| expr_nets(argument, out));
+        }
         Expr::StringGetByte { e, index } => {
             expr_nets(e, out);
             expr_nets(index, out);
@@ -51,6 +76,9 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         }
         Expr::StringToRadix { e, .. } => expr_nets(e, out),
         Expr::StringFromRadix { value, .. } => expr_nets(value, out),
+        Expr::MemoryPattern { .. } => {}
+        Expr::EnumPattern { value, .. } => expr_nets(value, out),
+        Expr::StructPattern { value, .. } => expr_nets(value, out),
         Expr::EventTriggered { net } => {
             out.insert(*net);
         }
@@ -60,6 +88,24 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|e| expr_nets(e, out));
             expr_nets(start, out);
+        }
+        Expr::Random { args, .. } => args.iter().for_each(|e| expr_nets(e, out)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            expr_nets(path, out);
+            expr_nets(mode, out);
+        }
+        Expr::FileGetc { fd } => expr_nets(fd, out),
+        Expr::FileUngetc { value, fd } => {
+            expr_nets(value, out);
+            expr_nets(fd, out);
+        }
+        Expr::FileEof { fd } => expr_nets(fd, out),
+        Expr::FileTell { fd } => expr_nets(fd, out),
+        Expr::FileSeek { fd, offset, whence } => {
+            expr_nets(fd, out);
+            expr_nets(offset, out);
+            expr_nets(whence, out);
         }
     }
 }
@@ -188,7 +234,9 @@ fn feedback(s: &Stmt) -> bool {
                 walk(body, reads, writes);
             }
             Stmt::Force { e, .. } => expr_nets(e, reads),
+            Stmt::ProceduralAssign { e, .. } => expr_nets(e, reads),
             Stmt::Release { .. } => {}
+            Stmt::ProceduralDeassign { .. } => {}
             Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
             Stmt::Scope(body) => walk(body, reads, writes),
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
@@ -202,7 +250,91 @@ fn feedback(s: &Stmt) -> bool {
                     expr_nets(finish, reads);
                 }
             }
-            Stmt::Display { .. } | Stmt::TimeFormat { .. } | Stmt::Finish => {}
+            Stmt::FileClose { fd } | Stmt::FileFlush { fd } => expr_nets(fd, reads),
+            Stmt::FileGets { fd, string, status } => {
+                expr_nets(fd, reads);
+                writes.extend(lv_bits(string));
+                writes.extend(lv_bits(status));
+            }
+            Stmt::FileError {
+                fd,
+                message,
+                status,
+            } => {
+                expr_nets(fd, reads);
+                writes.extend(lv_bits(message));
+                writes.extend(lv_bits(status));
+            }
+            Stmt::FileRead { fd, target, status } => {
+                expr_nets(fd, reads);
+                writes.extend(lv_bits(target));
+                writes.extend(lv_bits(status));
+            }
+            Stmt::FileReadMemory {
+                fd,
+                start,
+                count,
+                status,
+                ..
+            } => {
+                expr_nets(fd, reads);
+                if let Some(start) = start {
+                    expr_nets(start, reads);
+                }
+                if let Some(count) = count {
+                    expr_nets(count, reads);
+                }
+                writes.extend(lv_bits(status));
+            }
+            Stmt::FileScan {
+                fd,
+                targets,
+                status,
+                ..
+            } => {
+                expr_nets(fd, reads);
+                for target in targets {
+                    writes.extend(lv_bits(target));
+                }
+                writes.extend(lv_bits(status));
+            }
+            Stmt::StringScan {
+                source,
+                targets,
+                status,
+                ..
+            } => {
+                expr_nets(source, reads);
+                for target in targets {
+                    writes.extend(lv_bits(target));
+                }
+                writes.extend(lv_bits(status));
+            }
+            Stmt::FileDisplay { fd, args, .. } => {
+                expr_nets(fd, reads);
+                args.iter().for_each(|e| expr_nets(e, reads));
+            }
+            Stmt::RandomSeeded { seed, destination } => {
+                reads.extend(lv_bits(seed));
+                writes.extend(lv_bits(seed));
+                writes.extend(lv_bits(destination));
+            }
+            Stmt::ImmediateAssertion {
+                cond,
+                pass_action,
+                fail_action,
+                ..
+            } => {
+                expr_nets(cond, reads);
+                for action in pass_action.iter().chain(fail_action.iter()) {
+                    walk(action, reads, writes);
+                }
+            }
+            Stmt::Display { .. }
+            | Stmt::TimeFormat { .. }
+            | Stmt::AssertControl(_)
+            | Stmt::Finish
+            | Stmt::Stop => {}
         }
     }
     let mut r = HashSet::new();

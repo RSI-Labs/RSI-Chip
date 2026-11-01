@@ -36,7 +36,7 @@ fn collect_compilation_unit_definitions(
     for member in members {
         if matches!(
             string_field(member, "kind").as_deref(),
-            Some("Parameter" | "Subroutine" | "TypeAlias" | "EnumType")
+            Some("Parameter" | "Subroutine" | "TypeAlias" | "EnumType" | "Variable" | "Net")
         ) {
             let mut definition = member.clone();
             if string_field(member, "kind").as_deref() == Some("TypeAlias") {
@@ -97,11 +97,33 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
     let mut root = root.clone();
     let mut class_types = Vec::new();
     collect_class_types(&document, &mut class_types);
+    let definition_source_libraries: serde_json::Map<String, serde_json::Value> = document
+        .get("definitions")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|definition| {
+            let library = string_field(definition, "sourceLibrary")?;
+            let name = string_field(definition, "name")?;
+            Some((
+                name.to_string(),
+                serde_json::Value::String(library.to_string()),
+            ))
+        })
+        .collect();
     if !class_types.is_empty() {
         if let Some(fields) = root.as_object_mut() {
             fields.insert(
                 "eda_class_types".into(),
                 serde_json::Value::Array(class_types),
+            );
+        }
+    }
+    if !definition_source_libraries.is_empty() {
+        if let Some(fields) = root.as_object_mut() {
+            fields.insert(
+                "eda_definition_source_libraries".into(),
+                serde_json::Value::Object(definition_source_libraries),
             );
         }
     }
@@ -143,6 +165,19 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let explicit_import_addresses: std::collections::BTreeSet<u64> = root
+        .get("body")
+        .and_then(|body| body.get("members"))
+        .and_then(serde_json::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|member| string_field(member, "kind").as_deref() == Some("ExplicitImport"))
+                .filter_map(|member| string_field(member, "import"))
+                .filter_map(|symbol| symbol.split_whitespace().next()?.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     if let Some(members) = design.get("members").and_then(serde_json::Value::as_array) {
         for member in members {
             if string_field(member, "kind").as_deref() != Some("CompilationUnit") {
@@ -161,7 +196,40 @@ pub(crate) fn parse_ast_root(json: &str) -> Result<serde_json::Value, String> {
                 if imported_package_addresses.contains(&package_address) {
                     collect_compilation_unit_definitions(package, &mut compilation_unit_members);
                 }
+                if let Some(members) = package.get("members").and_then(serde_json::Value::as_array)
+                {
+                    for definition in members {
+                        let Some(address) =
+                            definition.get("addr").and_then(serde_json::Value::as_u64)
+                        else {
+                            continue;
+                        };
+                        if explicit_import_addresses.contains(&address)
+                            && !compilation_unit_members.iter().any(|existing| {
+                                existing.get("addr").and_then(serde_json::Value::as_u64)
+                                    == Some(address)
+                            })
+                        {
+                            let mut exact = definition.clone();
+                            if string_field(&exact, "kind").as_deref() == Some("TypeAlias") {
+                                if let Some(fields) = exact.as_object_mut() {
+                                    fields.insert(
+                                        "eda_package_scope".into(),
+                                        serde_json::Value::String(
+                                            string_field(package, "name").unwrap_or_default(),
+                                        ),
+                                    );
+                                }
+                            }
+                            compilation_unit_members.push(exact);
+                        }
+                    }
+                }
             }
+            // Unscoped compilation-unit declarations are visible to the selected
+            // design just like imported package definitions. slang stores them
+            // directly in the CompilationUnit while packages are nested members.
+            collect_compilation_unit_definitions(member, &mut compilation_unit_members);
         }
     }
     for member in &mut compilation_unit_members {
@@ -628,11 +696,26 @@ pub(super) struct AstInterfaceModportSymbol {
 pub(super) type InterfaceModportSymbols =
     std::collections::BTreeMap<String, AstInterfaceModportSymbol>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
+pub(super) enum DelayConstant {
+    Integer(u64),
+    Real(f64),
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct AstStructField {
     offset: usize,
     width: usize,
     field_index: usize,
+    signed: bool,
+    /// Struct/union-typed field whose alias or inline definition can render recursively.
+    nested_type: Option<AstNestedStruct>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum AstNestedStruct {
+    Alias(String),
+    Inline(Box<AstStructType>),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -642,6 +725,8 @@ struct AstStructType {
     fields: std::collections::BTreeMap<String, AstStructField>,
     is_union: bool,
     is_unpacked: bool,
+    /// Every field is a scalar integral value or recursively renderable aggregate.
+    flat_pattern: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -664,6 +749,7 @@ pub(super) struct SlangAstLowerer {
     constants: std::collections::BTreeMap<String, LogicWord>,
     subroutines: std::collections::BTreeMap<String, serde_json::Value>,
     type_aliases: std::collections::BTreeMap<String, AstStructType>,
+    package_type_aliases: std::collections::BTreeMap<String, AstStructType>,
     type_enums: std::collections::BTreeMap<String, AstEnumType>,
     ambiguous_type_aliases: std::collections::BTreeSet<String>,
     ambiguous_type_enums: std::collections::BTreeSet<String>,
@@ -738,10 +824,36 @@ pub(super) struct SlangAstLowerer {
     global_time_precision: i8,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
     generate_path: Vec<String>,
+    scope_path: String,
+    library_scopes: std::collections::BTreeMap<String, String>,
+    format_library_scope: String,
     inline_stack: std::cell::RefCell<Vec<String>>,
 }
 
 impl SlangAstLowerer {
+    pub(super) fn current_format_hierarchy_path(&self) -> String {
+        let mut path = self.scope_path.clone();
+        for component in self
+            .generate_path
+            .iter()
+            .chain(self.active_named_blocks.borrow().iter())
+        {
+            let component = component.split_whitespace().next_back().unwrap_or_default();
+            if component.is_empty() {
+                continue;
+            }
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(component);
+        }
+        path
+    }
+
+    pub(super) fn current_format_library_scope(&self) -> String {
+        self.format_library_scope.clone()
+    }
+
     pub(super) fn scale_delay(&self, delay: u64) -> Result<u64, String> {
         let exponent =
             i16::from(self.time_scale.unit_exponent) - i16::from(self.global_time_precision);
@@ -758,6 +870,114 @@ impl SlangAstLowerer {
         Ok(scale)
     }
 
+    pub(super) fn scale_delay_constant(&self, delay: DelayConstant) -> Result<u64, String> {
+        match delay {
+            DelayConstant::Integer(delay) => self.scale_delay(delay),
+            DelayConstant::Real(delay) => self.scale_real_delay(delay),
+        }
+    }
+
+    fn scale_real_delay(&self, delay: f64) -> Result<u64, String> {
+        if !delay.is_finite() || delay < 0.0 {
+            return Err("delay control must be a nonnegative finite real constant".into());
+        }
+        let exponent =
+            i16::from(self.time_scale.unit_exponent) - i16::from(self.global_time_precision);
+        if exponent < 0 {
+            return Err("module time unit is less precise than the global time precision".into());
+        }
+        let decimal = format!("{delay:?}");
+        let mut numerator = 0_u128;
+        let mut fractional_digits = 0_usize;
+        let mut scientific_exponent = 0_i32;
+        let mut seen_digit = false;
+        let mut seen_point = false;
+        let mut negative = false;
+        let mut index = 0_usize;
+        let bytes = decimal.as_bytes();
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match byte {
+                b'-' => {
+                    if index != 0 || negative {
+                        return Err(invalid_delay_decimal(&decimal));
+                    }
+                    negative = true;
+                }
+                b'0'..=b'9' => {
+                    seen_digit = true;
+                    numerator = numerator
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(u128::from(byte - b'0')))
+                        .ok_or_else(|| invalid_delay_decimal(&decimal))?;
+                    if seen_point {
+                        fractional_digits += 1;
+                    }
+                }
+                b'.' => {
+                    if seen_point || index == 0 {
+                        return Err(invalid_delay_decimal(&decimal));
+                    }
+                    seen_point = true;
+                }
+                b'e' | b'E' => {
+                    let suffix = decimal
+                        .get(index + 1..)
+                        .ok_or_else(|| invalid_delay_decimal(&decimal))?;
+                    scientific_exponent = suffix
+                        .parse::<i32>()
+                        .map_err(|_| invalid_delay_decimal(&decimal))?;
+                    break;
+                }
+                _ => return Err(invalid_delay_decimal(&decimal)),
+            }
+            index += 1;
+        }
+        if !seen_digit || negative {
+            return Err(invalid_delay_decimal(&decimal));
+        }
+        let effective_exponent = i64::from(exponent)
+            - i64::try_from(fractional_digits).unwrap_or(i64::MAX)
+            + i64::from(scientific_exponent);
+        let (scale, denominator) = if effective_exponent >= 0 {
+            (
+                10_u128
+                    .checked_pow(
+                        u32::try_from(effective_exponent)
+                            .map_err(|_| "fractional delay scale exponent overflows".to_string())?,
+                    )
+                    .and_then(|scale| scale.checked_mul(u128::from(self.time_scale.unit_magnitude)))
+                    .ok_or_else(|| "scaled fractional delay overflows".to_string())?,
+                1_u128,
+            )
+        } else {
+            (
+                u128::from(self.time_scale.unit_magnitude),
+                10_u128
+                    .checked_pow(
+                        u32::try_from(-effective_exponent)
+                            .map_err(|_| "fractional delay scale exponent overflows".to_string())?,
+                    )
+                    .ok_or_else(|| "fractional delay denominator overflows".to_string())?,
+            )
+        };
+        let scaled_numerator = numerator
+            .checked_mul(scale)
+            .ok_or_else(|| "scaled fractional delay overflows".to_string())?;
+        let quotient = scaled_numerator / denominator;
+        let remainder = scaled_numerator % denominator;
+        let rounded = if remainder
+            .checked_add(remainder)
+            .is_some_and(|doubled| doubled >= denominator)
+        {
+            quotient.checked_add(1)
+        } else {
+            Some(quotient)
+        }
+        .ok_or_else(|| "scaled fractional delay overflows".to_string())?;
+        u64::try_from(rounded).map_err(|_| "scaled fractional delay overflows".to_string())
+    }
+
     fn collect_compilation_unit_members(&mut self, root: &serde_json::Value) -> Result<(), String> {
         let Some(members) = root
             .get("eda_compilation_unit_members")
@@ -770,6 +990,8 @@ impl SlangAstLowerer {
             let name = declaration_name(member, "package definition")?;
             let symbol_kind = match string_field(member, "kind").as_deref() {
                 Some("Parameter") => "param",
+                Some("Variable") => "variable",
+                Some("Net") => "net",
                 Some("Subroutine") => "subroutine",
                 Some("EnumType") => "enum",
                 Some("TypeAlias") => "alias",
@@ -798,6 +1020,9 @@ impl SlangAstLowerer {
                 Some("Parameter") => self
                     .lower_parameter(member)
                     .map_err(|error| with_source_span(member, error))?,
+                Some("Variable") | Some("Net") => self
+                    .lower_declaration(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 _ => {}
             }
         }
@@ -818,6 +1043,11 @@ impl SlangAstLowerer {
             .or_else(|| string_field(body, "name"))
             .ok_or_else(|| "slang AST Instance has no name".to_string())?;
         let class_definitions = class_definitions(root)?;
+        let library_scopes = definition_library_scopes(root);
+        let format_library_scope = library_scopes
+            .get(&top_name)
+            .cloned()
+            .unwrap_or_else(|| top_name.clone());
         let mut lowerer = Self {
             design: Design {
                 name: top_name.clone(),
@@ -840,6 +1070,7 @@ impl SlangAstLowerer {
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
+            package_type_aliases: std::collections::BTreeMap::new(),
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
@@ -914,6 +1145,9 @@ impl SlangAstLowerer {
                 .unwrap_or(-9),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
             generate_path: Vec::new(),
+            scope_path: top_name.clone(),
+            library_scopes,
+            format_library_scope,
             inline_stack: std::cell::RefCell::new(Vec::new()),
         };
         let root_hierarchy_index = lowerer.design.hierarchy.len();
@@ -1135,4 +1369,44 @@ fn declaration_name(member: &serde_json::Value, kind: &str) -> Result<String, St
     string_field(member, "name")
         .filter(|name| !name.is_empty())
         .ok_or_else(|| format!("slang AST {kind} has no name"))
+}
+
+fn definition_library_scopes(
+    root: &serde_json::Value,
+) -> std::collections::BTreeMap<String, String> {
+    if let Some(libraries) = root
+        .get("eda_definition_source_libraries")
+        .and_then(serde_json::Value::as_object)
+    {
+        return libraries
+            .iter()
+            .map(|(name, library)| {
+                let library = library.as_str().unwrap_or_default();
+                let scope = if library.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{library}.{name}")
+                };
+                (name.clone(), scope)
+            })
+            .collect();
+    }
+    let empty = Vec::new();
+    root.get("definitions")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|definition| {
+            let name = string_field(definition, "name")?;
+            let scope = match string_field(definition, "sourceLibrary") {
+                Some(library) if !library.is_empty() => format!("{library}.{name}"),
+                _ => name.clone(),
+            };
+            Some((name, scope))
+        })
+        .collect()
+}
+
+fn invalid_delay_decimal(decimal: &str) -> String {
+    format!("invalid fractional delay constant '{decimal}'")
 }

@@ -123,9 +123,16 @@ pub(crate) fn expression_literal(value: &Value) -> Option<String> {
     let raw = match kind.as_str() {
         "IntegerLiteral" => string_field(value, "value")?,
         "RealLiteral" => {
-            let real = value.get("value").and_then(Value::as_f64).filter(|real| {
-                real.is_finite() && *real >= 0.0 && real.fract() == 0.0 && *real <= u64::MAX as f64
-            })?;
+            let real = value
+                .get("value")
+                .and_then(Value::as_f64)
+                .filter(|real| real.is_finite())?;
+            if real.fract() != 0.0 {
+                return Some(format!("{real}"));
+            }
+            if !(real >= 0.0 && real <= u64::MAX as f64) {
+                return None;
+            }
             return Some(format!(
                 "64:{}",
                 LogicWord::from_u64(64, real as u64).to_bin_str()
@@ -200,6 +207,13 @@ pub(crate) fn expression_operands(value: &Value) -> Vec<SlangExpressionSummary> 
             }
         }
         "BinaryOp" => {
+            for field in ["left", "right"] {
+                if let Some(operand) = value.get(field) {
+                    operands.push(expression_summary(operand));
+                }
+            }
+        }
+        "Assignment" => {
             for field in ["left", "right"] {
                 if let Some(operand) = value.get(field) {
                     operands.push(expression_summary(operand));
@@ -370,9 +384,7 @@ pub(crate) fn procedural_assignments(
     class_types: ClassHandleTypes<'_>,
 ) -> Vec<SlangAssignmentSummary> {
     let mut assignments = Vec::new();
-    if string_field(value, "kind").as_deref() == Some("ProceduralAssign")
-        && bool_field(value, "isForce")
-    {
+    if string_field(value, "kind").as_deref() == Some("ProceduralAssign") {
         return assignments;
     }
     if string_field(value, "kind").as_deref() == Some("RepeatLoop")
@@ -862,7 +874,7 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("BinaryOp", "Multiply") => Some("Mul"),
         ("BinaryOp", "Power") => Some("Pow"),
         ("BinaryOp", "Divide") => Some("Div"),
-        ("BinaryOp", "Modulus") => Some("Mod"),
+        ("BinaryOp", "Mod" | "Modulus") => Some("Mod"),
         ("BinaryOp", "BinaryAnd") => Some("And"),
         ("BinaryOp", "BinaryOr") => Some("Or"),
         ("BinaryOp", "BinaryXor" | "BitwiseXor") => Some("Xor"),
@@ -1199,6 +1211,10 @@ fn canonical_literal_fingerprint(width: usize, signed: bool, literal: &str) -> O
     Some(format!("Const:{width}:{signed_label}[{literal}]"))
 }
 
+fn type_is_realtime_compatible(type_name: &str) -> bool {
+    matches!(type_name.trim(), "real" | "realtime")
+}
+
 fn conversion_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
@@ -1226,6 +1242,58 @@ fn conversion_fingerprint(
     }
     if expression.type_name == "string" || operand.type_name == "string" {
         return None;
+    }
+    if type_is_realtime_compatible(&expression.type_name)
+        && type_is_realtime_compatible(&operand.type_name)
+    {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
+    if expression.type_name.trim() == "shortreal" && operand.type_name.trim() == "shortreal" {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
+    if type_is_realtime_compatible(&expression.type_name)
+        && !matches!(operand.type_name.trim(), "real" | "realtime" | "shortreal")
+    {
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+        return Some(format!("IntToReal:64:s[{operand_fingerprint}]"));
+    }
+    if expression.type_name.trim() == "shortreal" {
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+        if type_is_realtime_compatible(&operand.type_name) {
+            return Some(format!("RealToShortReal:32:s[{operand_fingerprint}]"));
+        }
+        if operand.type_name.trim() != "shortreal" {
+            return Some(format!(
+                "RealToShortReal:32:s[IntToReal:64:s[{operand_fingerprint}]]"
+            ));
+        }
+    }
+    if operand.type_name.trim() == "shortreal" {
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+        if type_is_realtime_compatible(&expression.type_name) {
+            return Some(format!("ShortRealToReal:64:s[{operand_fingerprint}]"));
+        }
+        if expression.type_name.trim() != "shortreal" {
+            let width = expression.type_width?;
+            let signed_label = if expression.type_signed? { "s" } else { "u" };
+            return Some(format!(
+                "RealToInt:{width}:{signed_label}[ShortRealToReal:64:s[{operand_fingerprint}]]"
+            ));
+        }
+    }
+    if type_is_realtime_compatible(&operand.type_name)
+        && !type_is_realtime_compatible(&expression.type_name)
+    {
+        let width = expression.type_width?;
+        let signed_label = if expression.type_signed? { "s" } else { "u" };
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+        return Some(format!(
+            "RealToInt:{width}:{signed_label}[{operand_fingerprint}]"
+        ));
     }
     let target_width = expression.type_width.or_else(|| {
         expression
@@ -1262,8 +1330,23 @@ fn conversion_fingerprint(
     let source_signed = simple_type_signed(&operand.type_name)?;
     let target_width = target_shape.width;
     let source_width = source_shape.width;
-    if target_width == source_width && target_signed == source_signed {
+    let lowered_source_signed = match mode {
+        ExpressionFingerprintMode::Direct => direct_lowered_signed(operand, parameters)?,
+        ExpressionFingerprintMode::BoundedCompatibility => source_signed,
+    };
+    if target_width == source_width
+        && target_signed == source_signed
+        && lowered_source_signed == target_signed
+    {
         return Some(operand_fingerprint);
+    }
+    if target_width == source_width
+        && lowered_source_signed != target_signed
+        && operand.kind == "IntegerLiteral"
+        && target_signed
+    {
+        let literal = operand.literal.as_deref()?;
+        return canonical_literal_fingerprint(target_width, target_signed, literal);
     }
 
     let resized = if target_width < source_width {
@@ -1401,6 +1484,12 @@ fn unary_composition_fingerprint(
     match expression.operator.as_str() {
         "Plus" => Some(operand_fingerprint),
         "Minus" => {
+            if type_is_realtime_compatible(&expression.type_name) {
+                return Some(format!("RealNeg:64:s[{operand_fingerprint}]"));
+            }
+            if expression.type_name.trim() == "shortreal" {
+                return Some(format!("ShortRealNeg:32:s[{operand_fingerprint}]"));
+            }
             let width = expression.type_width?;
             let signed_label = if expression.type_signed? { "s" } else { "u" };
             let zeros = "0".repeat(width);
@@ -1578,8 +1667,8 @@ fn direct_lowered_signed(
                 | "ArithmeticShiftLeft"
                 | "LogicalShiftRight"
                 | "ArithmeticShiftRight" => Some(left),
-                "Add" | "Subtract" | "Multiply" | "Divide" | "Modulus" | "Power" | "BinaryAnd"
-                | "BinaryOr" | "BinaryXor" | "BitwiseXor" => Some(left && right),
+                "Add" | "Subtract" | "Multiply" | "Divide" | "Mod" | "Modulus" | "Power"
+                | "BinaryAnd" | "BinaryOr" | "BinaryXor" | "BitwiseXor" => Some(left && right),
                 "Equality" | "Inequality" | "CaseEquality" | "CaseInequality" | "LessThan"
                 | "LessThanEqual" | "GreaterThan" | "GreaterThanEqual" | "LogicalAnd"
                 | "LogicalOr" | "LogicalImplication" | "LogicalEquivalence" => Some(false),
@@ -2176,6 +2265,27 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             eda_core::ir::plusarg_value_net_name(name)
         ));
     }
+    if expression.kind == "RealLiteral" {
+        let literal = expression.literal.as_deref()?;
+        if let Some(bits) = literal.strip_prefix("64:") {
+            return Some(format!("Const:64:u[64:{bits}]"));
+        }
+        let real = literal.parse::<f64>().ok().or_else(|| {
+            expression
+                .operands
+                .first()
+                .and_then(|operand| operand.literal.as_deref())
+                .and_then(|literal| literal.parse::<f64>().ok())
+        })?;
+        if !real.is_finite() {
+            return None;
+        }
+        if real.fract() == 0.0 && real >= 0.0 && real <= u64::MAX as f64 {
+            let literal = expression.literal.as_deref()?;
+            return Some(format!("Const:64:u[{literal}]"));
+        }
+        return Some(format!("RealConst:64:f[{real}]"));
+    }
     if expression.kind == "Call"
         && matches!(
             expression.operator.as_str(),
@@ -2184,6 +2294,237 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     {
         let name = expression.plusarg_name.as_deref()?;
         return Some(format!("Ref:1:u[{}]", eda_core::ir::plusarg_net_name(name)));
+    }
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$random" | "$urandom" | "$urandom_range"
+        )
+    {
+        let signed_label = if expression.operator == "$random" {
+            "s"
+        } else {
+            "u"
+        };
+        let operands = expression
+            .operands
+            .iter()
+            .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters, mode))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!(
+            "Random:32:{signed_label}[{},{}]",
+            expression.operator,
+            operands
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "$sformatf" {
+        let format_argument = expression.operands.first()?;
+        let format_value = format_argument.operands.first().unwrap_or(format_argument);
+        let format = format_value.literal.as_deref()?;
+        let args = expression
+            .operands
+            .iter()
+            .skip(1)
+            .map(|argument| {
+                slang_expression_fingerprint_with_parameters(argument, parameters, mode)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!(
+            "StringFormat:512:u[format:{format},{}]",
+            args.join(",")
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "$fopen" {
+        let literal_path = expression
+            .operands
+            .first()?
+            .operands
+            .first()
+            .and_then(|operand| operand.literal.as_deref());
+        let literal_mode = expression
+            .operands
+            .get(1)?
+            .operands
+            .first()
+            .and_then(|operand| operand.literal.as_deref());
+        if let (Some(path), Some(mode)) = (literal_path, literal_mode) {
+            let mode = canonical_literal_file_open_mode(mode)?;
+            return Some(format!("FileOpen:32:u[{path},{mode}]"));
+        }
+        let path = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let mode = slang_expression_fingerprint_with_parameters(
+            expression.operands.get(1)?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!("FileOpenDynamic:32:u[{path},{mode}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$fgetc" {
+        let argument = expression.operands.first()?;
+        let descriptor_argument = argument.operands.first().unwrap_or(argument);
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_argument, parameters, mode)?;
+        return Some(format!("FileGetc:32:s[{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$fgets" {
+        let output = expression.operands.first()?;
+        let target = output.operands.first()?;
+        let descriptor_argument = expression.operands.get(1)?;
+        let descriptor_value = descriptor_argument
+            .operands
+            .first()
+            .unwrap_or(descriptor_argument);
+        let target = slang_expression_fingerprint_with_parameters(target, parameters, mode)?;
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_value, parameters, mode)?;
+        return Some(format!("FileGets:32:s[{target},{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$ungetc" {
+        let mut operands = Vec::new();
+        for argument in expression.operands.iter().take(2) {
+            let argument_value = argument.operands.first().unwrap_or(argument);
+            operands.push(slang_expression_fingerprint_with_parameters(
+                argument_value,
+                parameters,
+                mode,
+            )?);
+        }
+        if operands.len() != 2 {
+            return None;
+        }
+        return Some(format!("FileUngetc:32:s[{}]", operands.join(",")));
+    }
+    if expression.kind == "Call" && expression.operator == "$ferror" {
+        let descriptor_argument = expression.operands.first()?;
+        let descriptor_value = descriptor_argument
+            .operands
+            .first()
+            .unwrap_or(descriptor_argument);
+        let output = expression.operands.get(1)?;
+        let target = output.operands.first()?;
+        let message = slang_expression_fingerprint_with_parameters(target, parameters, mode)?;
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_value, parameters, mode)?;
+        return Some(format!("FileError:32:s[{message},{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$sscanf" {
+        let source_argument = expression.operands.first()?;
+        let source =
+            slang_expression_fingerprint_with_parameters(source_argument, parameters, mode)?;
+        let format = expression.operands.get(1)?.literal.as_deref()?;
+        let mut targets = Vec::new();
+        for output in expression.operands.iter().skip(2) {
+            let target = output.operands.first()?;
+            targets.push(slang_expression_fingerprint_with_parameters(
+                target, parameters, mode,
+            )?);
+        }
+        return Some(format!(
+            "StringScan:32:s[{source},format:{format},{}]",
+            targets.join(",")
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "$fread" {
+        let output = expression.operands.first()?;
+        let target_summary = output.operands.first()?;
+        let descriptor_argument = expression.operands.get(1)?;
+        let descriptor_value = descriptor_argument
+            .operands
+            .first()
+            .unwrap_or(descriptor_argument);
+        let target =
+            slang_expression_fingerprint_with_parameters(target_summary, parameters, mode)?;
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_value, parameters, mode)?;
+        if target_summary.type_name.contains('$') && target_summary.type_name != "event" {
+            let start = match expression.operands.get(2) {
+                Some(argument) => Some(slang_expression_fingerprint_with_parameters(
+                    argument, parameters, mode,
+                )?),
+                None => None,
+            }
+            .unwrap_or_else(|| "None".to_string());
+            let count = match expression.operands.get(3) {
+                Some(argument) => Some(slang_expression_fingerprint_with_parameters(
+                    argument, parameters, mode,
+                )?),
+                None => None,
+            }
+            .unwrap_or_else(|| "None".to_string());
+            return Some(format!(
+                "FileReadMemory:32:s[{target},{descriptor},{start},{count}]"
+            ));
+        }
+        return Some(format!("FileRead:32:s[{target},{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$fscanf" {
+        let descriptor_argument = expression.operands.first()?;
+        let descriptor_value = descriptor_argument
+            .operands
+            .first()
+            .unwrap_or(descriptor_argument);
+        let format = expression.operands.get(1)?.literal.as_deref()?;
+        let mut targets = Vec::new();
+        for output in expression.operands.iter().skip(2) {
+            let target = output.operands.first()?;
+            targets.push(slang_expression_fingerprint_with_parameters(
+                target, parameters, mode,
+            )?);
+        }
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_value, parameters, mode)?;
+        return Some(format!(
+            "FileScan:32:s[{descriptor},format:{format},{}]",
+            targets.join(",")
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "$feof" {
+        let argument = expression.operands.first()?;
+        let descriptor_argument = argument.operands.first().unwrap_or(argument);
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_argument, parameters, mode)?;
+        return Some(format!("FileEof:32:s[{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$ftell" {
+        let argument = expression.operands.first()?;
+        let descriptor_argument = argument.operands.first().unwrap_or(argument);
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_argument, parameters, mode)?;
+        return Some(format!("FileTell:32:s[{descriptor}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$fseek" {
+        let mut operands = Vec::new();
+        for argument in expression.operands.iter() {
+            let argument_value = argument.operands.first().unwrap_or(argument);
+            operands.push(slang_expression_fingerprint_with_parameters(
+                argument_value,
+                parameters,
+                mode,
+            )?);
+        }
+        if operands.len() != 3 {
+            return None;
+        }
+        return Some(format!("FileSeek:32:s[{}]", operands.join(",")));
+    }
+    if expression.kind == "Call" && expression.operator == "$rewind" {
+        let argument = expression.operands.first()?;
+        let descriptor_argument = argument.operands.first().unwrap_or(argument);
+        let descriptor =
+            slang_expression_fingerprint_with_parameters(descriptor_argument, parameters, mode)?;
+        return Some(format!(
+            "FileSeek:32:s[{descriptor},Const:32:u[32:{}],Const:32:u[32:{}]]",
+            "0".repeat(32),
+            "0".repeat(32)
+        ));
     }
     if expression.kind == "Call"
         && matches!(
@@ -2299,6 +2640,19 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             let signed_label = if method == "$time" { "s" } else { "u" };
             let unit = expression.simulation_time_unit?;
             return Some(format!("SimulationTime:{width}:{signed_label}[Unit{unit}]"));
+        }
+        if method == "$realtime" && mode == ExpressionFingerprintMode::Direct {
+            let unit = expression.simulation_time_unit?;
+            return Some(format!("RealTime:64:s[Unit{unit}]"));
+        }
+        if matches!(method, "$timeunit" | "$timeprecision")
+            && mode == ExpressionFingerprintMode::Direct
+        {
+            let exponent = expression.simulation_time_unit?;
+            let word = LogicWord::from_u64(32, i32::from(exponent) as u32 as u64);
+            let bits = word.to_bin_str();
+            let signed_label = if bits.starts_with('1') { "s" } else { "u" };
+            return Some(format!("Const:32:{signed_label}[32:{bits}]",));
         }
         if matches!(method, "size" | "num") {
             let selected = expression.operands.first()?;
@@ -2536,11 +2890,20 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     if expression.kind == "MemberAccess" {
         if let Some((msb, lsb)) = expression.member_range {
             let width = expression.type_width?;
-            let base = slang_expression_fingerprint_with_parameters(
-                expression.operands.first()?,
-                parameters,
-                mode,
-            )?;
+            let selected = expression.operands.first()?;
+            if lsb == 0
+                && msb + 1 == width
+                && matches!(selected.kind.as_str(), "NamedValue" | "HierarchicalValue")
+            {
+                let name = selected.symbol.as_deref()?;
+                if expression.type_name.trim() == "shortreal" && width == 32 {
+                    return Some(format!("Ref:32:s[{name}]"));
+                }
+                if matches!(expression.type_name.trim(), "real" | "realtime") && width == 64 {
+                    return Some(format!("Ref:64:s[{name}]"));
+                }
+            }
+            let base = slang_expression_fingerprint_with_parameters(selected, parameters, mode)?;
             return Some(format!("PackedSelect:{width}:u[{base},Range:{msb}:{lsb}]"));
         } else if let Some(path) = expression.interface_path.as_deref() {
             let width = expression.type_width?;
@@ -2601,6 +2964,24 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             .collect::<Vec<_>>()
             .join(",")
     ))
+}
+
+fn canonical_literal_file_open_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        "8:01110010" | "16:0110001001110010" => Some("8:01110010"),
+        "16:0010101101110010" | "24:011000100010101101110010" | "24:001010110110001001110010" => {
+            Some("16:0010101101110010")
+        }
+        "8:01110111" | "16:0110001001110111" => Some("8:01110111"),
+        "16:0010101101110111" | "24:011000100010101101110111" | "24:001010110110001001110111" => {
+            Some("16:0010101101110111")
+        }
+        "8:01100001" | "16:0110001001100001" => Some("8:01100001"),
+        "16:0010101101100001" | "24:011000100010101101100001" | "24:001010110110001001100001" => {
+            Some("16:0010101101100001")
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn collect_kinds(value: &Value, kinds: &mut std::collections::BTreeSet<String>) {
@@ -2821,6 +3202,40 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
     use eda_core::ir::{BinOp, Expr, UnOp};
     match expression {
         Expr::Const(_) => "Const",
+        Expr::RealConst(_) => "RealConst",
+        Expr::RealRef { .. } => "Ref",
+        Expr::ShortRealConst(_) => "ShortRealConst",
+        Expr::ShortRealRef { .. } => "Ref",
+        Expr::ShortRealBinary { op, .. } => match op {
+            eda_core::ir::BinOp::Add => "Add",
+            eda_core::ir::BinOp::Sub => "Sub",
+            eda_core::ir::BinOp::Mul => "Mul",
+            eda_core::ir::BinOp::Div => "Div",
+            _ => "ShortRealBinary",
+        },
+        Expr::RealBinary { op, .. } => match op {
+            eda_core::ir::BinOp::Add => "Add",
+            eda_core::ir::BinOp::Sub => "Sub",
+            eda_core::ir::BinOp::Mul => "Mul",
+            eda_core::ir::BinOp::Div => "Div",
+            _ => "RealBinary",
+        },
+        Expr::RealCompare { op, .. } => match op {
+            eda_core::ir::BinOp::Eq => "Eq",
+            eda_core::ir::BinOp::Ne => "Ne",
+            eda_core::ir::BinOp::Lt => "Lt",
+            eda_core::ir::BinOp::Le => "Le",
+            eda_core::ir::BinOp::Gt => "Gt",
+            eda_core::ir::BinOp::Ge => "Ge",
+            _ => "RealCompare",
+        },
+        Expr::RealNeg(_) => "RealNeg",
+        Expr::ShortRealNeg(_) => "ShortRealNeg",
+        Expr::ShortRealToReal(_) => "ShortRealToReal",
+        Expr::RealToShortReal(_) => "RealToShortReal",
+        Expr::RealToInt { .. } => "RealToInt",
+        Expr::IntToReal { .. } => "IntToReal",
+        Expr::RealTime { .. } => "RealTime",
         Expr::Ref { .. } | Expr::MemoryRead { .. } | Expr::MemoryReadPart { .. } => "Ref",
         Expr::Un { op, .. } => match op {
             UnOp::Not => "Not",
@@ -2858,6 +3273,7 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::Index { .. } => "Index",
         Expr::StringLength { .. } => "StringLength",
         Expr::StringConcat { .. } => "StringConcat",
+        Expr::StringFormat { .. } => "StringFormat",
         Expr::StringGetByte { .. } => "StringGetByte",
         Expr::StringCase { .. } => "StringCase",
         Expr::StringCompare { .. } => "StringCompare",
@@ -2865,8 +3281,19 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::StringSubstr { .. } => "StringSubstr",
         Expr::StringToRadix { .. } => "StringToRadix",
         Expr::StringFromRadix { .. } => "StringFromRadix",
+        Expr::MemoryPattern { .. } => "MemoryPattern",
+        Expr::EnumPattern { .. } => "EnumPattern",
+        Expr::StructPattern { .. } => "StructPattern",
         Expr::EventTriggered { .. } => "EventTriggered",
         Expr::SimulationTime { .. } => "SimulationTime",
+        Expr::Random { .. } => "Random",
+        Expr::FileOpen { .. } => "FileOpen",
+        Expr::FileOpenDynamic { .. } => "FileOpenDynamic",
+        Expr::FileGetc { .. } => "FileGetc",
+        Expr::FileUngetc { .. } => "FileUngetc",
+        Expr::FileEof { .. } => "FileEof",
+        Expr::FileTell { .. } => "FileTell",
+        Expr::FileSeek { .. } => "FileSeek",
         Expr::MemorySize { .. } => "MemorySize",
         Expr::AssocRead { .. } => "AssocRead",
         Expr::AssocExists { .. } => "AssocExists",
@@ -2875,6 +3302,50 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
 
 pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir::Expr) -> String {
     use eda_core::ir::Expr;
+    if let Expr::Signed {
+        e: shifted,
+        signed: true,
+    } = expression
+    {
+        if let Expr::Bin {
+            op: eda_core::ir::BinOp::Shr,
+            a,
+            b,
+        } = shifted.as_ref()
+        {
+            if let Expr::Signed {
+                e: logical_operand,
+                signed: false,
+            } = a.as_ref()
+            {
+                return format!(
+                    "Shr:{}:s[{},{}]",
+                    expression.width(),
+                    design_expr_fingerprint(design, logical_operand),
+                    design_expr_fingerprint(design, b)
+                );
+            }
+        }
+    }
+    if let Expr::Bin {
+        op: eda_core::ir::BinOp::Shr,
+        a,
+        b,
+    } = expression
+    {
+        if let Expr::Signed {
+            e: logical_operand,
+            signed: false,
+        } = a.as_ref()
+        {
+            return format!(
+                "Shr:{}:u[{},{}]",
+                expression.width(),
+                design_expr_fingerprint(design, logical_operand),
+                design_expr_fingerprint(design, b)
+            );
+        }
+    }
     if let Expr::MemoryRead {
         memory,
         indexes,
@@ -2979,6 +3450,27 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             word.to_bin_str()
         );
     }
+    if let Expr::RealConst(real) = expression {
+        if real.fract() == 0.0 && *real >= 0.0 && *real <= u64::MAX as f64 {
+            let word = LogicWord::from_u64(64, *real as u64);
+            return format!("Const:64:u[64:{}]", word.to_bin_str());
+        }
+        return format!("RealConst:64:f[{real}]");
+    }
+    if let Expr::ShortRealConst(real) = expression {
+        return format!("ShortRealConst:32:f[{real}]");
+    }
+    if let Expr::RealRef { net, .. } = expression {
+        let name = design_expr_symbol(design, expression).unwrap_or_else(|| design.net_name(*net));
+        return format!("Ref:64:s[{name}]");
+    }
+    if let Expr::ShortRealRef { net } = expression {
+        let name = design_expr_symbol(design, expression).unwrap_or_else(|| design.net_name(*net));
+        return format!("Ref:32:s[{name}]");
+    }
+    if let Expr::RealTime { unit_exponent } = expression {
+        return format!("RealTime:64:s[Unit{unit_exponent}]");
+    }
     if let Expr::Signed {
         e: signed_operand,
         signed: true,
@@ -3042,6 +3534,120 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         let signed_label = if *signed { "s" } else { "u" };
         return format!("SimulationTime:{width}:{signed_label}[Unit{unit_exponent}]");
     }
+    if let Expr::Random {
+        function,
+        args,
+        width,
+        signed,
+    } = expression
+    {
+        let name = match function {
+            eda_core::ir::RandomFunction::Random => "$random",
+            eda_core::ir::RandomFunction::Urandom => "$urandom",
+            eda_core::ir::RandomFunction::UrandomRange => "$urandom_range",
+        };
+        let signed_label = if *signed { "s" } else { "u" };
+        return format!(
+            "Random:{width}:{signed_label}[{name},{}]",
+            args.iter()
+                .map(|argument| design_expr_fingerprint(design, argument))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    if let Expr::FileOpen {
+        path,
+        append,
+        read,
+        truncate,
+    } = expression
+    {
+        let Some(width) = path.len().checked_mul(8) else {
+            return "FileOpen:32:u[<path-too-large>]".to_string();
+        };
+        let path_word = LogicWord::from_bytes_le(width, path.as_bytes());
+        let mode = if *read && *append && *truncate {
+            "16:0010101101100001"
+        } else if *read && *append {
+            "16:0010101101110010"
+        } else if *read && *truncate {
+            "16:0010101101110111"
+        } else if *read {
+            "8:01110010"
+        } else if *append {
+            "8:01100001"
+        } else {
+            "8:01110111"
+        };
+        return format!("FileOpen:32:u[{}:{},{mode}]", width, path_word.to_bin_str());
+    }
+    if let Expr::FileOpenDynamic { path, mode } = expression {
+        return format!(
+            "FileOpenDynamic:32:u[{},{}]",
+            design_expr_fingerprint(design, path),
+            design_expr_fingerprint(design, mode)
+        );
+    }
+    if let Expr::StringFormat { format, args, .. } = expression {
+        let Some(format_width) = format.len().checked_mul(8) else {
+            return "StringFormat:512:u[<format-too-large>]".to_string();
+        };
+        let format_word = LogicWord::from_bytes_le(format_width, format.as_bytes());
+        return format!(
+            "StringFormat:512:u[format:{format_width}:{},{}]",
+            format_word.to_bin_str(),
+            args.iter()
+                .map(|argument| design_expr_fingerprint(design, argument))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    if let Expr::MemoryPattern { memory, .. } = expression {
+        let memory_name = design
+            .memories
+            .get(*memory)
+            .map(|memory| memory.name.as_str())
+            .unwrap_or("<unknown>");
+        return format!("MemoryCopy:{memory_name}");
+    }
+    if let Expr::EnumPattern { value, .. } = expression {
+        return design_expr_fingerprint(design, value);
+    }
+    if let Expr::StructPattern { value, .. } = expression {
+        return design_expr_fingerprint(design, value);
+    }
+    if let Expr::FileGetc { fd } = expression {
+        return format!("FileGetc:32:s[{}]", design_expr_fingerprint(design, fd));
+    }
+    if let Expr::FileUngetc { value, fd } = expression {
+        let mut semantic_value = value.as_ref();
+        while let Expr::Signed { e: inner, .. } = semantic_value {
+            if matches!(inner.as_ref(), Expr::Signed { .. }) {
+                semantic_value = inner.as_ref();
+            } else {
+                break;
+            }
+        }
+        return format!(
+            "FileUngetc:32:s[{},{}]",
+            design_expr_fingerprint(design, semantic_value),
+            design_expr_fingerprint(design, fd)
+        );
+    }
+    if let Expr::FileEof { fd } = expression {
+        return format!("FileEof:32:s[{}]", design_expr_fingerprint(design, fd));
+    }
+    if let Expr::FileTell { fd } = expression {
+        return format!("FileTell:32:s[{}]", design_expr_fingerprint(design, fd));
+    }
+    if let Expr::FileSeek { fd, offset, whence } = expression {
+        return format!(
+            "FileSeek:32:s[{},{},{}]",
+            design_expr_fingerprint(design, fd),
+            design_expr_fingerprint(design, offset),
+            design_expr_fingerprint(design, whence)
+        );
+    }
     if let Expr::MemorySize {
         memory,
         width,
@@ -3072,6 +3678,28 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             design_expr_fingerprint(design, index)
         );
     }
+    if let Expr::Signed {
+        e: operand,
+        signed: true,
+    } = expression
+    {
+        if let Expr::AssocRead {
+            memory,
+            index,
+            width,
+        } = operand.as_ref()
+        {
+            let memory_name = design
+                .memories
+                .get(*memory)
+                .map(|memory| memory.name.as_str())
+                .unwrap_or("<unknown>");
+            return format!(
+                "AssocRead:{width}:s[{memory_name},{}]",
+                design_expr_fingerprint(design, index)
+            );
+        }
+    }
     if let Expr::AssocExists { memory, index } = expression {
         let memory_name = design
             .memories
@@ -3088,10 +3716,34 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
     }
     let operands: Vec<String> = match expression {
         Expr::Const(_)
+        | Expr::RealConst(_)
+        | Expr::RealRef { .. }
+        | Expr::ShortRealConst(_)
+        | Expr::ShortRealRef { .. }
         | Expr::Ref { .. }
         | Expr::MemoryRead { .. }
         | Expr::SimulationTime { .. }
+        | Expr::RealTime { .. }
         | Expr::MemorySize { .. } => Vec::new(),
+        Expr::RealBinary { left, right, .. } => vec![
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right),
+        ],
+        Expr::RealCompare { left, right, .. } => vec![
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right),
+        ],
+        Expr::RealNeg(operand) => vec![design_expr_fingerprint(design, operand)],
+        Expr::ShortRealBinary { left, right, .. } => vec![
+            design_expr_fingerprint(design, left),
+            design_expr_fingerprint(design, right),
+        ],
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => vec![design_expr_fingerprint(design, operand)],
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            vec![design_expr_fingerprint(design, value)]
+        }
         Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
             vec![design_expr_fingerprint(design, index)]
         }
@@ -3124,6 +3776,10 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
             design_expr_fingerprint(design, left),
             design_expr_fingerprint(design, right),
         ],
+        Expr::StringFormat { args, .. } => args
+            .iter()
+            .map(|argument| design_expr_fingerprint(design, argument))
+            .collect(),
         Expr::StringGetByte { e, index } => vec![
             design_expr_fingerprint(design, e),
             design_expr_fingerprint(design, index),
@@ -3145,7 +3801,31 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         ],
         Expr::StringToRadix { e, .. } => vec![design_expr_fingerprint(design, e)],
         Expr::StringFromRadix { value, .. } => vec![design_expr_fingerprint(design, value)],
+        Expr::MemoryPattern { .. } => Vec::new(),
+        Expr::EnumPattern { value, .. } => vec![design_expr_fingerprint(design, value)],
+        Expr::StructPattern { value, .. } => vec![design_expr_fingerprint(design, value)],
         Expr::EventTriggered { net } => vec![format!("net:{net}")],
+        Expr::Random { args, .. } => args
+            .iter()
+            .map(|argument| design_expr_fingerprint(design, argument))
+            .collect(),
+        Expr::FileOpen { .. } => Vec::new(),
+        Expr::FileOpenDynamic { path, mode } => vec![
+            design_expr_fingerprint(design, path),
+            design_expr_fingerprint(design, mode),
+        ],
+        Expr::FileGetc { fd } => vec![design_expr_fingerprint(design, fd)],
+        Expr::FileUngetc { value, fd } => vec![
+            design_expr_fingerprint(design, value),
+            design_expr_fingerprint(design, fd),
+        ],
+        Expr::FileEof { fd } => vec![design_expr_fingerprint(design, fd)],
+        Expr::FileTell { fd } => vec![design_expr_fingerprint(design, fd)],
+        Expr::FileSeek { fd, offset, whence } => vec![
+            design_expr_fingerprint(design, fd),
+            design_expr_fingerprint(design, offset),
+            design_expr_fingerprint(design, whence),
+        ],
     };
     format!(
         "{}:{}:{}[{}]",
@@ -3166,15 +3846,17 @@ pub(crate) fn design_expr_symbol(
 ) -> Option<String> {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Ref { net, .. } => clocking_sample_symbol(design, *net).or_else(|| {
-            design
-                .net_decls
-                .iter()
-                .find(|declaration| {
-                    *net >= declaration.base && *net < declaration.base + declaration.width
-                })
-                .map(|declaration| canonical_ref_symbol_name(&declaration.name))
-        }),
+        Expr::Ref { net, .. } | Expr::RealRef { net, .. } | Expr::ShortRealRef { net } => {
+            clocking_sample_symbol(design, *net).or_else(|| {
+                design
+                    .net_decls
+                    .iter()
+                    .find(|declaration| {
+                        *net >= declaration.base && *net < declaration.base + declaration.width
+                    })
+                    .map(|declaration| canonical_ref_symbol_name(&declaration.name))
+            })
+        }
         Expr::MemoryRead { memory, .. } | Expr::MemoryReadPart { memory, .. } => design
             .memories
             .get(*memory)
@@ -3286,7 +3968,10 @@ fn design_stmt_assignments_guarded(
         Stmt::Repeat { body, .. } => {
             assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
-        Stmt::Force { .. } | Stmt::Release { .. } => {}
+        Stmt::Force { .. }
+        | Stmt::Release { .. }
+        | Stmt::ProceduralAssign { .. }
+        | Stmt::ProceduralDeassign { .. } => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => {
             assignments.extend(design_stmt_assignments_guarded(design, body, guard));
@@ -3295,6 +3980,165 @@ fn design_stmt_assignments_guarded(
             if let Some(name) = design_lvalue_name(design, lv) {
                 assignments.push((name, design_expr_fingerprint(design, e)));
             }
+        }
+        Stmt::FileGets { fd, string, status } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let Some(string_name) = design_lvalue_name(design, string) else {
+                return assignments;
+            };
+            assignments.push((
+                status_name,
+                format!(
+                    "FileGets:32:s[Ref:{}:u[{string_name}],{}]",
+                    string.decl_width,
+                    design_expr_fingerprint(design, fd)
+                ),
+            ));
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let Some(message_name) = design_lvalue_name(design, message) else {
+                return assignments;
+            };
+            assignments.push((
+                status_name,
+                format!(
+                    "FileError:32:s[Ref:{}:u[{message_name}],{}]",
+                    message.decl_width,
+                    design_expr_fingerprint(design, fd)
+                ),
+            ));
+        }
+        Stmt::FileRead { fd, target, status } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let Some(target_name) = design_lvalue_name(design, target) else {
+                return assignments;
+            };
+            assignments.push((
+                status_name,
+                format!(
+                    "FileRead:32:s[Ref:{}:u[{target_name}],{}]",
+                    target.decl_width,
+                    design_expr_fingerprint(design, fd)
+                ),
+            ));
+        }
+        Stmt::FileReadMemory {
+            fd,
+            memory,
+            start,
+            count,
+            status,
+        } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let Some(memory_name) = design
+                .memories
+                .get(*memory)
+                .map(|memory| memory.name.as_str())
+            else {
+                return assignments;
+            };
+            let start = start
+                .as_ref()
+                .map(|expression| design_expr_fingerprint(design, expression))
+                .unwrap_or_else(|| "None".to_string());
+            let count = count
+                .as_ref()
+                .map(|expression| design_expr_fingerprint(design, expression))
+                .unwrap_or_else(|| "None".to_string());
+            assignments.push((
+                status_name,
+                format!(
+                    "FileReadMemory:32:s[MemoryCopy:{memory_name},{},{start},{count}]",
+                    design_expr_fingerprint(design, fd)
+                ),
+            ));
+        }
+        Stmt::FileScan {
+            fd,
+            format,
+            targets,
+            status,
+        } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let format_width = format.len().saturating_mul(8);
+            let format_word = LogicWord::from_bytes_le(format_width, format.as_bytes());
+            let mut target_fingerprints = Vec::new();
+            for target in targets {
+                let Some(target_name) = design_lvalue_name(design, target) else {
+                    return assignments;
+                };
+                let target_signed = design
+                    .net_decls
+                    .iter()
+                    .find(|declaration| declaration.base == target.net)
+                    .is_some_and(|declaration| declaration.is_signed);
+                let signed_label = if target_signed { "s" } else { "u" };
+                target_fingerprints.push(format!(
+                    "Ref:{}:{signed_label}[{target_name}]",
+                    target.decl_width
+                ));
+            }
+            assignments.push((
+                status_name,
+                format!(
+                    "FileScan:32:s[{},format:{format_width}:{},{}]",
+                    design_expr_fingerprint(design, fd),
+                    format_word.to_bin_str(),
+                    target_fingerprints.join(",")
+                ),
+            ));
+        }
+        Stmt::StringScan {
+            source,
+            format,
+            targets,
+            status,
+        } => {
+            let Some(status_name) = design_lvalue_name(design, status) else {
+                return assignments;
+            };
+            let format_width = format.len().saturating_mul(8);
+            let format_word = LogicWord::from_bytes_le(format_width, format.as_bytes());
+            let mut target_fingerprints = Vec::new();
+            for target in targets {
+                let Some(target_name) = design_lvalue_name(design, target) else {
+                    return assignments;
+                };
+                let target_signed = design
+                    .net_decls
+                    .iter()
+                    .find(|declaration| declaration.base == target.net)
+                    .is_some_and(|declaration| declaration.is_signed);
+                let signed_label = if target_signed { "s" } else { "u" };
+                target_fingerprints.push(format!(
+                    "Ref:{}:{signed_label}[{target_name}]",
+                    target.decl_width
+                ));
+            }
+            assignments.push((
+                status_name,
+                format!(
+                    "StringScan:32:s[{},format:{format_width}:{},{}]",
+                    design_expr_fingerprint(design, source),
+                    format_word.to_bin_str(),
+                    target_fingerprints.join(",")
+                ),
+            ));
         }
         Stmt::MemoryBl { memory, e, .. }
         | Stmt::MemoryNBl { memory, e, .. }
@@ -3488,13 +4332,48 @@ fn design_stmt_assignments_guarded(
                 assignments.extend(design_stmt_assignments_guarded(design, body, guard));
             }
         }
+        Stmt::ImmediateAssertion {
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            // Slang's procedural summary records the syntactic action-block
+            // assignments without an assertion-condition guard. Mirror that
+            // order: fail action before pass action.
+            for action in fail_action.iter().chain(pass_action.iter()) {
+                assignments.extend(design_stmt_assignments_guarded(design, action, guard));
+            }
+        }
         Stmt::Display { .. }
         | Stmt::Assert { .. }
         | Stmt::Assume { .. }
         | Stmt::Cover { .. }
         | Stmt::TimeFormat { .. }
         | Stmt::WriteMem { .. }
-        | Stmt::Finish => {}
+        | Stmt::AssertControl(_)
+        | Stmt::FileClose { .. }
+        | Stmt::FileFlush { .. }
+        | Stmt::FileDisplay { .. }
+        | Stmt::Finish
+        | Stmt::Stop => {}
+        Stmt::RandomSeeded { seed, destination } => {
+            let Some(destination_name) = design_lvalue_name(design, destination) else {
+                return assignments;
+            };
+            let Some(seed_name) = design_lvalue_name(design, seed) else {
+                return assignments;
+            };
+            let seed_signed = design
+                .net_decls
+                .iter()
+                .find(|declaration| declaration.base == seed.net)
+                .is_some_and(|declaration| declaration.is_signed);
+            let signed_label = if seed_signed { "s" } else { "u" };
+            assignments.push((
+                destination_name,
+                format!("Random:32:s[$random,Ref:32:{signed_label}[{seed_name}]]"),
+            ));
+        }
     }
     assignments
 }

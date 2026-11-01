@@ -19,6 +19,23 @@ fn temporary_directory(name: &str) -> PathBuf {
     path
 }
 
+fn packed_string_data_bytes(word: &LogicWord) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for byte_bits in word.bits.chunks(8).take(63) {
+        let mut byte = 0_u8;
+        for (bit, value) in byte_bits.iter().enumerate() {
+            if value.as_bool() == Some(true) {
+                byte |= 1 << bit;
+            }
+        }
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte);
+    }
+    bytes
+}
+
 fn external_oracles_are_required() -> bool {
     std::env::var_os("EDA_REQUIRE_EXTERNAL_ORACLES").is_some_and(|value| value != "0")
 }
@@ -655,6 +672,45 @@ endmodule
         serde_json::to_value(Arc::as_ref(&persisted_composite.design)).unwrap(),
         serde_json::to_value(&artifact_design).unwrap()
     );
+    let fifth_frontend =
+        discover_slang_for_tests().expect("rediscover pinned slang for persistent leaf IR");
+    let persisted_leaf = fifth_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("load persistent leaf IR in a new frontend");
+    assert!(persisted_leaf.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&persisted_leaf.design)).unwrap(),
+        serde_json::to_value(Arc::as_ref(&leaf_first.design)).unwrap()
+    );
+
+    let leaf_ir_directory = cache.join("ir");
+    let leaf_ir_path = std::fs::read_dir(&leaf_ir_directory)
+        .expect("persistent leaf IR directory exists")
+        .map(|entry| entry.expect("read persistent leaf IR path").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("persistent leaf IR artifact exists");
+    std::fs::write(&leaf_ir_path, r#"{"schema":1}"#).expect("corrupt persistent leaf IR");
+    let sixth_frontend =
+        discover_slang_for_tests().expect("rediscover pinned slang after leaf IR corruption");
+    let recovered_leaf = sixth_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("recover from corrupt persistent leaf IR");
+    assert!(!recovered_leaf.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&recovered_leaf.design)).unwrap(),
+        serde_json::to_value(Arc::as_ref(&leaf_first.design)).unwrap()
+    );
+    let repaired_persistent_leaf = sixth_frontend
+        .compile_leaf_unit_artifact(&cache, "persistent_child")
+        .expect("load repaired persistent leaf IR");
+    assert!(repaired_persistent_leaf.cache_hit);
+    assert_eq!(
+        serde_json::to_value(Arc::as_ref(&repaired_persistent_leaf.design)).unwrap(),
+        serde_json::to_value(Arc::as_ref(&leaf_first.design)).unwrap()
+    );
 
     std::fs::write(cache.join("composite-ir.json"), r#"{"schema":1}"#)
         .expect("corrupt persistent composite IR");
@@ -769,6 +825,373 @@ endmodule
         .expect("compile after persistent library inventory changed");
     assert!(!inventory_changed.cache_hit);
     assert!(inventory_changed.rebuilt_units.is_empty());
+}
+
+#[test]
+fn slang_project_cache_persists_all_leaf_ir_despite_lru_eviction() {
+    let Some(initial_frontend) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("persistent-all-leaf-ir");
+    let cache = root.join("cache");
+    let top_path = root.join("many_leaf_top.sv");
+    let mut sources = vec![top_path.to_string_lossy().into_owned()];
+    let mut instances = String::new();
+    for index in 0..5 {
+        let path = root.join(format!("many_leaf_child_{index}.sv"));
+        std::fs::write(
+            &path,
+            format!(
+                "module many_leaf_child_{index}(input logic a, output logic y);\n\
+                 assign y = !a;\n\
+                 endmodule\n"
+            ),
+        )
+        .expect("write leaf child");
+        sources.push(path.to_string_lossy().into_owned());
+        instances.push_str(&format!(
+            "many_leaf_child_{index} child_{index}(.a(a[{index}]), .y(y[{index}]));\n"
+        ));
+    }
+    std::fs::write(
+        &top_path,
+        format!(
+            "module many_leaf_top(input logic [4:0] a, output logic [4:0] y);\n{instances}endmodule\n"
+        ),
+    )
+    .expect("write leaf-bearing top");
+    let source_json = sources
+        .iter()
+        .map(|source| format!("\"{}\"", source.replace('\\', "\\\\")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let manifest_path = root.join("project.json");
+    std::fs::write(
+        &manifest_path,
+        format!("{{\"top\":\"many_leaf_top\",\"sources\":[{source_json}]}}\n"),
+    )
+    .expect("write leaf project manifest");
+
+    initial_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("build persistent project artifacts");
+    let lowered = initial_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("lower leaf-bearing composite");
+    assert!(!lowered.cache_hit);
+    let leaf_artifact_count = std::fs::read_dir(cache.join("ir"))
+        .expect("persistent leaf IR directory exists")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("read persistent leaf IR entry")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert_eq!(leaf_artifact_count, 5);
+
+    let second_frontend =
+        discover_slang_for_tests().expect("rediscover pinned slang for every leaf fragment");
+    for index in 0..5 {
+        let leaf = second_frontend
+            .compile_leaf_unit_artifact(&cache, &format!("many_leaf_child_{index}"))
+            .unwrap_or_else(|error| panic!("load leaf {index}: {error}"));
+        assert!(leaf.cache_hit, "leaf {index} must survive LRU eviction");
+        assert_eq!(leaf.design.name, format!("many_leaf_child_{index}"));
+    }
+}
+
+#[test]
+fn slang_dirty_top_reuses_persistent_composite_child_fragment() {
+    let Some(initial_frontend) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("persistent-composite-fragment");
+    let cache = root.join("cache");
+    let leaf_path = root.join("fragment_leaf.sv");
+    let middle_path = root.join("fragment_middle.sv");
+    let top_path = root.join("fragment_top.sv");
+    std::fs::write(
+        &leaf_path,
+        r#"
+module fragment_leaf(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("write fragment leaf");
+    std::fs::write(
+        &middle_path,
+        r#"
+module fragment_middle(input logic a, output logic y);
+fragment_leaf child(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write fragment middle");
+    let original_top = r#"
+module fragment_top(input logic a, output logic y);
+fragment_middle middle(.a(a), .y(y));
+endmodule
+"#;
+    std::fs::write(&top_path, original_top).expect("write fragment top");
+    let sources = [top_path.clone(), middle_path, leaf_path.clone()];
+    let manifest_path = root.join("project.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "top": "fragment_top",
+            "sources": sources,
+        })
+        .to_string(),
+    )
+    .expect("write fragment project manifest");
+
+    initial_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("build fragment project artifacts");
+    let first = initial_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("lower initial fragment hierarchy");
+    assert!(!first.cache_hit);
+    let fragment_count = std::fs::read_dir(cache.join("ir"))
+        .expect("persistent fragment directory exists")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("read persistent fragment entry")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert_eq!(fragment_count, 2, "leaf and middle fragments must persist");
+
+    std::fs::remove_file(cache.join("composite-ir.json"))
+        .expect("force fragment relink by removing whole-composite IR");
+    let second_frontend =
+        discover_slang_for_tests().expect("rediscover slang for clean fragment relink");
+    let clean_relink = second_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("relink using persistent middle fragment");
+    assert!(!clean_relink.cache_hit);
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("fragment stats"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 1,
+            misses: 1,
+            evictions: 0,
+            entries: 3,
+        }
+    );
+
+    std::fs::write(
+        &top_path,
+        r#"
+module fragment_top(input logic a, output logic y);
+wire changed_top_wire;
+assign changed_top_wire = a;
+fragment_middle middle(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("dirty only the top source");
+    second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("rebuild dirty top artifacts");
+    let third_frontend =
+        discover_slang_for_tests().expect("rediscover slang after dirty top rebuild");
+    let dirty_top = third_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("relink dirty top around unchanged middle");
+    assert!(!dirty_top.cache_hit);
+    assert!(dirty_top.design.n_nets > first.design.n_nets);
+    assert_eq!(
+        third_frontend.unit_ir_cache_stats().expect("dirty stats"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 1,
+            misses: 1,
+            evictions: 0,
+            entries: 3,
+        }
+    );
+}
+
+#[test]
+fn slang_dirty_top_reuses_generated_instance_array_composite_fragment() {
+    let Some(initial_frontend) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("persistent-generated-composite-fragment");
+    let cache = root.join("cache");
+    let leaf_path = root.join("generated_fragment_leaf.sv");
+    let middle_path = root.join("generated_fragment_middle.sv");
+    let top_path = root.join("generated_fragment_top.sv");
+    std::fs::write(
+        &leaf_path,
+        r#"
+module generated_fragment_leaf(input logic a, output logic y);
+assign y = !a;
+endmodule
+"#,
+    )
+    .expect("write generated fragment leaf");
+    std::fs::write(
+        &middle_path,
+        r#"
+module generated_fragment_middle(input logic [3:0] a, output logic [3:0] y);
+generate
+  if (1) begin : generated_scope
+    generated_fragment_leaf cells[4] (.a(a), .y(y));
+  end
+endgenerate
+endmodule
+"#,
+    )
+    .expect("write generated fragment middle");
+    std::fs::write(
+        &top_path,
+        r#"
+module generated_fragment_top(input logic [3:0] a, output logic [3:0] y);
+generated_fragment_middle middle(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("write generated fragment top");
+    let sources = [top_path.clone(), middle_path, leaf_path.clone()];
+    let manifest_path = root.join("project.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "top": "generated_fragment_top",
+            "sources": sources,
+        })
+        .to_string(),
+    )
+    .expect("write generated fragment manifest");
+
+    initial_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("build generated fragment artifacts");
+    let first = initial_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("lower generated fragment hierarchy");
+    assert_eq!(first.design.hierarchy.len(), 6);
+    let fragment_count = std::fs::read_dir(cache.join("ir"))
+        .expect("generated fragment directory exists")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("read generated fragment entry")
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert_eq!(fragment_count, 2);
+
+    std::fs::remove_file(cache.join("composite-ir.json")).expect("force generated fragment relink");
+    let second_frontend =
+        discover_slang_for_tests().expect("rediscover slang for generated fragment relink");
+    let clean_relink = second_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("relink using generated middle fragment");
+    assert!(!clean_relink.cache_hit);
+    assert_eq!(
+        second_frontend
+            .unit_ir_cache_stats()
+            .expect("generated clean stats"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 1,
+            misses: 1,
+            evictions: 0,
+            entries: 3,
+        }
+    );
+
+    std::fs::write(
+        &top_path,
+        r#"
+module generated_fragment_top(input logic [3:0] a, output logic [3:0] y);
+wire [3:0] changed_top_wire;
+assign changed_top_wire = ~a;
+generated_fragment_middle middle(.a(a), .y(y));
+endmodule
+"#,
+    )
+    .expect("dirty only generated fragment top");
+    second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("rebuild dirty generated top artifacts");
+    let third_frontend =
+        discover_slang_for_tests().expect("rediscover slang after dirty generated top");
+    let dirty_top = third_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("relink dirty generated top");
+    assert!(!dirty_top.cache_hit);
+    assert_eq!(dirty_top.design.hierarchy.len(), 6);
+    assert!(dirty_top.design.n_nets > first.design.n_nets);
+    assert_eq!(
+        third_frontend
+            .unit_ir_cache_stats()
+            .expect("generated dirty stats"),
+        eda_slang::SlangUnitIrCacheStats {
+            hits: 1,
+            misses: 1,
+            evictions: 0,
+            entries: 3,
+        }
+    );
+
+    std::fs::write(
+        &leaf_path,
+        r#"
+module generated_fragment_leaf(input logic a, output logic y);
+assign y = a;
+endmodule
+"#,
+    )
+    .expect("dirty only generated fragment leaf");
+    second_frontend
+        .compile_project_manifest_with_cache(&manifest_path, Some(&cache))
+        .expect("rebuild artifacts after leaf semantic change");
+    let fourth_frontend = discover_slang_for_tests().expect("rediscover slang after dirty leaf");
+    let dirty_leaf = fourth_frontend
+        .compile_project_unit_artifacts_cached(&cache)
+        .expect("relink transitive closure after dirty leaf");
+    assert!(!dirty_leaf.cache_hit);
+    assert_eq!(dirty_leaf.design.hierarchy.len(), 6);
+    assert_eq!(
+        fourth_frontend
+            .unit_ir_cache_stats()
+            .expect("generated dirty-leaf stats"),
+        eda_slang::SlangUnitIrCacheStats {
+            // The changed leaf has no old artifact under its new semantic key.
+            // Middle relink lowers one generated element to create it; the other
+            // three generated elements reuse that new fragment.
+            hits: 3,
+            misses: 3,
+            evictions: 0,
+            entries: 3,
+        }
+    );
+    let mut simulator = eda_sim::Simulator::new(&dirty_leaf.design)
+        .expect("create non-stale generated fragment simulator");
+    simulator
+        .set_input("a", &eda_core::logic::LogicWord::from_u64(4, 0b1001))
+        .expect("set generated fragment input");
+    simulator
+        .run_until(0)
+        .expect("settle generated fragment outputs");
+    assert_eq!(
+        simulator.read("y").unwrap().to_u64(),
+        Some(0b1001),
+        "old middle fragment must not hide the leaf semantic change"
+    );
 }
 
 #[test]
@@ -3798,7 +4221,7 @@ endmodule
     let unsupported_path = root.join("unsupported.sv");
     std::fs::write(
         &unsupported_path,
-        "module unsupported(output logic y); initial $fopen(\"unsupported\"); endmodule\n",
+        "module unsupported(output logic y); initial $fopen(\"unsupported\", \"x\"); endmodule\n",
     )
     .expect("write unsupported source");
     let error = slang
@@ -3809,7 +4232,7 @@ endmodule
         )
         .expect_err("direct path must reject unsupported constructs");
     assert!(
-        error.contains("does not support system call"),
+        error.contains("direct slang-AST lowering does not support system call \"$fopen\""),
         "unexpected error: {error}"
     );
 }
@@ -3879,13 +4302,18 @@ fn slang_ast_direct_lowering_supports_display_tasks() {
         r#"
 module displays(
   input logic [3:0] a,
-  input logic [3:0] b
+  input logic [3:0] b,
+  input logic [3:0] unknown
 );
   initial begin
     #1;
     $display("a=%b b=%h text%%", a, b);
     $displayb(a);
     $displayh(a);
+    $displayo(a);
+    $display("octal=%o", b);
+    $writeo(a);
+    $displayo(unknown);
     $display("decimal=%d", a);
     $display(a, b);
     $write("plain");
@@ -3902,6 +4330,18 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower display tasks");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("displays"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower display tasks through the bounded path");
+    assert_eq!(
+        serde_json::to_value(&design).unwrap(),
+        serde_json::to_value(&bounded).unwrap(),
+        "direct and bounded display families must lower identically"
+    );
     let mut simulator = Simulator::new(&design).expect("create display simulator");
     simulator
         .set_input("a", &LogicWord::from_u64(4, 0b1011))
@@ -3909,6 +4349,7 @@ endmodule
     simulator
         .set_input("b", &LogicWord::from_u64(4, 0b0010))
         .unwrap();
+    simulator.set_input("unknown", &LogicWord::xes(4)).unwrap();
     simulator.run_until(1).expect("run display initial block");
     assert_eq!(
         simulator.take_displays(),
@@ -3916,6 +4357,10 @@ endmodule
             "a=1011 b=2 text%\n",
             "1011\n",
             "b\n",
+            "13\n",
+            "octal=2\n",
+            "13",
+            "xx\n",
             "decimal=11\n",
             "11 2\n",
             "plain",
@@ -3956,7 +4401,7 @@ endmodule
         &unsupported_path,
         r#"
 module display_unsupported(input logic [3:0] a);
-  initial $display("octal=%o", a);
+  initial $display("unformatted=%u", a);
 endmodule
 "#,
     )
@@ -3969,8 +4414,3767 @@ endmodule
         )
         .expect_err("unsupported display specifiers must fail closed");
     assert!(
-        error.contains("does not support display specifier '%o'"),
+        error.contains("does not support display specifier '%u'"),
         "unexpected display specifier error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_write_tasks() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-io");
+    let output_path = root.join("output.txt");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_io.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_io(output int fd, output int tell_after_display);
+  initial begin
+    fd = $fopen("{path_literal}", "w");
+    $fdisplay(fd, "a=%d", 4'd11);
+    tell_after_display = $ftell(fd);
+    $fwrite(fd, "raw");
+    $fwrite(fd, "%8d|%-6s|", 4'd11, "ab");
+    $fdisplayo(fd, 4'd11);
+    $fclose(fd);
+    fd = $fopen("{path_literal}", "a");
+    $fwrite(fd, "+");
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-I/O source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_io"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file I/O");
+    let mut simulator = Simulator::new(&design).expect("create file-I/O simulator");
+    simulator.run_until(0).expect("execute file I/O");
+    assert!(simulator
+        .read("fd")
+        .unwrap()
+        .to_u64()
+        .is_some_and(|fd| fd != 0));
+    assert_eq!(
+        simulator.read("tell_after_display").unwrap().to_u64(),
+        Some(5),
+        "$ftell must advance by the five bytes written by $fdisplay"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read generated file"),
+        "a=11\nraw      11|ab    |13\n+"
+    );
+
+    let unknown_path = root.join("unknown_fd.sv");
+    std::fs::write(
+        &unknown_path,
+        r#"
+module unknown_fd;
+  initial $fwrite(32'd99, "bad");
+endmodule
+"#,
+    )
+    .expect("write unknown-fd source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&unknown_path),
+            Some("unknown_fd"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower unknown-fd source");
+    let mut simulator = Simulator::new(&design).expect("create unknown-fd simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("unknown file descriptors must fail closed");
+    assert!(
+        error.contains("cannot write unknown file descriptor 99"),
+        "unexpected unknown-fd error: {error}"
+    );
+
+    let read_mode_path = root.join("read_mode.sv");
+    std::fs::write(
+        &read_mode_path,
+        r#"
+module read_mode(output int fd);
+  initial fd = $fopen("input.txt", "x+");
+endmodule
+"#,
+    )
+    .expect("write read-mode source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&read_mode_path),
+            Some("read_mode"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported mixed file modes must fail closed");
+    assert!(
+        error.contains("$fopen mode 'x+' is unsupported"),
+        "unsupported mixed-mode error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_write_mode_file_seek() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-write-seek");
+    let output_path = root.join("write-seek.txt");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_write_seek.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_write_seek(
+  output int fd,
+  output int seek_status,
+  output int tell_after_seek,
+  output int rewind_status,
+  output int tell_after_rewind,
+  output int tell_after_flush
+);
+  initial begin
+    fd = $fopen("{path_literal}", "w");
+    $fwrite(fd, "abc");
+    seek_status = $fseek(fd, 1, 0);
+    tell_after_seek = $ftell(fd);
+    $fwrite(fd, "X");
+    rewind_status = $rewind(fd);
+    tell_after_rewind = $ftell(fd);
+    $fwrite(fd, "Y");
+    $fflush(fd);
+    tell_after_flush = $ftell(fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-write-seek source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_write_seek"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower write-mode file seek");
+    let mut simulator = Simulator::new(&design).expect("create write-seek simulator");
+    simulator.run_until(0).expect("execute write-mode seeks");
+    assert_eq!(
+        simulator.read("seek_status").unwrap().to_u64(),
+        Some(0),
+        "write-mode $fseek must return zero on success"
+    );
+    assert_eq!(
+        simulator.read("tell_after_seek").unwrap().to_u64(),
+        Some(1),
+        "write-mode $ftell must report the sought position"
+    );
+    assert_eq!(
+        simulator.read("rewind_status").unwrap().to_u64(),
+        Some(0),
+        "write-mode $rewind must return zero on success"
+    );
+    assert_eq!(
+        simulator.read("tell_after_rewind").unwrap().to_u64(),
+        Some(0),
+        "write-mode $rewind must move the cursor to byte zero"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read write-seek output"),
+        "YXc",
+        "write-mode seeks must affect subsequent checked writes"
+    );
+    assert_eq!(
+        simulator.read("tell_after_flush").unwrap().to_u64(),
+        Some(1),
+        "$fflush must preserve the writer cursor"
+    );
+
+    let append_path = root.join("append-seek.txt");
+    std::fs::write(&append_path, "AB").expect("seed append file");
+    let append_literal = append_path.to_string_lossy().replace('\\', "\\\\");
+    let append_source = root.join("file_append_seek.sv");
+    std::fs::write(
+        &append_source,
+        format!(
+            r#"
+module file_append_seek(output int fd, output int status, output int tell_before, output int tell_after);
+  initial begin
+    fd = $fopen("{append_literal}", "a");
+    status = $fseek(fd, 0, 0);
+    tell_before = $ftell(fd);
+    $fwrite(fd, "Z");
+    tell_after = $ftell(fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write append-seek source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&append_source),
+            Some("file_append_seek"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower append-mode seek");
+    let mut simulator = Simulator::new(&design).expect("create append-seek simulator");
+    simulator.run_until(0).expect("execute append-mode seek");
+    assert_eq!(
+        simulator.read("status").unwrap().to_u64(),
+        Some(0),
+        "append-mode descriptor seek may reposition its cursor"
+    );
+    assert_eq!(
+        simulator.read("tell_before").unwrap().to_u64(),
+        Some(0),
+        "$ftell must report the sought append cursor"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&append_path).expect("read append-seek output"),
+        "ABZ",
+        "append-mode writes must still append despite a seek"
+    );
+    assert_eq!(
+        simulator.read("tell_after").unwrap().to_u64(),
+        Some(3),
+        "append-mode $ftell must advance to the end after writing"
+    );
+
+    let unknown_source = root.join("unknown_flush.sv");
+    std::fs::write(
+        &unknown_source,
+        r#"
+module unknown_flush;
+  initial $fflush(32'd99);
+endmodule
+"#,
+    )
+    .expect("write unknown-flush source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&unknown_source),
+            Some("unknown_flush"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unknown flush");
+    let mut simulator = Simulator::new(&design).expect("create unknown-flush simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("unknown file descriptors must fail closed during flush");
+    assert!(
+        error.contains("cannot flush unknown file descriptor 99"),
+        "unexpected flush error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_file_open_paths_and_modes() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = std::path::PathBuf::from(format!("/tmp/rsi-dynamic-open-{}", std::process::id()));
+    let _ = std::fs::remove_file(root.join("dynamic.txt"));
+    let _ = std::fs::remove_file(root.join("dynamic_open.sv"));
+    std::fs::create_dir_all(&root).expect("create short dynamic-open directory");
+    let output_path = root.join("dynamic.txt");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("dynamic_open.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module dynamic_open(
+  output string path,
+  output string mode,
+  output int fd,
+  output int invalid_fd,
+  output int first
+);
+  initial begin
+    path = "{path_literal}";
+    mode = "w";
+    fd = $fopen(path, mode);
+    $fwrite(fd, "AB");
+    $fclose(fd);
+
+    mode = "a";
+    fd = $fopen(path, mode);
+    $fwrite(fd, "C");
+    $fclose(fd);
+
+    mode = "r";
+    fd = $fopen(path, mode);
+    first = $fgetc(fd);
+    $fclose(fd);
+
+    mode = "x";
+    invalid_fd = $fopen(path, mode);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write dynamic-open source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_open"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic file open");
+    let mut simulator = Simulator::new(&design).expect("create dynamic-open simulator");
+    simulator.run_until(0).expect("execute dynamic file open");
+    assert_eq!(
+        simulator.read("first").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "dynamic read mode must open and read the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read dynamic-open output"),
+        "ABC",
+        "dynamic write and append modes must execute"
+    );
+    assert_eq!(
+        simulator.read("invalid_fd").unwrap().to_u64(),
+        Some(0),
+        "an unsupported dynamic mode must return descriptor zero"
+    );
+    std::fs::remove_file(&source_path).expect("remove dynamic-open source");
+    std::fs::remove_file(&output_path).expect("remove dynamic-open output");
+    std::fs::remove_dir(&root).expect("remove dynamic-open directory");
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_getc() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-getc");
+    let input_path = root.join("input.txt");
+    std::fs::write(&input_path, b"AB").expect("write input file");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let protected_path = root.join("protected.txt");
+    std::fs::write(&protected_path, b"ro").expect("write protected file");
+    let protected_literal = protected_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_getc.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_getc(
+  output int fd,
+  output int first,
+  output int second,
+  output int eof,
+  output int eof_before_read,
+  output int eof_mid_read,
+  output int eof_after_read,
+  output int tell_mid_read,
+  output int tell_after_read,
+  output int seek_status,
+  output int tell_after_seek,
+  output int eof_after_seek,
+  output int seek_byte,
+  output int rewind_status,
+  output int rewind_byte,
+  output int bad_whence_status
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    eof_before_read = $feof(fd);
+    first = $fgetc(fd);
+    second = $fgetc(fd);
+    tell_mid_read = $ftell(fd);
+    eof_mid_read = $feof(fd);
+    eof = $fgetc(fd);
+    tell_after_read = $ftell(fd);
+    eof_after_read = $feof(fd);
+    seek_status = $fseek(fd, 1, 0);
+    tell_after_seek = $ftell(fd);
+    eof_after_seek = $feof(fd);
+    seek_byte = $fgetc(fd);
+    rewind_status = $rewind(fd);
+    rewind_byte = $fgetc(fd);
+    bad_whence_status = $fseek(fd, 0, 3);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-getc source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_getc"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file getc");
+    let mut simulator = Simulator::new(&design).expect("create file-getc simulator");
+    simulator
+        .run_until(0)
+        .expect("read bytes through descriptor");
+    assert_eq!(
+        simulator.read("first").unwrap().to_u64(),
+        Some(u64::from(b'A'))
+    );
+    assert_eq!(
+        simulator.read("second").unwrap().to_u64(),
+        Some(u64::from(b'B'))
+    );
+    assert_eq!(
+        simulator.read("eof").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "the third read must return signed -1 at EOF"
+    );
+    assert_eq!(
+        simulator.read("eof_before_read").unwrap().to_u64(),
+        Some(0),
+        "a newly opened descriptor must not report EOF"
+    );
+    assert_eq!(
+        simulator.read("eof_mid_read").unwrap().to_u64(),
+        Some(0),
+        "EOF must not be set before all bytes are consumed"
+    );
+    assert_eq!(
+        simulator.read("eof_after_read").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "$feof must return nonzero after a read reaches EOF"
+    );
+    assert_eq!(
+        simulator.read("tell_mid_read").unwrap().to_u64(),
+        Some(2),
+        "$ftell must report the read cursor after two bytes"
+    );
+    assert_eq!(
+        simulator.read("tell_after_read").unwrap().to_u64(),
+        Some(2),
+        "$ftell must remain at EOF after the failed read"
+    );
+    assert_eq!(
+        simulator.read("seek_status").unwrap().to_u64(),
+        Some(0),
+        "successful $fseek must return zero"
+    );
+    assert_eq!(
+        simulator.read("tell_after_seek").unwrap().to_u64(),
+        Some(1),
+        "$fseek must reposition the read cursor"
+    );
+    assert_eq!(
+        simulator.read("eof_after_seek").unwrap().to_u64(),
+        Some(0),
+        "successful $fseek must clear EOF state"
+    );
+    assert_eq!(
+        simulator.read("seek_byte").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "$fgetc must read from the sought position"
+    );
+    assert_eq!(
+        simulator.read("rewind_status").unwrap().to_u64(),
+        Some(0),
+        "$rewind must return zero on success"
+    );
+    assert_eq!(
+        simulator.read("rewind_byte").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "$rewind must restart at the first byte"
+    );
+    assert_eq!(
+        simulator.read("bad_whence_status").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "invalid $fseek whence must return signed -1"
+    );
+
+    let write_mode_path = root.join("write_getc.sv");
+    std::fs::write(
+        &write_mode_path,
+        format!(
+            r#"
+module write_getc(output int fd, output int value, output int eof, output int tell);
+  initial begin
+    fd = $fopen("{path_literal}", "w");
+    value = $fgetc(fd);
+    eof = $feof(fd);
+    tell = $ftell(fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write wrong-mode getc source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&write_mode_path),
+            Some("write_getc"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower wrong-mode getc source");
+    let mut simulator = Simulator::new(&design).expect("create wrong-mode simulator");
+    simulator
+        .run_until(0)
+        .expect("evaluate wrong-mode descriptor");
+    assert_eq!(
+        simulator.read("value").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "getc on a write descriptor must report the error/EOF value"
+    );
+    assert_eq!(
+        simulator.read("eof").unwrap().to_u64(),
+        Some(0),
+        "write descriptors do not carry read-mode EOF state"
+    );
+    assert_eq!(
+        simulator.read("tell").unwrap().to_u64(),
+        Some(0),
+        "a newly truncated write descriptor starts at position zero"
+    );
+
+    let write_to_read_path = root.join("write_to_read.sv");
+    std::fs::write(
+        &write_to_read_path,
+        format!(
+            r#"
+module write_to_read(output int fd);
+  initial begin
+    fd = $fopen("{protected_literal}", "r");
+    $fwrite(fd, "forbidden");
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write read-mode write source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&write_to_read_path),
+            Some("write_to_read"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower read-mode write source");
+    let mut simulator = Simulator::new(&design).expect("create read-mode write simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("writes through a read descriptor must fail closed");
+    assert!(
+        error.contains("cannot write read-mode file descriptor"),
+        "unexpected read-mode write error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_gets() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-fgets");
+    let input_path = root.join("lines.txt");
+    std::fs::write(&input_path, b"AB\nC").expect("write bounded lines");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_fgets.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_fgets(
+  output int fd,
+  output int first_count,
+  output int second_count,
+  output int eof_count,
+  output string first_line,
+  output string second_line,
+  output string eof_line
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    first_count = $fgets(first_line, fd);
+    second_count = $fgets(second_line, fd);
+    eof_count = $fgets(eof_line, fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-fgets source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_fgets"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file fgets");
+    let mut simulator = Simulator::new(&design).expect("create file-fgets simulator");
+    simulator.run_until(0).expect("read bounded lines");
+    assert_eq!(
+        simulator.read("first_count").unwrap().to_u64(),
+        Some(3),
+        "$fgets must return the newline character count"
+    );
+    assert_eq!(
+        simulator
+            .read("first_line")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "AB\n"
+    );
+    assert_eq!(
+        simulator.read("second_count").unwrap().to_u64(),
+        Some(1),
+        "$fgets must return the final unterminated line's byte count"
+    );
+    assert_eq!(
+        simulator
+            .read("second_line")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "C"
+    );
+    assert_eq!(
+        simulator.read("eof_count").unwrap().to_u64(),
+        Some(0),
+        "$fgets must return zero at EOF"
+    );
+    assert_eq!(
+        simulator
+            .read("eof_line")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "",
+        "$fgets at EOF must clear the bounded string"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_ungetc() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-ungetc");
+    let input_path = root.join("ungetc.txt");
+    std::fs::write(&input_path, b"AB").expect("write ungetc input");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_ungetc.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_ungetc(
+  output int fd,
+  output int first,
+  output int ungetc_status,
+  output int logical_position,
+  output int eof_after_ungetc,
+  output int reread,
+  output int second,
+  output int eof_byte,
+  output int eof_ungetc_status,
+  output int byte_after_eof_ungetc,
+  output int second_ungetc_status
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    first = $fgetc(fd);
+    ungetc_status = $ungetc(first, fd);
+    logical_position = $ftell(fd);
+    eof_after_ungetc = $feof(fd);
+    second_ungetc_status = $ungetc(8'h43, fd);
+    reread = $fgetc(fd);
+    second = $fgetc(fd);
+    eof_byte = $fgetc(fd);
+    eof_ungetc_status = $ungetc(second, fd);
+    byte_after_eof_ungetc = $fgetc(fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-ungetc source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_ungetc"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file ungetc");
+    let mut simulator = Simulator::new(&design).expect("create file-ungetc simulator");
+    simulator.run_until(0).expect("execute file ungetc");
+    assert_eq!(
+        simulator.read("ungetc_status").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "successful $ungetc returns the pushed byte"
+    );
+    assert_eq!(
+        simulator.read("logical_position").unwrap().to_u64(),
+        Some(0),
+        "$ftell must expose the logical pre-read position while pushback is pending"
+    );
+    assert_eq!(
+        simulator.read("eof_after_ungetc").unwrap().to_u64(),
+        Some(0),
+        "pending pushback must satisfy EOF"
+    );
+    assert_eq!(
+        simulator.read("second_ungetc_status").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "the one-byte pushback slot must reject a second pending byte"
+    );
+    assert_eq!(
+        simulator.read("reread").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "$fgetc must consume the pending pushback byte"
+    );
+    assert_eq!(
+        simulator.read("second").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "normal file reads resume after consuming pushback"
+    );
+    assert_eq!(
+        simulator.read("eof_byte").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "reading past the final byte returns EOF"
+    );
+    assert_eq!(
+        simulator.read("eof_ungetc_status").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "$ungetc after EOF must return the pushed byte and clear EOF"
+    );
+    assert_eq!(
+        simulator.read("byte_after_eof_ungetc").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "$fgetc must consume the EOF pushback"
+    );
+
+    let pushback_line_path = root.join("pushback-line.txt");
+    std::fs::write(&pushback_line_path, b"AB\nC").expect("write pushback line input");
+    let pushback_line_literal = pushback_line_path.to_string_lossy().replace('\\', "\\\\");
+    let pushback_line_source = root.join("file_ungetc_fgets.sv");
+    std::fs::write(
+        &pushback_line_source,
+        format!(
+            r#"
+module file_ungetc_fgets(
+  output int fd,
+  output int first,
+  output int status,
+  output int line_count,
+  output string line
+);
+  initial begin
+    fd = $fopen("{pushback_line_literal}", "r");
+    first = $fgetc(fd);
+    status = $ungetc(8'h5a, fd);
+    line_count = $fgets(line, fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write ungetc/fgets source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&pushback_line_source),
+            Some("file_ungetc_fgets"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower ungetc before fgets");
+    let mut simulator = Simulator::new(&design).expect("create ungetc/fgets simulator");
+    simulator.run_until(0).expect("execute ungetc before fgets");
+    assert_eq!(
+        simulator.read("line_count").unwrap().to_u64(),
+        Some(3),
+        "$fgets must count a pending pushback byte plus bytes through newline"
+    );
+    assert_eq!(
+        simulator
+            .read("line")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "ZB\n",
+        "$fgets must consume the arbitrary pending pushback byte before file bytes"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_ferror() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-ferror");
+    let read_path = root.join("read.txt");
+    std::fs::write(&read_path, b"AB").expect("write read input");
+    let read_literal = read_path.to_string_lossy().replace('\\', "\\\\");
+    let write_path = root.join("write.txt");
+    let write_literal = write_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_ferror.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_ferror(
+  output int fd,
+  output int clean_code,
+  output string clean_message,
+  output int wrong_mode_byte,
+  output int error_code,
+  output string error_message
+);
+  initial begin
+    fd = $fopen("{read_literal}", "r");
+    clean_code = $ferror(fd, clean_message);
+    $fclose(fd);
+    fd = $fopen("{write_literal}", "w");
+    wrong_mode_byte = $fgetc(fd);
+    error_code = $ferror(fd, error_message);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-ferror source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_ferror"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file ferror");
+    let mut simulator = Simulator::new(&design).expect("create file-ferror simulator");
+    simulator.run_until(0).expect("execute file ferror");
+    assert_eq!(
+        simulator.read("clean_code").unwrap().to_u64(),
+        Some(0),
+        "a newly opened clean descriptor must report no error"
+    );
+    assert_eq!(
+        simulator
+            .read("clean_message")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "",
+        "a clean descriptor must clear the bounded error message"
+    );
+    assert_eq!(
+        simulator.read("wrong_mode_byte").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "getc through a write descriptor must return signed -1"
+    );
+    assert_eq!(
+        simulator.read("error_code").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "$ferror must return nonzero after a wrong-mode read"
+    );
+    assert_eq!(
+        simulator
+            .read("error_message")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "file descriptor is not open for reading",
+        "$ferror must preserve the bounded diagnostic message"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_scalar_literal_file_fread() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-fread");
+    let input_path = root.join("input.bin");
+    std::fs::write(&input_path, [0x01, 0x02, 0x03, 0x04, 0x05]).expect("write binary input");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_fread.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_fread(
+  output int fd,
+  output logic [31:0] first,
+  output int first_count,
+  output logic [15:0] partial,
+  output int partial_count,
+  output logic [15:0] eof_value,
+  output int eof_count,
+  output int ungetc_status,
+  output logic [15:0] pushback_value,
+  output int pushback_count
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    first_count = $fread(first, fd);
+    partial_count = $fread(partial, fd);
+    eof_count = $fread(eof_value, fd);
+    ungetc_status = $ungetc(8'h5a, fd);
+    pushback_count = $fread(pushback_value, fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write scalar file-fread source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_fread"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower scalar literal file fread");
+    let mut simulator = Simulator::new(&design).expect("create file-fread simulator");
+    simulator.run_until(0).expect("execute scalar file fread");
+    assert_eq!(
+        simulator.read("first").unwrap().to_u64(),
+        Some(0x0403_0201),
+        "scalar $fread must fill bytes least-significant byte first"
+    );
+    assert_eq!(
+        simulator.read("first_count").unwrap().to_u64(),
+        Some(4),
+        "full 32-bit $fread must return four bytes"
+    );
+    assert_eq!(
+        simulator.read("partial").unwrap().to_u64(),
+        Some(0x0005),
+        "partial $fread must preserve only the bytes actually read"
+    );
+    assert_eq!(
+        simulator.read("partial_count").unwrap().to_u64(),
+        Some(1),
+        "partial $fread must return the actual byte count and set EOF"
+    );
+    assert_eq!(
+        simulator.read("eof_value").unwrap().to_u64(),
+        Some(0),
+        "$fread at EOF must clear the integral target"
+    );
+    assert_eq!(
+        simulator.read("eof_count").unwrap().to_u64(),
+        Some(0),
+        "$fread at EOF must return zero bytes"
+    );
+    assert_eq!(
+        simulator.read("ungetc_status").unwrap().to_u64(),
+        Some(u64::from(b'Z')),
+        "$ungetc after EOF must return the pushed byte"
+    );
+    assert_eq!(
+        simulator.read("pushback_value").unwrap().to_u64(),
+        Some(0x005a),
+        "$fread must consume pending $ungetc bytes before file bytes"
+    );
+    assert_eq!(
+        simulator.read("pushback_count").unwrap().to_u64(),
+        Some(1),
+        "$fread must return the pending pushback byte count"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_memory_target_file_fread() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-file-fread");
+    let input_path = root.join("memory-input.bin");
+    std::fs::write(&input_path, b"ABCDEF").expect("write memory file input");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let partial_path = root.join("partial-input.bin");
+    std::fs::write(&partial_path, [0x01, 0x02, 0x03]).expect("write partial memory file input");
+    let partial_path_literal = partial_path.to_string_lossy().replace('\\', "\\\\");
+    let wrong_mode_path = root.join("wrong-mode.bin");
+    let wrong_mode_path_literal = wrong_mode_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("memory_file_fread.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module memory_file_fread(
+  input int selected_start,
+  input int selected_count,
+  output int fd,
+  output int default_count,
+  output logic [7:0] default_value_0,
+  output logic [7:0] default_value_1,
+  output logic [7:0] default_value_2,
+  output logic [7:0] default_value_3,
+  output logic [7:0] default_value_4,
+  output logic [7:0] default_value_5,
+  output int descending_count,
+  output logic [7:0] descending_value_5,
+  output logic [7:0] descending_value_4,
+  output int selected_count_value,
+  output logic [7:0] selected_value_2,
+  output logic [7:0] selected_value_3,
+  output logic [7:0] selected_value_4,
+  output int partial_count,
+  output logic [15:0] partial_value_0,
+  output logic [15:0] partial_value_1,
+  output int wrong_mode_count
+);
+  logic [7:0] default_memory [0:7];
+  logic [7:0] descending_memory [7:0];
+  logic [7:0] selected_memory [0:7];
+  logic [15:0] partial_memory [0:1];
+  logic [7:0] wrong_mode_memory [0:0];
+
+  initial begin
+    #1;
+    fd = $fopen("{path_literal}", "r");
+    default_count = $fread(default_memory, fd);
+    $fclose(fd);
+    default_value_0 = default_memory[0];
+    default_value_1 = default_memory[1];
+    default_value_2 = default_memory[2];
+    default_value_3 = default_memory[3];
+    default_value_4 = default_memory[4];
+    default_value_5 = default_memory[5];
+
+    fd = $fopen("{path_literal}", "r");
+    descending_count = $fread(descending_memory, fd, 5, 2);
+    $fclose(fd);
+    descending_value_5 = descending_memory[5];
+    descending_value_4 = descending_memory[4];
+
+    fd = $fopen("{path_literal}", "r");
+    selected_count_value = $fread(
+      selected_memory,
+      fd,
+      selected_start,
+      selected_count
+    );
+    $fclose(fd);
+    selected_value_2 = selected_memory[2];
+    selected_value_3 = selected_memory[3];
+    selected_value_4 = selected_memory[4];
+
+    fd = $fopen("{partial_path_literal}", "r");
+    partial_count = $fread(partial_memory, fd);
+    $fclose(fd);
+    partial_value_0 = partial_memory[0];
+    partial_value_1 = partial_memory[1];
+
+    fd = $fopen("{wrong_mode_path_literal}", "w");
+    wrong_mode_count = $fread(wrong_mode_memory, fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write memory file-fread source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_file_fread"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower memory-target file fread");
+    let mut simulator = Simulator::new(&design).expect("create memory file-fread simulator");
+    simulator
+        .set_input("selected_start", &LogicWord::from_u64(32, 2))
+        .expect("set selected memory start");
+    simulator
+        .set_input("selected_count", &LogicWord::from_u64(32, 3))
+        .expect("set selected element count");
+    simulator
+        .run_until(1)
+        .expect("execute memory-target file fread");
+
+    assert_eq!(
+        simulator.read("default_count").unwrap().to_u64(),
+        Some(6),
+        "default memory $fread must return the number of bytes read"
+    );
+    for (index, value) in [
+        ("default_value_0", b'A'),
+        ("default_value_1", b'B'),
+        ("default_value_2", b'C'),
+        ("default_value_3", b'D'),
+        ("default_value_4", b'E'),
+        ("default_value_5", b'F'),
+    ] {
+        assert_eq!(
+            simulator.read(index).unwrap().to_u64(),
+            Some(u64::from(value)),
+            "wrong default-load element {index}"
+        );
+    }
+
+    assert_eq!(
+        simulator.read("descending_count").unwrap().to_u64(),
+        Some(2),
+        "descending memory $fread must count bytes, not elements"
+    );
+    assert_eq!(
+        simulator.read("descending_value_5").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "descending memory load must begin at logical index 5"
+    );
+    assert_eq!(
+        simulator.read("descending_value_4").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "descending memory load must follow the declared descending stride"
+    );
+
+    assert_eq!(
+        simulator.read("selected_count_value").unwrap().to_u64(),
+        Some(3),
+        "runtime start/count memory $fread must return three bytes"
+    );
+    assert_eq!(
+        simulator.read("selected_value_2").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "runtime start must select logical index 2"
+    );
+    assert_eq!(
+        simulator.read("selected_value_3").unwrap().to_u64(),
+        Some(u64::from(b'B')),
+        "runtime memory load must continue at logical index 3"
+    );
+    assert_eq!(
+        simulator.read("selected_value_4").unwrap().to_u64(),
+        Some(u64::from(b'C')),
+        "runtime count must bound the memory load"
+    );
+
+    assert_eq!(
+        simulator.read("partial_count").unwrap().to_u64(),
+        Some(3),
+        "partial wide-element memory $fread must return three bytes"
+    );
+    assert_eq!(
+        simulator.read("partial_value_0").unwrap().to_u64(),
+        Some(0x0201),
+        "wide memory elements must load least-significant byte first"
+    );
+    assert_eq!(
+        simulator.read("partial_value_1").unwrap().to_u64(),
+        Some(0x0003),
+        "a partial final element must be zero extended"
+    );
+    assert_eq!(
+        simulator.read("wrong_mode_count").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "memory $fread through a write descriptor must return signed -1"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_out_of_range_memory_file_fread_count() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-memory-fread-range");
+    let input_path = root.join("input.bin");
+    std::fs::write(&input_path, b"ABCDEF").expect("write range file input");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("memory_file_fread_range.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module memory_file_fread_range;
+  logic [7:0] memory [0:3];
+  int fd;
+  int count;
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    count = $fread(memory, fd, 2, 3);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write range file-fread source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("memory_file_fread_range"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower out-of-range memory fread");
+    let mut simulator = Simulator::new(&design).expect("create range simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("a count larger than the remaining elements must fail closed");
+    assert!(
+        error.contains("exceeds the 2 elements remaining"),
+        "unexpected range error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_integer_literal_file_fscanf() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-fscanf");
+    let input_path = root.join("fscanf.txt");
+    std::fs::write(&input_path, b"-12 1f 17 101 hello").expect("write fscanf input");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let width_path = root.join("fscanf-width.txt");
+    std::fs::write(&width_path, b"-1 1 10 10 he").expect("write width input");
+    let width_path_literal = width_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_fscanf.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_fscanf(
+  output int fd,
+  output int signed_value,
+  output logic [7:0] hex_value,
+  output logic [7:0] octal_value,
+  output logic [7:0] binary_value,
+  output string text_value,
+  output int matched,
+  output int eof_matched,
+  output int width_fd,
+  output int width_matched,
+  output int width_signed,
+  output logic [7:0] width_hex,
+  output logic [7:0] width_octal,
+  output logic [7:0] width_binary,
+  output string width_text
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r");
+    matched = $fscanf(
+      fd,
+      "%d %h %o %b %s",
+      signed_value,
+      hex_value,
+      octal_value,
+      binary_value,
+      text_value
+    );
+    eof_matched = $fscanf(fd, "%d", signed_value);
+    $fclose(fd);
+    width_fd = $fopen("{width_path_literal}", "r");
+    width_matched = $fscanf(
+      width_fd,
+      "%2d %1h %2o %2b %2s",
+      width_signed,
+      width_hex,
+      width_octal,
+      width_binary,
+      width_text
+    );
+    $fclose(width_fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-fscanf source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_fscanf"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower integer literal file fscanf");
+    let mut simulator = Simulator::new(&design).expect("create file-fscanf simulator");
+    simulator.run_until(0).expect("execute file fscanf");
+    assert_eq!(
+        simulator.read("signed_value").unwrap().to_u64(),
+        Some((-12_i32) as u32 as u64),
+        "%d must parse a signed decimal value with two's-complement storage"
+    );
+    assert_eq!(
+        simulator.read("hex_value").unwrap().to_u64(),
+        Some(0x1f),
+        "%h must parse hexadecimal digits"
+    );
+    assert_eq!(
+        simulator.read("octal_value").unwrap().to_u64(),
+        Some(0o17),
+        "%o must parse octal digits"
+    );
+    assert_eq!(
+        simulator.read("binary_value").unwrap().to_u64(),
+        Some(0b101),
+        "%b must parse binary digits"
+    );
+    assert_eq!(
+        simulator.read("matched").unwrap().to_u64(),
+        Some(5),
+        "$fscanf must return the number of matched fields"
+    );
+    assert_eq!(
+        simulator
+            .read("text_value")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hello",
+        "%s must parse a whitespace-delimited bounded string"
+    );
+    assert_eq!(
+        simulator.read("eof_matched").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "$fscanf at EOF before the first conversion must return signed -1"
+    );
+    assert_eq!(
+        simulator.read("width_signed").unwrap().to_u64(),
+        Some((-1_i32) as u32 as u64),
+        "a width of two must include the sign as one of the scanned characters"
+    );
+    assert_eq!(
+        simulator.read("width_hex").unwrap().to_u64(),
+        Some(1),
+        "a width of one must limit a hexadecimal field"
+    );
+    assert_eq!(
+        simulator.read("width_octal").unwrap().to_u64(),
+        Some(0o10),
+        "a width of two must limit an octal field"
+    );
+    assert_eq!(
+        simulator.read("width_binary").unwrap().to_u64(),
+        Some(0b10),
+        "a width of two must limit a binary field"
+    );
+    assert_eq!(
+        simulator
+            .read("width_text")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "he",
+        "a width of two must limit a bounded string field"
+    );
+    assert_eq!(
+        simulator.read("width_matched").unwrap().to_u64(),
+        Some(5),
+        "all five width-limited fields must match"
+    );
+    assert!(
+        simulator
+            .read("width_fd")
+            .unwrap()
+            .to_u64()
+            .is_some_and(|descriptor| descriptor != 0),
+        "the width-limited scan must use its own open descriptor"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_string_sscanf() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-sscanf");
+    let source_path = root.join("sscanf.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module sscanf(
+  output string source,
+  output int signed_value,
+  output logic [7:0] hex_value,
+  output logic [7:0] octal_value,
+  output logic [7:0] binary_value,
+  output string text_value,
+  output int matched,
+  output int width_matched,
+  output int width_signed,
+  output logic [7:0] width_hex,
+  output int mismatched,
+  output int empty_matched,
+  output int literal_matched,
+  output int literal_value
+);
+  initial begin
+    source = "-12 1f 17 101 hello";
+    matched = $sscanf(
+      source,
+      "%d %h %o %b %s",
+      signed_value,
+      hex_value,
+      octal_value,
+      binary_value,
+      text_value
+    );
+
+    source = "-1 10 he";
+    width_matched = $sscanf(
+      source,
+      "%2d %1h %2s",
+      width_signed,
+      width_hex,
+      text_value
+    );
+
+    source = "B 12";
+    mismatched = $sscanf(source, "A %d", literal_value);
+
+    source = "";
+    empty_matched = $sscanf(source, "%d", literal_value);
+
+    source = "A 42";
+    literal_matched = $sscanf(source, "A %d", literal_value);
+  end
+endmodule
+"#,
+    )
+    .expect("write sscanf source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("sscanf"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower string sscanf");
+    let mut simulator = Simulator::new(&design).expect("create sscanf simulator");
+    simulator.run_until(0).expect("execute string sscanf");
+
+    assert_eq!(
+        simulator.read("signed_value").unwrap().to_u64(),
+        Some((-12_i32) as u32 as u64),
+        "$sscanf %d must parse signed decimal values"
+    );
+    assert_eq!(
+        simulator.read("hex_value").unwrap().to_u64(),
+        Some(0x1f),
+        "$sscanf %h must parse hexadecimal values"
+    );
+    assert_eq!(
+        simulator.read("octal_value").unwrap().to_u64(),
+        Some(0o17),
+        "$sscanf %o must parse octal values"
+    );
+    assert_eq!(
+        simulator.read("binary_value").unwrap().to_u64(),
+        Some(0b101),
+        "$sscanf %b must parse binary values"
+    );
+    assert_eq!(
+        simulator.read("matched").unwrap().to_u64(),
+        Some(5),
+        "$sscanf must return all five matched fields"
+    );
+    assert_eq!(
+        simulator.read("width_matched").unwrap().to_u64(),
+        Some(3),
+        "width-limited $sscanf fields must all execute"
+    );
+    assert_eq!(
+        simulator.read("width_signed").unwrap().to_u64(),
+        Some((-1_i32) as u32 as u64),
+        "$sscanf %2d must count the sign character"
+    );
+    assert_eq!(
+        simulator.read("width_hex").unwrap().to_u64(),
+        Some(1),
+        "$sscanf %1h must consume only one digit"
+    );
+    assert_eq!(
+        simulator.read("mismatched").unwrap().to_u64(),
+        Some(0),
+        "a mismatching literal must stop scanning and return zero matches"
+    );
+    assert_eq!(
+        simulator.read("empty_matched").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "$sscanf on an exhausted input before a conversion must return signed -1"
+    );
+    assert_eq!(
+        simulator.read("literal_matched").unwrap().to_u64(),
+        Some(1),
+        "a matching literal followed by a conversion must return one match"
+    );
+    assert_eq!(
+        simulator.read("literal_value").unwrap().to_u64(),
+        Some(42),
+        "the final successful $sscanf conversion must write its target"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_runtime_sformatf() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-sformatf");
+    let source_path = root.join("sformatf.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module sformatf(
+  input int signed_value,
+  input logic [7:0] hex_value,
+  input logic [3:0] binary_value,
+  input logic [7:0] character_value,
+  input logic [3:0] strength_value,
+  input string suffix,
+  input string overflow_left,
+  input string overflow_right,
+  output string formatted,
+  output string width_formatted,
+  output string strength_formatted,
+  output string pattern_string,
+  output string pattern_real_fraction,
+  output string pattern_real_integer,
+  output string pattern_real_exponent,
+  output string pattern_real_fixed,
+  output string pattern_real_general,
+  output string pattern_real_general_large,
+  output string pattern_real_general_small,
+  output string pattern_real_width,
+  output string pattern_real_precision_exponent,
+  output string pattern_real_precision_fixed,
+  output string pattern_real_precision_zero_fixed,
+  output string pattern_real_precision_general,
+  output string pattern_real_precision_width,
+  output string pattern_real_variable,
+  output string pattern_real_variable_exponent,
+  output string pattern_real_variable_fixed,
+  output string pattern_real_variable_precision,
+  output string pattern_real_arithmetic_literal,
+  output string pattern_real_arithmetic_variable,
+  output string pattern_real_arithmetic_division,
+  output string pattern_real_arithmetic_assignment,
+  output string pattern_real_division_zero,
+  output string pattern_real_unary_literal,
+  output string pattern_real_unary_variable,
+  output string pattern_real_unary_arithmetic,
+  output string pattern_real_mixed_arithmetic,
+  output int real_to_int_round,
+  output int real_to_int_negative,
+  output logic real_compare_equal,
+  output logic real_compare_not_equal,
+  output logic real_compare_less,
+  output logic real_compare_less_equal,
+  output logic real_compare_greater,
+  output logic real_compare_greater_equal,
+  output string pattern_signed,
+  output string pattern_nibble,
+  output string pattern_unknown,
+  output string pattern_array,
+  output string pattern_array_abbreviated,
+  output string pattern_matrix,
+  output string pattern_matrix_abbreviated,
+  output string pattern_dynamic,
+  output string pattern_dynamic_abbreviated,
+  output string pattern_queue,
+  output string pattern_queue_abbreviated,
+  output string pattern_associative,
+  output string pattern_associative_abbreviated,
+  output string pattern_struct_array,
+  output string pattern_struct_array_abbreviated,
+  output string pattern_struct_dynamic,
+  output string pattern_struct_dynamic_abbreviated,
+  output string pattern_struct_queue,
+  output string pattern_struct_queue_abbreviated,
+  output string pattern_struct_associative,
+  output string pattern_struct_associative_abbreviated,
+  output string pattern_packed_union_array,
+  output string pattern_packed_union_array_abbreviated,
+  output string pattern_unpacked_union_array,
+  output string pattern_unpacked_union_array_abbreviated,
+  output string pattern_packed_union_dynamic,
+  output string pattern_packed_union_dynamic_abbreviated,
+  output string pattern_packed_union_queue,
+  output string pattern_packed_union_queue_abbreviated,
+  output string pattern_packed_union_associative,
+  output string pattern_packed_union_associative_abbreviated,
+  output string pattern_unpacked_union_dynamic,
+  output string pattern_unpacked_union_dynamic_abbreviated,
+  output string pattern_unpacked_union_queue,
+  output string pattern_unpacked_union_queue_abbreviated,
+  output string pattern_unpacked_union_associative,
+  output string pattern_unpacked_union_associative_abbreviated,
+  output string pattern_nested_packed_union,
+  output string pattern_nested_packed_union_abbreviated,
+  output string pattern_nested_unpacked_union,
+  output string pattern_nested_unpacked_union_abbreviated,
+  output string pattern_enum,
+  output string pattern_enum_invalid,
+  output string pattern_struct,
+  output string pattern_struct_abbreviated,
+  output string pattern_unpacked_struct,
+  output string pattern_unpacked_struct_abbreviated,
+  output string pattern_packed_union,
+  output string pattern_packed_union_abbreviated,
+  output string pattern_unpacked_union,
+  output string pattern_unpacked_union_abbreviated,
+  output string pattern_nested_struct,
+  output string pattern_nested_struct_abbreviated,
+  output string pattern_anonymous_nested_struct,
+  output string raw_two_state,
+  output string raw_four_state,
+  output string overflowed
+);
+  typedef enum logic [1:0] {
+    PATTERN_IDLE = 2'd0,
+    PATTERN_RUN = 2'd2
+  } pattern_enum_t;
+
+  typedef struct packed {
+    logic [3:0] low;
+    int signed high;
+  } pattern_struct_t;
+
+  typedef struct {
+    logic [3:0] low;
+    int signed high;
+  } pattern_unpacked_struct_t;
+
+  typedef union packed {
+    logic [3:0] left;
+    logic [3:0] right;
+  } pattern_packed_union_t;
+
+  typedef union {
+    logic [3:0] low;
+    int signed high;
+  } pattern_unpacked_union_t;
+
+  typedef union {
+    logic [3:0] low;
+    logic [3:0] high;
+  } pattern_small_unpacked_union_t;
+
+  typedef struct packed {
+    logic [1:0] nibble;
+  } pattern_nested_inner_t;
+
+  typedef struct packed {
+    logic [3:0] low;
+    pattern_nested_inner_t high;
+  } pattern_nested_struct_t;
+
+  typedef struct packed {
+    logic [3:0] value;
+  } pattern_memory_struct_t;
+
+  typedef struct packed {
+    logic [3:0] low;
+    struct packed {
+      logic [1:0] nibble;
+    } high;
+  } pattern_anonymous_nested_struct_t;
+
+  typedef struct packed {
+    logic [3:0] low;
+    pattern_packed_union_t nested;
+  } pattern_nested_packed_union_struct_t;
+
+  typedef struct {
+    logic [3:0] low;
+    pattern_small_unpacked_union_t nested;
+  } pattern_nested_unpacked_union_struct_t;
+
+  logic [7:0] pattern_values [0:3];
+  logic [7:0] pattern_matrix_values [0:1][0:2];
+  logic [7:0] pattern_dynamic_values[];
+  logic [7:0] pattern_queue_values[$];
+  logic [7:0] pattern_associative_values[int];
+  pattern_memory_struct_t pattern_struct_values [0:2];
+  real pattern_real_variable_data;
+  pattern_memory_struct_t pattern_struct_dynamic_values[];
+  pattern_memory_struct_t pattern_struct_queue_values[$];
+  pattern_memory_struct_t pattern_struct_associative_values[int];
+  pattern_memory_struct_t pattern_struct_associative_source;
+  pattern_packed_union_t pattern_packed_union_values [0:1];
+  pattern_unpacked_union_t pattern_unpacked_union_values [0:0];
+  pattern_packed_union_t pattern_packed_union_dynamic_values[];
+  pattern_packed_union_t pattern_packed_union_queue_values[$];
+  pattern_packed_union_t pattern_packed_union_associative_values[int];
+  pattern_small_unpacked_union_t pattern_unpacked_union_dynamic_values[];
+  pattern_small_unpacked_union_t pattern_unpacked_union_queue_values[$];
+  pattern_small_unpacked_union_t pattern_unpacked_union_associative_values[int];
+  pattern_packed_union_t pattern_packed_union_source;
+  pattern_small_unpacked_union_t pattern_unpacked_union_source;
+  pattern_enum_t pattern_state;
+  pattern_struct_t pattern_data;
+  pattern_unpacked_struct_t pattern_unpacked_data;
+  pattern_packed_union_t pattern_packed_union_data;
+  pattern_unpacked_union_t pattern_unpacked_union_data;
+  pattern_nested_struct_t pattern_nested_struct_data;
+  pattern_anonymous_nested_struct_t pattern_anonymous_nested_struct_data;
+  pattern_nested_packed_union_struct_t pattern_nested_packed_union_data;
+  pattern_nested_unpacked_union_struct_t pattern_nested_unpacked_union_data;
+  initial begin
+    #1;
+    pattern_values[0] = 8'd1;
+    pattern_values[1] = 8'd2;
+    pattern_values[2] = 8'd3;
+    pattern_values[3] = 8'd4;
+    pattern_matrix_values[0][0] = 8'd1;
+    pattern_matrix_values[0][1] = 8'd2;
+    pattern_matrix_values[0][2] = 8'd3;
+    pattern_matrix_values[1][0] = 8'd4;
+    pattern_matrix_values[1][1] = 8'd5;
+    pattern_matrix_values[1][2] = 8'd6;
+    pattern_dynamic_values = new[3];
+    pattern_dynamic_values[0] = 1;
+    pattern_dynamic_values[1] = 2;
+    pattern_dynamic_values[2] = 3;
+    pattern_queue_values.push_back(4);
+    pattern_queue_values.push_back(5);
+    pattern_queue_values.push_back(6);
+    pattern_associative_values[2] = 8'd3;
+    pattern_associative_values[-1] = 8'd1;
+    pattern_associative_values[0] = 8'd2;
+    pattern_struct_values[0].value = 4'd1;
+    pattern_struct_values[1].value = 4'd2;
+    pattern_struct_values[2].value = 4'd3;
+    pattern_struct_dynamic_values = new[2];
+    pattern_struct_dynamic_values[0].value = 4'd4;
+    pattern_struct_dynamic_values[1].value = 4'd5;
+    pattern_struct_queue_values.push_back(pattern_memory_struct_t'(4'd6));
+    pattern_struct_queue_values.push_back(pattern_memory_struct_t'(4'd7));
+    pattern_struct_associative_source.value = 4'd8;
+    pattern_struct_associative_values[-1] = pattern_struct_associative_source;
+    pattern_struct_associative_source.value = 4'd9;
+    pattern_struct_associative_values[2] = pattern_struct_associative_source;
+    pattern_packed_union_values[0].left = 4'b1000;
+    pattern_packed_union_values[1].left = 4'b1001;
+    pattern_unpacked_union_values[0].high = -12;
+    pattern_packed_union_dynamic_values = new[2];
+    pattern_packed_union_dynamic_values[0].left = 4'b0010;
+    pattern_packed_union_dynamic_values[1].right = 4'b0011;
+    pattern_packed_union_queue_values.push_back(pattern_packed_union_t'(4'b0100));
+    pattern_packed_union_queue_values.push_back(pattern_packed_union_t'(4'b0101));
+    pattern_packed_union_source.left = 4'b0110;
+    pattern_packed_union_associative_values[-1] = pattern_packed_union_source;
+    pattern_packed_union_source.right = 4'b0111;
+    pattern_packed_union_associative_values[2] = pattern_packed_union_source;
+    pattern_unpacked_union_dynamic_values = new[1];
+    pattern_unpacked_union_dynamic_values[0].high = 4'b1100;
+    pattern_unpacked_union_source.high = 4'b1100;
+    pattern_unpacked_union_queue_values.push_back(pattern_unpacked_union_source);
+    pattern_unpacked_union_associative_values[-1] = pattern_unpacked_union_source;
+    pattern_state = PATTERN_RUN;
+    pattern_data.low = 4'b1011;
+    pattern_data.high = -12;
+    pattern_unpacked_data.low = 4'b1011;
+    pattern_unpacked_data.high = -12;
+    pattern_packed_union_data.left = 4'b1011;
+    pattern_unpacked_union_data.high = -12;
+    pattern_nested_struct_data.low = 4'b1011;
+    pattern_nested_struct_data.high.nibble = 2'b01;
+    pattern_anonymous_nested_struct_data.low = 4'b0110;
+    pattern_nested_packed_union_data.low = 4'b0011;
+    pattern_nested_packed_union_data.nested.left = 4'b1100;
+    pattern_nested_unpacked_union_data.low = 4'b0101;
+    pattern_nested_unpacked_union_data.nested = pattern_unpacked_union_source;
+    formatted = $sformatf(
+      "n=%0d h=%0h b=%0b s=%s%%",
+      signed_value,
+      hex_value,
+      binary_value,
+      suffix
+    );
+    overflowed = $sformatf("%s%s", overflow_left, overflow_right);
+    width_formatted = $sformatf(
+      "[%8d|%-8s|%4h|%4b|%c]",
+      signed_value,
+      suffix,
+      hex_value,
+      binary_value,
+      character_value
+    );
+    raw_two_state = $sformatf("%u", 14'ha2c);
+    raw_four_state = $sformatf("%z", 14'hzX2c);
+    strength_formatted = $sformatf("%v", strength_value);
+    pattern_string = $sformatf("%p", suffix);
+    pattern_real_fraction = $sformatf("%p", 1.5);
+    pattern_real_integer = $sformatf("%p", 1.0);
+    pattern_real_exponent = $sformatf("%e", 1.5);
+    pattern_real_fixed = $sformatf("%f", 1.5);
+    pattern_real_general = $sformatf("%g", 1.5);
+    pattern_real_general_large = $sformatf("%g", 1234567.0);
+    pattern_real_general_small = $sformatf("%g", 0.00001234);
+    pattern_real_width = $sformatf("[%9e|%-9f]", 1.5, 1.5);
+    pattern_real_precision_exponent = $sformatf("%.2e", 1.5);
+    pattern_real_precision_fixed = $sformatf("%.3f", 1.5);
+    pattern_real_precision_zero_fixed = $sformatf("%.0f", 1.5);
+    pattern_real_precision_general = $sformatf("%.4g", 1234567.0);
+    pattern_real_precision_width = $sformatf("[%12.2e]", 1.5);
+    pattern_real_variable_data = 1.5;
+    pattern_real_variable = $sformatf("%p", pattern_real_variable_data);
+    pattern_real_variable_exponent = $sformatf("%e", pattern_real_variable_data);
+    pattern_real_variable_fixed = $sformatf("%f", pattern_real_variable_data);
+    pattern_real_variable_precision = $sformatf("%.2f", pattern_real_variable_data);
+    real_compare_equal = pattern_real_variable_data == 1.5;
+    real_compare_not_equal = pattern_real_variable_data != 1.5;
+    real_compare_less = pattern_real_variable_data < 1.75;
+    real_compare_less_equal = pattern_real_variable_data <= 1.5;
+    real_compare_greater = pattern_real_variable_data > 1.25;
+    real_compare_greater_equal = pattern_real_variable_data >= 1.5;
+    pattern_real_unary_literal = $sformatf("%p", -1.5);
+    pattern_real_unary_variable =
+      $sformatf("%p", -pattern_real_variable_data);
+    pattern_real_unary_arithmetic =
+      $sformatf("%p", pattern_real_variable_data + (-0.25));
+    pattern_real_mixed_arithmetic =
+      $sformatf("%p", signed_value + 0.5);
+    real_to_int_round = pattern_real_variable_data;
+    real_to_int_negative = -pattern_real_variable_data;
+    pattern_real_arithmetic_literal = $sformatf("%p", 1.5 + 0.25);
+    pattern_real_arithmetic_variable =
+      $sformatf("%p", pattern_real_variable_data + 0.25);
+    pattern_real_arithmetic_division =
+      $sformatf("%p", pattern_real_variable_data / 0.5);
+    pattern_real_variable_data = pattern_real_variable_data + 0.25;
+    pattern_real_arithmetic_assignment = $sformatf("%p", pattern_real_variable_data);
+    pattern_real_division_zero = $sformatf("%p", 1.5 / 0.0);
+    pattern_signed = $sformatf("%p", signed_value);
+    pattern_nibble = $sformatf("%p", binary_value);
+    pattern_unknown = $sformatf("%p", strength_value);
+    pattern_array = $sformatf("%p", pattern_values);
+    pattern_array_abbreviated = $sformatf("%0p", pattern_values);
+    pattern_matrix = $sformatf("%p", pattern_matrix_values);
+    pattern_matrix_abbreviated = $sformatf("%0p", pattern_matrix_values);
+    pattern_dynamic = $sformatf("%p", pattern_dynamic_values);
+    pattern_dynamic_abbreviated = $sformatf("%0p", pattern_dynamic_values);
+    pattern_queue = $sformatf("%p", pattern_queue_values);
+    pattern_queue_abbreviated = $sformatf("%0p", pattern_queue_values);
+    pattern_associative = $sformatf("%p", pattern_associative_values);
+    pattern_associative_abbreviated = $sformatf("%0p", pattern_associative_values);
+    pattern_struct_array = $sformatf("%p", pattern_struct_values);
+    pattern_struct_array_abbreviated = $sformatf("%0p", pattern_struct_values);
+    pattern_struct_dynamic = $sformatf("%p", pattern_struct_dynamic_values);
+    pattern_struct_dynamic_abbreviated = $sformatf("%0p", pattern_struct_dynamic_values);
+    pattern_struct_queue = $sformatf("%p", pattern_struct_queue_values);
+    pattern_struct_queue_abbreviated = $sformatf("%0p", pattern_struct_queue_values);
+    pattern_struct_associative = $sformatf("%p", pattern_struct_associative_values);
+    pattern_struct_associative_abbreviated = $sformatf(
+      "%0p",
+      pattern_struct_associative_values
+    );
+    pattern_packed_union_array = $sformatf("%p", pattern_packed_union_values);
+    pattern_packed_union_array_abbreviated = $sformatf(
+      "%0p",
+      pattern_packed_union_values
+    );
+    pattern_unpacked_union_array = $sformatf("%p", pattern_unpacked_union_values);
+    pattern_unpacked_union_array_abbreviated = $sformatf(
+      "%0p",
+      pattern_unpacked_union_values
+    );
+    pattern_packed_union_dynamic = $sformatf("%p", pattern_packed_union_dynamic_values);
+    pattern_packed_union_dynamic_abbreviated = $sformatf(
+      "%0p",
+      pattern_packed_union_dynamic_values
+    );
+    pattern_packed_union_queue = $sformatf("%p", pattern_packed_union_queue_values);
+    pattern_packed_union_queue_abbreviated = $sformatf(
+      "%0p",
+      pattern_packed_union_queue_values
+    );
+    pattern_packed_union_associative = $sformatf(
+      "%p",
+      pattern_packed_union_associative_values
+    );
+    pattern_packed_union_associative_abbreviated = $sformatf(
+      "%0p",
+      pattern_packed_union_associative_values
+    );
+    pattern_unpacked_union_dynamic = $sformatf("%p", pattern_unpacked_union_dynamic_values);
+    pattern_unpacked_union_dynamic_abbreviated = $sformatf(
+      "%0p",
+      pattern_unpacked_union_dynamic_values
+    );
+    pattern_unpacked_union_queue = $sformatf("%p", pattern_unpacked_union_queue_values);
+    pattern_unpacked_union_queue_abbreviated = $sformatf(
+      "%0p",
+      pattern_unpacked_union_queue_values
+    );
+    pattern_unpacked_union_associative = $sformatf(
+      "%p",
+      pattern_unpacked_union_associative_values
+    );
+    pattern_unpacked_union_associative_abbreviated = $sformatf(
+      "%0p",
+      pattern_unpacked_union_associative_values
+    );
+    pattern_enum = $sformatf("%p", pattern_state);
+    pattern_state = pattern_enum_t'(2'd3);
+    pattern_enum_invalid = $sformatf("%p", pattern_state);
+    pattern_struct = $sformatf("%p", pattern_data);
+    pattern_struct_abbreviated = $sformatf("%0p", pattern_data);
+    pattern_unpacked_struct = $sformatf("%p", pattern_unpacked_data);
+    pattern_unpacked_struct_abbreviated = $sformatf("%0p", pattern_unpacked_data);
+    pattern_packed_union = $sformatf("%p", pattern_packed_union_data);
+    pattern_packed_union_abbreviated = $sformatf("%0p", pattern_packed_union_data);
+    pattern_unpacked_union = $sformatf("%p", pattern_unpacked_union_data);
+    pattern_unpacked_union_abbreviated = $sformatf("%0p", pattern_unpacked_union_data);
+    pattern_nested_struct = $sformatf("%p", pattern_nested_struct_data);
+    pattern_nested_struct_abbreviated = $sformatf("%0p", pattern_nested_struct_data);
+    pattern_anonymous_nested_struct = $sformatf("%p", pattern_anonymous_nested_struct_data);
+    pattern_nested_packed_union = $sformatf("%p", pattern_nested_packed_union_data);
+    pattern_nested_packed_union_abbreviated = $sformatf(
+      "%0p",
+      pattern_nested_packed_union_data
+    );
+    pattern_nested_unpacked_union = $sformatf("%p", pattern_nested_unpacked_union_data);
+    pattern_nested_unpacked_union_abbreviated = $sformatf(
+      "%0p",
+      pattern_nested_unpacked_union_data
+    );
+  end
+endmodule
+"#,
+    )
+    .expect("write runtime-sformatf source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("sformatf"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower runtime sformatf");
+    let mut simulator = Simulator::new(&design).expect("create sformatf simulator");
+    simulator
+        .set_input(
+            "signed_value",
+            &LogicWord::from_u64(32, (-12_i32) as u32 as u64),
+        )
+        .expect("set signed decimal");
+    simulator
+        .set_input("hex_value", &LogicWord::from_u64(8, 0xa5))
+        .expect("set hexadecimal value");
+    simulator
+        .set_input("binary_value", &LogicWord::from_u64(4, 0b1011))
+        .expect("set binary value");
+    simulator
+        .set_input("character_value", &LogicWord::from_u64(8, u64::from(b'X')))
+        .expect("set character value");
+    simulator
+        .set_input(
+            "strength_value",
+            &LogicWord {
+                bits: vec![
+                    eda_core::logic::LogicValue::X,
+                    eda_core::logic::LogicValue::Zero,
+                    eda_core::logic::LogicValue::Z,
+                    eda_core::logic::LogicValue::One,
+                ],
+            },
+        )
+        .expect("set strength value");
+    simulator
+        .set_input("suffix", &LogicWord::from_bytes_le(512, b"ready"))
+        .expect("set string argument");
+    simulator
+        .set_input(
+            "overflow_left",
+            &LogicWord::from_bytes_le(512, b"0123456789abcdef0123456789abcdef"),
+        )
+        .expect("set left overflow string");
+    simulator
+        .set_input(
+            "overflow_right",
+            &LogicWord::from_bytes_le(512, b"0123456789abcdef0123456789abcdef"),
+        )
+        .expect("set right overflow string");
+    simulator.run_until(1).expect("execute runtime sformatf");
+
+    assert_eq!(
+        simulator
+            .read("formatted")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "n=-12 h=a5 b=1011 s=ready%",
+        "runtime $sformatf must format signed, radix, string, and literal fields"
+    );
+    assert!(
+        simulator
+            .read("overflowed")
+            .unwrap()
+            .bits
+            .iter()
+            .all(|bit| *bit == eda_core::logic::LogicValue::X),
+        "$sformatf overflow beyond the 63-byte bounded-string model must be all-X"
+    );
+    assert_eq!(
+        simulator
+            .read("width_formatted")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "[     -12|ready   |00a5|1011|X]",
+        "$sformatf must execute explicit width, left justification, radix padding, and %c"
+    );
+    assert_eq!(
+        packed_string_data_bytes(&simulator.read("raw_two_state").unwrap()),
+        vec![0x2c, 0x0a],
+        "$sformatf %u must remove NUL padding from the raw two-state result"
+    );
+    assert_eq!(
+        packed_string_data_bytes(&simulator.read("raw_four_state").unwrap()),
+        vec![0x2c, 0x0f, 0x3f],
+        "$sformatf %z must remove NUL padding from the raw four-state result"
+    );
+    assert_eq!(
+        simulator
+            .read("strength_formatted")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "St1 HiZ St0 StX",
+        "$sformatf %v must format four-state strength labels from MSB to LSB"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_string")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "\"ready\"",
+        "$sformatf %p must quote a bounded string value"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_fraction")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.5",
+        "$sformatf %p must render a finite fractional real literal"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_integer")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1",
+        "$sformatf %p must render an integer-valued real literal without inventing decimals"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_exponent")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.500000e+00",
+        "$sformatf %e must use six fractional digits and a signed two-digit exponent"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_fixed")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.500000",
+        "$sformatf %f must use six fractional digits"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_general")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.5",
+        "$sformatf %g must use compact general formatting"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_general_large")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.23457e+06",
+        "$sformatf %g must switch to exponent notation at six significant digits"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_general_small")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.234e-05",
+        "$sformatf %g must switch to exponent notation below 1e-4"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_width")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "[1.500000e+00|1.500000 ]",
+        "$sformatf real formats must honor explicit width and left justification"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_precision_exponent")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.50e+00",
+        "$sformatf %.2e must control exponent fractional precision"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_precision_fixed")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.500",
+        "$sformatf %.3f must control fixed precision"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_precision_zero_fixed")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "2",
+        "$sformatf %.0f must round to zero fractional digits"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_precision_general")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.235e+06",
+        "$sformatf %.4g must control significant precision"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_precision_width")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "[    1.50e+00]",
+        "$sformatf real formats must combine explicit width and precision"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_variable")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.5",
+        "$sformatf %p must read a real variable's IEEE-754 runtime bits"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_variable_exponent")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.500000e+00",
+        "$sformatf %e must format a real variable"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_variable_fixed")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.500000",
+        "$sformatf %f must format a real variable"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_variable_precision")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.50",
+        "$sformatf explicit precision must format a real variable"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_arithmetic_literal")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.75",
+        "$sformatf %p must execute finite real literal addition"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_arithmetic_variable")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.75",
+        "$sformatf %p must execute real variable/literal addition"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_arithmetic_division")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "3",
+        "$sformatf %p must execute real division"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_arithmetic_assignment")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.75",
+        "real arithmetic assignment must update the variable's IEEE-754 bits"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_division_zero")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "x",
+        "non-finite real division must format as unknown rather than a false numeric value"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_unary_literal")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "-1.5",
+        "$sformatf %p must negate a finite real literal"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_unary_variable")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "-1.5",
+        "$sformatf %p must negate a real variable's IEEE-754 value"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_unary_arithmetic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "1.25",
+        "real arithmetic must consume a negated real operand"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_real_mixed_arithmetic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "-11.5",
+        "mixed real/integer arithmetic must convert the integer operand to real"
+    );
+    assert_eq!(
+        simulator.read("real_to_int_round").unwrap().to_u64(),
+        Some(2),
+        "real-to-integer conversion must round 1.5 to 2"
+    );
+    let negative_round = simulator.read("real_to_int_negative").unwrap();
+    assert_eq!(
+        negative_round.to_u64().map(|value| value as u32 as i32),
+        Some(-2),
+        "real-to-integer conversion must round -1.5 away from zero"
+    );
+    assert_eq!(
+        simulator.read("real_compare_equal").unwrap().to_u64(),
+        Some(1),
+        "real equality must compare IEEE-754 values"
+    );
+    assert_eq!(
+        simulator.read("real_compare_not_equal").unwrap().to_u64(),
+        Some(0),
+        "real inequality must compare IEEE-754 values"
+    );
+    assert_eq!(
+        simulator.read("real_compare_less").unwrap().to_u64(),
+        Some(1),
+        "real less-than must compare numeric values"
+    );
+    assert_eq!(
+        simulator.read("real_compare_less_equal").unwrap().to_u64(),
+        Some(1),
+        "real less-or-equal must include equality"
+    );
+    assert_eq!(
+        simulator.read("real_compare_greater").unwrap().to_u64(),
+        Some(1),
+        "real greater-than must compare numeric values"
+    );
+    assert_eq!(
+        simulator
+            .read("real_compare_greater_equal")
+            .unwrap()
+            .to_u64(),
+        Some(1),
+        "real greater-or-equal must include equality"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_signed")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "-12",
+        "$sformatf %p must print signed 32-bit integers in natural decimal form"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nibble")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "4'b1011",
+        "$sformatf %p must preserve narrow unsigned integral width and binary pattern"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unknown")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "4'b1z0x",
+        "$sformatf %p must preserve unknown four-state patterns"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_array")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd1, 8'd2, 8'd3, 8'd4}",
+        "$sformatf %p must render a one-dimensional fixed integral array"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_array_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd1,8'd2,8'd3,8'd4}",
+        "$sformatf %0p must abbreviate array separators while preserving element widths"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_matrix")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{8'd1, 8'd2, 8'd3}, '{8'd4, 8'd5, 8'd6}}",
+        "$sformatf %p must preserve multidimensional fixed-array groups"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_matrix_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{8'd1,8'd2,8'd3},'{8'd4,8'd5,8'd6}}",
+        "$sformatf %0p must abbreviate multidimensional fixed-array separators"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_dynamic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd1, 8'd2, 8'd3}",
+        "$sformatf %p must render the active dynamic-array length and elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_dynamic_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd1,8'd2,8'd3}",
+        "$sformatf %0p must abbreviate dynamic-array separators"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_queue")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd4, 8'd5, 8'd6}",
+        "$sformatf %p must render queue elements in logical order"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_queue_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{8'd4,8'd5,8'd6}",
+        "$sformatf %0p must abbreviate queue separators"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_associative")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:8'd1, 0:8'd2, 2:8'd3}",
+        "$sformatf %p must sort associative keys and preserve key/value widths"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_associative_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:8'd1,0:8'd2,2:8'd3}",
+        "$sformatf %0p must abbreviate associative-array separators"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_array")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{value:4'b0001}, '{value:4'b0010}, '{value:4'b0011}}",
+        "$sformatf %p must render fixed-array struct elements recursively"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_array_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b0001},'{4'b0010},'{4'b0011}}",
+        "$sformatf %0p must recursively abbreviate fixed-array struct elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_dynamic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{value:4'b0100}, '{value:4'b0101}}",
+        "$sformatf %p must render active dynamic-array struct elements recursively"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_dynamic_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b0100},'{4'b0101}}",
+        "$sformatf %0p must recursively abbreviate dynamic-array struct elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_queue")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{value:4'b0110}, '{value:4'b0111}}",
+        "$sformatf %p must render queue struct elements recursively"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_queue_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b0110},'{4'b0111}}",
+        "$sformatf %0p must recursively abbreviate queue struct elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_associative")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:'{value:4'b1000}, 2:'{value:4'b1001}}",
+        "$sformatf %p must render associative-array struct values recursively"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_associative_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:'{4'b1000},2:'{4'b1001}}",
+        "$sformatf %0p must recursively abbreviate associative-array struct values"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_array")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b1000, 4'b1001}",
+        "$sformatf %p must render packed-union array elements as shared scalar values"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_array_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b1000,4'b1001}",
+        "$sformatf %0p must abbreviate packed-union array separators"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_array")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{low:4'b0100, high:-12}}",
+        "$sformatf %p must render unpacked-union array fields from shared storage"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_array_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b0100,-12}}",
+        "$sformatf %0p must abbreviate unpacked-union array fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_dynamic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0010, 4'b0011}",
+        "$sformatf %p must render active dynamic packed-union elements as shared scalars"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_dynamic_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0010,4'b0011}",
+        "$sformatf %0p must abbreviate dynamic packed-union elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_queue")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0100, 4'b0101}",
+        "$sformatf %p must render packed-union queue elements as shared scalars"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_queue_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0100,4'b0101}",
+        "$sformatf %0p must abbreviate packed-union queue elements"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_associative")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:4'b0110, 2:4'b0111}",
+        "$sformatf %p must render associative packed-union values as shared scalars"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_associative_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:4'b0110,2:4'b0111}",
+        "$sformatf %0p must abbreviate associative packed-union values"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_dynamic")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{low:4'b1100, high:4'b1100}}",
+        "$sformatf %p must render active dynamic unpacked-union fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_dynamic_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b1100,4'b1100}}",
+        "$sformatf %0p must abbreviate dynamic unpacked-union fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_queue")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{low:4'b1100, high:4'b1100}}",
+        "$sformatf %p must render unpacked-union queue fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_queue_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{'{4'b1100,4'b1100}}",
+        "$sformatf %0p must abbreviate unpacked-union queue fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_associative")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:'{low:4'b1100, high:4'b1100}}",
+        "$sformatf %p must render associative unpacked-union fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_associative_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{-1:'{4'b1100,4'b1100}}",
+        "$sformatf %0p must abbreviate associative unpacked-union fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_enum")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "PATTERN_RUN",
+        "$sformatf %p must print the matching enum member name"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_enum_invalid")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "2'b11",
+        "$sformatf %p must fall back to exact scalar pattern for an unnamed enum value"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b1011, high:-12}",
+        "$sformatf %p must render flat packed struct fields in declaration order"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_struct_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b1011,-12}",
+        "$sformatf %0p must omit packed struct field names and separator spaces"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_struct")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b1011, high:-12}",
+        "$sformatf %p must render flat unpacked struct fields in declaration order"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_struct_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b1011,-12}",
+        "$sformatf %0p must abbreviate flat unpacked struct output"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "4'b1011",
+        "$sformatf %p must render a packed union through its shared scalar representation"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_packed_union_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "4'b1011",
+        "$sformatf %0p must preserve a packed union's shared scalar representation"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b0100, high:-12}",
+        "$sformatf %p must render every unpacked-union field from shared storage"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_unpacked_union_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0100,-12}",
+        "$sformatf %0p must abbreviate unpacked-union fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_struct")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b1011, high:'{nibble:2'b01}}",
+        "$sformatf %p must recursively render named nested struct fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_struct_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b1011,'{2'b01}}",
+        "$sformatf %0p must recursively abbreviate nested struct fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_anonymous_nested_struct")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b0110, high:'{nibble:2'bxx}}",
+        "$sformatf %p must recursively render anonymous nested struct fields"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_packed_union")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b0011, nested:4'b1100}",
+        "$sformatf %p must render a nested packed union as shared scalar storage"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_packed_union_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0011,4'b1100}",
+        "$sformatf %0p must abbreviate a nested packed union field"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_unpacked_union")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{low:4'b0101, nested:'{low:4'b1100, high:4'b1100}}",
+        "$sformatf %p must render nested unpacked-union fields from shared storage"
+    );
+    assert_eq!(
+        simulator
+            .read("pattern_nested_unpacked_union_abbreviated")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "'{4'b0101,'{4'b1100,4'b1100}}",
+        "$sformatf %0p must abbreviate nested unpacked-union fields"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_hierarchy_format_specifier() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-hierarchy-format");
+    let source_path = root.join("hierarchy_format.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module hierarchy_leaf(output string path, output string library_scope);
+  initial begin
+    path = $sformatf("%m");
+    library_scope = $sformatf("%l");
+  end
+endmodule
+
+module hierarchy_format(
+  output string top_path,
+  output string leaf_path,
+  output string generate_path,
+  output string top_library_scope,
+  output string leaf_library
+);
+  hierarchy_leaf u_leaf(.path(leaf_path), .library_scope(leaf_library));
+  generate
+    for (genvar index = 0; index < 1; index++) begin : generated_block
+      hierarchy_leaf u_generated(.path(generate_path), .library_scope());
+    end
+  endgenerate
+
+  initial begin
+    #1;
+    top_path = $sformatf("%m");
+    top_library_scope = $sformatf("%l");
+  end
+endmodule
+"#,
+    )
+    .expect("write hierarchy-format source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("hierarchy_format"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower hierarchy format specifier");
+    let mut simulator = Simulator::new(&design).expect("create hierarchy-format simulator");
+    simulator
+        .run_until(1)
+        .expect("execute hierarchy formatting");
+
+    assert_eq!(
+        simulator
+            .read("top_path")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hierarchy_format",
+        "%m at the top scope must report the top instance path"
+    );
+    assert_eq!(
+        simulator
+            .read("leaf_path")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hierarchy_format.u_leaf",
+        "%m in a child instance must include the parent and instance names"
+    );
+    assert_eq!(
+        simulator
+            .read("generate_path")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hierarchy_format.generated_block[0].u_generated",
+        "%m in a generated instance must include the generated block scope"
+    );
+    assert_eq!(
+        simulator
+            .read("top_library_scope")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hierarchy_format",
+        "%l at the top scope must report the default library definition name"
+    );
+    assert_eq!(
+        simulator
+            .read("leaf_library")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "hierarchy_leaf",
+        "%l in a child instance must report the child definition, not its instance path"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_named_library_format_specifier() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-named-library-format");
+    let leaf_path = root.join("leaf.sv");
+    std::fs::write(
+        &leaf_path,
+        r#"
+module named_library_leaf(output string library_scope);
+  initial library_scope = $sformatf("%l");
+endmodule
+"#,
+    )
+    .expect("write named-library leaf");
+    let top_path = root.join("top.sv");
+    std::fs::write(
+        &top_path,
+        r#"
+module named_library_top(output string library_scope, output string leaf_library_scope);
+  named_library_leaf u_leaf(.library_scope(leaf_library_scope));
+  initial #1 library_scope = $sformatf("%l");
+endmodule
+"#,
+    )
+    .expect("write named-library top");
+    let slang_bin =
+        std::env::var("SLANG_BIN").unwrap_or_else(|_| "/tmp/rsi-slang-v12.0-pinned".into());
+    let output = std::process::Command::new(slang_bin)
+        .arg("--quiet")
+        .arg("--top")
+        .arg("named_library_top")
+        .arg("--ast-json")
+        .arg("-")
+        .arg("--ast-json-detailed-types")
+        .arg("--ast-json-source-info")
+        .arg("-v")
+        .arg(format!("mylib={}", leaf_path.display()))
+        .arg(&top_path)
+        .output()
+        .expect("run pinned slang for named library AST");
+    assert!(
+        output.status.success(),
+        "slang named-library AST failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let json = &stdout[stdout.find('{').expect("slang AST output contains JSON")..];
+    let design = slang
+        .lower_ast_json(json)
+        .expect("directly lower named-library AST");
+    let mut simulator = Simulator::new(&design).expect("create named-library simulator");
+    simulator
+        .run_until(1)
+        .expect("execute named-library formatting");
+    assert_eq!(
+        simulator
+            .read("leaf_library_scope")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "mylib.named_library_leaf",
+        "child %l must include the non-default source library and definition name"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unsupported_sformatf_formats() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-invalid-sformatf");
+    let source_path = root.join("invalid_sformatf.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module invalid_sformatf(output string result);
+  initial result = $sformatf("%4v", 1);
+endmodule
+"#,
+    )
+    .expect("write invalid-sformatf source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("invalid_sformatf"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("invalid $sformatf strength modifiers must fail closed");
+    assert!(
+        error.contains("field width not allowed on '%v' format specifiers"),
+        "unexpected $sformatf format error: {error}"
+    );
+
+    let invalid_precision_path = root.join("invalid_sformatf_precision.sv");
+    std::fs::write(
+        &invalid_precision_path,
+        r#"
+module invalid_sformatf_precision(output string result);
+  initial result = $sformatf("%.513e", 1.5);
+endmodule
+"#,
+    )
+    .expect("write invalid-sformatf precision source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_precision_path),
+            Some("invalid_sformatf_precision"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("overlarge real format precision must fail closed");
+    assert!(
+        error.contains("display format precision must be at most 512"),
+        "unexpected precision error: {error}"
+    );
+
+    let invalid_pattern_path = root.join("invalid_sformatf_pattern.sv");
+    std::fs::write(
+        &invalid_pattern_path,
+        r#"
+module invalid_sformatf_pattern(output string result);
+  logic [65:0] values[];
+  initial result = $sformatf("%p", values);
+endmodule
+"#,
+    )
+    .expect("write invalid-sformatf pattern source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_pattern_path),
+            Some("invalid_sformatf_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported wide dynamic-array patterns must fail closed");
+    assert!(
+        error.contains("%p array elements must be scalar integrals up to 64 bits"),
+        "unexpected invalid-pattern error: {error}"
+    );
+
+    let invalid_nonintegral_path = root.join("invalid_sformatf_nonintegral_pattern.sv");
+    std::fs::write(
+        &invalid_nonintegral_path,
+        r#"
+module invalid_sformatf_nonintegral_pattern(output string result);
+  typedef struct {
+    logic [3:0] low;
+    string name;
+  } values_t;
+  values_t values;
+  initial result = $sformatf("%p", values);
+endmodule
+"#,
+    )
+    .expect("write invalid-sformatf nonintegral source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_nonintegral_path),
+            Some("invalid_sformatf_nonintegral_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported $sformatf nonintegral-field patterns must fail closed");
+    assert!(
+        error.contains("%p currently supports flat packed/unpacked structs, scalar-field unpacked unions, and scalar packed unions"),
+        "unexpected invalid-nonintegral-field error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_invalid_sscanf_formats() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-invalid-sscanf");
+    let source_path = root.join("invalid_sscanf.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module invalid_sscanf(
+  output string source,
+  output int value,
+  output int matched
+);
+  initial begin
+    source = "12";
+    matched = $sscanf(source, "%u", value);
+  end
+endmodule
+"#,
+    )
+    .expect("write invalid sscanf source");
+
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("invalid_sscanf"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("unsupported $sscanf conversions must fail closed");
+    assert!(
+        error.contains("$sscanf conversion '%u' is unsupported"),
+        "unexpected invalid-format error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_unknown_sscanf_strings() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-unknown-sscanf");
+    let source_path = root.join("unknown_sscanf.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module unknown_sscanf(
+  input string source,
+  output int matched,
+  output int value
+);
+  initial begin
+    #1;
+    matched = $sscanf(source, "%d", value);
+  end
+endmodule
+"#,
+    )
+    .expect("write unknown-sscanf source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("unknown_sscanf"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower unknown sscanf");
+    let mut simulator = Simulator::new(&design).expect("create unknown-sscanf simulator");
+    let mut unknown = LogicWord::zero(512);
+    for bit in unknown.bits.iter_mut() {
+        *bit = eda_core::logic::LogicValue::X;
+    }
+    simulator
+        .set_input("source", &unknown)
+        .expect("set unknown sscanf source");
+    let error = simulator
+        .run_until(1)
+        .expect_err("unknown $sscanf source bits must fail closed");
+    assert!(
+        error.contains("$sscanf input string contains unknown bits"),
+        "unexpected unknown-string error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_mixed_read_write_file_mode() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-mixed-file-mode");
+    let output_path = root.join("mixed.txt");
+    std::fs::write(&output_path, "ABCD").expect("seed mixed-mode file");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let dynamic_path =
+        std::path::PathBuf::from(format!("/tmp/rsi-mixed-mode-{}.txt", std::process::id()));
+    std::fs::write(&dynamic_path, "ZXYD").expect("seed dynamic mixed-mode file");
+    let source_path = root.join("mixed_mode.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module mixed_mode(
+  input string dynamic_path,
+  input string dynamic_mode,
+  output int literal_fd,
+  output int literal_first,
+  output int literal_second,
+  output int literal_tell,
+  output int literal_seek_status,
+  output int dynamic_fd,
+  output int dynamic_first
+);
+  initial begin
+    #1;
+    literal_fd = $fopen("{path_literal}", "r+");
+    literal_first = $fgetc(literal_fd);
+    $fwrite(literal_fd, "XY");
+    literal_second = $fgetc(literal_fd);
+    literal_tell = $ftell(literal_fd);
+    literal_seek_status = $fseek(literal_fd, 0, 0);
+    $fwrite(literal_fd, "Z");
+    $fclose(literal_fd);
+
+    dynamic_fd = $fopen(dynamic_path, dynamic_mode);
+    dynamic_first = $fgetc(dynamic_fd);
+    $fwrite(dynamic_fd, "!");
+    $fclose(dynamic_fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write mixed-mode source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("mixed_mode"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower mixed read/write file mode");
+    let mut simulator = Simulator::new(&design).expect("create mixed-mode simulator");
+    let dynamic_path_word =
+        LogicWord::from_bytes_le(512, dynamic_path.to_string_lossy().as_bytes());
+    let dynamic_mode_word = LogicWord::from_bytes_le(512, b"r+");
+    simulator
+        .set_input("dynamic_path", &dynamic_path_word)
+        .expect("set dynamic mixed-mode path");
+    simulator
+        .set_input("dynamic_mode", &dynamic_mode_word)
+        .expect("set dynamic mixed-mode mode");
+    simulator
+        .run_until(1)
+        .expect("execute literal and dynamic mixed-mode I/O");
+    assert_eq!(
+        simulator.read("literal_first").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "literal r+ must start reading at byte zero without truncation"
+    );
+    assert_eq!(
+        simulator.read("literal_second").unwrap().to_u64(),
+        Some(u64::from(b'D')),
+        "a mixed-mode write must advance the shared cursor past the written bytes"
+    );
+    assert_eq!(
+        simulator.read("literal_tell").unwrap().to_u64(),
+        Some(4),
+        "$ftell must observe the mixed-mode cursor after read and write"
+    );
+    assert_eq!(
+        simulator.read("literal_seek_status").unwrap().to_u64(),
+        Some(0),
+        "$fseek must succeed on a mixed descriptor"
+    );
+    assert_eq!(
+        simulator.read("dynamic_first").unwrap().to_u64(),
+        Some(u64::from(b'Z')),
+        "dynamic r+ mode must reopen without truncating or appending"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read literal mixed-mode output"),
+        "ZXYD",
+        "literal mixed-mode writes must preserve unrelated file bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dynamic_path).expect("read dynamic mixed-mode output"),
+        "Z!YD",
+        "dynamic mixed-mode writes must preserve unrelated file bytes"
+    );
+    std::fs::remove_file(&dynamic_path).expect("remove dynamic mixed-mode file");
+}
+
+#[test]
+fn slang_ast_direct_lowering_rejects_mixed_write_with_pending_ungetc() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-mixed-ungetc");
+    let input_path = root.join("input.txt");
+    std::fs::write(&input_path, "A").expect("seed pending-ungetc file");
+    let path_literal = input_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("mixed_ungetc.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module mixed_ungetc(
+  output int fd,
+  output int ungetc_status
+);
+  initial begin
+    fd = $fopen("{path_literal}", "r+");
+    ungetc_status = $ungetc(8'h42, fd);
+    $fwrite(fd, "X");
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write mixed-ungetc source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("mixed_ungetc"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower mixed write with pending ungetc");
+    let mut simulator = Simulator::new(&design).expect("create mixed-ungetc simulator");
+    let error = simulator
+        .run_until(0)
+        .expect_err("writing with pending mixed-mode lookahead must fail closed");
+    assert!(
+        error.contains("while an ungetc byte is pending"),
+        "unexpected mixed-mode ungetc error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_creating_mixed_file_modes() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = std::path::PathBuf::from(format!("/tmp/rsi-mixed-create-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create short mixed-mode directory");
+    let wplus_path = root.join("wplus.txt");
+    std::fs::write(&wplus_path, "OLD").expect("seed w+ file");
+    let aplus_path = root.join("aplus.txt");
+    std::fs::write(&aplus_path, "AB").expect("seed a+ file");
+    let dynamic_path = root.join("dynamic.txt");
+    std::fs::write(&dynamic_path, "AB").expect("seed dynamic a+ file");
+    let dynamic_wplus_path = root.join("dynamic-wplus.txt");
+    std::fs::write(&dynamic_wplus_path, "OLD").expect("seed dynamic w+ file");
+    let wplus_literal = wplus_path.to_string_lossy().replace('\\', "\\\\");
+    let aplus_literal = aplus_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("mixed_create.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module mixed_create(
+  input string dynamic_path,
+  input string dynamic_mode,
+  input string dynamic_wplus_path,
+  input string dynamic_wplus_mode,
+  output int fd,
+  output int wplus_first,
+  output int wplus_tell_after_write,
+  output int wplus_seek,
+  output logic [7:0] wplus_readback,
+  output int aplus_first,
+  output int aplus_tell_after_write,
+  output int aplus_rewind,
+  output logic [7:0] aplus_readback,
+  output int dynamic_fd,
+  output int dynamic_first,
+  output int dynamic_tell,
+  output int dynamic_wplus_fd,
+  output int dynamic_wplus_first
+);
+  initial begin
+    #1;
+    fd = $fopen("{wplus_literal}", "w+");
+    wplus_first = $fgetc(fd);
+    $fwrite(fd, "AB");
+    wplus_tell_after_write = $ftell(fd);
+    wplus_seek = $fseek(fd, 0, 0);
+    wplus_readback = $fgetc(fd);
+    $fclose(fd);
+
+    fd = $fopen("{aplus_literal}", "a+");
+    aplus_first = $fgetc(fd);
+    $fwrite(fd, "C");
+    aplus_tell_after_write = $ftell(fd);
+    aplus_rewind = $rewind(fd);
+    aplus_readback = $fgetc(fd);
+    $fclose(fd);
+
+    dynamic_fd = $fopen(dynamic_path, dynamic_mode);
+    dynamic_first = $fgetc(dynamic_fd);
+    $fwrite(dynamic_fd, "D");
+    dynamic_tell = $ftell(dynamic_fd);
+    $fclose(dynamic_fd);
+
+    dynamic_wplus_fd = $fopen(dynamic_wplus_path, dynamic_wplus_mode);
+    dynamic_wplus_first = $fgetc(dynamic_wplus_fd);
+    $fwrite(dynamic_wplus_fd, "Q");
+    $fclose(dynamic_wplus_fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write creating-mixed source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("mixed_create"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower creating mixed modes");
+    let mut simulator = Simulator::new(&design).expect("create mixed-mode simulator");
+    simulator
+        .set_input(
+            "dynamic_path",
+            &LogicWord::from_bytes_le(512, dynamic_path.to_string_lossy().as_bytes()),
+        )
+        .expect("set dynamic mixed path");
+    simulator
+        .set_input("dynamic_mode", &LogicWord::from_bytes_le(512, b"a+b"))
+        .expect("set dynamic mixed mode");
+    simulator
+        .set_input(
+            "dynamic_wplus_path",
+            &LogicWord::from_bytes_le(512, dynamic_wplus_path.to_string_lossy().as_bytes()),
+        )
+        .expect("set dynamic w+ path");
+    simulator
+        .set_input("dynamic_wplus_mode", &LogicWord::from_bytes_le(512, b"w+b"))
+        .expect("set dynamic w+ mode");
+    simulator
+        .run_until(1)
+        .expect("execute creating mixed file modes");
+
+    assert_eq!(
+        simulator.read("wplus_first").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "w+ must truncate before the first read"
+    );
+    assert_eq!(
+        simulator.read("wplus_tell_after_write").unwrap().to_u64(),
+        Some(2),
+        "w+ writes must start at byte zero"
+    );
+    assert_eq!(
+        simulator.read("wplus_seek").unwrap().to_u64(),
+        Some(0),
+        "w+ descriptors must support seek"
+    );
+    assert_eq!(
+        simulator.read("wplus_readback").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "w+ must read back bytes written in the same descriptor"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&wplus_path).expect("read w+ output"),
+        "AB",
+        "w+ must discard the old file contents"
+    );
+
+    assert_eq!(
+        simulator.read("aplus_first").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "a+ initial reads must start at byte zero"
+    );
+    assert_eq!(
+        simulator.read("aplus_tell_after_write").unwrap().to_u64(),
+        Some(3),
+        "a+ writes must be forced to the old end of file"
+    );
+    assert_eq!(
+        simulator.read("aplus_rewind").unwrap().to_u64(),
+        Some(0),
+        "a+ rewind must succeed"
+    );
+    assert_eq!(
+        simulator.read("aplus_readback").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "a+ must rewind reads without moving the append target"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&aplus_path).expect("read a+ output"),
+        "ABC",
+        "a+ writes must append and preserve existing bytes"
+    );
+
+    assert_eq!(
+        simulator.read("dynamic_first").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "runtime a+ mode must support initial reads"
+    );
+    assert_eq!(
+        simulator.read("dynamic_tell").unwrap().to_u64(),
+        Some(3),
+        "runtime a+ writes must append"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dynamic_path).expect("read dynamic output"),
+        "ABD",
+        "runtime a+ writes must preserve existing bytes"
+    );
+    assert_eq!(
+        simulator.read("dynamic_wplus_first").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "runtime w+ mode must truncate before the first read"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dynamic_wplus_path).expect("read dynamic w+ output"),
+        "Q",
+        "runtime w+ writes must start at byte zero"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove mixed-mode directory");
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_binary_fopen_mode_suffixes() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = std::path::PathBuf::from(format!("/tmp/rsi-bmode-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create short binary-mode directory");
+    let read_path = root.join("read.txt");
+    std::fs::write(&read_path, "AB").expect("seed read-mode file");
+    let write_path = root.join("write.txt");
+    std::fs::write(&write_path, "OLD").expect("seed write-mode file");
+    let append_path = root.join("append.txt");
+    std::fs::write(&append_path, "AB").expect("seed append-mode file");
+    let mixed_path = root.join("mixed.txt");
+    std::fs::write(&mixed_path, "ABCD").expect("seed mixed-mode file");
+    let alternate_r_path = root.join("alternate-r.txt");
+    std::fs::write(&alternate_r_path, "ABC").expect("seed alternate read file");
+    let alternate_w_path = root.join("alternate-w.txt");
+    std::fs::write(&alternate_w_path, "OLD").expect("seed alternate write file");
+    let alternate_a_path = root.join("alternate-a.txt");
+    std::fs::write(&alternate_a_path, "AB").expect("seed alternate append file");
+    let paths = [
+        &read_path,
+        &write_path,
+        &append_path,
+        &mixed_path,
+        &alternate_r_path,
+        &alternate_w_path,
+        &alternate_a_path,
+    ]
+    .map(|path| path.to_string_lossy().replace('\\', "\\\\"));
+    let source_path = root.join("binary_modes.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module binary_modes(
+  output int fd,
+  output int rb_value,
+  output int wb_value,
+  output int ab_tell,
+  output int rpb_second,
+  output int rpb_rewind,
+  output int rbplus_value,
+  output int wpb_value,
+  output int wpb_rewind,
+  output int wpb_readback,
+  output int wbplus_value,
+  output int apb_value,
+  output int apb_rewind,
+  output int apb_readback,
+  output int abplus_value
+);
+  initial begin
+    fd = $fopen("{}", "rb");
+    rb_value = $fgetc(fd);
+    $fclose(fd);
+
+    fd = $fopen("{}", "wb");
+    wb_value = $fgetc(fd);
+    $fwrite(fd, "Q");
+    $fclose(fd);
+
+    fd = $fopen("{}", "ab");
+    ab_tell = $ftell(fd);
+    $fwrite(fd, "C");
+    $fclose(fd);
+
+    fd = $fopen("{}", "r+b");
+    rpb_second = $fgetc(fd);
+    $fwrite(fd, "XY");
+    rpb_second = $fgetc(fd);
+    rpb_rewind = $rewind(fd);
+    $fwrite(fd, "Z");
+    $fclose(fd);
+
+    fd = $fopen("{}", "rb+");
+    rbplus_value = $fgetc(fd);
+    $fclose(fd);
+
+    fd = $fopen("{}", "w+b");
+    wpb_value = $fgetc(fd);
+    $fwrite(fd, "AB");
+    wpb_rewind = $rewind(fd);
+    wpb_readback = $fgetc(fd);
+    $fclose(fd);
+
+    fd = $fopen("{}", "wb+");
+    wbplus_value = $fgetc(fd);
+    $fwrite(fd, "M");
+    $fclose(fd);
+
+    fd = $fopen("{}", "a+b");
+    apb_value = $fgetc(fd);
+    $fwrite(fd, "C");
+    apb_rewind = $rewind(fd);
+    apb_readback = $fgetc(fd);
+    $fclose(fd);
+
+    fd = $fopen("{}", "ab+");
+    abplus_value = $fgetc(fd);
+    $fwrite(fd, "D");
+    $fclose(fd);
+  end
+endmodule
+"#,
+            paths[0],
+            paths[1],
+            paths[2],
+            paths[3],
+            paths[4],
+            paths[5],
+            paths[5],
+            paths[6],
+            paths[6],
+        ),
+    )
+    .expect("write binary-mode source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("binary_modes"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal binary fopen suffixes");
+    let mut simulator = Simulator::new(&design).expect("create binary-mode simulator");
+    simulator
+        .run_until(0)
+        .expect("execute literal binary fopen suffixes");
+
+    assert_eq!(
+        simulator.read("rb_value").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "rb must read an existing file"
+    );
+    assert_eq!(
+        simulator.read("wb_value").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "wb must truncate before the first read"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&write_path).unwrap(),
+        "Q",
+        "wb must replace the old contents"
+    );
+    assert_eq!(
+        simulator.read("ab_tell").unwrap().to_u64(),
+        Some(2),
+        "ab must expose the append cursor"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&append_path).unwrap(),
+        "ABC",
+        "ab must preserve and append"
+    );
+    assert_eq!(
+        simulator.read("rpb_second").unwrap().to_u64(),
+        Some(u64::from(b'D')),
+        "r+b must use the existing-file mixed cursor"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mixed_path).unwrap(),
+        "ZXYD",
+        "r+b writes must preserve unrelated bytes"
+    );
+    assert_eq!(
+        simulator.read("rbplus_value").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "rb+ must alias r+b"
+    );
+    assert_eq!(
+        simulator.read("wpb_value").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "w+b must truncate before the first read"
+    );
+    assert_eq!(
+        simulator.read("wpb_readback").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "w+b must read back bytes written through the same descriptor"
+    );
+    assert_eq!(
+        simulator.read("wbplus_value").unwrap().to_u64(),
+        Some(u64::from(u32::MAX)),
+        "wb+ must alias w+b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&alternate_w_path).unwrap(),
+        "M",
+        "wb+ writes must start at byte zero"
+    );
+    assert_eq!(
+        simulator.read("apb_value").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "a+b must begin reads at byte zero"
+    );
+    assert_eq!(
+        simulator.read("apb_readback").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "a+b rewind must move the read cursor"
+    );
+    assert_eq!(
+        simulator.read("abplus_value").unwrap().to_u64(),
+        Some(u64::from(b'A')),
+        "ab+ must alias a+b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&alternate_a_path).unwrap(),
+        "ABCD",
+        "ab+ writes must append"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove binary-mode directory");
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_raw_binary_file_writes() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-binary-file-write");
+    let output_path = root.join("output.bin");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("binary_write.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module binary_write(
+  output int fd,
+  output int tell_after_writes
+);
+  initial begin
+    fd = $fopen("{path_literal}", "w");
+    $fwrite(fd, "%u", 14'ha2c);
+    $fwrite(fd, "%z", 14'hzX2c);
+    tell_after_writes = $ftell(fd);
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write binary-file-output source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("binary_write"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower raw binary file writes");
+    let mut simulator = Simulator::new(&design).expect("create binary-write simulator");
+    simulator
+        .run_until(0)
+        .expect("execute raw binary file writes");
+    assert_eq!(
+        std::fs::read(&output_path).expect("read raw binary output"),
+        vec![
+            0x2c, 0x0a, 0x00, 0x00, //
+            0x2c, 0x0f, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00,
+        ],
+        "%u and %z must follow slang's raw two-state/four-state VPI encodings"
+    );
+    assert_eq!(
+        simulator.read("tell_after_writes").unwrap().to_u64(),
+        Some(12),
+        "$ftell must count all raw binary bytes including NUL padding"
+    );
+
+    let invalid_path = root.join("invalid_width.sv");
+    std::fs::write(
+        &invalid_path,
+        r#"
+module invalid_width(output int fd);
+  initial begin
+    fd = $fopen("invalid-width.bin", "w");
+    $fwrite(fd, "%0u", 1);
+  end
+endmodule
+"#,
+    )
+    .expect("write invalid raw-width source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_path),
+            Some("invalid_width"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("raw binary output must reject width modifiers");
+    assert!(
+        error.contains("field width not allowed on '%u' format specifiers"),
+        "unexpected raw-width error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_literal_file_strobe_tasks() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-file-strobe");
+    let output_path = root.join("strobe-output.txt");
+    let path_literal = output_path.to_string_lossy().replace('\\', "\\\\");
+    let source_path = root.join("file_strobe.sv");
+    std::fs::write(
+        &source_path,
+        format!(
+            r#"
+module file_strobe(output int fd);
+  reg [3:0] a;
+  initial begin
+    #1;
+    fd = $fopen("{path_literal}", "w");
+    a = 4'd11;
+    $fstrobe(fd, "a=%d", a);
+    $fstrobeo(fd, a);
+    a <= 4'd5;
+    #2;
+    $fclose(fd);
+  end
+endmodule
+"#
+        ),
+    )
+    .expect("write file-strobe source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("file_strobe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower literal file strobes");
+    let mut simulator = Simulator::new(&design).expect("create file-strobe simulator");
+    simulator.run_until(2).expect("run file-strobe timeline");
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read generated file"),
+        "a=5\n5\n",
+        "file strobes must sample after nonblocking updates settle"
     );
 }
 
@@ -3985,10 +8189,11 @@ fn slang_ast_direct_lowering_supports_monitor_tasks() {
         &source_path,
         r#"
 module monitor_tb;
-  reg a;
-  initial a = 0;
-  initial #10 a = 1;
+  reg [3:0] a;
+  initial a = 4'b1011;
+  initial #10 a = 4'b0010;
   initial $monitor("a=%b", a);
+  initial $monitoro(a);
 endmodule
 "#,
     )
@@ -4004,8 +8209,61 @@ endmodule
     let mut simulator = Simulator::new(&design).expect("create monitor simulator");
     simulator.run_until(20).expect("run monitor timeline");
     let displays = simulator.take_displays();
-    assert!(displays.iter().any(|line| line == "a=0"));
-    assert!(displays.iter().any(|line| line == "a=1"));
+    assert!(displays.iter().any(|line| line == "a=1011"));
+    assert!(displays.iter().any(|line| line == "a=0010"));
+    assert!(displays.iter().any(|line| line == "13"));
+    assert!(displays.iter().any(|line| line == "2"));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_strobe_tasks() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-strobe");
+    let source_path = root.join("strobe.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module strobe_tb;
+  reg [3:0] a;
+  initial begin
+    a = 4'b1011;
+    $strobe("a=%b", a);
+    $strobeo(a);
+    a <= 4'b0010;
+  end
+endmodule
+"#,
+    )
+    .expect("write strobe source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("strobe_tb"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower strobe tasks");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("strobe_tb"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower strobe tasks through the bounded path");
+    assert_eq!(
+        serde_json::to_value(&design).unwrap(),
+        serde_json::to_value(&bounded).unwrap(),
+        "direct and bounded strobe families must lower identically"
+    );
+    let mut simulator = Simulator::new(&design).expect("create strobe simulator");
+    simulator.run_until(0).expect("run strobe timeline");
+    assert_eq!(
+        simulator.take_displays(),
+        vec!["a=0010\n", "2\n"],
+        "strobe arguments must be sampled after nonblocking updates"
+    );
 }
 
 #[test]
@@ -4110,6 +8368,300 @@ endmodule
     assert!(
         error.contains("$timeformat precision 10 is outside 0..=9"),
         "unexpected timeformat error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_random_system_functions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-random");
+    let source_path = root.join("random.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module random_probe(
+  output int signed random_value,
+  output int unsigned urandom_value,
+  output int unsigned default_range,
+  output int unsigned swapped_range
+);
+  assign random_value = $random;
+  assign urandom_value = $urandom;
+  assign default_range = $urandom_range(9);
+  assign swapped_range = $urandom_range(3, 9);
+endmodule
+"#,
+    )
+    .expect("write random-function source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("random_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower random system functions");
+    let mut first = Simulator::new(&design).expect("create first random simulator");
+    first.run_until(0).expect("evaluate first random outputs");
+    let mut second = Simulator::new(&design).expect("create second random simulator");
+    second.run_until(0).expect("evaluate second random outputs");
+    for name in [
+        "random_value",
+        "urandom_value",
+        "default_range",
+        "swapped_range",
+    ] {
+        assert_eq!(
+            first.read(name).unwrap().to_bin_str(),
+            second.read(name).unwrap().to_bin_str(),
+            "{name} must be deterministic for a fresh simulator"
+        );
+    }
+    assert_ne!(
+        first.read("random_value").unwrap().to_bin_str(),
+        first.read("urandom_value").unwrap().to_bin_str()
+    );
+    let default_range = first.read("default_range").unwrap().to_u64().unwrap();
+    let swapped_range = first.read("swapped_range").unwrap().to_u64().unwrap();
+    assert!(default_range <= 9, "default range returned {default_range}");
+    assert!(
+        (3..=9).contains(&swapped_range),
+        "swapped range returned {swapped_range}"
+    );
+
+    let seeded_path = root.join("random_seeded.sv");
+    std::fs::write(
+        &seeded_path,
+        r#"
+module random_seeded(
+  input int seed_start,
+  output int signed value,
+  output int seed_after
+);
+  int seed;
+  initial begin
+    #1;
+    seed = seed_start;
+    value = $random(seed);
+    seed_after = seed;
+  end
+endmodule
+"#,
+    )
+    .expect("write seeded random source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&seeded_path),
+            Some("random_seeded"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower seeded random");
+    let mut first = Simulator::new(&design).expect("create first seeded simulator");
+    first
+        .set_input("seed_start", &LogicWord::from_u64(32, 42))
+        .expect("set first random seed");
+    first.run_until(1).expect("execute first seeded random");
+    let mut second = Simulator::new(&design).expect("create second seeded simulator");
+    second
+        .set_input("seed_start", &LogicWord::from_u64(32, 42))
+        .expect("set second random seed");
+    second.run_until(1).expect("execute second seeded random");
+    let mut changed = Simulator::new(&design).expect("create changed-seed simulator");
+    changed
+        .set_input("seed_start", &LogicWord::from_u64(32, 43))
+        .expect("set changed random seed");
+    changed.run_until(1).expect("execute changed seeded random");
+
+    assert_eq!(
+        first.read("value").unwrap().to_bin_str(),
+        second.read("value").unwrap().to_bin_str(),
+        "the same seed must reproduce the same signed $random result"
+    );
+    assert_eq!(
+        first.read("seed_after").unwrap().to_bin_str(),
+        second.read("seed_after").unwrap().to_bin_str(),
+        "the same seed must reproduce the same updated inout seed"
+    );
+    assert_ne!(
+        first.read("seed_after").unwrap().to_u64(),
+        Some(42),
+        "seeded $random must update its inout seed"
+    );
+    assert!(
+        changed.read("value").unwrap().to_u64().is_some(),
+        "a different known seed must still produce a known result"
+    );
+
+    let invalid_seed_path = root.join("random_invalid_seed.sv");
+    std::fs::write(
+        &invalid_seed_path,
+        r#"
+module random_invalid_seed(output int signed value);
+  shortint seed;
+  initial value = $random(seed);
+endmodule
+"#,
+    )
+    .expect("write invalid seeded-random source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_seed_path),
+            Some("random_invalid_seed"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("seeded $random must reject a non-32-bit seed");
+    assert!(
+        error.contains("seeded $random requires a whole 32-bit seed lvalue"),
+        "unexpected invalid-seed error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_distinguishes_stop_from_finish() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-stop");
+    let source_path = root.join("stop.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module stop_probe(
+  output logic before_stop,
+  output logic after_stop
+);
+  initial begin
+    after_stop = 1'b0;
+    #1;
+    before_stop = 1'b1;
+    $stop;
+    #1;
+    after_stop = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write stop source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("stop_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower stop");
+    let bounded = slang
+        .compile_files_bounded(
+            std::slice::from_ref(&source_path),
+            Some("stop_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower stop through bounded differential");
+    assert_eq!(
+        serde_json::to_value(&design).unwrap(),
+        serde_json::to_value(&bounded).unwrap(),
+        "direct and bounded paths must preserve `$stop` distinctly from `$finish`"
+    );
+    let mut simulator = Simulator::new(&design).expect("create stop simulator");
+    simulator
+        .run_until(2)
+        .expect("run until the terminal pause");
+    assert!(simulator.stopped(), "$stop must pause the simulation");
+    assert!(
+        !simulator.finished(),
+        "$stop must not be conflated with $finish"
+    );
+    assert_eq!(
+        simulator.read("before_stop").unwrap().to_u64(),
+        Some(1),
+        "statements before `$stop` must execute"
+    );
+    assert_eq!(
+        simulator.read("after_stop").unwrap().to_u64(),
+        Some(0),
+        "statements after `$stop` must wait for an explicit resume"
+    );
+    simulator
+        .resume_until(2)
+        .expect("resume the procedural continuation after `$stop`");
+    assert!(!simulator.stopped(), "explicit resume must clear the pause");
+    assert!(
+        !simulator.finished(),
+        "resuming `$stop` must not imply `$finish`"
+    );
+    assert_eq!(
+        simulator.read("after_stop").unwrap().to_u64(),
+        Some(1),
+        "statements after `$stop` must execute after an explicit resume"
+    );
+
+    let final_path = root.join("stop_final.sv");
+    std::fs::write(
+        &final_path,
+        r#"
+module stop_final(
+  output logic before_stop,
+  output logic after_stop,
+  output logic final_ran
+);
+  initial begin
+    after_stop = 1'b0;
+    final_ran = 1'b0;
+    #1;
+    before_stop = 1'b1;
+    $stop;
+    #1;
+    after_stop = 1'b1;
+    $finish;
+  end
+
+  final begin
+    final_ran = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write stop-final source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&final_path),
+            Some("stop_final"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower `$stop` before a final block");
+    let mut simulator = Simulator::new(&design).expect("create stop-final simulator");
+    simulator.run_until(1).expect("pause before `$finish`");
+    assert!(
+        simulator.stopped() && !simulator.finished(),
+        "`$stop` must pause before final-block execution"
+    );
+    assert_eq!(
+        simulator.read("final_ran").unwrap().to_u64(),
+        Some(0),
+        "final blocks must wait while `$stop` is paused"
+    );
+    simulator
+        .resume_until(2)
+        .expect("resume and reach the later `$finish`");
+    assert!(
+        simulator.finished(),
+        "the later `$finish` must execute after resume"
+    );
+    assert!(
+        !simulator.stopped(),
+        "`$finish` must clear the paused state"
+    );
+    assert_eq!(
+        simulator.read("after_stop").unwrap().to_u64(),
+        Some(1),
+        "the post-stop statement must execute before the later `$finish`"
+    );
+    assert_eq!(
+        simulator.read("final_ran").unwrap().to_u64(),
+        Some(1),
+        "final blocks must execute at `$finish` after a resumed `$stop`"
     );
 }
 
@@ -4255,7 +8807,148 @@ endmodule
 }
 
 #[test]
-fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
+fn slang_ast_direct_lowering_supports_timeunit_and_timeprecision_functions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-timeunit-functions");
+    let source_path = root.join("timeunit_functions.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module timeunit_functions_leaf(
+  output int leaf_unit,
+  output int leaf_precision
+);
+  timeunit 100ns;
+  timeprecision 1ns;
+  initial begin
+    leaf_unit = $timeunit;
+    leaf_precision = $timeprecision;
+  end
+endmodule
+
+module timeunit_functions_probe(
+  output int top_unit,
+  output int top_precision,
+  output int leaf_unit,
+  output int leaf_precision
+);
+  timeunit 10ns;
+  timeprecision 1ps;
+  timeunit_functions_leaf leaf(
+    .leaf_unit(leaf_unit),
+    .leaf_precision(leaf_precision)
+  );
+  initial begin
+    top_unit = $timeunit;
+    top_precision = $timeprecision;
+  end
+endmodule
+"#,
+    )
+    .expect("write timeunit-function source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("timeunit_functions_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower $timeunit and $timeprecision");
+    assert_eq!(design.time_scale.precision_exponent, -12);
+
+    let ast_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("timeunit_functions_probe"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize timeunit-function AST");
+    let mut summary = slang
+        .summarize_ast_json(&ast_json)
+        .expect("summarize timeunit-function AST");
+    summary
+        .validate_against_design(&design)
+        .expect("exact timeunit-function fingerprints should match");
+
+    fn corrupt_timeunit(expression: &mut eda_slang::SlangExpressionSummary) -> bool {
+        if expression.kind == "Call" && expression.operator == "$timeunit" {
+            expression.simulation_time_unit = Some(-7);
+            return true;
+        }
+        expression.operands.iter_mut().any(corrupt_timeunit)
+    }
+    if let Some(assignment) = summary.procedural_blocks.iter_mut().find_map(|block| {
+        block.assignments.iter_mut().find(|assignment| {
+            assignment
+                .target_names
+                .first()
+                .is_some_and(|name| name == "top_unit")
+        })
+    }) {
+        assert!(
+            corrupt_timeunit(&mut assignment.rhs),
+            "$timeunit fingerprint was not found"
+        );
+    } else {
+        panic!("top_unit assignment was not summarized");
+    }
+    let wrong_unit_error = summary
+        .validate_against_design(&design)
+        .expect_err("wrong $timeunit exponent must fail");
+    let wrong_unit_bits = LogicWord::from_u64(32, -7_i32 as u32 as u64).to_bin_str();
+    let correct_unit_bits = LogicWord::from_u64(32, -8_i32 as u32 as u64).to_bin_str();
+    assert!(
+        wrong_unit_error.contains(&format!("Const:32:s[32:{wrong_unit_bits}]"))
+            && wrong_unit_error.contains(&format!("Const:32:s[32:{correct_unit_bits}]")),
+        "unexpected timeunit fingerprint error: {wrong_unit_error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create timeunit-function simulator");
+    simulator.run_until(0).expect("run initial assignments");
+    let expected = [
+        ("top_unit", -8_i32),
+        ("top_precision", -12_i32),
+        ("leaf_unit", -7_i32),
+        ("leaf_precision", -12_i32),
+    ];
+    for (name, value) in expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(u64::from(value as u32)),
+            "unexpected {name} value"
+        );
+    }
+
+    let argument_path = root.join("timeunit_argument.sv");
+    std::fs::write(
+        &argument_path,
+        r#"
+module timeunit_argument(output int unit);
+  timeunit 10ns;
+  timeprecision 1ps;
+  initial unit = $timeunit($root);
+endmodule
+"#,
+    )
+    .expect("write timeunit-argument source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&argument_path),
+            Some("timeunit_argument"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("argument-bearing timeunit functions must fail closed");
+    assert!(
+        error.contains("$timeunit does not take arguments"),
+        "unexpected timeunit-argument error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_realtime() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
     };
@@ -4264,22 +8957,3190 @@ fn slang_ast_direct_lowering_rejects_realtime_until_real_types_exist() {
     std::fs::write(
         &source_path,
         r#"
-module realtime_probe(output logic [63:0] now_realtime);
-  initial now_realtime = $realtime;
+module realtime_leaf(output logic tick);
+  timeunit 1ns;
+  timeprecision 1ps;
+  initial #1 tick = 1;
+endmodule
+
+module realtime_probe(output realtime now_realtime);
+  timeunit 10ns;
+  timeprecision 1ns;
+  logic tick;
+  realtime_leaf leaf(.tick(tick));
+  always @(tick) now_realtime = $realtime;
 endmodule
 "#,
     )
     .expect("write realtime source");
-    let error = slang
+    let design = slang
         .compile_files_via_ast(
             std::slice::from_ref(&source_path),
             Some("realtime_probe"),
             &PreprocessOptions::default(),
         )
-        .expect_err("realtime requires a real type model and must fail closed");
+        .expect("directly lower $realtime");
+    assert_eq!(design.time_scale.precision_exponent, -12);
+
+    let mut simulator = Simulator::new(&design).expect("create realtime simulator");
+    simulator.run_until(1_000).expect("run realtime timeline");
+    let realtime_bits = simulator.read("now_realtime").unwrap();
+    let realtime = f64::from_bits(realtime_bits.to_u64().expect("known realtime"));
     assert!(
-        error.contains("unknown function '$realtime'") || error.contains("cannot resolve"),
-        "unexpected realtime error: {error}"
+        (realtime - 0.1).abs() < f64::EPSILON,
+        "unexpected $realtime value: {realtime}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_realtime_data_type() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-realtime-type");
+    let source_path = root.join("realtime_type.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module realtime_type_probe(
+  input realtime operand,
+  output realtime rounded,
+  output realtime sum,
+  output realtime negated,
+  output real widened,
+  output int rounded_int,
+  output logic greater,
+  output string pattern,
+  output string exponent,
+  output string fixed,
+  output string general
+);
+  initial rounded = 1.25;
+  always @(*) begin
+    sum = rounded + operand;
+    negated = -rounded;
+    widened = rounded;
+    rounded_int = rounded;
+    greater = rounded > 0.5;
+    pattern = $sformatf("%p", rounded);
+    exponent = $sformatf("%e", rounded);
+    fixed = $sformatf("%f", rounded);
+    general = $sformatf("%g", rounded);
+  end
+endmodule
+"#,
+    )
+    .expect("write realtime-type source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("realtime_type_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower realtime data type");
+    assert!(design.net_decls.iter().any(|declaration| {
+        declaration.name == "rounded" && declaration.width == 64 && declaration.is_signed
+    }));
+
+    let mut simulator = Simulator::new(&design).expect("create realtime-type simulator");
+    let rounded = 1.25_f64;
+    for operand in [
+        0.5_f64,
+        f64::from_bits(1),
+        f64::INFINITY,
+        f64::from_bits(0x7ff8_0000_0000_0000),
+    ] {
+        simulator
+            .set_input("operand", &LogicWord::from_u64(64, operand.to_bits()))
+            .expect("set realtime operand");
+        simulator
+            .run_until(0)
+            .expect("evaluate realtime operations");
+
+        fn realtime_output(simulator: &Simulator, name: &str) -> f64 {
+            let bits = simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing realtime output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("realtime output {name} is unknown"));
+            f64::from_bits(bits)
+        }
+
+        assert_eq!(realtime_output(&simulator, "rounded"), rounded);
+        let sum = realtime_output(&simulator, "sum");
+        let expected_sum = rounded + operand;
+        if expected_sum.is_nan() {
+            assert!(sum.is_nan());
+        } else {
+            assert_eq!(sum, expected_sum);
+        }
+        assert_eq!(
+            realtime_output(&simulator, "negated").to_bits(),
+            (-rounded).to_bits()
+        );
+        assert_eq!(realtime_output(&simulator, "widened"), rounded);
+        assert_eq!(simulator.read("rounded_int").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("greater").unwrap().to_u64(), Some(1));
+        assert_eq!(
+            simulator
+                .read("pattern")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.25"
+        );
+        assert_eq!(
+            simulator
+                .read("exponent")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.250000e+00"
+        );
+        assert_eq!(
+            simulator
+                .read("fixed")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.250000"
+        );
+        assert_eq!(
+            simulator
+                .read("general")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.25"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_fixed_real_arrays() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-real-array");
+    let source_path = root.join("real_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module real_array_probe(
+  input int index,
+  input int row,
+  input int column,
+  output real first,
+  output real second,
+  output real sum,
+  output real negated,
+  output real selected,
+  output realtime stamp,
+  output real grid_sum,
+  output real grid_selected
+);
+  real values[0:2];
+  realtime stamps[0:1];
+  real grid[0:1][1:2];
+  initial begin
+    values[0] = 1.25;
+    values[1] = 2.5;
+    values[2] = values[0] + values[1];
+    stamps[0] = 10.25;
+    stamps[1] = stamps[0] + 0.5;
+    grid[0][1] = 4.25;
+    grid[0][2] = 5.5;
+    grid[1][1] = grid[0][1] + grid[0][2];
+    grid[1][2] = -grid[0][2];
+    grid_sum = grid[1][1];
+    first = values[0];
+    second = values[1];
+    sum = values[2];
+    negated = -values[1];
+  end
+  always @(*) selected = values[index];
+  always @(*) stamp = stamps[index];
+  always @(*) grid_selected = grid[row][column];
+endmodule
+"#,
+    )
+    .expect("write real-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("real_array_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fixed real arrays");
+    assert_eq!(design.memories.len(), 3);
+    assert_eq!(design.memories[0].element_width, 64);
+
+    let mut simulator = Simulator::new(&design).expect("create real-array simulator");
+    simulator.run_until(0).expect("execute real-array writes");
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    assert_eq!(real_output(&simulator, "first"), 1.25);
+    assert_eq!(real_output(&simulator, "second"), 2.5);
+    assert_eq!(real_output(&simulator, "sum"), 3.75);
+    assert_eq!(real_output(&simulator, "negated"), -2.5);
+    assert_eq!(real_output(&simulator, "grid_sum"), 9.75);
+    for (index, expected) in [(0, 1.25), (1, 2.5), (2, 3.75)] {
+        simulator
+            .set_input("index", &LogicWord::from_u64(32, index))
+            .expect("set real-array index");
+        simulator.run_until(0).expect("select real-array element");
+        assert_eq!(
+            real_output(&simulator, "selected"),
+            expected,
+            "unexpected real-array element {index}"
+        );
+    }
+    for (index, expected) in [(0, 10.25), (1, 10.75)] {
+        simulator
+            .set_input("index", &LogicWord::from_u64(32, index))
+            .expect("set realtime-array index");
+        simulator
+            .run_until(0)
+            .expect("select realtime-array element");
+        assert_eq!(
+            real_output(&simulator, "stamp"),
+            expected,
+            "unexpected realtime-array element {index}"
+        );
+    }
+    for ((row, column), expected) in [
+        ((0, 1), 4.25),
+        ((0, 2), 5.5),
+        ((1, 1), 9.75),
+        ((1, 2), -5.5),
+    ] {
+        simulator
+            .set_input("row", &LogicWord::from_u64(32, row))
+            .expect("set real-array row");
+        simulator
+            .set_input("column", &LogicWord::from_u64(32, column))
+            .expect("set real-array column");
+        simulator
+            .run_until(0)
+            .expect("select multidimensional real element");
+        assert_eq!(
+            real_output(&simulator, "grid_selected"),
+            expected,
+            "unexpected real grid element {row}/{column}"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_fixed_shortreal_arrays() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-shortreal-array");
+    let source_path = root.join("shortreal_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module shortreal_array_probe(
+  input int index,
+  input int row,
+  input int column,
+  output shortreal first,
+  output shortreal second,
+  output shortreal sum,
+  output shortreal negated,
+  output shortreal selected,
+  output shortreal grid_sum,
+  output shortreal grid_selected
+);
+  shortreal values[0:2];
+  shortreal grid[0:1][1:2];
+  initial begin
+    values[0] = 1.25;
+    values[1] = 2.5;
+    values[2] = values[0] + values[1];
+    grid[0][1] = 4.25;
+    grid[0][2] = 5.5;
+    grid[1][1] = grid[0][1] + grid[0][2];
+    grid[1][2] = -grid[0][2];
+    grid_sum = grid[1][1];
+    first = values[0];
+    second = values[1];
+    sum = values[2];
+    negated = -values[1];
+  end
+  always @(*) selected = values[index];
+  always @(*) grid_selected = grid[row][column];
+endmodule
+"#,
+    )
+    .expect("write shortreal-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("shortreal_array_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fixed shortreal arrays");
+    assert_eq!(design.memories.len(), 2);
+    assert_eq!(design.memories[0].element_width, 32);
+
+    let mut simulator = Simulator::new(&design).expect("create shortreal-array simulator");
+    simulator
+        .run_until(0)
+        .expect("execute shortreal-array writes");
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+    assert_eq!(shortreal_output(&simulator, "first"), 1.25_f32);
+    assert_eq!(shortreal_output(&simulator, "second"), 2.5_f32);
+    assert_eq!(shortreal_output(&simulator, "sum"), 3.75_f32);
+    assert_eq!(
+        shortreal_output(&simulator, "negated").to_bits(),
+        (-2.5_f32).to_bits()
+    );
+    assert_eq!(shortreal_output(&simulator, "grid_sum"), 9.75_f32);
+    for (index, expected) in [(0, 1.25_f32), (1, 2.5), (2, 3.75)] {
+        simulator
+            .set_input("index", &LogicWord::from_u64(32, index))
+            .expect("set shortreal-array index");
+        simulator
+            .run_until(0)
+            .expect("select shortreal-array element");
+        assert_eq!(
+            shortreal_output(&simulator, "selected"),
+            expected,
+            "unexpected shortreal-array element {index}"
+        );
+    }
+    for ((row, column), expected) in [
+        ((0, 1), 4.25_f32),
+        ((0, 2), 5.5),
+        ((1, 1), 9.75),
+        ((1, 2), -5.5),
+    ] {
+        simulator
+            .set_input("row", &LogicWord::from_u64(32, row))
+            .expect("set shortreal-array row");
+        simulator
+            .set_input("column", &LogicWord::from_u64(32, column))
+            .expect("set shortreal-array column");
+        simulator
+            .run_until(0)
+            .expect("select multidimensional shortreal element");
+        assert_eq!(
+            shortreal_output(&simulator, "grid_selected"),
+            expected,
+            "unexpected shortreal grid element {row}/{column}"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_floating_arrays() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-floating-array");
+    let source_path = root.join("dynamic_floating_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_floating_array(
+  input int requested_size,
+  output int real_size,
+  output int compact_size,
+  output int deleted_size,
+  output int realtime_size,
+  output real first,
+  output real last,
+  output real sum,
+  output real out_of_bounds,
+  output shortreal compact_first,
+  output shortreal compact_last,
+  output shortreal compact_sum,
+  output realtime realtime_first,
+  output realtime realtime_last,
+  output realtime realtime_sum
+);
+  real values[];
+  shortreal compact_values[];
+  realtime timeline[];
+  initial begin
+    #1;
+    values = new[requested_size];
+    real_size = values.size();
+    values[0] = 1.25;
+    values[requested_size - 1] = 2.5;
+    first = values[0];
+    last = values[requested_size - 1];
+    sum = values[0] + values[requested_size - 1];
+    out_of_bounds = values[requested_size];
+
+    compact_values = new[3];
+    compact_size = compact_values.size();
+    compact_values[0] = 0.25;
+    compact_values[2] = compact_values[0] + 1.5;
+    compact_first = compact_values[0];
+    compact_last = compact_values[2];
+    compact_sum = compact_values[0] + compact_values[2];
+
+    timeline = new[3];
+    realtime_size = timeline.size();
+    timeline[0] = 0.5;
+    timeline[2] = 1.25;
+    realtime_first = timeline[0];
+    realtime_last = timeline[2];
+    realtime_sum = timeline[0] + timeline[2];
+
+    values.delete();
+    deleted_size = values.size();
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic floating-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_floating_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic floating arrays");
+    assert_eq!(design.memories.len(), 3);
+    assert!(design.memories.iter().all(|memory| memory.dynamic));
+    assert_eq!(design.memories[0].element_width, 64);
+    assert_eq!(design.memories[1].element_width, 32);
+    assert_eq!(design.memories[2].element_width, 64);
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic floating simulator");
+    simulator
+        .set_input("requested_size", &LogicWord::from_u64(32, 3))
+        .expect("set dynamic floating-array size");
+    simulator
+        .run_until(2)
+        .expect("run dynamic floating lifecycle");
+
+    assert_eq!(simulator.read("real_size").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("compact_size").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(0));
+    assert_eq!(simulator.read("realtime_size").unwrap().to_u64(), Some(3));
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing dynamic real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("dynamic real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing dynamic shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("dynamic shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("dynamic shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "first"), 1.25);
+    assert_eq!(real_output(&simulator, "last"), 2.5);
+    assert_eq!(real_output(&simulator, "sum"), 3.75);
+    assert!(!simulator.read("out_of_bounds").unwrap().is_fully_known());
+    assert_eq!(shortreal_output(&simulator, "compact_first"), 0.25_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_last"), 1.75_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_sum"), 2.0_f32);
+    assert_eq!(real_output(&simulator, "realtime_first"), 0.5);
+    assert_eq!(real_output(&simulator, "realtime_last"), 1.25);
+    assert_eq!(real_output(&simulator, "realtime_sum"), 1.75);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_queue_lifecycle() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-queue");
+    let source_path = root.join("floating_queue.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_queue(
+  output int real_size,
+  output int real_popped_size,
+  output int compact_size,
+  output int compact_popped_size,
+  output int realtime_size,
+  output int inserted_size,
+  output int deleted_size,
+  output real first,
+  output real second,
+  output real front,
+  output real back,
+  output shortreal compact_first,
+  output shortreal compact_second,
+  output shortreal compact_front,
+  output shortreal compact_back,
+  output shortreal compact_inserted_first,
+  output shortreal compact_inserted_second,
+  output shortreal compact_inserted_third,
+  output shortreal compact_deleted_first,
+  output shortreal compact_deleted_second,
+  output realtime timeline_first,
+  output realtime timeline_second
+);
+  real values[$];
+  shortreal compact_values[$];
+  realtime timeline[$];
+
+  initial begin
+    #1;
+    values.push_back(1.25);
+    values.push_front(0.5);
+    real_size = values.size();
+    first = values[0];
+    second = values[1];
+    front = values.pop_front();
+    back = values.pop_back();
+    real_popped_size = values.size();
+
+    values.push_back(2.5);
+    values.push_front(1.25);
+    values.insert(1, 3.75);
+    inserted_size = values.size();
+    first = values[0];
+    second = values[1];
+    values.delete(0);
+    deleted_size = values.size();
+
+    compact_values.push_back(1.5);
+    compact_values.push_front(0.25);
+    compact_size = compact_values.size();
+    compact_first = compact_values[0];
+    compact_second = compact_values[1];
+    compact_front = compact_values.pop_front();
+    compact_back = compact_values.pop_back();
+    compact_popped_size = compact_values.size();
+
+    compact_values.push_back(4.5);
+    compact_values.push_front(0.75);
+    compact_values.insert(1, 2.25);
+    compact_inserted_first = compact_values[0];
+    compact_inserted_second = compact_values[1];
+    compact_inserted_third = compact_values[2];
+    compact_values.delete(0);
+    compact_deleted_first = compact_values[0];
+    compact_deleted_second = compact_values[1];
+
+    timeline.push_back(10.25);
+    timeline.push_front(9.5);
+    realtime_size = timeline.size();
+    timeline_first = timeline[0];
+    timeline_second = timeline[1];
+  end
+endmodule
+"#,
+    )
+    .expect("write floating-queue source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_queue"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating queues");
+    assert_eq!(design.memories.len(), 3);
+    assert!(design.memories.iter().all(|memory| memory.queue));
+    assert_eq!(design.memories[0].element_width, 64);
+    assert_eq!(design.memories[1].element_width, 32);
+    assert_eq!(design.memories[2].element_width, 64);
+
+    let mut simulator = Simulator::new(&design).expect("create floating-queue simulator");
+    simulator
+        .run_until(1)
+        .expect("run floating queue lifecycle");
+
+    assert_eq!(simulator.read("real_size").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("real_popped_size").unwrap().to_u64(),
+        Some(0)
+    );
+    assert_eq!(simulator.read("compact_size").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("compact_popped_size").unwrap().to_u64(),
+        Some(0)
+    );
+    assert_eq!(simulator.read("realtime_size").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("inserted_size").unwrap().to_u64(), Some(3));
+    assert_eq!(simulator.read("deleted_size").unwrap().to_u64(), Some(2));
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating-queue real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating-queue real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating-queue shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("floating-queue shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("floating-queue shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "first"), 1.25);
+    assert_eq!(real_output(&simulator, "second"), 3.75);
+    assert_eq!(real_output(&simulator, "front"), 0.5);
+    assert_eq!(real_output(&simulator, "back"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "compact_first"), 0.25_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_second"), 1.5_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_front"), 0.25_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_back"), 1.5_f32);
+    assert_eq!(
+        shortreal_output(&simulator, "compact_inserted_first"),
+        0.75_f32
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "compact_inserted_second"),
+        2.25_f32
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "compact_inserted_third"),
+        4.5_f32
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "compact_deleted_first"),
+        2.25_f32
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "compact_deleted_second"),
+        4.5_f32
+    );
+    assert_eq!(real_output(&simulator, "timeline_first"), 9.5);
+    assert_eq!(real_output(&simulator, "timeline_second"), 10.25);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_associative_arrays() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-associative");
+    let source_path = root.join("floating_associative.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_associative(
+  input int key,
+  output int real_count,
+  output int real_deleted_count,
+  output int real_exists_before,
+  output int real_exists_after,
+  output int compact_count,
+  output int compact_deleted_count,
+  output int realtime_count,
+  output real first,
+  output real second,
+  output real sum,
+  output real missing,
+  output shortreal compact_first,
+  output shortreal compact_second,
+  output shortreal compact_sum,
+  output shortreal compact_missing,
+  output realtime timeline_first,
+  output realtime timeline_second,
+  output realtime timeline_missing
+);
+  real values[int];
+  shortreal compact_values[int];
+  realtime timeline[int];
+
+  initial begin
+    #1;
+    values[key] = 1.25;
+    values[key + 1] = 2.5;
+    real_count = values.num();
+    real_exists_before = values.exists(key);
+    first = values[key];
+    second = values[key + 1];
+    sum = values[key] + values[key + 1];
+    missing = values[key + 99];
+    values.delete(key);
+    real_exists_after = values.exists(key);
+    real_deleted_count = values.num();
+
+    compact_values[key] = 0.25;
+    compact_values[key + 1] = 1.5;
+    compact_count = compact_values.num();
+    compact_first = compact_values[key];
+    compact_second = compact_values[key + 1];
+    compact_sum = compact_values[key] + compact_values[key + 1];
+    compact_missing = compact_values[key + 99];
+    compact_values.delete(key);
+    compact_deleted_count = compact_values.num();
+
+    timeline[key] = 9.5;
+    timeline[key + 1] = 10.25;
+    realtime_count = timeline.num();
+    timeline_first = timeline[key];
+    timeline_second = timeline[key + 1];
+    timeline_missing = timeline[key + 99];
+  end
+endmodule
+"#,
+    )
+    .expect("write floating associative-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_associative"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating associative arrays");
+    assert_eq!(design.memories.len(), 3);
+    assert!(design.memories.iter().all(|memory| memory.associative));
+    assert_eq!(design.memories[0].element_width, 64);
+    assert_eq!(design.memories[1].element_width, 32);
+    assert_eq!(design.memories[2].element_width, 64);
+
+    let mut simulator = Simulator::new(&design).expect("create floating associative simulator");
+    simulator
+        .set_input("key", &LogicWord::from_u64(32, 7))
+        .expect("set floating associative key");
+    simulator
+        .run_until(1)
+        .expect("run floating associative lifecycle");
+
+    assert_eq!(simulator.read("real_count").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("real_exists_before").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        simulator.read("real_exists_after").unwrap().to_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        simulator.read("real_deleted_count").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(simulator.read("compact_count").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("compact_deleted_count").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(simulator.read("realtime_count").unwrap().to_u64(), Some(2));
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating associative real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating associative real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating associative shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| {
+                    panic!("floating associative shortreal output {name} is unknown")
+                }),
+        )
+        .unwrap_or_else(|_| panic!("floating associative shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "first"), 1.25);
+    assert_eq!(real_output(&simulator, "second"), 2.5);
+    assert_eq!(real_output(&simulator, "sum"), 3.75);
+    assert!(!simulator.read("missing").unwrap().is_fully_known());
+    assert_eq!(shortreal_output(&simulator, "compact_first"), 0.25_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_second"), 1.5_f32);
+    assert_eq!(shortreal_output(&simulator, "compact_sum"), 1.75_f32);
+    assert!(!simulator.read("compact_missing").unwrap().is_fully_known());
+    assert_eq!(real_output(&simulator, "timeline_first"), 9.5);
+    assert_eq!(real_output(&simulator, "timeline_second"), 10.25);
+    assert!(!simulator.read("timeline_missing").unwrap().is_fully_known());
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_mixed_floating_type_conversions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-mixed-floating-conversions");
+    let source_path = root.join("mixed_floating_conversions.sv");
+    let include_path = root.join("mixed_floating_conversion_values.svh");
+    std::fs::write(
+        &include_path,
+        r#"int unsigned included_unsigned = 32'hffff_ffff;
+"#,
+    )
+    .expect("write included unsigned source");
+    std::fs::write(
+        &source_path,
+        r#"
+module mixed_floating_conversions(
+  output int unsigned unsigned_port, output int signed signed_port, output real unsigned_port_as_real, output real signed_port_as_real,
+  output real paired_first_as_real, output real paired_second_as_real,
+  output real byte_unsigned_as_real, output real shortint_unsigned_as_real, output real integer_unsigned_as_real, output real longint_unsigned_as_real,
+  output real byte_signed_as_real, output real shortint_signed_as_real, output real integer_signed_as_real, output real longint_signed_as_real,
+  output real widened_compact,
+  output shortreal rounded_wide,
+  output real signed_int_as_real,
+  output shortreal signed_int_as_compact,
+  output real unsigned_int_as_real,
+  output real aliased_unsigned_as_real,
+  output real included_unsigned_as_real,
+  output int positive_half_as_int,
+  output int negative_half_as_int,
+  output int compact_half_as_int,
+  output realtime realtime_value,
+  output real realtime_as_real,
+  output realtime real_as_realtime,
+  output real mixed_add,
+  output real mixed_add_reverse,
+  output real mixed_divide,
+  output shortreal compact_result
+);
+`include "mixed_floating_conversion_values.svh"
+typedef int unsigned unsigned_alias_t;
+unsigned_alias_t aliased_unsigned = 32'hffff_ffff;
+  shortreal compact = 0.1;
+  real wide = 1.23456789;
+  int signed_value = -7;
+  int unsigned unsigned_value = 32'hffff_ffff;
+  int unsigned paired_first = 32'hffff_ffff, paired_second = 32'hffff_ffff;
+  byte unsigned byte_unsigned = 8'hff;
+  shortint unsigned shortint_unsigned = 16'hffff;
+  integer unsigned integer_unsigned = 32'hffff_ffff;
+  longint unsigned longint_unsigned = 64'hffff_ffff_ffff_ffff;
+  byte signed byte_signed = -128;
+  shortint signed shortint_signed = -32768;
+  integer signed integer_signed = -2147483648;
+  longint signed longint_signed = 64'h8000_0000_0000_0000;
+  realtime time_value = 12.5;
+
+  initial begin
+    widened_compact = real'(compact);
+    rounded_wide = shortreal'(wide);
+    signed_int_as_real = real'(signed_value);
+    signed_int_as_compact = shortreal'(signed_value);
+    unsigned_int_as_real = real'(unsigned_value);
+    unsigned_port = 32'hffff_ffff;
+    signed_port = -7;
+    unsigned_port_as_real = real'(unsigned_port);
+    signed_port_as_real = real'(signed_port);
+    aliased_unsigned_as_real = real'(aliased_unsigned);
+    included_unsigned_as_real = real'(included_unsigned);
+    paired_first_as_real = real'(paired_first);
+    paired_second_as_real = real'(paired_second);
+    byte_unsigned_as_real = real'(byte_unsigned);
+    shortint_unsigned_as_real = real'(shortint_unsigned);
+    integer_unsigned_as_real = real'(integer_unsigned);
+    longint_unsigned_as_real = real'(longint_unsigned);
+    byte_signed_as_real = real'(byte_signed);
+    shortint_signed_as_real = real'(shortint_signed);
+    integer_signed_as_real = real'(integer_signed);
+    longint_signed_as_real = real'(longint_signed);
+    positive_half_as_int = int'(1.5);
+    negative_half_as_int = int'(-1.5);
+    compact_half_as_int = int'(shortreal'(2.5));
+
+    realtime_value = time_value;
+    realtime_as_real = real'(time_value);
+    real_as_realtime = realtime'(wide);
+
+    mixed_add = wide + compact;
+    mixed_add_reverse = compact + wide;
+    mixed_divide = wide / compact;
+    compact_result = shortreal'(wide + compact);
+  end
+endmodule
+"#,
+    )
+    .expect("write mixed-floating-conversion source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("mixed_floating_conversions"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower mixed floating conversions");
+
+    let conversion_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("mixed_floating_conversions"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize mixed-floating-conversion AST");
+    let mut conversion_summary = slang
+        .summarize_ast_json(&conversion_json)
+        .expect("summarize mixed-floating-conversion AST");
+    conversion_summary
+        .validate_against_design(&design)
+        .expect("exact mixed-floating-conversion fingerprints should match");
+    if let Some(assignment) = conversion_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "rounded_wide")
+            })
+        })
+    {
+        if let Some(operand) = assignment.rhs.operands.first_mut() {
+            operand.kind = "NamedValue".into();
+            operand.symbol = Some("wrong_wide".into());
+            operand.symbol_id = None;
+            operand.literal = None;
+            operand.type_width = Some(64);
+            operand.type_signed = Some(true);
+            operand.operands.clear();
+        }
+    }
+    let wrong_conversion_error = conversion_summary
+        .validate_against_design(&design)
+        .expect_err("wrong mixed-floating conversion operand must fail");
+    assert!(
+        wrong_conversion_error.contains("wrong_wide")
+            || wrong_conversion_error.contains("1.23456789"),
+        "unexpected mixed-floating conversion error: {wrong_conversion_error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create mixed-conversion simulator");
+    simulator
+        .run_until(0)
+        .expect("execute mixed floating conversions");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing mixed-conversion real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("mixed-conversion real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing mixed-conversion shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("mixed-conversion shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("mixed-conversion shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    let widened = f64::from(0.1_f32);
+    assert_eq!(real_output(&simulator, "widened_compact"), widened);
+    assert_eq!(
+        shortreal_output(&simulator, "rounded_wide"),
+        1.23456789_f64 as f32
+    );
+    assert_eq!(real_output(&simulator, "signed_int_as_real"), -7.0);
+    assert_eq!(
+        shortreal_output(&simulator, "signed_int_as_compact"),
+        -7.0_f32
+    );
+    assert_eq!(
+        real_output(&simulator, "unsigned_int_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "unsigned_port_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(real_output(&simulator, "signed_port_as_real"), -7.0);
+    assert_eq!(
+        real_output(&simulator, "paired_first_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "paired_second_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "aliased_unsigned_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "included_unsigned_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "byte_unsigned_as_real"),
+        u8::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "shortint_unsigned_as_real"),
+        u16::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "integer_unsigned_as_real"),
+        u32::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "longint_unsigned_as_real"),
+        u64::MAX as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "byte_signed_as_real"),
+        i8::MIN as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "shortint_signed_as_real"),
+        i16::MIN as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "integer_signed_as_real"),
+        i32::MIN as f64
+    );
+    assert_eq!(
+        real_output(&simulator, "longint_signed_as_real"),
+        i64::MIN as f64
+    );
+    assert_eq!(
+        simulator.read("positive_half_as_int").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        simulator.read("negative_half_as_int").unwrap().to_u64(),
+        Some(u64::from(-2_i32 as u32))
+    );
+    assert_eq!(
+        simulator.read("compact_half_as_int").unwrap().to_u64(),
+        Some(3)
+    );
+    assert_eq!(real_output(&simulator, "realtime_value"), 12.5);
+    assert_eq!(real_output(&simulator, "realtime_as_real"), 12.5);
+    assert_eq!(real_output(&simulator, "real_as_realtime"), 1.23456789);
+    assert_eq!(real_output(&simulator, "mixed_add"), 1.23456789 + widened);
+    assert_eq!(
+        real_output(&simulator, "mixed_add_reverse"),
+        widened + 1.23456789
+    );
+    assert_eq!(
+        real_output(&simulator, "mixed_divide"),
+        1.23456789 / widened
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "compact_result"),
+        (1.23456789 + widened) as f32
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_explicit_package_exports() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-package-exports");
+    let source_path = root.join("package_exports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package internal_pkg;
+  typedef logic [15:0] wide_t;
+  typedef int count_t;
+  parameter string MESSAGE = "EXPORT";
+  parameter int VALUE = 41;
+endpackage
+
+package export_pkg;
+  import internal_pkg::*;
+  export internal_pkg::wide_t;
+  export internal_pkg::count_t;
+  export internal_pkg::MESSAGE;
+  export internal_pkg::VALUE;
+endpackage
+
+module package_export_top
+  import export_pkg::wide_t,
+          export_pkg::count_t,
+          export_pkg::MESSAGE,
+          export_pkg::VALUE;
+(
+  output wide_t wide,
+  output count_t count,
+  output string message,
+  output int value
+);
+  assign wide = 16'h5a5a;
+  assign count = 7;
+  assign message = MESSAGE;
+  assign value = VALUE;
+endmodule
+"#,
+    )
+    .expect("write package-export source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("package_export_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower explicit package exports");
+    let export_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("package_export_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize package-export AST");
+    let export_summary = slang
+        .summarize_ast_json(&export_json)
+        .expect("summarize package-export AST");
+    export_summary
+        .validate_against_design(&design)
+        .expect("exact package-export fingerprints should match");
+
+    let mut simulator = Simulator::new(&design).expect("create package-export simulator");
+    simulator.run_until(0).expect("execute package exports");
+    assert_eq!(simulator.read("wide").unwrap().to_u64(), Some(0x5a5a));
+    assert_eq!(simulator.read("count").unwrap().to_u64(), Some(7));
+    assert_eq!(
+        simulator
+            .read("message")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "EXPORT"
+    );
+    assert_eq!(simulator.read("value").unwrap().to_u64(), Some(41));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_simple_let_expressions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-simple-let");
+    let source_path = root.join("simple_let.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+let identity_value(int value) = value;
+let max_value(int left, int right) = left > right ? left : right;
+
+module simple_let_top(
+  output int continuous_max,
+  output int procedural_identity,
+  output int negative_identity
+);
+  assign continuous_max = max_value(3, 9);
+  initial begin
+    procedural_identity = identity_value(17);
+    negative_identity = identity_value(-5);
+  end
+endmodule
+"#,
+    )
+    .expect("write simple-let source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("simple_let_top"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower simple let expressions");
+    let let_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("simple_let_top"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize simple-let AST");
+    let let_summary = slang
+        .summarize_ast_json(&let_json)
+        .expect("summarize simple-let AST");
+    let_summary
+        .validate_against_design(&design)
+        .expect("exact simple-let fingerprints should match");
+
+    let mut simulator = Simulator::new(&design).expect("create simple-let simulator");
+    simulator
+        .run_until(0)
+        .expect("execute simple let expressions");
+    assert_eq!(simulator.read("continuous_max").unwrap().to_u64(), Some(9));
+    assert_eq!(
+        simulator.read("procedural_identity").unwrap().to_u64(),
+        Some(17)
+    );
+    assert_eq!(
+        simulator.read("negative_identity").unwrap().to_u64(),
+        Some(-5_i32 as u32 as u64)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_mixed_predefined_integer_semantics() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-mixed-predefined-integers");
+    let source_path = root.join("mixed_predefined_integers.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module mixed_predefined_integers(
+  input logic condition,
+  output logic signed_less_than_unsigned,
+  output logic signed_greater_than_unsigned,
+  output byte signed byte_from_long,
+  output byte unsigned byte_unsigned_from_signed,
+  output longint unsigned long_unsigned_from_byte_signed,
+  output shortint unsigned short_unsigned_from_int_signed,
+  output int signed int_signed_from_short_unsigned,
+  output int signed signed_byte_sum_as_int,
+  output int unsigned unsigned_byte_sum_as_int,
+  output int signed arithmetic_shift_right,
+  output int signed logical_shift_right,
+  output int signed logical_shift_left,
+  output int unsigned mixed_unsigned_division,
+  output int unsigned mixed_unsigned_modulus,
+  output int signed conditional_signed_narrow
+);
+  int signed signed_minus_one = -1;
+  int unsigned unsigned_one = 1;
+  longint signed signed_long_source = -12345;
+  byte signed signed_byte_source = -1;
+  byte signed signed_byte_sum_operand = -128;
+  byte unsigned unsigned_byte_sum_operand = 128;
+  shortint unsigned unsigned_half_pattern = 16'h8000;
+  int signed shift_source = -8;
+  int unsigned unsigned_divisor = 2;
+  byte signed conditional_byte = -1;
+  int signed conditional_int = 0;
+
+  assign signed_less_than_unsigned = signed_minus_one < unsigned_one;
+  assign signed_greater_than_unsigned = signed_minus_one > unsigned_one;
+  assign byte_from_long = byte'(signed_long_source);
+  assign byte_unsigned_from_signed = byte unsigned'(signed_byte_source);
+  assign long_unsigned_from_byte_signed = longint unsigned'(signed_byte_source);
+  assign short_unsigned_from_int_signed = shortint unsigned'(signed_minus_one);
+  assign int_signed_from_short_unsigned = int'(unsigned_half_pattern);
+  assign signed_byte_sum_as_int = signed_byte_sum_operand + signed_byte_sum_operand;
+  assign unsigned_byte_sum_as_int = unsigned_byte_sum_operand + unsigned_byte_sum_operand;
+  assign arithmetic_shift_right = shift_source >>> 1;
+  assign logical_shift_right = shift_source >> 1;
+  assign logical_shift_left = shift_source << 1;
+  assign mixed_unsigned_division = signed_minus_one / unsigned_divisor;
+  assign mixed_unsigned_modulus = signed_minus_one % unsigned_divisor;
+  assign conditional_signed_narrow = condition ? conditional_byte : conditional_int;
+endmodule
+"#,
+    )
+    .expect("write mixed predefined-integer source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("mixed_predefined_integers"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower mixed predefined integers");
+    let integer_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("mixed_predefined_integers"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize mixed predefined-integer AST");
+    let integer_summary = slang
+        .summarize_ast_json(&integer_json)
+        .expect("summarize mixed predefined-integer AST");
+    integer_summary
+        .validate_against_design(&design)
+        .expect("exact mixed predefined-integer fingerprints should match");
+
+    let mut simulator = Simulator::new(&design).expect("create mixed-integer simulator");
+    simulator
+        .run_until(0)
+        .expect("execute mixed predefined integers");
+    assert_eq!(
+        simulator
+            .read("signed_less_than_unsigned")
+            .unwrap()
+            .to_u64(),
+        Some(0),
+        "mixed signed/unsigned comparison must use unsigned semantics"
+    );
+    assert_eq!(
+        simulator
+            .read("signed_greater_than_unsigned")
+            .unwrap()
+            .to_u64(),
+        Some(1),
+        "-1 compared with unsigned one must order as a large unsigned value"
+    );
+    assert_eq!(
+        simulator.read("byte_from_long").unwrap().to_u64(),
+        Some(u64::from(-12345_i64 as u8))
+    );
+    assert_eq!(
+        simulator
+            .read("byte_unsigned_from_signed")
+            .unwrap()
+            .to_u64(),
+        Some(u8::MAX.into())
+    );
+    assert_eq!(
+        simulator
+            .read("long_unsigned_from_byte_signed")
+            .unwrap()
+            .to_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        simulator
+            .read("short_unsigned_from_int_signed")
+            .unwrap()
+            .to_u64(),
+        Some(u16::MAX.into())
+    );
+    assert_eq!(
+        simulator
+            .read("int_signed_from_short_unsigned")
+            .unwrap()
+            .to_u64(),
+        Some(0x8000)
+    );
+    assert_eq!(
+        simulator.read("signed_byte_sum_as_int").unwrap().to_u64(),
+        Some(-256_i32 as u32 as u64),
+        "assignment context must widen signed byte arithmetic before wrapping"
+    );
+    assert_eq!(
+        simulator.read("unsigned_byte_sum_as_int").unwrap().to_u64(),
+        Some(256),
+        "assignment context must widen unsigned byte arithmetic before wrapping"
+    );
+    assert_eq!(
+        simulator.read("arithmetic_shift_right").unwrap().to_u64(),
+        Some(-4_i32 as u32 as u64)
+    );
+    assert_eq!(
+        simulator.read("logical_shift_right").unwrap().to_u64(),
+        Some(0x7fff_fffc)
+    );
+    assert_eq!(
+        simulator.read("logical_shift_left").unwrap().to_u64(),
+        Some(-16_i32 as u32 as u64)
+    );
+    assert_eq!(
+        simulator.read("mixed_unsigned_division").unwrap().to_u64(),
+        Some(0xffff_ffff / 2)
+    );
+    assert_eq!(
+        simulator.read("mixed_unsigned_modulus").unwrap().to_u64(),
+        Some(1)
+    );
+    let conditional_unknown = simulator
+        .read("conditional_signed_narrow")
+        .expect("conditional output is readable");
+    assert!(
+        conditional_unknown
+            .bits
+            .iter()
+            .enumerate()
+            .all(|(index, bit)| index < 8 || bit.is_unknown()),
+        "unknown condition must sign-extend the signed byte arm before X merging"
+    );
+    simulator
+        .set_input("condition", &LogicWord::from_u64(1, 1))
+        .expect("select signed conditional byte arm");
+    simulator
+        .run_until(1)
+        .expect("evaluate true conditional arm");
+    assert_eq!(
+        simulator
+            .read("conditional_signed_narrow")
+            .unwrap()
+            .to_u64(),
+        Some(-1_i32 as u32 as u64)
+    );
+    simulator
+        .set_input("condition", &LogicWord::from_u64(1, 0))
+        .expect("select signed conditional int arm");
+    simulator
+        .run_until(2)
+        .expect("evaluate false conditional arm");
+    assert_eq!(
+        simulator
+            .read("conditional_signed_narrow")
+            .unwrap()
+            .to_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_struct_members() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-struct");
+    let source_path = root.join("floating_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_struct(
+  output real a_out,
+  output shortreal b_out,
+  output logic [7:0] c_out,
+  output real sum,
+  output shortreal compact_sum
+);
+  typedef struct {
+    real a;
+    shortreal b;
+    logic [7:0] c;
+  } payload_t;
+  payload_t p;
+
+  initial begin
+    p.a = 1.25;
+    p.b = 0.5;
+    p.c = 8'h5a;
+    a_out = p.a;
+    b_out = p.b;
+    c_out = p.c;
+    compact_sum = p.b + p.b;
+  end
+  always @(*) begin
+    sum = p.a + p.a;
+  end
+endmodule
+"#,
+    )
+    .expect("write floating-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_struct"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating struct members");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "p" && declaration.width == 104 }));
+
+    let mut simulator = Simulator::new(&design).expect("create floating-struct simulator");
+    simulator
+        .run_until(0)
+        .expect("execute floating struct members");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating-struct real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating-struct real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating-struct shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("floating-struct shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("floating-struct shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "a_out"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "b_out"), 0.5_f32);
+    assert_eq!(simulator.read("c_out").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(real_output(&simulator, "sum"), 2.5);
+    assert_eq!(shortreal_output(&simulator, "compact_sum"), 1.0_f32);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_nested_floating_struct_members() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nested-floating-struct");
+    let source_path = root.join("nested_floating_struct.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module nested_floating_struct(
+  output real first_real,
+  output shortreal first_shortreal,
+  output logic [7:0] first_byte,
+  output real copied_real,
+  output shortreal copied_shortreal,
+  output logic [7:0] copied_byte,
+  output real scalar,
+  output real nested_sum,
+  output shortreal nested_compact_sum
+);
+  typedef struct {
+    real x;
+    shortreal y;
+    logic [7:0] byte_value;
+  } leaf_t;
+
+  typedef struct {
+    leaf_t first;
+    leaf_t second;
+    real scalar;
+  } outer_t;
+
+  outer_t value;
+
+  initial begin
+    value.first.x = 1.25;
+    value.first.y = 0.5;
+    value.first.byte_value = 8'h5a;
+    value.second = value.first;
+    value.scalar = 9.75;
+
+    first_real = value.first.x;
+    first_shortreal = value.first.y;
+    first_byte = value.first.byte_value;
+    copied_real = value.second.x;
+    copied_shortreal = value.second.y;
+    copied_byte = value.second.byte_value;
+    scalar = value.scalar;
+    nested_sum = value.first.x + value.second.x + value.scalar;
+    nested_compact_sum = value.first.y + value.second.y;
+  end
+endmodule
+"#,
+    )
+    .expect("write nested-floating-struct source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("nested_floating_struct"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nested floating struct members");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "value" && declaration.width == 272 }));
+
+    let mut simulator = Simulator::new(&design).expect("create nested-floating-struct simulator");
+    simulator
+        .run_until(0)
+        .expect("execute nested floating struct members");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing nested-floating real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("nested-floating real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing nested-floating shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("nested-floating shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("nested-floating shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "first_real"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "first_shortreal"), 0.5_f32);
+    assert_eq!(simulator.read("first_byte").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(real_output(&simulator, "copied_real"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "copied_shortreal"), 0.5_f32);
+    assert_eq!(simulator.read("copied_byte").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(real_output(&simulator, "scalar"), 9.75);
+    assert_eq!(real_output(&simulator, "nested_sum"), 12.25);
+    assert_eq!(shortreal_output(&simulator, "nested_compact_sum"), 1.0_f32);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_struct_assignment_patterns() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-struct-pattern");
+    let source_path = root.join("floating_struct_pattern.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_struct_pattern(
+  output real positional_real,
+  output shortreal positional_shortreal,
+  output logic [7:0] positional_byte,
+  output real named_real,
+  output shortreal named_shortreal,
+  output logic [7:0] named_byte,
+  output real real_sum,
+  output shortreal shortreal_sum
+);
+  typedef struct {
+    real a;
+    shortreal b;
+    logic [7:0] c;
+  } payload_t;
+
+  payload_t positional;
+  payload_t named;
+
+  initial begin
+    positional = '{1.25, 0.5, 8'h5a};
+    named = '{c: 8'ha5, b: 1.5, a: 3.75};
+
+    positional_real = positional.a;
+    positional_shortreal = positional.b;
+    positional_byte = positional.c;
+    named_real = named.a;
+    named_shortreal = named.b;
+    named_byte = named.c;
+    real_sum = positional.a + named.a;
+    shortreal_sum = positional.b + named.b;
+  end
+endmodule
+"#,
+    )
+    .expect("write floating-struct-pattern source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_struct_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating struct assignment patterns");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "positional" && declaration.width == 104 }));
+
+    let pattern_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("floating_struct_pattern"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize floating-struct-pattern AST");
+    let mut pattern_summary = slang
+        .summarize_ast_json(&pattern_json)
+        .expect("summarize floating-struct-pattern AST");
+    pattern_summary
+        .validate_against_design(&design)
+        .expect("exact floating-struct-pattern fingerprints should match");
+    if let Some(assignment) = pattern_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "positional")
+            })
+        })
+    {
+        assignment.rhs.kind = "UnsupportedPattern".into();
+    }
+    let wrong_pattern_error = pattern_summary
+        .validate_against_design(&design)
+        .expect_err("wrong floating-struct pattern shape must fail");
+    assert!(
+        wrong_pattern_error.contains("positional") || wrong_pattern_error.contains("pattern"),
+        "unexpected floating-struct-pattern error: {wrong_pattern_error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create floating-struct-pattern simulator");
+    simulator
+        .run_until(0)
+        .expect("execute floating struct patterns");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating-pattern real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating-pattern real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating-pattern shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("floating-pattern shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("floating-pattern shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "positional_real"), 1.25);
+    assert_eq!(
+        shortreal_output(&simulator, "positional_shortreal"),
+        0.5_f32
+    );
+    assert_eq!(
+        simulator.read("positional_byte").unwrap().to_u64(),
+        Some(0x5a)
+    );
+    assert_eq!(real_output(&simulator, "named_real"), 3.75);
+    assert_eq!(shortreal_output(&simulator, "named_shortreal"), 1.5_f32);
+    assert_eq!(simulator.read("named_byte").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(real_output(&simulator, "real_sum"), 5.0);
+    assert_eq!(shortreal_output(&simulator, "shortreal_sum"), 2.0_f32);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_nested_floating_struct_assignment_patterns() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-nested-floating-struct-pattern");
+    let source_path = root.join("nested_floating_struct_pattern.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module nested_floating_struct_pattern(
+  output real positional_first_real,
+  output shortreal positional_first_shortreal,
+  output logic [7:0] positional_first_byte,
+  output real positional_second_real,
+  output shortreal positional_second_shortreal,
+  output logic [7:0] positional_second_byte,
+  output real positional_scalar,
+  output real named_first_real,
+  output shortreal named_first_shortreal,
+  output logic [7:0] named_first_byte,
+  output real named_second_real,
+  output shortreal named_second_shortreal,
+  output logic [7:0] named_second_byte,
+  output real named_scalar,
+  output real all_real_sum,
+  output shortreal all_shortreal_sum
+);
+  typedef struct {
+    real x;
+    shortreal y;
+    logic [7:0] byte_value;
+  } leaf_t;
+
+  typedef struct {
+    leaf_t first;
+    leaf_t second;
+    real scalar;
+  } outer_t;
+
+  outer_t positional;
+  outer_t named;
+
+  initial begin
+    positional = '{
+      '{1.25, 0.5, 8'h5a},
+      '{3.75, 1.5, 8'ha5},
+      9.75
+    };
+    named = '{
+      scalar: 8.5,
+      second: '{byte_value: 8'hc3, y: -0.25, x: -2.5},
+      first:  '{x: 2.25, y: 0.75, byte_value: 8'h3c}
+    };
+
+    positional_first_real = positional.first.x;
+    positional_first_shortreal = positional.first.y;
+    positional_first_byte = positional.first.byte_value;
+    positional_second_real = positional.second.x;
+    positional_second_shortreal = positional.second.y;
+    positional_second_byte = positional.second.byte_value;
+    positional_scalar = positional.scalar;
+
+    named_first_real = named.first.x;
+    named_first_shortreal = named.first.y;
+    named_first_byte = named.first.byte_value;
+    named_second_real = named.second.x;
+    named_second_shortreal = named.second.y;
+    named_second_byte = named.second.byte_value;
+    named_scalar = named.scalar;
+
+    all_real_sum = positional.first.x
+      + positional.second.x
+      + positional.scalar
+      + named.first.x
+      + named.second.x
+      + named.scalar;
+    all_shortreal_sum = positional.first.y
+      + positional.second.y
+      + named.first.y
+      + named.second.y;
+  end
+endmodule
+"#,
+    )
+    .expect("write nested-floating-struct-pattern source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("nested_floating_struct_pattern"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower nested floating struct patterns");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "positional" && declaration.width == 272 }));
+
+    let nested_pattern_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("nested_floating_struct_pattern"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize nested-floating-struct-pattern AST");
+    let nested_pattern_summary = slang
+        .summarize_ast_json(&nested_pattern_json)
+        .expect("summarize nested-floating-struct-pattern AST");
+    nested_pattern_summary
+        .validate_against_design(&design)
+        .expect("exact nested-floating-struct-pattern fingerprints should match");
+
+    let mut simulator = Simulator::new(&design).expect("create nested-pattern simulator");
+    simulator
+        .run_until(0)
+        .expect("execute nested floating struct patterns");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing nested-pattern real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("nested-pattern real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing nested-pattern shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("nested-pattern shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("nested-pattern shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "positional_first_real"), 1.25);
+    assert_eq!(
+        shortreal_output(&simulator, "positional_first_shortreal"),
+        0.5_f32
+    );
+    assert_eq!(
+        simulator.read("positional_first_byte").unwrap().to_u64(),
+        Some(0x5a)
+    );
+    assert_eq!(real_output(&simulator, "positional_second_real"), 3.75);
+    assert_eq!(
+        shortreal_output(&simulator, "positional_second_shortreal"),
+        1.5_f32
+    );
+    assert_eq!(
+        simulator.read("positional_second_byte").unwrap().to_u64(),
+        Some(0xa5)
+    );
+    assert_eq!(real_output(&simulator, "positional_scalar"), 9.75);
+
+    assert_eq!(real_output(&simulator, "named_first_real"), 2.25);
+    assert_eq!(
+        shortreal_output(&simulator, "named_first_shortreal"),
+        0.75_f32
+    );
+    assert_eq!(
+        simulator.read("named_first_byte").unwrap().to_u64(),
+        Some(0x3c)
+    );
+    assert_eq!(real_output(&simulator, "named_second_real"), -2.5);
+    assert_eq!(
+        shortreal_output(&simulator, "named_second_shortreal"),
+        -0.25_f32
+    );
+    assert_eq!(
+        simulator.read("named_second_byte").unwrap().to_u64(),
+        Some(0xc3)
+    );
+    assert_eq!(real_output(&simulator, "named_scalar"), 8.5);
+    assert_eq!(
+        real_output(&simulator, "all_real_sum"),
+        1.25 + 3.75 + 9.75 + 2.25 - 2.5 + 8.5
+    );
+    assert_eq!(
+        shortreal_output(&simulator, "all_shortreal_sum"),
+        0.5 + 1.5 + 0.75 - 0.25
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_unpacked_unions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-unpacked-union");
+    let source_path = root.join("floating_unpacked_union.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_unpacked_union(
+  output real real_roundtrip,
+  output logic [63:0] real_raw,
+  output shortreal compact_roundtrip,
+  output logic [31:0] compact_raw
+);
+  typedef union {
+    real real_value;
+    logic [63:0] raw_value;
+  } real_union_t;
+
+  typedef union {
+    shortreal compact_value;
+    logic [31:0] compact_raw_value;
+  } compact_union_t;
+
+  real_union_t wide;
+  compact_union_t compact;
+
+  initial begin
+    wide.real_value = 1.25;
+    real_roundtrip = wide.real_value;
+    real_raw = wide.raw_value;
+
+    wide.raw_value = 64'hc004000000000000;
+    real_roundtrip = wide.real_value;
+    real_raw = wide.raw_value;
+
+    compact.compact_value = 0.5;
+    compact_roundtrip = compact.compact_value;
+    compact_raw = compact.compact_raw_value;
+
+    compact.compact_raw_value = 32'hbe800000;
+    compact_roundtrip = compact.compact_value;
+    compact_raw = compact.compact_raw_value;
+  end
+endmodule
+"#,
+    )
+    .expect("write floating-unpacked-union source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_unpacked_union"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating unpacked unions");
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "wide" && declaration.width == 64 }));
+    assert!(design
+        .net_decls
+        .iter()
+        .any(|declaration| { declaration.name == "compact" && declaration.width == 32 }));
+
+    let union_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("floating_unpacked_union"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize floating-unpacked-union AST");
+    let mut union_summary = slang
+        .summarize_ast_json(&union_json)
+        .expect("summarize floating-unpacked-union AST");
+    union_summary
+        .validate_against_design(&design)
+        .expect("exact floating-unpacked-union fingerprints should match");
+    if let Some(assignment) = union_summary
+        .procedural_blocks
+        .iter_mut()
+        .find_map(|block| {
+            block.assignments.iter_mut().find(|assignment| {
+                assignment
+                    .target_names
+                    .first()
+                    .is_some_and(|name| name == "real_roundtrip")
+            })
+        })
+    {
+        assignment.rhs.member_path = vec!["raw_value".into()];
+        assignment.rhs.member_range = Some((63, 0));
+        assignment.rhs.type_width = Some(64);
+        assignment.rhs.type_name = "logic [63:0]".into();
+    }
+    let wrong_union_member_error = union_summary
+        .validate_against_design(&design)
+        .expect_err("wrong floating-union member must fail");
+    assert!(
+        wrong_union_member_error.contains("Range:63:0")
+            || wrong_union_member_error.contains("real_value")
+            || wrong_union_member_error.contains("raw_value"),
+        "unexpected floating-union fingerprint error: {wrong_union_member_error}"
+    );
+
+    let mut simulator = Simulator::new(&design).expect("create floating-union simulator");
+    simulator
+        .run_until(0)
+        .expect("execute floating unpacked unions");
+
+    let final_real_bits = simulator.read("real_raw").unwrap().to_u64().unwrap();
+    assert_eq!(f64::from_bits(final_real_bits), -2.5);
+    assert_eq!(final_real_bits, (-2.5_f64).to_bits());
+
+    let final_compact_bits =
+        u32::try_from(simulator.read("compact_raw").unwrap().to_u64().unwrap()).unwrap();
+    assert_eq!(f32::from_bits(final_compact_bits), -0.25);
+    assert_eq!(final_compact_bits, (-0.25_f32).to_bits());
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_struct_arrays() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-struct-array");
+    let source_path = root.join("floating_struct_array.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_struct_array(
+  input int index,
+  output real first_real,
+  output shortreal first_shortreal,
+  output logic [7:0] first_byte,
+  output real selected_real,
+  output shortreal selected_shortreal,
+  output logic [7:0] selected_byte,
+  output real real_sum,
+  output shortreal shortreal_sum
+);
+  typedef struct {
+    real a;
+    shortreal b;
+    logic [7:0] c;
+  } payload_t;
+  payload_t values[0:2];
+
+  initial begin
+    values[0].a = 1.25;
+    values[0].b = 0.5;
+    values[0].c = 8'h5a;
+    values[1].a = 3.75;
+    values[1].b = 1.5;
+    values[1].c = 8'ha5;
+    values[2].a = -2.5;
+    values[2].b = -0.25;
+    values[2].c = 8'h3c;
+    first_real = values[0].a;
+    first_shortreal = values[0].b;
+    first_byte = values[0].c;
+  end
+
+  always @(*) begin
+    selected_real = values[index].a;
+    selected_shortreal = values[index].b;
+    selected_byte = values[index].c;
+    real_sum = values[index].a + values[index].a;
+    shortreal_sum = values[index].b + values[index].b;
+  end
+endmodule
+"#,
+    )
+    .expect("write floating-struct-array source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_struct_array"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating struct arrays");
+    assert_eq!(design.memories.len(), 1);
+    assert_eq!(design.memories[0].element_width, 104);
+
+    let mut simulator = Simulator::new(&design).expect("create floating-struct-array simulator");
+    simulator
+        .run_until(0)
+        .expect("execute floating struct elements");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating-struct-array real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating-struct-array real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating-struct-array shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| {
+                    panic!("floating-struct-array shortreal output {name} is unknown")
+                }),
+        )
+        .unwrap_or_else(|_| {
+            panic!("floating-struct-array shortreal output {name} exceeds 32 bits")
+        });
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(real_output(&simulator, "first_real"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "first_shortreal"), 0.5_f32);
+    assert_eq!(simulator.read("first_byte").unwrap().to_u64(), Some(0x5a));
+
+    for (index, real, compact, byte) in [
+        (0_u64, 1.25_f64, 0.5_f32, 0x5a_u64),
+        (1, 3.75, 1.5, 0xa5),
+        (2, -2.5, -0.25, 0x3c),
+    ] {
+        simulator
+            .set_input("index", &LogicWord::from_u64(32, index))
+            .expect("set floating-struct-array index");
+        simulator
+            .run_until(0)
+            .expect("select floating struct element");
+        assert_eq!(
+            real_output(&simulator, "selected_real"),
+            real,
+            "unexpected real member {index}"
+        );
+        assert_eq!(
+            shortreal_output(&simulator, "selected_shortreal"),
+            compact,
+            "unexpected shortreal member {index}"
+        );
+        assert_eq!(
+            simulator.read("selected_byte").unwrap().to_u64(),
+            Some(byte),
+            "unexpected byte member {index}"
+        );
+        assert_eq!(
+            real_output(&simulator, "real_sum"),
+            real + real,
+            "unexpected real member sum {index}"
+        );
+        if compact.is_nan() {
+            assert!(shortreal_output(&simulator, "shortreal_sum").is_nan());
+        } else {
+            assert_eq!(
+                shortreal_output(&simulator, "shortreal_sum"),
+                compact + compact,
+                "unexpected shortreal member sum {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_dynamic_floating_struct_containers() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-dynamic-floating-struct-containers");
+    let source_path = root.join("dynamic_floating_struct_containers.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module dynamic_floating_struct_containers(
+  input int key,
+  output int dynamic_size,
+  output int queue_size,
+  output int associative_count,
+  output real dynamic_real,
+  output shortreal dynamic_shortreal,
+  output logic [7:0] dynamic_byte,
+  output real queue_real,
+  output shortreal queue_shortreal,
+  output logic [7:0] queue_byte,
+  output real associative_real,
+  output shortreal associative_shortreal,
+  output logic [7:0] associative_byte
+);
+  typedef struct {
+    real a;
+    shortreal b;
+    logic [7:0] c;
+  } payload_t;
+
+  payload_t source;
+  payload_t dynamic_values[];
+  payload_t queue_values[$];
+  payload_t associative_values[int];
+
+  initial begin
+    #1;
+    source.a = 1.25;
+    source.b = 0.5;
+    source.c = 8'h5a;
+
+    dynamic_values = new[2];
+    dynamic_values[0] = source;
+    dynamic_values[1].a = 3.75;
+    dynamic_values[1].b = 1.5;
+    dynamic_values[1].c = 8'ha5;
+    dynamic_size = dynamic_values.size();
+    dynamic_real = dynamic_values[1].a;
+    dynamic_shortreal = dynamic_values[1].b;
+    dynamic_byte = dynamic_values[1].c;
+
+    queue_values.push_back(source);
+    queue_values.push_front(source);
+    queue_size = queue_values.size();
+    queue_real = queue_values[1].a;
+    queue_shortreal = queue_values[1].b;
+    queue_byte = queue_values[1].c;
+
+    associative_values[key] = source;
+    associative_count = associative_values.num();
+    associative_real = associative_values[key].a;
+    associative_shortreal = associative_values[key].b;
+    associative_byte = associative_values[key].c;
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic-floating-struct-container source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("dynamic_floating_struct_containers"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic floating struct containers");
+    assert_eq!(design.memories.len(), 3);
+    assert!(design.memories.iter().all(|memory| memory.dynamic));
+    assert!(design
+        .memories
+        .iter()
+        .all(|memory| memory.element_width == 104));
+    assert!(!design.memories[0].queue && !design.memories[0].associative);
+    assert!(design.memories[1].queue && !design.memories[1].associative);
+    assert!(!design.memories[2].queue && design.memories[2].associative);
+
+    let mut simulator = Simulator::new(&design).expect("create dynamic-struct-container simulator");
+    simulator
+        .set_input("key", &LogicWord::from_u64(32, 41))
+        .expect("set associative key");
+    simulator
+        .run_until(1)
+        .expect("execute dynamic floating struct containers");
+
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing dynamic-struct real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("dynamic-struct real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing dynamic-struct shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("dynamic-struct shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("dynamic-struct shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    assert_eq!(simulator.read("dynamic_size").unwrap().to_u64(), Some(2));
+    assert_eq!(simulator.read("queue_size").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator.read("associative_count").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(real_output(&simulator, "dynamic_real"), 3.75);
+    assert_eq!(shortreal_output(&simulator, "dynamic_shortreal"), 1.5_f32);
+    assert_eq!(simulator.read("dynamic_byte").unwrap().to_u64(), Some(0xa5));
+    assert_eq!(real_output(&simulator, "queue_real"), 1.25);
+    assert_eq!(shortreal_output(&simulator, "queue_shortreal"), 0.5_f32);
+    assert_eq!(simulator.read("queue_byte").unwrap().to_u64(), Some(0x5a));
+    assert_eq!(real_output(&simulator, "associative_real"), 1.25);
+    assert_eq!(
+        shortreal_output(&simulator, "associative_shortreal"),
+        0.5_f32
+    );
+    assert_eq!(
+        simulator.read("associative_byte").unwrap().to_u64(),
+        Some(0x5a)
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_connects_floating_struct_ports() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-struct-ports");
+    let source_path = root.join("floating_struct_ports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+package payload_pkg;
+  typedef struct {
+    real a;
+    shortreal b;
+    logic [7:0] c;
+  } payload_t;
+endpackage
+
+module payload_child(source, destination);
+  import payload_pkg::*;
+  input payload_t source;
+  output payload_t destination;
+  assign destination.a = source.a + 1.0;
+  assign destination.b = source.b + 0.25;
+  assign destination.c = source.c + 8'd1;
+endmodule
+
+module floating_struct_ports(
+  source,
+  destination,
+  observed_real,
+  observed_shortreal,
+  observed_byte
+);
+  import payload_pkg::*;
+  input payload_t source;
+  output payload_t destination;
+  output real observed_real;
+  output shortreal observed_shortreal;
+  output logic [7:0] observed_byte;
+  payload_child child(
+    .source(source),
+    .destination(destination)
+  );
+  assign observed_real = destination.a;
+  assign observed_shortreal = destination.b;
+  assign observed_byte = destination.c;
+endmodule
+"#,
+    )
+    .expect("write floating-struct-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_struct_ports"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating struct ports");
+    assert_eq!(design.ports.len(), 5);
+    assert_eq!(design.hierarchy.len(), 2);
+
+    fn payload_word(real: f64, compact: f32, byte: u8) -> LogicWord {
+        let mut bits = LogicWord::from_u64(64, real.to_bits()).bits;
+        bits.extend(LogicWord::from_u64(32, u64::from(compact.to_bits())).bits);
+        bits.extend(LogicWord::from_u64(8, u64::from(byte)).bits);
+        LogicWord { bits }
+    }
+
+    let mut simulator = Simulator::new(&design).expect("create floating-struct-port simulator");
+    simulator
+        .set_input("source", &payload_word(10.25, 1.5, 0x5a))
+        .expect("set floating struct input port");
+    simulator
+        .run_until(0)
+        .expect("evaluate floating struct ports");
+
+    let destination = simulator
+        .read("destination")
+        .expect("read struct output port");
+    let destination_real = f64::from_bits(destination.slice(63, 0).to_u64().unwrap());
+    let destination_compact =
+        f32::from_bits(u32::try_from(destination.slice(95, 64).to_u64().unwrap()).unwrap());
+    let destination_byte = u8::try_from(destination.slice(103, 96).to_u64().unwrap()).unwrap();
+    assert_eq!(destination_real, 11.25);
+    assert_eq!(destination_compact, 1.75_f32);
+    assert_eq!(destination_byte, 0x5b);
+
+    let observed_real = f64::from_bits(simulator.read("observed_real").unwrap().to_u64().unwrap());
+    let observed_compact = f32::from_bits(
+        u32::try_from(
+            simulator
+                .read("observed_shortreal")
+                .unwrap()
+                .to_u64()
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    let observed_byte =
+        u8::try_from(simulator.read("observed_byte").unwrap().to_u64().unwrap()).unwrap();
+    assert_eq!(observed_real, 11.25);
+    assert_eq!(observed_compact, 1.75_f32);
+    assert_eq!(observed_byte, 0x5b);
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_floating_array_ports() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-floating-array-ports");
+    let source_path = root.join("floating_array_ports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module floating_array_ports(
+  input real source[0:1],
+  input shortreal compact_source[0:1],
+  output real destination[0:1],
+  output shortreal compact_destination[0:1],
+  output real observed,
+  output shortreal compact_observed
+);
+  initial begin
+    destination[0] = 10.25;
+    destination[1] = 11.5;
+    compact_destination[0] = 0.25;
+    compact_destination[1] = 1.5;
+  end
+  assign observed = source[1];
+  assign compact_observed = compact_source[0];
+endmodule
+"#,
+    )
+    .expect("write floating-array-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("floating_array_ports"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower floating array ports");
+    assert_eq!(design.array_ports.len(), 4);
+
+    let mut simulator = Simulator::new(&design).expect("create floating-array-port simulator");
+    simulator.run_until(0).expect("settle array initializers");
+    simulator
+        .set_ordinary_array_input("source", &[1], &LogicWord::from_u64(64, 12.5_f64.to_bits()))
+        .expect("set real array input");
+    simulator
+        .set_ordinary_array_input(
+            "compact_source",
+            &[0],
+            &LogicWord::from_u64(32, u64::from(2.5_f32.to_bits())),
+        )
+        .expect("set shortreal array input");
+    simulator
+        .run_until(0)
+        .expect("observe floating array inputs");
+
+    let observed_bits = simulator.read("observed").unwrap().to_u64().unwrap();
+    assert_eq!(f64::from_bits(observed_bits), 12.5);
+    let compact_bits = u32::try_from(
+        simulator
+            .read("compact_observed")
+            .unwrap()
+            .to_u64()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(f32::from_bits(compact_bits), 2.5);
+
+    let real_output = simulator
+        .read_ordinary_array_output("destination", &[1])
+        .expect("read real array output");
+    assert_eq!(f64::from_bits(real_output.to_u64().unwrap()), 11.5);
+    let shortreal_output = simulator
+        .read_ordinary_array_output("compact_destination", &[0])
+        .expect("read shortreal array output");
+    assert_eq!(
+        f32::from_bits(u32::try_from(shortreal_output.to_u64().unwrap()).unwrap()),
+        0.25
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_connects_child_floating_array_ports() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-child-floating-array-ports");
+    let source_path = root.join("child_floating_array_ports.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module real_leaf(
+  input real source[0:1],
+  output real destination[0:1]
+);
+  assign destination[0] = source[0] + 1.0;
+  assign destination[1] = source[1] * 2.0;
+endmodule
+
+module shortreal_leaf(
+  input shortreal source[0:1],
+  output shortreal destination[0:1]
+);
+  assign destination[0] = source[0] + 0.25;
+  assign destination[1] = source[1] * 2.0;
+endmodule
+
+module child_floating_array_ports(
+  input real real_source[0:1],
+  output real real_destination[0:1],
+  input shortreal compact_source[0:1],
+  output shortreal compact_destination[0:1]
+);
+  real_leaf real_instance(
+    .source(real_source),
+    .destination(real_destination)
+  );
+  shortreal_leaf compact_instance(
+    .source(compact_source),
+    .destination(compact_destination)
+  );
+endmodule
+"#,
+    )
+    .expect("write child floating-array-port source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("child_floating_array_ports"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower child floating array ports");
+    assert_eq!(design.array_ports.len(), 0);
+    assert_eq!(design.memory_ports.len(), 4);
+    assert_eq!(design.array_connections.len(), 0);
+    assert_eq!(design.memory_connections.len(), 4);
+
+    let mut simulator = Simulator::new(&design).expect("create child floating-port simulator");
+    simulator.run_until(0).expect("settle child connections");
+    simulator
+        .set_memory_input(
+            "real_source",
+            &[0],
+            &LogicWord::from_u64(64, 10.5_f64.to_bits()),
+        )
+        .expect("set child real input element zero");
+    simulator
+        .set_memory_input(
+            "real_source",
+            &[1],
+            &LogicWord::from_u64(64, 12.5_f64.to_bits()),
+        )
+        .expect("set child real input element one");
+    simulator
+        .set_memory_input(
+            "compact_source",
+            &[0],
+            &LogicWord::from_u64(32, u64::from(1.5_f32.to_bits())),
+        )
+        .expect("set child shortreal input element zero");
+    simulator
+        .set_memory_input(
+            "compact_source",
+            &[1],
+            &LogicWord::from_u64(32, u64::from(2.5_f32.to_bits())),
+        )
+        .expect("set child shortreal input element one");
+    simulator
+        .run_until(0)
+        .expect("evaluate child floating ports");
+
+    let real_zero = simulator
+        .read_memory_output("real_destination", &[0])
+        .expect("read child real output zero");
+    assert_eq!(
+        f64::from_bits(real_zero.to_u64().expect("known real output")),
+        11.5
+    );
+    let real_one = simulator
+        .read_memory_output("real_destination", &[1])
+        .expect("read child real output one");
+    assert_eq!(
+        f64::from_bits(real_one.to_u64().expect("known real output")),
+        25.0
+    );
+    let compact_zero = simulator
+        .read_memory_output("compact_destination", &[0])
+        .expect("read child shortreal output zero");
+    assert_eq!(
+        f32::from_bits(
+            u32::try_from(compact_zero.to_u64().expect("known shortreal output")).unwrap()
+        ),
+        1.75_f32
+    );
+    let compact_one = simulator
+        .read_memory_output("compact_destination", &[1])
+        .expect("read child shortreal output one");
+    assert_eq!(
+        f32::from_bits(
+            u32::try_from(compact_one.to_u64().expect("known shortreal output")).unwrap()
+        ),
+        5.0_f32
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_rounds_fractional_delays_to_precision() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-fractional-delay");
+    let source_path = root.join("fractional_delay.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module fractional_delay_probe(
+  input logic source,
+  output real elapsed,
+  output logic delayed
+);
+  timeunit 1ns;
+  timeprecision 100ps;
+  initial begin
+    #1.55 elapsed = $realtime;
+  end
+  assign #1.54 delayed = source;
+endmodule
+"#,
+    )
+    .expect("write fractional-delay source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("fractional_delay_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower fractional delays");
+    assert_eq!(design.time_scale.precision_exponent, -10);
+
+    let mut simulator = Simulator::new(&design).expect("create fractional-delay simulator");
+    simulator
+        .set_input("source", &LogicWord::ones(1))
+        .expect("set delayed-assignment input");
+    simulator
+        .run_until(15)
+        .expect("run through rounded continuous delay");
+    assert!(
+        simulator
+            .read("delayed")
+            .is_some_and(|value| value.to_u64() == Some(1)),
+        "1.54ns continuous delay must round to 15 precision ticks"
+    );
+    assert!(
+        simulator
+            .read("elapsed")
+            .is_some_and(|value| !value.is_fully_known()),
+        "1.55ns procedural delay must not fire before rounding to 16 ticks"
+    );
+
+    simulator
+        .run_until(16)
+        .expect("run rounded procedural delay");
+    let elapsed_bits = simulator.read("elapsed").expect("read elapsed realtime");
+    let elapsed = f64::from_bits(elapsed_bits.to_u64().expect("known elapsed"));
+    assert!(
+        (elapsed - 1.6).abs() < f64::EPSILON,
+        "unexpected fractional-delay elapsed time: {elapsed}"
+    );
+
+    let invalid_path = root.join("negative_fractional_delay.sv");
+    std::fs::write(
+        &invalid_path,
+        r#"
+module negative_fractional_delay(output logic value);
+  timeunit 1ns;
+  timeprecision 100ps;
+  initial #(-1.5) value = 1;
+endmodule
+"#,
+    )
+    .expect("write negative fractional-delay source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&invalid_path),
+            Some("negative_fractional_delay"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("negative fractional delays must fail closed");
+    assert!(
+        error.contains("delay control must be a nonnegative finite real constant"),
+        "unexpected negative fractional-delay error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_uses_real_values_as_conditions() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-real-condition");
+    let source_path = root.join("real_condition.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module real_condition(
+  input real value,
+  output logic zero,
+  output logic nonzero,
+  output logic negative
+);
+  always @(*) begin
+    zero = value ? 1'b0 : 1'b1;
+    nonzero = value ? 1'b1 : 1'b0;
+    negative = (value < 0.0) ? 1'b1 : 1'b0;
+  end
+endmodule
+"#,
+    )
+    .expect("write real-condition source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("real_condition"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower real conditions");
+    let mut simulator = Simulator::new(&design).expect("create real-condition simulator");
+
+    for (value, zero, nonzero, negative) in [
+        (0.0_f64, 1_u64, 0, 0),
+        (1.5_f64, 0, 1, 0),
+        (-2.25_f64, 0, 1, 1),
+    ] {
+        simulator
+            .set_input("value", &LogicWord::from_u64(64, value.to_bits()))
+            .expect("set real condition input");
+        simulator.run_until(0).expect("evaluate real condition");
+        assert_eq!(
+            simulator.read("zero").unwrap().to_u64(),
+            Some(zero),
+            "unexpected zero test for {value}"
+        );
+        assert_eq!(
+            simulator.read("nonzero").unwrap().to_u64(),
+            Some(nonzero),
+            "unexpected nonzero test for {value}"
+        );
+        assert_eq!(
+            simulator.read("negative").unwrap().to_u64(),
+            Some(negative),
+            "unexpected negative test for {value}"
+        );
+    }
+}
+
+#[test]
+fn slang_ast_direct_lowering_preserves_real_nan_and_subnormal_semantics() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-real-nan-subnormal");
+    let source_path = root.join("real_nan_subnormal.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module real_nan_subnormal(
+  input real lhs,
+  input real rhs,
+  output real sum,
+  output real negated,
+  output real quotient,
+  output logic lhs_condition,
+  output logic lhs_self_equal,
+  output logic lhs_less_self,
+  output logic lhs_greater_self,
+  output logic lhs_nonzero,
+  output logic lhs_less_one,
+  output logic lhs_negative
+);
+  always @(*) begin
+    sum = lhs + 0.0;
+    negated = -lhs;
+    quotient = 1.0 / rhs;
+    lhs_condition = lhs ? 1'b1 : 1'b0;
+    lhs_self_equal = lhs == lhs;
+    lhs_less_self = lhs < lhs;
+    lhs_greater_self = lhs > lhs;
+    lhs_nonzero = lhs != 0.0;
+    lhs_less_one = lhs < 1.0;
+    lhs_negative = lhs < 0.0;
+  end
+endmodule
+"#,
+    )
+    .expect("write real NaN/subnormal source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("real_nan_subnormal"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower real NaN/subnormal semantics");
+    let mut simulator = Simulator::new(&design).expect("create real NaN/subnormal simulator");
+
+    fn set_real(simulator: &mut Simulator, name: &str, value: f64) -> Result<(), String> {
+        simulator.set_input(name, &LogicWord::from_u64(64, value.to_bits()))
+    }
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn logic_output(simulator: &Simulator, name: &str) -> u64 {
+        simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing logic output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("logic output {name} is unknown"))
+    }
+
+    let vectors = [
+        (
+            f64::from_bits(0x7ff8_0000_0000_0000),
+            2.0_f64,
+            [1, 0, 0, 0, 1, 0, 0],
+        ),
+        (
+            f64::from_bits(0x7ff0_0000_0000_0001),
+            2.0_f64,
+            [1, 0, 0, 0, 1, 0, 0],
+        ),
+        (f64::from_bits(1), 0.5_f64, [1, 1, 0, 0, 1, 1, 0]),
+        (
+            f64::from_bits(0x8000_0000_0000_0001),
+            0.5_f64,
+            [1, 1, 0, 0, 1, 1, 1],
+        ),
+        (f64::INFINITY, 2.0_f64, [1, 1, 0, 0, 1, 0, 0]),
+    ];
+
+    for (lhs, rhs, expected) in vectors {
+        set_real(&mut simulator, "lhs", lhs).expect("set real lhs input");
+        set_real(&mut simulator, "rhs", rhs).expect("set real rhs input");
+        simulator
+            .run_until(0)
+            .expect("evaluate real edge semantics");
+
+        let sum = real_output(&simulator, "sum");
+        let negated = real_output(&simulator, "negated");
+        let quotient = real_output(&simulator, "quotient");
+        if lhs.is_nan() {
+            assert!(sum.is_nan(), "NaN must propagate through addition");
+            assert!(negated.is_nan(), "NaN must propagate through negation");
+        } else {
+            assert_eq!(sum, lhs, "unexpected addition result for {lhs}");
+            assert_eq!(
+                negated.to_bits(),
+                (-lhs).to_bits(),
+                "unexpected negation result for {lhs}"
+            );
+        }
+        assert_eq!(quotient, 1.0 / rhs, "unexpected quotient for {rhs}");
+
+        let names = [
+            "lhs_condition",
+            "lhs_self_equal",
+            "lhs_less_self",
+            "lhs_greater_self",
+            "lhs_nonzero",
+            "lhs_less_one",
+            "lhs_negative",
+        ];
+        for (name, expected) in names.iter().zip(expected) {
+            assert_eq!(
+                logic_output(&simulator, name),
+                expected as u64,
+                "unexpected {name} for lhs={lhs:?}"
+            );
+        }
+    }
+
+    set_real(&mut simulator, "lhs", 1.0).expect("set finite division lhs");
+    set_real(&mut simulator, "rhs", 0.0).expect("set positive-zero divisor");
+    simulator.run_until(0).expect("evaluate positive infinity");
+    assert_eq!(
+        real_output(&simulator, "quotient"),
+        f64::INFINITY,
+        "1.0 / +0.0 must produce positive infinity"
+    );
+
+    set_real(&mut simulator, "rhs", f64::from_bits(0x8000_0000_0000_0000))
+        .expect("set negative-zero divisor");
+    simulator.run_until(0).expect("evaluate negative infinity");
+    assert_eq!(
+        real_output(&simulator, "quotient"),
+        f64::NEG_INFINITY,
+        "1.0 / -0.0 must produce negative infinity"
+    );
+
+    set_real(&mut simulator, "rhs", f64::from_bits(0x7ff8_0000_0000_0000))
+        .expect("set NaN divisor");
+    simulator.run_until(0).expect("evaluate NaN quotient");
+    assert!(
+        real_output(&simulator, "quotient").is_nan(),
+        "1.0 / NaN must produce NaN"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_shortreal_types() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-shortreal");
+    let source_path = root.join("shortreal.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module shortreal_type_probe(
+  input shortreal operand,
+  output shortreal rounded,
+  output shortreal sum,
+  output shortreal negated,
+  output shortreal quotient,
+  output real widened,
+  output int rounded_int,
+  output logic greater,
+  output string pattern,
+  output string exponent,
+  output string fixed,
+  output string general
+);
+  initial rounded = 1.23456789;
+  always @(*) begin
+    sum = rounded + operand;
+    negated = -rounded;
+    quotient = 1.0 / operand;
+    widened = rounded;
+    rounded_int = rounded;
+    greater = rounded > 1.0;
+    pattern = $sformatf("%p", rounded);
+    exponent = $sformatf("%e", rounded);
+    fixed = $sformatf("%f", rounded);
+    general = $sformatf("%g", rounded);
+  end
+endmodule
+"#,
+    )
+    .expect("write shortreal source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("shortreal_type_probe"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower shortreal");
+
+    assert!(design.net_decls.iter().any(|declaration| {
+        declaration.name == "rounded" && declaration.width == 32 && declaration.is_signed
+    }));
+
+    let mut simulator = Simulator::new(&design).expect("create shortreal simulator");
+    let rounded = 1.23456789_f64 as f32;
+    for operand in [
+        0.5_f32,
+        f32::from_bits(1),
+        f32::INFINITY,
+        f32::from_bits(0x7fc0_0000),
+    ] {
+        simulator
+            .set_input(
+                "operand",
+                &LogicWord::from_u64(32, u64::from(operand.to_bits())),
+            )
+            .expect("set shortreal operand");
+        simulator
+            .run_until(0)
+            .expect("evaluate shortreal operations");
+
+        fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+            let raw = u32::try_from(
+                simulator
+                    .read(name)
+                    .unwrap_or_else(|| panic!("missing shortreal output {name}"))
+                    .to_u64()
+                    .unwrap_or_else(|| panic!("shortreal output {name} is unknown")),
+            )
+            .unwrap_or_else(|_| panic!("shortreal output {name} exceeds 32 bits"));
+            f32::from_bits(raw)
+        }
+
+        assert_eq!(shortreal_output(&simulator, "rounded"), rounded);
+        let sum = shortreal_output(&simulator, "sum");
+        let expected_sum = rounded + operand;
+        if expected_sum.is_nan() {
+            assert!(
+                sum.is_nan(),
+                "unexpected shortreal sum for operand {operand:?}"
+            );
+        } else {
+            assert_eq!(
+                sum, expected_sum,
+                "unexpected shortreal sum for operand {operand:?}"
+            );
+        }
+        assert_eq!(
+            shortreal_output(&simulator, "negated").to_bits(),
+            (-rounded).to_bits()
+        );
+        let quotient = shortreal_output(&simulator, "quotient");
+        if operand.is_nan() {
+            assert!(quotient.is_nan());
+        } else {
+            assert_eq!(quotient, 1.0_f32 / operand);
+        }
+        let widened_bits = simulator.read("widened").unwrap().to_u64().unwrap();
+        assert_eq!(f64::from_bits(widened_bits), f64::from(rounded));
+        assert_eq!(simulator.read("rounded_int").unwrap().to_u64(), Some(1));
+        assert_eq!(simulator.read("greater").unwrap().to_u64(), Some(1));
+        assert_eq!(
+            simulator
+                .read("pattern")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            format!("{}", f64::from(rounded))
+        );
+        assert_eq!(
+            simulator
+                .read("exponent")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.234568e+00"
+        );
+        assert_eq!(
+            simulator
+                .read("fixed")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.234568"
+        );
+        assert_eq!(
+            simulator
+                .read("general")
+                .unwrap()
+                .to_ascii_string_nul_terminated(),
+            "1.23457"
+        );
+    }
+
+    simulator
+        .set_input(
+            "operand",
+            &LogicWord::from_u64(32, u64::from(0.0_f32.to_bits())),
+        )
+        .expect("set positive-zero shortreal divisor");
+    simulator.run_until(0).expect("evaluate positive infinity");
+    let positive = simulator.read("quotient").unwrap().to_u64().unwrap();
+    assert_eq!(
+        f32::from_bits(u32::try_from(positive).unwrap()),
+        f32::INFINITY
+    );
+
+    simulator
+        .set_input(
+            "operand",
+            &LogicWord::from_u64(32, u64::from(f32::from_bits(0x8000_0000).to_bits())),
+        )
+        .expect("set negative-zero shortreal divisor");
+    simulator.run_until(0).expect("evaluate negative infinity");
+    let negative = simulator.read("quotient").unwrap().to_u64().unwrap();
+    assert_eq!(
+        f32::from_bits(u32::try_from(negative).unwrap()),
+        f32::NEG_INFINITY
+    );
+
+    let synthesis_path = root.join("shortreal_synthesis.sv");
+    std::fs::write(
+        &synthesis_path,
+        r#"
+module shortreal_synthesis(input shortreal source, output logic sink);
+  assign sink = source != 0.0;
+endmodule
+"#,
+    )
+    .expect("write shortreal synthesis source");
+    let synthesis_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&synthesis_path),
+            Some("shortreal_synthesis"),
+            &PreprocessOptions::default(),
+        )
+        .expect("lower shortreal synthesis probe");
+    let error = eda_synth::synthesize(&synthesis_design, &eda_synth::SynthOptions::default())
+        .expect_err("shortreal synthesis must fail closed");
+    assert!(
+        error.contains("real comparisons are not synthesizable"),
+        "unexpected shortreal synthesis error: {error}"
     );
 }
 
@@ -4700,16 +12561,53 @@ package types_pkg;
   parameter string MESSAGE = "UVM";
 endpackage
 
+typedef int unsigned global_unsigned_t;
+typedef logic [3:0] global_state_base_t;
+typedef enum global_state_base_t {
+  GLOBAL_A = 4'd1,
+  GLOBAL_B = 4'd2
+} global_state_t;
+
+parameter int GLOBAL_PARAMETER = 13;
+parameter global_state_t GLOBAL_STATE = GLOBAL_B;
+int global_counter = 7;
+
+function int global_add(int lhs);
+  global_add = lhs + GLOBAL_PARAMETER;
+endfunction
+
+function void bump_global_counter();
+  global_counter++;
+endfunction
+
 module type_alias_top
   import types_pkg::*;
 (
   output wide_t wide,
   output count_t count,
-  output string message
+  output string message,
+  output real global_unsigned_as_real,
+  output global_state_t global_state,
+  output string global_state_name,
+  output int global_parameter_value,
+  output int global_function_value,
+  output int global_variable_value,
+  output int global_counter_after_bump
 );
+  global_unsigned_t global_unsigned = 32'hffff_ffff;
   assign wide = 16'h1234;
   assign count = 42;
   assign message = MESSAGE;
+  assign global_state = GLOBAL_STATE;
+  assign global_state_name = GLOBAL_STATE.name();
+  initial global_unsigned_as_real = real'(global_unsigned);
+  initial begin
+    global_parameter_value = GLOBAL_PARAMETER;
+    global_function_value = global_add(29);
+    global_variable_value = global_counter;
+    bump_global_counter();
+    global_counter_after_bump = global_counter;
+  end
 endmodule
 "#,
     )
@@ -4761,6 +12659,39 @@ endmodule
             .unwrap()
             .to_ascii_string_nul_terminated(),
         "UVM"
+    );
+    let global_bits = simulator
+        .read("global_unsigned_as_real")
+        .unwrap()
+        .to_u64()
+        .expect("global unsigned conversion is known");
+    assert_eq!(f64::from_bits(global_bits), u32::MAX as f64);
+    assert_eq!(simulator.read("global_state").unwrap().to_u64(), Some(2));
+    assert_eq!(
+        simulator
+            .read("global_state_name")
+            .unwrap()
+            .to_ascii_string_nul_terminated(),
+        "GLOBAL_B"
+    );
+    assert_eq!(
+        simulator.read("global_parameter_value").unwrap().to_u64(),
+        Some(13)
+    );
+    assert_eq!(
+        simulator.read("global_function_value").unwrap().to_u64(),
+        Some(42)
+    );
+    assert_eq!(
+        simulator.read("global_variable_value").unwrap().to_u64(),
+        Some(7)
+    );
+    assert_eq!(
+        simulator
+            .read("global_counter_after_bump")
+            .unwrap()
+            .to_u64(),
+        Some(8)
     );
 }
 
@@ -7069,8 +15000,8 @@ endmodule
         .validate_against_design_legacy_compatibility(&bounded)
         .expect_err("wrong constant multidimensional array simple-range width must fail");
     assert!(
-        constant_simple_range_width_error.contains("Const:3:u[3:111]")
-            && constant_simple_range_width_error.contains("Const:4:u[4:1111]"),
+        constant_simple_range_width_error.contains("MemoryReadPart:3:u[mem")
+            && constant_simple_range_width_error.contains("Cond:8:u["),
         "unexpected constant simple-range width error: {constant_simple_range_width_error}"
     );
     if let Some(target) = summary
@@ -7079,7 +15010,7 @@ endmodule
         .find(|target| target.name == "r")
     {
         target.rhs.type_width = Some(4);
-        target.rhs.operands[1].literal = Some("32:101".into());
+        target.rhs.operands[1].literal = Some("32:00000000000000000000000000000101".into());
     }
 
     if let Some(part) = summary.procedural_blocks.iter_mut().find_map(|block| {
@@ -8572,18 +16503,38 @@ module associative_traversal(
   output int empty_cursor_final,
   output int cursor_after_first,
   output int cursor_after_next,
-  output int cursor_after_prev
+  output int cursor_after_prev,
+  output int floating_first_status,
+  output int floating_next_status,
+  output int floating_prev_status,
+  output int floating_last_status,
+  output int floating_cursor_final,
+  output int compact_first_status,
+  output int compact_next_status,
+  output int compact_prev_status,
+  output int compact_last_status,
+  output int compact_cursor_final
 );
   logic [7:0] values[int];
   logic [7:0] empty[int];
+  real floating_values[int];
+  shortreal compact_values[int];
   int cursor;
   int empty_cursor;
+  int floating_cursor;
+  int compact_cursor;
 
   initial begin
     #1;
     values[-3] = 8'h10;
     values[2] = 8'h21;
     values[7] = 8'h32;
+    floating_values[-3] = 1.25;
+    floating_values[2] = 3.75;
+    floating_values[7] = -2.5;
+    compact_values[-3] = 0.25;
+    compact_values[2] = 1.5;
+    compact_values[7] = -0.75;
 
     first_status = values.first(cursor);
     cursor_after_first = cursor;
@@ -8599,6 +16550,18 @@ module associative_traversal(
     empty_cursor = 0;
     empty_status = empty.first(empty_cursor);
     empty_cursor_final = empty_cursor;
+
+    floating_first_status = floating_values.first(floating_cursor);
+    floating_next_status = floating_values.next(floating_cursor);
+    floating_prev_status = floating_values.prev(floating_cursor);
+    floating_last_status = floating_values.last(floating_cursor);
+    floating_cursor_final = floating_cursor;
+
+    compact_first_status = compact_values.first(compact_cursor);
+    compact_next_status = compact_values.next(compact_cursor);
+    compact_prev_status = compact_values.prev(compact_cursor);
+    compact_last_status = compact_values.last(compact_cursor);
+    compact_cursor_final = compact_cursor;
   end
 endmodule
 "#,
@@ -8612,7 +16575,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower associative traversal");
-    assert_eq!(design.memories.len(), 2);
+    assert_eq!(design.memories.len(), 4);
     let traversal_json = slang
         .ast_json_with_options(
             std::slice::from_ref(&source_path),
@@ -8670,6 +16633,16 @@ endmodule
         ("cursor_after_first", u32::MAX as u64 - 2),
         ("cursor_after_next", 2),
         ("cursor_after_prev", 2),
+        ("floating_first_status", 1),
+        ("floating_next_status", 1),
+        ("floating_prev_status", 1),
+        ("floating_last_status", 1),
+        ("floating_cursor_final", 7),
+        ("compact_first_status", 1),
+        ("compact_next_status", 1),
+        ("compact_prev_status", 1),
+        ("compact_last_status", 1),
+        ("compact_cursor_final", 7),
     ];
     for (name, value) in expected {
         assert_eq!(
@@ -8708,7 +16681,28 @@ module dynamic_container_copies(
   output logic [7:0] associative_first,
   output logic [7:0] associative_second,
   output logic [7:0] nonblocking_associative_first,
-  output logic [7:0] nonblocking_associative_second
+  output logic [7:0] nonblocking_associative_second,
+  output int real_dynamic_size,
+  output real real_dynamic_first,
+  output real real_dynamic_last,
+  output int compact_dynamic_size,
+  output shortreal compact_dynamic_first,
+  output shortreal compact_dynamic_last,
+  output int realtime_dynamic_size,
+  output realtime realtime_dynamic_first,
+  output realtime realtime_dynamic_last,
+  output int real_queue_size,
+  output real real_queue_first,
+  output real real_queue_last,
+  output int compact_queue_size,
+  output shortreal compact_queue_first,
+  output shortreal compact_queue_last,
+  output int real_associative_count,
+  output real real_associative_first,
+  output real real_associative_second,
+  output int compact_associative_count,
+  output shortreal compact_associative_first,
+  output shortreal compact_associative_second
 );
   logic [7:0] dynamic_source[];
   logic [7:0] dynamic_destination[];
@@ -8721,6 +16715,20 @@ module dynamic_container_copies(
   logic [7:0] associative_destination[int];
   logic [7:0] nonblocking_associative_source[int];
   logic [7:0] nonblocking_associative_destination[int];
+  real real_dynamic_source[];
+  real real_dynamic_destination[];
+  shortreal compact_dynamic_source[];
+  shortreal compact_dynamic_destination[];
+  realtime realtime_dynamic_source[];
+  realtime realtime_dynamic_destination[];
+  real real_queue_source[$];
+  real real_queue_destination[$];
+  shortreal compact_queue_source[$];
+  shortreal compact_queue_destination[$];
+  real real_associative_source[int];
+  real real_associative_destination[int];
+  shortreal compact_associative_source[int];
+  shortreal compact_associative_destination[int];
 
   initial begin
     #1;
@@ -8748,6 +16756,37 @@ module dynamic_container_copies(
     nonblocking_associative_source[43] = 8'h70;
     nonblocking_associative_source[44] = 8'b1;
     nonblocking_associative_destination <= nonblocking_associative_source;
+
+    real_dynamic_source = new[2];
+    real_dynamic_source[0] = 1.25;
+    real_dynamic_source[1] = 2.5;
+    real_dynamic_destination = real_dynamic_source;
+
+    compact_dynamic_source = new[2];
+    compact_dynamic_source[0] = 0.25;
+    compact_dynamic_source[1] = 1.5;
+    compact_dynamic_destination = compact_dynamic_source;
+
+    realtime_dynamic_source = new[2];
+    realtime_dynamic_source[0] = 9.5;
+    realtime_dynamic_source[1] = 10.25;
+    realtime_dynamic_destination = realtime_dynamic_source;
+
+    real_queue_source.push_back(3.75);
+    real_queue_source.push_back(4.5);
+    real_queue_destination = real_queue_source;
+
+    compact_queue_source.push_back(2.25);
+    compact_queue_source.push_back(3.0);
+    compact_queue_destination = compact_queue_source;
+
+    real_associative_source[51] = 5.25;
+    real_associative_source[52] = 6.5;
+    real_associative_destination = real_associative_source;
+
+    compact_associative_source[53] = 0.75;
+    compact_associative_source[54] = 1.25;
+    compact_associative_destination = compact_associative_source;
   end
 
   initial begin
@@ -8770,6 +16809,27 @@ module dynamic_container_copies(
     associative_second = associative_destination[42];
     nonblocking_associative_first = nonblocking_associative_destination[43];
     nonblocking_associative_second = nonblocking_associative_destination[44];
+    real_dynamic_size = real_dynamic_destination.size();
+    real_dynamic_first = real_dynamic_destination[0];
+    real_dynamic_last = real_dynamic_destination[1];
+    compact_dynamic_size = compact_dynamic_destination.size();
+    compact_dynamic_first = compact_dynamic_destination[0];
+    compact_dynamic_last = compact_dynamic_destination[1];
+    realtime_dynamic_size = realtime_dynamic_destination.size();
+    realtime_dynamic_first = realtime_dynamic_destination[0];
+    realtime_dynamic_last = realtime_dynamic_destination[1];
+    real_queue_size = real_queue_destination.size();
+    real_queue_first = real_queue_destination[0];
+    real_queue_last = real_queue_destination[1];
+    compact_queue_size = compact_queue_destination.size();
+    compact_queue_first = compact_queue_destination[0];
+    compact_queue_last = compact_queue_destination[1];
+    real_associative_count = real_associative_destination.num();
+    real_associative_first = real_associative_destination[51];
+    real_associative_second = real_associative_destination[52];
+    compact_associative_count = compact_associative_destination.num();
+    compact_associative_first = compact_associative_destination[53];
+    compact_associative_second = compact_associative_destination[54];
   end
 endmodule
 "#,
@@ -8783,7 +16843,7 @@ endmodule
             &PreprocessOptions::default(),
         )
         .expect("directly lower dynamic-container copies");
-    assert_eq!(design.memories.len(), 11);
+    assert_eq!(design.memories.len(), 25);
     let copy_json = slang
         .ast_json_with_options(
             std::slice::from_ref(&source_path),
@@ -8846,6 +16906,74 @@ endmodule
             simulator.read(name).unwrap().to_u64(),
             Some(value),
             "wrong value for {name}"
+        );
+    }
+    fn real_output(simulator: &Simulator, name: &str) -> f64 {
+        let bits = simulator
+            .read(name)
+            .unwrap_or_else(|| panic!("missing floating-copy real output {name}"))
+            .to_u64()
+            .unwrap_or_else(|| panic!("floating-copy real output {name} is unknown"));
+        f64::from_bits(bits)
+    }
+    fn shortreal_output(simulator: &Simulator, name: &str) -> f32 {
+        let raw = u32::try_from(
+            simulator
+                .read(name)
+                .unwrap_or_else(|| panic!("missing floating-copy shortreal output {name}"))
+                .to_u64()
+                .unwrap_or_else(|| panic!("floating-copy shortreal output {name} is unknown")),
+        )
+        .unwrap_or_else(|_| panic!("floating-copy shortreal output {name} exceeds 32 bits"));
+        f32::from_bits(raw)
+    }
+
+    let integral_expected = [
+        ("real_dynamic_size", 2),
+        ("compact_dynamic_size", 2),
+        ("realtime_dynamic_size", 2),
+        ("real_queue_size", 2),
+        ("compact_queue_size", 2),
+        ("real_associative_count", 2),
+        ("compact_associative_count", 2),
+    ];
+    for (name, value) in integral_expected {
+        assert_eq!(
+            simulator.read(name).unwrap().to_u64(),
+            Some(value),
+            "wrong floating-copy value for {name}"
+        );
+    }
+    let real_expected = [
+        ("real_dynamic_first", 1.25),
+        ("real_dynamic_last", 2.5),
+        ("realtime_dynamic_first", 9.5),
+        ("realtime_dynamic_last", 10.25),
+        ("real_queue_first", 3.75),
+        ("real_queue_last", 4.5),
+        ("real_associative_first", 5.25),
+        ("real_associative_second", 6.5),
+    ];
+    for (name, value) in real_expected {
+        assert_eq!(
+            real_output(&simulator, name),
+            value,
+            "wrong floating-copy real value for {name}"
+        );
+    }
+    let shortreal_expected = [
+        ("compact_dynamic_first", 0.25_f32),
+        ("compact_dynamic_last", 1.5),
+        ("compact_queue_first", 2.25),
+        ("compact_queue_last", 3.0),
+        ("compact_associative_first", 0.75),
+        ("compact_associative_second", 1.25),
+    ];
+    for (name, value) in shortreal_expected {
+        assert_eq!(
+            shortreal_output(&simulator, name),
+            value,
+            "wrong floating-copy shortreal value for {name}"
         );
     }
 }
@@ -13222,12 +21350,7 @@ fn slang_ast_direct_lowering_rejects_unsupported_unpacked_aggregate_forms() {
         &pattern_path,
         r#"
 module unpacked_pattern;
-  typedef struct {
-    logic [7:0] wide;
-    logic [3:0] narrow;
-  } packet_t;
-
-  packet_t packet;
+  logic [7:0] packet[];
   initial packet = '{8'h12, 4'h3};
 endmodule
 "#,
@@ -13239,9 +21362,9 @@ endmodule
             Some("unpacked_pattern"),
             &PreprocessOptions::default(),
         )
-        .expect_err("unpacked aggregate assignment patterns must fail closed");
+        .expect_err("dynamic unpacked assignment patterns must fail closed");
     assert!(
-        error.contains("unpacked aggregate assignment patterns are not supported"),
+        error.contains("unpacked assignment patterns are not supported for dynamic arrays"),
         "unexpected unpacked pattern error: {error}"
     );
 
@@ -16002,6 +24125,622 @@ endmodule
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(0));
     simulator.run_until(2).unwrap();
     assert_eq!(simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(simulator.read("released").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_procedural_assign_and_deassign() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-procedural-assign");
+    let source_path = root.join("procedural_assign.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module procedural_assign_deassign(
+  input logic en,
+  output logic held,
+  output logic wrote_during_assign,
+  output logic retained_snapshot,
+  output logic released
+);
+  initial begin
+    held = 1'b0;
+    wrote_during_assign = 1'b0;
+    retained_snapshot = 1'b0;
+    released = 1'b0;
+    wait (en);
+    assign held = 1'b1;
+    #1;
+    wrote_during_assign = 1'b0;
+    #1;
+    deassign held;
+    retained_snapshot = held;
+    held = 1'b0;
+    released = 1'b1;
+  end
+endmodule
+"#,
+    )
+    .expect("write procedural assign/deassign source");
+
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("procedural_assign_deassign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower procedural assign/deassign");
+
+    let dynamic_path = root.join("dynamic_procedural_assign.sv");
+    std::fs::write(
+        &dynamic_path,
+        r#"
+module dynamic_procedural_assign(
+  input logic enable,
+  input logic start,
+  input logic stop,
+  output logic y,
+  output logic installed,
+  output logic blocked_write,
+  output logic retained_after_disable
+);
+  initial begin
+    y = 1'b0;
+    installed = 1'b0;
+    blocked_write = 1'b1;
+    retained_after_disable = 1'b0;
+    wait (start);
+    assign y = enable;
+    y = 1'b0;
+    blocked_write = 1'b0;
+    installed = 1'b1;
+    wait (stop);
+    deassign y;
+    retained_after_disable = y;
+    y = 1'b0;
+  end
+endmodule
+"#,
+    )
+    .expect("write dynamic procedural-assign source");
+    let dynamic_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&dynamic_path),
+            Some("dynamic_procedural_assign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower dynamic procedural assignment");
+    let dynamic_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&dynamic_path),
+            Some("dynamic_procedural_assign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize dynamic procedural-assignment AST");
+    let dynamic_summary = slang
+        .summarize_ast_json(&dynamic_json)
+        .expect("summarize dynamic procedural-assignment AST");
+    dynamic_summary
+        .validate_against_design(&dynamic_design)
+        .expect("exact dynamic procedural-assignment fingerprints should match");
+    let mut dynamic_simulator =
+        Simulator::new(&dynamic_design).expect("create dynamic procedural-assign simulator");
+    dynamic_simulator
+        .run_until(0)
+        .expect("start dynamic testbench");
+    dynamic_simulator
+        .set_input("enable", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    dynamic_simulator
+        .set_input("start", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(dynamic_simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        dynamic_simulator.read("installed").unwrap().to_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        dynamic_simulator.read("blocked_write").unwrap().to_u64(),
+        Some(0),
+        "ordinary write must be blocked while dynamic procedural assignment is active"
+    );
+    dynamic_simulator
+        .set_input("enable", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        dynamic_simulator.read("y").unwrap().to_u64(),
+        Some(1),
+        "dynamic procedural driver must follow rising RHS"
+    );
+    dynamic_simulator
+        .set_input("enable", &LogicWord::from_u64(1, 0))
+        .unwrap();
+    assert_eq!(
+        dynamic_simulator.read("y").unwrap().to_u64(),
+        Some(0),
+        "dynamic procedural driver must follow falling RHS"
+    );
+    dynamic_simulator
+        .set_input("enable", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    dynamic_simulator
+        .set_input("stop", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        dynamic_simulator
+            .read("retained_after_disable")
+            .unwrap()
+            .to_u64(),
+        Some(1)
+    );
+    assert_eq!(dynamic_simulator.read("y").unwrap().to_u64(), Some(0));
+
+    let aggregate_path = root.join("aggregate_procedural_assign.sv");
+    std::fs::write(
+        &aggregate_path,
+        r#"
+module aggregate_procedural_assign(
+  input logic [3:0] rhs,
+  input logic start,
+  input logic stop,
+  output logic [1:0] first,
+  output logic [1:0] second,
+  output logic installed
+);
+  initial begin
+    first = 2'b00;
+    second = 2'b00;
+    installed = 1'b0;
+    wait (start);
+    assign {first, second} = rhs;
+    first = 2'b00;
+    second = 2'b00;
+    installed = 1'b1;
+    wait (stop);
+    deassign {first, second};
+  end
+endmodule
+"#,
+    )
+    .expect("write aggregate procedural-assign source");
+    let aggregate_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&aggregate_path),
+            Some("aggregate_procedural_assign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower aggregate procedural assignment");
+    let aggregate_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&aggregate_path),
+            Some("aggregate_procedural_assign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize aggregate procedural-assignment AST");
+    let aggregate_summary = slang
+        .summarize_ast_json(&aggregate_json)
+        .expect("summarize aggregate procedural-assignment AST");
+    aggregate_summary
+        .validate_against_design(&aggregate_design)
+        .expect("exact aggregate procedural-assignment fingerprints should match");
+    let mut aggregate_simulator =
+        Simulator::new(&aggregate_design).expect("create aggregate procedural-assign simulator");
+    aggregate_simulator
+        .run_until(0)
+        .expect("start aggregate procedural-assignment testbench");
+    aggregate_simulator
+        .set_input("rhs", &LogicWord::from_u64(4, 0b1010))
+        .unwrap();
+    aggregate_simulator
+        .set_input("start", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        aggregate_simulator.read("first").unwrap().to_u64(),
+        Some(0b10)
+    );
+    assert_eq!(
+        aggregate_simulator.read("second").unwrap().to_u64(),
+        Some(0b10)
+    );
+    aggregate_simulator
+        .set_input("rhs", &LogicWord::from_u64(4, 0b0101))
+        .unwrap();
+    assert_eq!(
+        aggregate_simulator.read("first").unwrap().to_u64(),
+        Some(0b01),
+        "aggregate procedural driver must follow upper RHS bits"
+    );
+    assert_eq!(
+        aggregate_simulator.read("second").unwrap().to_u64(),
+        Some(0b01),
+        "aggregate procedural driver must follow lower RHS bits"
+    );
+    aggregate_simulator
+        .set_input("stop", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert!(
+        aggregate_simulator.read("installed").unwrap().to_u64() == Some(1)
+            && aggregate_simulator.read("first").unwrap().to_u64() == Some(0b01)
+            && aggregate_simulator.read("second").unwrap().to_u64() == Some(0b01),
+        "aggregate deassign must retain the last driven fields"
+    );
+
+    let memory_path = root.join("memory_procedural_assign.sv");
+    std::fs::write(
+        &memory_path,
+        r#"
+module memory_procedural_assign(
+  input logic start,
+  input logic update_zero,
+  input logic update_one,
+  input logic stop,
+  output logic y,
+  output logic blocked_write,
+  output logic after_falling,
+  output logic after_rising,
+  output logic retained_after_disable
+);
+  logic [7:0] values [0:3];
+  initial begin
+    values[0] = 8'h01;
+    y = 1'b0;
+    blocked_write = 1'b1;
+    after_falling = 1'b0;
+    after_rising = 1'b0;
+    retained_after_disable = 1'b0;
+    wait (start);
+    assign y = values[0];
+    y = 1'b0;
+    blocked_write = 1'b0;
+    wait (update_zero);
+    values[0] = 8'h00;
+    #1;
+    after_falling = y;
+    wait (update_one);
+    values[0] = 8'h01;
+    #1;
+    after_rising = y;
+    wait (stop);
+    deassign y;
+    retained_after_disable = y;
+    y = 1'b0;
+  end
+endmodule
+"#,
+    )
+    .expect("write memory procedural-assign source");
+    let memory_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&memory_path),
+            Some("memory_procedural_assign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower memory-dependent procedural assignment");
+    let memory_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&memory_path),
+            Some("memory_procedural_assign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize memory-dependent procedural-assignment AST");
+    let memory_summary = slang
+        .summarize_ast_json(&memory_json)
+        .expect("summarize memory-dependent procedural-assignment AST");
+    memory_summary
+        .validate_against_design(&memory_design)
+        .expect("exact memory-dependent procedural-assignment fingerprints should match");
+    let mut memory_simulator =
+        Simulator::new(&memory_design).expect("create memory procedural-assign simulator");
+    memory_simulator
+        .run_until(0)
+        .expect("start memory procedural-assignment testbench");
+    memory_simulator
+        .set_input("start", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(memory_simulator.read("y").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        memory_simulator.read("blocked_write").unwrap().to_u64(),
+        Some(0),
+        "ordinary write must be blocked by memory-dependent procedural driver"
+    );
+    memory_simulator
+        .set_input("update_zero", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert!(
+        memory_simulator.read("after_falling").unwrap().to_u64() == Some(0),
+        "memory-dependent procedural driver must follow a falling memory element"
+    );
+    memory_simulator
+        .run_until(1)
+        .expect("advance past memory falling-update delay");
+    memory_simulator
+        .set_input("update_one", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    memory_simulator
+        .run_until(2)
+        .expect("advance past memory rising-update delay");
+    assert!(
+        memory_simulator.read("after_rising").unwrap().to_u64() == Some(1),
+        "memory-dependent procedural driver must follow a rising memory element"
+    );
+    memory_simulator
+        .set_input("stop", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert!(
+        memory_simulator
+            .read("retained_after_disable")
+            .unwrap()
+            .to_u64()
+            == Some(1)
+            && memory_simulator.read("y").unwrap().to_u64() == Some(0),
+        "memory-dependent deassign must retain the last value and then resume ordinary writes"
+    );
+
+    let event_path = root.join("event_procedural_assign.sv");
+    std::fs::write(
+        &event_path,
+        r#"
+module event_procedural_assign(
+  input logic start,
+  input logic trigger,
+  input logic stop,
+  output logic y,
+  output logic installed,
+  output logic retained_after_disable
+);
+  event trigger_event;
+  initial begin
+    y = 1'b0;
+    installed = 1'b0;
+    retained_after_disable = 1'b0;
+    wait (start);
+    assign y = trigger_event.triggered;
+    y = 1'b0;
+    installed = 1'b1;
+    wait (stop);
+    deassign y;
+    retained_after_disable = y;
+    y = 1'b0;
+  end
+
+  initial begin
+    wait (trigger);
+    ->trigger_event;
+  end
+endmodule
+"#,
+    )
+    .expect("write event-dependent procedural-assign source");
+    let event_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&event_path),
+            Some("event_procedural_assign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower event-dependent procedural assignment");
+    let event_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&event_path),
+            Some("event_procedural_assign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize event-dependent procedural-assignment AST");
+    let event_summary = slang
+        .summarize_ast_json(&event_json)
+        .expect("summarize event-dependent procedural-assignment AST");
+    event_summary
+        .validate_against_design(&event_design)
+        .expect("exact event-dependent procedural-assignment fingerprints should match");
+    let mut event_simulator =
+        Simulator::new(&event_design).expect("create event procedural-assign simulator");
+    event_simulator
+        .run_until(0)
+        .expect("start event procedural-assignment testbench");
+    event_simulator
+        .set_input("start", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(event_simulator.read("y").unwrap().to_u64(), Some(0));
+    event_simulator
+        .set_input("trigger", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        event_simulator.read("y").unwrap().to_u64(),
+        Some(1),
+        "event-triggered RHS must become true in the triggering time slot"
+    );
+    event_simulator
+        .run_until(1)
+        .expect("advance out of the triggering time slot");
+    assert_eq!(
+        event_simulator.read("y").unwrap().to_u64(),
+        Some(0),
+        "event-triggered RHS must become false in the next time slot"
+    );
+    event_simulator
+        .set_input("stop", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        event_simulator
+            .read("retained_after_disable")
+            .unwrap()
+            .to_u64(),
+        Some(0)
+    );
+    assert_eq!(event_simulator.read("y").unwrap().to_u64(), Some(0));
+
+    let time_path = root.join("time_procedural_assign.sv");
+    std::fs::write(
+        &time_path,
+        r#"
+module time_procedural_assign(
+  input logic start,
+  input logic stop,
+  output time integer_time,
+  output realtime realtime_value,
+  output logic installed,
+  output time retained_integer_time,
+  output realtime retained_realtime
+);
+  initial begin
+    integer_time = 0;
+    realtime_value = 0.0;
+    installed = 1'b0;
+    retained_integer_time = 0;
+    retained_realtime = 0.0;
+    wait (start);
+    assign integer_time = $time;
+    assign realtime_value = $realtime;
+    integer_time = 0;
+    realtime_value = 0.0;
+    installed = 1'b1;
+    wait (stop);
+    deassign integer_time;
+    deassign realtime_value;
+    retained_integer_time = integer_time;
+    retained_realtime = realtime_value;
+    integer_time = 0;
+    realtime_value = 0.0;
+  end
+endmodule
+"#,
+    )
+    .expect("write time-dependent procedural-assign source");
+    let time_design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&time_path),
+            Some("time_procedural_assign"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower time-dependent procedural assignment");
+    let time_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&time_path),
+            Some("time_procedural_assign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize time-dependent procedural-assignment AST");
+    let time_summary = slang
+        .summarize_ast_json(&time_json)
+        .expect("summarize time-dependent procedural-assignment AST");
+    time_summary
+        .validate_against_design(&time_design)
+        .expect("exact time-dependent procedural-assignment fingerprints should match");
+    let mut time_simulator =
+        Simulator::new(&time_design).expect("create time procedural-assign simulator");
+    time_simulator
+        .run_until(0)
+        .expect("start time procedural-assignment testbench");
+    time_simulator
+        .set_input("start", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(time_simulator.read("installed").unwrap().to_u64(), Some(1));
+    time_simulator.run_until(1).unwrap();
+    assert_eq!(
+        time_simulator.read("integer_time").unwrap().to_u64(),
+        Some(1),
+        "integer time RHS must update when simulation time advances"
+    );
+    assert_eq!(
+        f64::from_bits(
+            time_simulator
+                .read("realtime_value")
+                .unwrap()
+                .to_u64()
+                .expect("realtime procedural driver is known")
+        ),
+        1.0,
+        "realtime RHS must update when simulation time advances"
+    );
+    time_simulator.run_until(2).unwrap();
+    assert_eq!(
+        time_simulator.read("integer_time").unwrap().to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        f64::from_bits(
+            time_simulator
+                .read("realtime_value")
+                .unwrap()
+                .to_u64()
+                .expect("realtime procedural driver is known")
+        ),
+        2.0
+    );
+    time_simulator
+        .set_input("stop", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    assert_eq!(
+        time_simulator
+            .read("retained_integer_time")
+            .unwrap()
+            .to_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        f64::from_bits(
+            time_simulator
+                .read("retained_realtime")
+                .unwrap()
+                .to_u64()
+                .expect("retained realtime is known")
+        ),
+        2.0
+    );
+    assert_eq!(
+        time_simulator.read("integer_time").unwrap().to_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        f64::from_bits(
+            time_simulator
+                .read("realtime_value")
+                .unwrap()
+                .to_u64()
+                .expect("final realtime is known")
+        ),
+        0.0
+    );
+
+    let procedural_json = slang
+        .ast_json_with_options(
+            std::slice::from_ref(&source_path),
+            Some("procedural_assign_deassign"),
+            &[],
+            &PreprocessOptions::default(),
+        )
+        .expect("serialize procedural assign/deassign AST");
+    let procedural_summary = slang
+        .summarize_ast_json(&procedural_json)
+        .expect("summarize procedural assign/deassign AST");
+    procedural_summary
+        .validate_against_design(&design)
+        .expect("exact procedural assign/deassign fingerprints should match");
+
+    let mut simulator = Simulator::new(&design).expect("create procedural-assign simulator");
+    simulator
+        .set_input("en", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    simulator.run_until(1).unwrap();
+    assert_eq!(simulator.read("held").unwrap().to_u64(), Some(1));
+    assert_eq!(
+        simulator.read("wrote_during_assign").unwrap().to_u64(),
+        Some(0),
+        "procedural continuous assignment must block ordinary procedural writes"
+    );
+    simulator.run_until(2).unwrap();
+    assert_eq!(
+        simulator.read("retained_snapshot").unwrap().to_u64(),
+        Some(1),
+        "deassign must retain the last procedurally assigned value"
+    );
+    assert_eq!(simulator.read("held").unwrap().to_u64(), Some(0));
     assert_eq!(simulator.read("released").unwrap().to_u64(), Some(1));
 }
 
@@ -19225,6 +27964,158 @@ endmodule
 }
 
 #[test]
+fn slang_ast_direct_lowering_supports_global_assertion_controls() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-assert-controls");
+    let source_path = root.join("assert_controls.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module assert_controls;
+  initial begin
+    cover (1);
+    $assertoff;
+    cover (1);
+    #1 $asserton;
+    cover (1);
+    $assertkill;
+    cover (1);
+  end
+endmodule
+"#,
+    )
+    .expect("write assertion-control source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("assert_controls"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower global assertion controls");
+    let mut simulator = Simulator::new(&design).expect("create assertion-control simulator");
+    simulator.run_until(1).expect("run assertion controls");
+    let covers = simulator.take_property_covers();
+    let count: u64 = covers.values().sum();
+    assert_eq!(
+        count, 3,
+        "off must skip cover, while on and kill with no resident attempt execute: {covers:?}"
+    );
+
+    let disabled_path = root.join("assert_disabled.sv");
+    std::fs::write(
+        &disabled_path,
+        r#"
+module assert_disabled;
+  initial begin
+    $assertoff;
+    assert (1'b0);
+    #1 $asserton;
+    assert (1'b0);
+  end
+endmodule
+"#,
+    )
+    .expect("write disabled assertion source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&disabled_path),
+            Some("assert_disabled"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower disabled assertion source");
+    let mut simulator = Simulator::new(&design).expect("create disabled assertion simulator");
+    let error = simulator
+        .run_until(1)
+        .expect_err("assertoff must suppress the first failing assertion only");
+    assert!(
+        error.contains("assertion failed at t=1"),
+        "unexpected assertion-control error: {error}"
+    );
+
+    let scoped_path = root.join("assert_scoped.sv");
+    std::fs::write(
+        &scoped_path,
+        r#"
+module assert_scoped;
+  initial $assertoff(0);
+endmodule
+"#,
+    )
+    .expect("write scoped assertion source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&scoped_path),
+            Some("assert_scoped"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("argument-scoped assertion controls must fail closed");
+    assert!(
+        error.contains("argument-scoped '$assertoff' is not supported"),
+        "unexpected scoped assertion error: {error}"
+    );
+}
+
+#[test]
+fn slang_ast_direct_lowering_supports_immediate_assertion_action_blocks() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let root = temporary_directory("direct-ast-immediate-actions");
+    let source_path = root.join("immediate_actions.sv");
+    std::fs::write(
+        &source_path,
+        r#"
+module immediate_actions(output int stage);
+  initial begin
+    stage = 0;
+    assert (1'b1) stage = 1; else stage = 2;
+    assert (1'b0) stage = 10; else stage = 3;
+    assume (1'b1) stage = 4; else stage = 5;
+    assume (1'b0) stage = 20; else stage = 6;
+    cover (1'b1) stage = 7;
+  end
+endmodule
+"#,
+    )
+    .expect("write immediate-action source");
+    let design = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&source_path),
+            Some("immediate_actions"),
+            &PreprocessOptions::default(),
+        )
+        .expect("directly lower immediate assertion actions");
+    let mut simulator = Simulator::new(&design).expect("create immediate-action simulator");
+    simulator.run_until(0).expect("execute immediate actions");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(7));
+    assert_eq!(simulator.property_cover_hits("immediate"), 1);
+
+    let deferred_path = root.join("deferred_assertion.sv");
+    std::fs::write(
+        &deferred_path,
+        r#"
+module deferred_assertion;
+  initial assert #0 (1'b1) else $display("deferred");
+endmodule
+"#,
+    )
+    .expect("write deferred assertion source");
+    let error = slang
+        .compile_files_via_ast(
+            std::slice::from_ref(&deferred_path),
+            Some("deferred_assertion"),
+            &PreprocessOptions::default(),
+        )
+        .expect_err("deferred immediate assertions must fail closed");
+    assert!(
+        error.contains("deferred/final immediate assertion semantics are not supported"),
+        "unexpected deferred assertion error: {error}"
+    );
+}
+
+#[test]
 fn slang_ast_direct_lowering_supports_indexed_packed_part_selects() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -20045,6 +28936,85 @@ endmodule
 }
 
 #[test]
+fn slang_direct_official_uvm_stop_action_pauses_simulation() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-stop-action-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class direct_report_stop_probe extends uvm_test;
+  function new(string name = "direct_report_stop_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    this.set_report_id_action("STOP", UVM_DISPLAY | UVM_STOP);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    uvm_report_info("STOP", "terminal pause requested", UVM_LOW);
+  endtask
+endclass
+
+module official_uvm_report_stop_probe;
+  initial run_test("direct_report_stop_probe");
+endmodule
+"#,
+    )
+    .expect("write official-UVM stop-action wrapper");
+    let design = slang
+        .compile_files(&[source, wrapper], None, &options)
+        .expect("directly lower official UVM stop action");
+    let mut simulator = Simulator::new(&design).expect("create UVM stop simulator");
+    simulator
+        .run_until(0)
+        .expect("execute through the UVM stop action");
+    assert!(simulator.stopped(), "UVM_STOP must pause the simulation");
+    assert!(
+        !simulator.finished(),
+        "UVM_STOP must not execute $finish semantics"
+    );
+    assert!(
+        simulator
+            .take_displays()
+            .iter()
+            .any(|message| message.contains("terminal pause requested")),
+        "UVM_DISPLAY combined with UVM_STOP must still emit the report"
+    );
+    simulator
+        .resume_until(1)
+        .expect("resume the official UVM continuation after UVM_STOP");
+    assert!(
+        !simulator.stopped(),
+        "resuming after UVM_STOP must clear the paused state"
+    );
+}
+
+#[test]
 fn slang_direct_official_uvm_queries_report_controls() {
     let Some(slang) = discover_slang_for_tests() else {
         return;
@@ -20857,6 +29827,169 @@ endmodule
         simulator.read("mode_after").unwrap().to_u64(),
         Some(1),
         "re-enabled callback mode should query as one"
+    );
+}
+
+#[test]
+fn slang_direct_official_uvm_callbacks_add_by_name_execute_in_order() {
+    let Some(slang) = discover_slang_for_tests() else {
+        return;
+    };
+    let Some((root, source)) = official_uvm_sources() else {
+        return;
+    };
+    let options = PreprocessOptions {
+        include_directories: vec![root.join("src")],
+        defines: vec!["UVM_NO_DPI".to_string()],
+        undefines: Vec::new(),
+        library_directories: Vec::new(),
+        library_extensions: Vec::new(),
+    };
+    let wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-add-callback-by-name-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &wrapper,
+        r#"
+`include "uvm_macros.svh"
+
+import uvm_pkg::*;
+
+class AddByNameTrace;
+  static int stage = 0;
+endclass
+
+class direct_add_by_name_callback extends uvm_callback;
+  function new(string name = "direct_add_by_name_callback");
+  endfunction
+
+  virtual function void observe(int value);
+    AddByNameTrace::stage = AddByNameTrace::stage + 1;
+  endfunction
+endclass
+
+class direct_derived_add_by_name_callback extends direct_add_by_name_callback;
+  function new(string name = "direct_derived_add_by_name_callback");
+  endfunction
+
+  virtual function void observe(int value);
+    AddByNameTrace::stage = AddByNameTrace::stage + 10;
+  endfunction
+endclass
+
+class direct_add_by_name_probe extends uvm_test;
+  direct_add_by_name_callback first;
+  direct_derived_add_by_name_callback second;
+
+  function new(string name = "direct_add_by_name_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    first = new("first_callback");
+    second = new("second_callback");
+    uvm_callbacks#(
+      direct_add_by_name_probe,
+      direct_add_by_name_callback
+    )::add_by_name("uvm_test_top", first, null);
+    uvm_callbacks#(
+      direct_add_by_name_probe,
+      direct_add_by_name_callback
+    )::add_by_name("uvm_test_top", second, null, UVM_PREPEND);
+  endfunction
+
+  virtual task run_phase(uvm_phase phase);
+    `uvm_do_callbacks(
+      direct_add_by_name_probe,
+      direct_add_by_name_callback,
+      observe(0)
+    )
+    phase.raise_objection(this);
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module official_uvm_add_by_name_probe(output int stage);
+  initial begin
+    run_test("direct_add_by_name_probe");
+    stage = AddByNameTrace::stage;
+  end
+endmodule
+"#,
+    )
+    .expect("write official-UVM add-by-name wrapper");
+    let design = slang
+        .compile_files(
+            &[source.clone(), wrapper],
+            Some("official_uvm_add_by_name_probe"),
+            &options,
+        )
+        .expect("directly lower UVM add_by_name callbacks");
+    let mut simulator = Simulator::new(&design).expect("create UVM add-by-name simulator");
+    simulator
+        .run_until(0)
+        .expect("run UVM add-by-name callbacks");
+    assert_eq!(simulator.read("stage").unwrap().to_u64(), Some(11));
+
+    let missing_wrapper = std::env::temp_dir().join(format!(
+        "eda-official-uvm-add-callback-by-name-missing-{}-{}.sv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &missing_wrapper,
+        r#"
+import uvm_pkg::*;
+
+class direct_missing_name_callback extends uvm_callback;
+  function new(string name = "direct_missing_name_callback");
+  endfunction
+endclass
+
+class direct_missing_name_probe extends uvm_test;
+  direct_missing_name_callback callback;
+
+  function new(string name = "direct_missing_name_probe",
+               uvm_component parent = null);
+    super.new(name, parent);
+  endfunction
+
+  virtual function void build_phase(uvm_phase phase);
+    callback = new("missing_callback");
+    uvm_callbacks#(
+      direct_missing_name_probe,
+      direct_missing_name_callback
+    )::add_by_name("uvm_test_top.does_not_exist", callback, null);
+  endfunction
+endclass
+
+module official_uvm_missing_name_probe;
+  initial begin
+    run_test("direct_missing_name_probe");
+  end
+endmodule
+"#,
+    )
+    .expect("write missing UVM add-by-name wrapper");
+    let error = slang
+        .compile_files(
+            &[source, missing_wrapper],
+            Some("official_uvm_missing_name_probe"),
+            &options,
+        )
+        .expect_err("missing UVM add_by_name component must fail closed");
+    assert!(
+        error.contains("matches no component"),
+        "unexpected missing-name error: {error}"
     );
 }
 

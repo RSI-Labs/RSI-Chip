@@ -231,7 +231,9 @@ impl SlangAstLowerer {
         &mut self,
         member: &serde_json::Value,
     ) -> Result<(), String> {
-        let delay = self.scale_delay(continuous_assignment_delay(member)?)?;
+        let delay = self.scale_delay_constant(
+            continuous_assignment_delay(member)?.unwrap_or(super::DelayConstant::Integer(0)),
+        )?;
         let assignment = member
             .get("assignment")
             .ok_or_else(|| "ContinuousAssign has no assignment".to_string())?;
@@ -257,7 +259,7 @@ impl SlangAstLowerer {
         }
         let lv = self.lower_lvalue(left)?;
         self.record_implicit_type_mismatch(&lv, right)?;
-        let rhs = self.lower_expression(right)?;
+        let rhs = self.lower_real_assignment_expression(left, right)?;
         self.design
             .assigns
             .push(eda_core::ir::Assign { lv, e: rhs, delay });
@@ -275,6 +277,12 @@ impl SlangAstLowerer {
         let Some(operand) = expression.get("operand") else {
             return Ok(());
         };
+        if string_field(operand, "kind").as_deref() == Some("Streaming") {
+            // Streaming conversions are sized by the streaming lowering path;
+            // their operand has void type and is not an ordinary implicit
+            // integral conversion.
+            return Ok(());
+        }
 
         // slang gives an implicit assignment conversion the same source span as
         // its operand. An explicit cast starts at the cast operator instead.
@@ -541,6 +549,89 @@ impl SlangAstLowerer {
         })
     }
 
+    fn lower_procedural_concatenation_assign(
+        &self,
+        left: &Value,
+        right: &Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::{Expr, Stmt};
+
+        let empty_operands = Vec::new();
+        let operands = left
+            .get("operands")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_operands);
+        let targets = operands
+            .iter()
+            .map(|operand| {
+                let lv = self.lower_lvalue(operand)?;
+                validate_static_procedural_assignment_lvalue(operand, &lv)?;
+                Ok((operand, lv))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let total_width = targets
+            .iter()
+            .map(|(_, lv)| lv.range.width())
+            .sum::<usize>();
+        let rhs = self.lower_expression(right)?;
+        if rhs.width() != total_width {
+            return Err(format!(
+                "procedural concatenation assignment width {} does not match RHS width {}",
+                total_width,
+                rhs.width()
+            ));
+        }
+
+        let mut statements = Vec::new();
+        let mut remaining = total_width;
+        for (operand, lv) in targets {
+            let width = lv.range.width();
+            let lsb = remaining
+                .checked_sub(width)
+                .ok_or_else(|| "procedural concatenation assignment width underflow".to_string())?;
+            let msb = remaining - 1;
+            let e = if width == remaining {
+                rhs.clone()
+            } else {
+                Expr::Index {
+                    e: Box::new(rhs.clone()),
+                    msb,
+                    lsb,
+                }
+            };
+            validate_procedural_driver_rhs(&e)?;
+            let _ = operand;
+            statements.push(Stmt::ProceduralAssign { lv, e });
+            remaining = lsb;
+        }
+        if remaining != 0 {
+            return Err("procedural concatenation assignment did not cover RHS".into());
+        }
+        Ok(Stmt::Block(statements))
+    }
+
+    fn lower_procedural_concatenation_deassign(
+        &self,
+        left: &Value,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        use eda_core::ir::Stmt;
+
+        let empty_operands = Vec::new();
+        let operands = left
+            .get("operands")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_operands);
+        let statements = operands
+            .iter()
+            .map(|operand| {
+                let lv = self.lower_lvalue(operand)?;
+                validate_static_procedural_assignment_lvalue(operand, &lv)?;
+                Ok(Stmt::ProceduralDeassign { lv })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Stmt::Block(statements))
+    }
+
     fn lower_statement_inner(
         &self,
         statement: &serde_json::Value,
@@ -688,6 +779,54 @@ impl SlangAstLowerer {
                 }
                 Ok(Stmt::Block(statements))
             }
+            "ImmediateAssertion" => {
+                if bool_field(statement, "isDeferred") || bool_field(statement, "isFinal") {
+                    return Err(
+                        "deferred/final immediate assertion semantics are not supported".into(),
+                    );
+                }
+                let condition = statement
+                    .get("cond")
+                    .ok_or_else(|| "immediate assertion has no condition".to_string())?;
+                let condition = self.lower_expression(condition)?;
+                let lower_action = |action: Option<&serde_json::Value>| -> Result<
+                    Option<Box<Stmt>>,
+                    String,
+                > {
+                    let Some(action) = action else {
+                        return Ok(None);
+                    };
+                    if string_field(action, "kind").as_deref() == Some("Empty") {
+                        return Ok(None);
+                    }
+                    Ok(Some(Box::new(self.lower_statement(action)?)))
+                };
+                let pass_action = lower_action(statement.get("ifTrue"))?;
+                let fail_action = lower_action(statement.get("ifFalse"))?;
+                match string_field(statement, "assertionKind").as_deref() {
+                    Some("Assert") => Ok(Stmt::ImmediateAssertion {
+                        kind: eda_core::ir::ImmediateAssertionKind::Assert,
+                        cond: condition,
+                        pass_action,
+                        fail_action,
+                    }),
+                    Some("Assume") => Ok(Stmt::ImmediateAssertion {
+                        kind: eda_core::ir::ImmediateAssertionKind::Assume,
+                        cond: condition,
+                        pass_action,
+                        fail_action,
+                    }),
+                    Some("CoverProperty") => Ok(Stmt::ImmediateAssertion {
+                        kind: eda_core::ir::ImmediateAssertionKind::Cover,
+                        cond: condition,
+                        pass_action,
+                        fail_action,
+                    }),
+                    other => Err(format!(
+                        "unsupported immediate assertion kind {other:?}"
+                    )),
+                }
+            }
             "ExpressionStatement" => {
                 let expression = statement
                     .get("expr")
@@ -712,28 +851,50 @@ impl SlangAstLowerer {
                 }
                 self.lower_assignment(expression)
             }
-            "ProceduralAssign" if bool_field(statement, "isForce") => {
+            "ProceduralAssign" => {
                 let assignment = statement
                     .get("assignment")
-                    .ok_or_else(|| "force statement has no assignment".to_string())?;
+                    .ok_or_else(|| "procedural assignment statement has no assignment".to_string())?;
                 let left = assignment
                     .get("left")
-                    .ok_or_else(|| "force statement has no left side".to_string())?;
+                    .ok_or_else(|| "procedural assignment statement has no left side".to_string())?;
                 let right = assignment
                     .get("right")
-                    .ok_or_else(|| "force statement has no right side".to_string())?;
-                Ok(Stmt::Force {
-                    lv: self.lower_lvalue(left)?,
-                    e: self.lower_expression(right)?,
-                })
+                    .ok_or_else(|| "procedural assignment statement has no right side".to_string())?;
+                if !bool_field(statement, "isForce")
+                    && string_field(left, "kind").as_deref() == Some("Concatenation")
+                {
+                    return self.lower_procedural_concatenation_assign(
+                        left,
+                        right,
+                    );
+                }
+                let lv = self.lower_lvalue(left)?;
+                let e = self.lower_expression(right)?;
+                if bool_field(statement, "isForce") {
+                    Ok(Stmt::Force { lv, e })
+                } else {
+                    validate_static_procedural_assignment_lvalue(left, &lv)?;
+                    validate_procedural_driver_rhs(&e)?;
+                    Ok(Stmt::ProceduralAssign { lv, e })
+                }
             }
-            "ProceduralDeassign" if bool_field(statement, "isRelease") => {
+            "ProceduralDeassign" => {
                 let left = statement
                     .get("lvalue")
-                    .ok_or_else(|| "release statement has no lvalue".to_string())?;
-                Ok(Stmt::Release {
-                    lv: self.lower_lvalue(left)?,
-                })
+                    .ok_or_else(|| "procedural deassignment statement has no lvalue".to_string())?;
+                if !bool_field(statement, "isRelease")
+                    && string_field(left, "kind").as_deref() == Some("Concatenation")
+                {
+                    return self.lower_procedural_concatenation_deassign(left);
+                }
+                let lv = self.lower_lvalue(left)?;
+                if bool_field(statement, "isRelease") {
+                    Ok(Stmt::Release { lv })
+                } else {
+                    validate_static_procedural_assignment_lvalue(left, &lv)?;
+                    Ok(Stmt::ProceduralDeassign { lv })
+                }
             }
             "Assignment" => self.lower_assignment(statement),
             "VariableDeclaration" => Err(
@@ -1591,9 +1752,32 @@ impl SlangAstLowerer {
         if string_field(expression, "kind").as_deref() == Some("MinTypMax") {
             return Err("min:typ:max delay controls are not supported".into());
         }
+        if string_field(expression, "kind").as_deref() == Some("RealLiteral") {
+            let real = expression
+                .get("value")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| "fractional delay control has no numeric value".to_string())?;
+            return self.scale_delay_constant(super::DelayConstant::Real(real));
+        }
+        if string_field(expression, "kind").as_deref() == Some("UnaryOp")
+            && string_field(expression, "op").as_deref() == Some("Minus")
+            && expression
+                .get("operand")
+                .and_then(|operand| operand.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                == Some("RealLiteral")
+        {
+            let real = expression
+                .get("operand")
+                .and_then(|operand| operand.get("value"))
+                .and_then(serde_json::Value::as_f64)
+                .map(|value| -value)
+                .ok_or_else(|| "fractional delay control has no numeric value".to_string())?;
+            return self.scale_delay_constant(super::DelayConstant::Real(real));
+        }
         let delay = slang_constant_u64(expression)
-            .map_err(|_| "delay control must be an integer constant".to_string())?;
-        self.scale_delay(delay)
+            .map_err(|_| "delay control must be an integer or finite real constant".to_string())?;
+        self.scale_delay_constant(super::DelayConstant::Integer(delay))
     }
 
     fn lower_event_trigger(
@@ -1851,6 +2035,21 @@ impl SlangAstLowerer {
         let right = assignment
             .get("right")
             .ok_or_else(|| "assignment has no right side".to_string())?;
+        if let Some(statement) = self.lower_file_error_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = self.lower_file_read_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = self.lower_file_scan_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = self.lower_file_gets_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
+        if let Some(statement) = self.lower_seeded_random_assignment(assignment, left, right)? {
+            return Ok(statement);
+        }
         if self.is_external_input_lvalue(left)? {
             return Err("modport input variable cannot be assigned directly".into());
         }
@@ -1909,7 +2108,14 @@ impl SlangAstLowerer {
             return Ok(statement);
         }
         if let Some((memory, indexes)) = self.memory_element_select(left)? {
-            let expression = self.lower_expression(right)?;
+            let expression = if string_field(left, "type")
+                .as_deref()
+                .is_some_and(super::expressions::type_is_realtime_compatible)
+            {
+                self.lower_real_assignment_expression(left, right)?
+            } else {
+                self.lower_expression(right)?
+            };
             if self.design.memories[memory].associative {
                 let [index] = indexes.as_slice() else {
                     return Err("associative array assignment requires one index".into());
@@ -1958,12 +2164,439 @@ impl SlangAstLowerer {
             });
         }
         let lv = self.lower_lvalue(left)?;
-        let expression = self.lower_expression(right)?;
+        let expression = self.lower_real_assignment_expression(left, right)?;
         if bool_field(assignment, "isNonBlocking") {
             Ok(Stmt::NBl { lv, e: expression })
         } else {
             Ok(Stmt::Bl { lv, e: expression })
         }
+    }
+
+    fn lower_file_gets_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        mut right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        while string_field(right, "kind").as_deref() == Some("Conversion") {
+            right = right
+                .get("operand")
+                .ok_or_else(|| "conversion has no operand".to_string())?;
+        }
+        if string_field(right, "kind").as_deref() != Some("Call")
+            || string_field(right, "subroutine").as_deref() != Some("$fgets")
+        {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("nonblocking $fgets assignment is not supported".into());
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Err("$fgets requires one string output and one descriptor".into());
+        }
+        let Some(output) = arguments.first() else {
+            return Err("$fgets has no string output".into());
+        };
+        if string_field(output, "kind").as_deref() != Some("Assignment")
+            || output
+                .get("right")
+                .and_then(|value| string_field(value, "kind"))
+                .as_deref()
+                != Some("EmptyArgument")
+        {
+            return Err("$fgets first argument must be its string output".into());
+        }
+        let Some(string_source) = output.get("left") else {
+            return Err("$fgets string output has no target".into());
+        };
+        let Some(descriptor_source) = arguments.get(1) else {
+            return Err("$fgets has no descriptor".into());
+        };
+        let string = self.lower_lvalue(string_source)?;
+        if string.decl_width != crate::types::STRING_WIDTH {
+            return Err("$fgets requires a 512-bit string target".into());
+        }
+        let status = self.lower_lvalue(left)?;
+        if status.decl_width > 32 {
+            return Err("$fgets status target exceeds 32 bits".into());
+        }
+        let fd = self.lower_expression(descriptor_source)?;
+        Ok(Some(eda_core::ir::Stmt::FileGets { fd, string, status }))
+    }
+
+    fn lower_file_error_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let mut right = right;
+        while string_field(right, "kind").as_deref() == Some("Conversion") {
+            right = right
+                .get("operand")
+                .ok_or_else(|| "conversion has no operand".to_string())?;
+        }
+        if string_field(right, "kind").as_deref() != Some("Call")
+            || string_field(right, "subroutine").as_deref() != Some("$ferror")
+        {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("nonblocking $ferror assignment is not supported".into());
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 2 {
+            return Err("$ferror requires a descriptor and string output".into());
+        }
+        let Some(descriptor_source) = arguments.first() else {
+            return Err("$ferror has no descriptor".into());
+        };
+        let Some(output) = arguments.get(1) else {
+            return Err("$ferror has no string output".into());
+        };
+        if string_field(output, "kind").as_deref() != Some("Assignment")
+            || output
+                .get("right")
+                .and_then(|value| string_field(value, "kind"))
+                .as_deref()
+                != Some("EmptyArgument")
+        {
+            return Err("$ferror second argument must be its string output".into());
+        }
+        let Some(message_source) = output.get("left") else {
+            return Err("$ferror string output has no target".into());
+        };
+        let message = self.lower_lvalue(message_source)?;
+        if message.decl_width != crate::types::STRING_WIDTH {
+            return Err("$ferror requires a 512-bit string target".into());
+        }
+        let status = self.lower_lvalue(left)?;
+        if status.decl_width > 32 {
+            return Err("$ferror status target exceeds 32 bits".into());
+        }
+        let fd = self.lower_expression(descriptor_source)?;
+        Ok(Some(eda_core::ir::Stmt::FileError {
+            fd,
+            message,
+            status,
+        }))
+    }
+
+    fn lower_file_read_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let mut right = right;
+        while string_field(right, "kind").as_deref() == Some("Conversion") {
+            right = right
+                .get("operand")
+                .ok_or_else(|| "conversion has no operand".to_string())?;
+        }
+        if string_field(right, "kind").as_deref() != Some("Call")
+            || string_field(right, "subroutine").as_deref() != Some("$fread")
+        {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("nonblocking $fread assignment is not supported".into());
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() < 2 || arguments.len() > 4 {
+            return Err(
+                "$fread requires a target, descriptor, and optional start/count".to_string(),
+            );
+        }
+        let Some(output) = arguments.first() else {
+            return Err("$fread has no target".into());
+        };
+        if string_field(output, "kind").as_deref() != Some("Assignment")
+            || output
+                .get("right")
+                .and_then(|value| string_field(value, "kind"))
+                .as_deref()
+                != Some("EmptyArgument")
+        {
+            return Err("$fread first argument must be its output target".into());
+        }
+        let Some(target_source) = output.get("left") else {
+            return Err("$fread output has no target".into());
+        };
+        let Some(descriptor_source) = arguments.get(1) else {
+            return Err("$fread has no descriptor".into());
+        };
+        let memory_symbol = self.named_symbol(target_source)?;
+        if let Some(memory) = memory_symbol.memory {
+            let declaration = &self.design.memories[memory];
+            if declaration.dynamic {
+                return Err("dynamic-array $fread targets are not supported".into());
+            }
+            if declaration.queue {
+                return Err("queue $fread targets are not supported".into());
+            }
+            if declaration.associative {
+                return Err("associative-array $fread targets are not supported".into());
+            }
+            if declaration.dimensions.len() != 1 {
+                return Err(
+                    "$fread memory targets currently require one unpacked dimension".into(),
+                );
+            }
+            if declaration.element_width == 0 || !declaration.element_width.is_multiple_of(8) {
+                return Err("$fread memory elements must contain whole bytes".into());
+            }
+
+            let start = arguments
+                .get(2)
+                .map(|source| self.lower_expression(source))
+                .transpose()?;
+            let count = arguments
+                .get(3)
+                .map(|source| self.lower_expression(source))
+                .transpose()?;
+            let status = self.lower_lvalue(left)?;
+            if status.decl_width > 32 {
+                return Err("$fread status target exceeds 32 bits".into());
+            }
+            let fd = self.lower_expression(descriptor_source)?;
+            return Ok(Some(eda_core::ir::Stmt::FileReadMemory {
+                fd,
+                memory,
+                start,
+                count,
+                status,
+            }));
+        }
+
+        if arguments.len() > 2 {
+            return Err("optional $fread start/count arguments require a memory target".into());
+        }
+
+        let target = self.lower_lvalue(target_source)?;
+        if target.decl_width == 0 || target.decl_width % 8 != 0 {
+            return Err("scalar $fread requires a whole-byte integral target".into());
+        }
+        if target.decl_width > 512 {
+            return Err("scalar $fread targets currently support at most 512 bits".into());
+        }
+        let status = self.lower_lvalue(left)?;
+        if status.decl_width > 32 {
+            return Err("$fread status target exceeds 32 bits".into());
+        }
+        let fd = self.lower_expression(descriptor_source)?;
+        Ok(Some(eda_core::ir::Stmt::FileRead { fd, target, status }))
+    }
+
+    fn lower_seeded_random_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        mut right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        while string_field(right, "kind").as_deref() == Some("Conversion") {
+            right = right
+                .get("operand")
+                .ok_or_else(|| "conversion has no operand".to_string())?;
+        }
+        if string_field(right, "kind").as_deref() != Some("Call")
+            || string_field(right, "subroutine").as_deref() != Some("$random")
+        {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err("nonblocking seeded $random assignment is not supported".into());
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != 1 {
+            return Err("seeded $random requires exactly one inout seed".into());
+        }
+        let Some(seed_source) = arguments.first() else {
+            return Err("seeded $random has no inout seed".into());
+        };
+        let seed = self.lower_lvalue(seed_source)?;
+        if seed.decl_width != 32 || seed.range.width() != 32 {
+            return Err("seeded $random requires a whole 32-bit seed lvalue".into());
+        }
+        let destination = self.lower_lvalue(left)?;
+        if destination.decl_width > 32 {
+            return Err("seeded $random destination exceeds 32 bits".into());
+        }
+        if destination.net == seed.net && destination.range == seed.range {
+            return Err("seeded $random destination and inout seed must be distinct".into());
+        }
+        Ok(Some(eda_core::ir::Stmt::RandomSeeded { seed, destination }))
+    }
+
+    fn lower_file_scan_assignment(
+        &self,
+        assignment: &serde_json::Value,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let mut right = right;
+        while string_field(right, "kind").as_deref() == Some("Conversion") {
+            right = right
+                .get("operand")
+                .ok_or_else(|| "conversion has no operand".to_string())?;
+        }
+        if string_field(right, "kind").as_deref() != Some("Call") {
+            return Ok(None);
+        }
+        let Some(task_name) = string_field(right, "subroutine") else {
+            return Ok(None);
+        };
+        if !matches!(task_name.as_str(), "$fscanf" | "$sscanf") {
+            return Ok(None);
+        }
+        if bool_field(assignment, "isNonBlocking") {
+            return Err(format!(
+                "nonblocking {task_name} assignment is not supported"
+            ));
+        }
+        let empty_arguments = Vec::new();
+        let arguments = right
+            .get("arguments")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() < 2 {
+            return Err(format!("{task_name} requires input and a format string"));
+        }
+        let Some(input_source) = arguments.first() else {
+            return Err(format!("{task_name} has no input expression"));
+        };
+        let format_source = arguments
+            .get(1)
+            .ok_or_else(|| format!("{task_name} has no format string"))?;
+        let format = string_field(format_source, "literal")
+            .ok_or_else(|| format!("{task_name} format must be a string literal"))?;
+        let specifiers = Self::file_scan_specifiers(&format, &task_name)?;
+        let conversion_count = specifiers.len();
+        if arguments.len() != conversion_count + 2 {
+            return Err(format!(
+                "{task_name} format has {conversion_count} conversions but {} output arguments",
+                arguments.len().saturating_sub(2)
+            ));
+        }
+        let mut targets = Vec::with_capacity(conversion_count);
+        for (output, expected_specifier) in arguments.iter().skip(2).zip(specifiers.iter()) {
+            if string_field(output, "kind").as_deref() != Some("Assignment")
+                || output
+                    .get("right")
+                    .and_then(|value| string_field(value, "kind"))
+                    .as_deref()
+                    != Some("EmptyArgument")
+            {
+                return Err(format!(
+                    "{task_name} output arguments must be lvalue outputs"
+                ));
+            }
+            let Some(target_source) = output.get("left") else {
+                return Err(format!("{task_name} output has no target"));
+            };
+            let target = self.lower_lvalue(target_source)?;
+            let target_is_string = string_field(output, "type").as_deref() == Some("string");
+            if (expected_specifier.0 == 's') != target_is_string {
+                return Err(format!(
+                    "{task_name} conversion '%{}' does not match its target type",
+                    expected_specifier.0
+                ));
+            }
+            if target.range != full_range(target.decl_width)
+                || (!target_is_string && target.decl_width > 64)
+                || (target_is_string && target.decl_width != crate::types::STRING_WIDTH)
+            {
+                return Err(
+                    format!("{task_name} targets must be whole integer declarations up to 64 bits or bounded strings"),
+                );
+            }
+            targets.push(target);
+        }
+        let status = self.lower_lvalue(left)?;
+        if status.decl_width > 32 {
+            return Err(format!("{task_name} status target exceeds 32 bits"));
+        }
+        if task_name == "$fscanf" {
+            let fd = self.lower_expression(input_source)?;
+            return Ok(Some(eda_core::ir::Stmt::FileScan {
+                fd,
+                format,
+                targets,
+                status,
+            }));
+        }
+
+        let source = self.lower_expression(input_source)?;
+        if source.width() != crate::types::STRING_WIDTH {
+            return Err("$sscanf input must be a 512-bit string expression".into());
+        }
+        Ok(Some(eda_core::ir::Stmt::StringScan {
+            source,
+            format,
+            targets,
+            status,
+        }))
+    }
+
+    fn file_scan_specifiers(
+        format: &str,
+        task_name: &str,
+    ) -> Result<Vec<(char, Option<usize>)>, String> {
+        let mut conversions = Vec::new();
+        let mut characters = format.chars();
+        while let Some(character) = characters.next() {
+            if character != '%' {
+                continue;
+            }
+            let mut width = String::new();
+            while matches!(characters.clone().next(), Some(c) if c.is_ascii_digit()) {
+                width.push(characters.next().expect("peeked width digit"));
+            }
+            let field_width = if width.is_empty() {
+                None
+            } else {
+                let parsed = width
+                    .parse::<usize>()
+                    .map_err(|_| format!("{task_name} width is too large"))?;
+                if parsed == 0 || parsed > 64 {
+                    return Err(format!("{task_name} width must be 1..=64"));
+                }
+                Some(parsed)
+            };
+            match characters.next() {
+                Some(specifier @ ('d' | 'h' | 'o' | 'b' | 's')) => {
+                    conversions.push((specifier, field_width))
+                }
+                Some('%') if field_width.is_none() => {}
+                Some('%') => {
+                    return Err(format!("{task_name} literal % cannot take a width"));
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "{task_name} conversion '%{other}' is unsupported; only %d/%h/%o/%b/%s, optional width 1..=64, and %% execute"
+                ))
+                }
+                None => return Err("$fscanf format ends with an incomplete conversion".into()),
+            }
+        }
+        Ok(conversions)
     }
 
     fn lower_value_plusarg_output(
@@ -2553,7 +3186,7 @@ impl SlangAstLowerer {
             ));
         }
 
-        let value = self.lower_expression(right)?;
+        let value = self.lower_real_assignment_expression(left, right)?;
         if value.width() != field_width {
             return Err(format!(
                 "memory struct member '{member}' width {} does not match assignment width {}",
@@ -2874,7 +3507,23 @@ fn collect_expression_references(
 ) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) | Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
+        Expr::Const(_)
+        | Expr::RealConst(_)
+        | Expr::RealRef { .. }
+        | Expr::RealBinary { .. }
+        | Expr::RealCompare { .. }
+        | Expr::RealNeg(_)
+        | Expr::RealToInt { .. }
+        | Expr::IntToReal { .. }
+        | Expr::RealTime { .. }
+        | Expr::ShortRealConst(_)
+        | Expr::ShortRealRef { .. }
+        | Expr::ShortRealBinary { .. }
+        | Expr::ShortRealNeg(_)
+        | Expr::ShortRealToReal(_)
+        | Expr::RealToShortReal(_)
+        | Expr::EventTriggered { .. }
+        | Expr::SimulationTime { .. } => {}
         Expr::Ref { .. } => references.push(expression.clone()),
         Expr::Un { a, .. }
         | Expr::Signed { e: a, .. }
@@ -2912,6 +3561,9 @@ fn collect_expression_references(
             collect_expression_references(left, references);
             collect_expression_references(right, references);
         }
+        Expr::StringFormat { args, .. } => args
+            .iter()
+            .for_each(|argument| collect_expression_references(argument, references)),
         Expr::StringGetByte { e, index } | Expr::StringPutc { e, index, .. } => {
             collect_expression_references(e, references);
             collect_expression_references(index, references);
@@ -2922,6 +3574,29 @@ fn collect_expression_references(
             collect_expression_references(right, references);
         }
         Expr::StringFromRadix { value, .. } => collect_expression_references(value, references),
+        Expr::MemoryPattern { .. } => {}
+        Expr::EnumPattern { value, .. } => collect_expression_references(value, references),
+        Expr::StructPattern { value, .. } => collect_expression_references(value, references),
+        Expr::Random { args, .. } => args
+            .iter()
+            .for_each(|argument| collect_expression_references(argument, references)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            collect_expression_references(path, references);
+            collect_expression_references(mode, references);
+        }
+        Expr::FileGetc { fd } => collect_expression_references(fd, references),
+        Expr::FileUngetc { value, fd } => {
+            collect_expression_references(value, references);
+            collect_expression_references(fd, references);
+        }
+        Expr::FileEof { fd } => collect_expression_references(fd, references),
+        Expr::FileTell { fd } => collect_expression_references(fd, references),
+        Expr::FileSeek { fd, offset, whence } => {
+            collect_expression_references(fd, references);
+            collect_expression_references(offset, references);
+            collect_expression_references(whence, references);
+        }
     }
 }
 
@@ -2930,5 +3605,116 @@ fn definite_true(expression: &eda_core::ir::Expr) -> eda_core::ir::Expr {
         op: eda_core::ir::BinOp::CaseEq,
         a: Box::new(expression.clone()),
         b: Box::new(eda_core::ir::Expr::Const(LogicWord::ones(1))),
+    }
+}
+
+fn validate_static_procedural_assignment_lvalue(
+    source: &serde_json::Value,
+    lv: &eda_core::ir::LValue,
+) -> Result<(), String> {
+    if !matches!(
+        string_field(source, "kind").as_deref(),
+        Some("NamedValue" | "HierarchicalValue")
+    ) {
+        return Err(
+            "direct procedural continuous assignment supports only whole packed-variable lvalues"
+                .into(),
+        );
+    }
+    if lv.range.width() != lv.decl_width {
+        return Err(
+            "direct procedural continuous assignment does not support part-select/member lvalues"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_procedural_driver_rhs(expression: &eda_core::ir::Expr) -> Result<(), String> {
+    if matches!(
+        expression,
+        eda_core::ir::Expr::EventTriggered { .. }
+            | eda_core::ir::Expr::SimulationTime { .. }
+            | eda_core::ir::Expr::RealTime { .. }
+    ) {
+        return Ok(());
+    }
+    if procedural_rhs_has_untracked_dependency(expression) {
+        return Err(
+            "procedural continuous assignment RHS has runtime state not tracked by the driver model"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn procedural_rhs_has_untracked_dependency(expression: &eda_core::ir::Expr) -> bool {
+    use eda_core::ir::Expr;
+    match expression {
+        Expr::EventTriggered { .. }
+        | Expr::SimulationTime { .. }
+        | Expr::Random { .. }
+        | Expr::FileOpen { .. }
+        | Expr::FileOpenDynamic { .. }
+        | Expr::FileGetc { .. }
+        | Expr::FileUngetc { .. }
+        | Expr::FileEof { .. }
+        | Expr::FileTell { .. }
+        | Expr::FileSeek { .. }
+        | Expr::RealTime { .. } => true,
+        Expr::Un { a, .. }
+        | Expr::Signed { e: a, .. }
+        | Expr::StringLength { e: a }
+        | Expr::StringCase { e: a, .. }
+        | Expr::StringToRadix { e: a, .. }
+        | Expr::RealNeg(a)
+        | Expr::ShortRealNeg(a)
+        | Expr::ShortRealToReal(a)
+        | Expr::RealToShortReal(a)
+        | Expr::RealToInt { value: a, .. }
+        | Expr::IntToReal { value: a, .. }
+        | Expr::StringFromRadix { value: a, .. }
+        | Expr::EnumPattern { value: a, .. }
+        | Expr::StructPattern { value: a, .. } => procedural_rhs_has_untracked_dependency(a),
+        Expr::Bin { a, b, .. }
+        | Expr::StringConcat { left: a, right: b }
+        | Expr::StringCompare {
+            left: a, right: b, ..
+        }
+        | Expr::RealBinary {
+            left: a, right: b, ..
+        }
+        | Expr::RealCompare {
+            left: a, right: b, ..
+        }
+        | Expr::ShortRealBinary {
+            left: a, right: b, ..
+        } => {
+            procedural_rhs_has_untracked_dependency(a) || procedural_rhs_has_untracked_dependency(b)
+        }
+        Expr::Cond { c, t, f } => {
+            procedural_rhs_has_untracked_dependency(c)
+                || procedural_rhs_has_untracked_dependency(t)
+                || procedural_rhs_has_untracked_dependency(f)
+        }
+        Expr::Concat(parts) => parts.iter().any(procedural_rhs_has_untracked_dependency),
+        Expr::Repeat { e, .. } => procedural_rhs_has_untracked_dependency(e),
+        Expr::Index { e, .. } => procedural_rhs_has_untracked_dependency(e),
+        Expr::StringGetByte { e, index } => {
+            procedural_rhs_has_untracked_dependency(e)
+                || procedural_rhs_has_untracked_dependency(index)
+        }
+        Expr::StringPutc { e, index, value } => {
+            procedural_rhs_has_untracked_dependency(e)
+                || procedural_rhs_has_untracked_dependency(index)
+                || procedural_rhs_has_untracked_dependency(value)
+        }
+        Expr::StringSubstr { e, left, right } => {
+            procedural_rhs_has_untracked_dependency(e)
+                || procedural_rhs_has_untracked_dependency(left)
+                || procedural_rhs_has_untracked_dependency(right)
+        }
+        Expr::StringFormat { args, .. } => args.iter().any(procedural_rhs_has_untracked_dependency),
+        _ => false,
     }
 }

@@ -59,6 +59,12 @@ impl<'a> Synth<'a> {
             Stmt::Force { .. } => Err("force statements are not synthesizable".into()),
             Stmt::TimeFormat { .. } => Err("time formatting is not synthesizable".into()),
             Stmt::Release { .. } => Err("release statements are not synthesizable".into()),
+            Stmt::ProceduralAssign { .. } => {
+                Err("procedural continuous assignments are not synthesizable".into())
+            }
+            Stmt::ProceduralDeassign { .. } => {
+                Err("procedural deassignments are not synthesizable".into())
+            }
             Stmt::Break | Stmt::Continue => Err("loop jumps are not synthesizable".into()),
             Stmt::ReturnBarrier | Stmt::Return => {
                 Err("procedure return is not synthesizable".into())
@@ -289,10 +295,30 @@ impl<'a> Synth<'a> {
             }
             Stmt::Display { .. }
             | Stmt::Finish
+            | Stmt::Stop
             | Stmt::WriteMem { .. }
             | Stmt::Assert { .. }
             | Stmt::Assume { .. }
-            | Stmt::Cover { .. } => Ok(()),
+            | Stmt::Cover { .. }
+            | Stmt::AssertControl(_) => Ok(()),
+            Stmt::FileClose { .. }
+            | Stmt::FileFlush { .. }
+            | Stmt::FileGets { .. }
+            | Stmt::FileError { .. }
+            | Stmt::FileRead { .. }
+            | Stmt::FileReadMemory { .. }
+            | Stmt::FileScan { .. }
+            | Stmt::StringScan { .. }
+            | Stmt::FileDisplay { .. } => Err("file I/O is not synthesizable".into()),
+            Stmt::RandomSeeded { .. } => Err("seeded randomization is not synthesizable".into()),
+            Stmt::ImmediateAssertion {
+                pass_action,
+                fail_action,
+                ..
+            } if pass_action.is_some() || fail_action.is_some() => {
+                Err("immediate assertion action blocks are not synthesizable".into())
+            }
+            Stmt::ImmediateAssertion { .. } => Ok(()),
         }
     }
 

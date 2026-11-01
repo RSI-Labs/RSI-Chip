@@ -5,12 +5,16 @@
 //! scheduling: active events, delta cycles for continuous assignments,
 //! non-blocking (NBA) updates at the end of each time slot, edge and
 //! combinational `always` processes, `#delay` continuations, `forever`,
-//! `$display`, `$monitor`, `$finish` and optional VCD dumping.
+//! `$display`, `$monitor`, deterministic unseeded random system functions,
+//! `$finish`, and optional VCD dumping.
 
 use eda_core::cancellation::FlowCancellation;
 use eda_core::ir::{Design, Dir, EventEdge, EventWatch, Expr, ForkMode, LValue, Range, Sens, Stmt};
 use eda_core::logic::{LogicValue, LogicWord};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 mod vcd;
 pub use vcd::VcdWriter;
@@ -95,6 +99,18 @@ struct Monitor<'d> {
     parts: &'d [eda_core::ir::DispPart],
     args: &'d [Expr],
     last: Vec<LogicWord>,
+}
+
+struct Strobe<'d> {
+    parts: &'d [eda_core::ir::DispPart],
+    args: &'d [Expr],
+}
+
+struct FileStrobe<'d> {
+    fd: &'d Expr,
+    parts: &'d [eda_core::ir::DispPart],
+    args: &'d [Expr],
+    newline: bool,
 }
 
 const MAX_STEPS_PER_TIME: u64 = 200_000;
@@ -192,6 +208,10 @@ pub struct Simulator<'d> {
     ordered_event_waiters: Vec<OrderedEventWaiter<'d>>,
     forced_values: HashMap<usize, LogicValue>,
     forced_saved_values: HashMap<usize, LogicValue>,
+    procedural_drivers: Vec<ProceduralDriver>,
+    procedural_wake_nets: HashSet<usize>,
+    procedural_wake_memories: HashSet<usize>,
+    procedural_time_wake: bool,
     net_change_times: HashMap<usize, u64>,
     memory_elements: Vec<MemoryElementStorage>,
     memory_aliases: Vec<usize>,
@@ -210,17 +230,40 @@ pub struct Simulator<'d> {
     timeformat_suffix: String,
     timeformat_min_width: usize,
     property_covers: BTreeMap<String, u64>,
+    assertions_enabled: bool,
     finished: bool,
+    stopped: bool,
+    paused_cont: Option<Cont<'d>>,
     final_blocks_executed: bool,
     print_stdout: bool,
     monitors: Vec<Monitor<'d>>,
+    strobes: Vec<Strobe<'d>>,
+    file_strobes: Vec<FileStrobe<'d>>,
     vcd: Option<VcdWriter>,
     vcd_changes: HashSet<usize>,
     vcd_memory_changes: HashSet<(usize, u64)>,
     event_count: u64,
+    random_state: Cell<u64>,
+    next_file_descriptor: Cell<u32>,
+    file_paths: RefCell<BTreeMap<u32, PathBuf>>,
+    file_readers: RefCell<BTreeMap<u32, std::fs::File>>,
+    file_writers: RefCell<BTreeMap<u32, std::fs::File>>,
+    file_pushbacks: RefCell<BTreeMap<u32, u8>>,
+    file_errors: RefCell<BTreeMap<u32, String>>,
+    file_eof: RefCell<BTreeSet<u32>>,
+    file_write_positions: RefCell<BTreeMap<u32, u64>>,
     has_zero_delay_feedback: bool,
     zero_delay_feedback_nets: Vec<String>,
     cancellation: FlowCancellation,
+}
+
+#[derive(Clone)]
+struct ProceduralDriver {
+    lv: eda_core::ir::LValue,
+    e: Expr,
+    sources: HashSet<usize>,
+    source_memories: HashSet<usize>,
+    time_dependent: bool,
 }
 
 impl<'d> Simulator<'d> {
@@ -242,7 +285,7 @@ impl<'d> Simulator<'d> {
             }
             let total_bits =
                 u128::from(memory.flat_length) * u128::try_from(memory.element_width).unwrap_or(0);
-            if memory.associative {
+            if memory.associative || memory.dynamic {
                 memory_elements.push(MemoryElementStorage::Sparse(HashMap::new()));
             } else if memory.storage == eda_core::ir::MemoryStorage::Ordinary {
                 if total_bits > 4096 {
@@ -344,6 +387,10 @@ impl<'d> Simulator<'d> {
             ordered_event_waiters: Vec::new(),
             forced_values: HashMap::new(),
             forced_saved_values: HashMap::new(),
+            procedural_drivers: Vec::new(),
+            procedural_wake_nets: HashSet::new(),
+            procedural_wake_memories: HashSet::new(),
+            procedural_time_wake: false,
             net_change_times: HashMap::new(),
             memory_elements,
             memory_aliases,
@@ -362,7 +409,10 @@ impl<'d> Simulator<'d> {
             timeformat_suffix: String::new(),
             timeformat_min_width: 0,
             property_covers: BTreeMap::new(),
+            assertions_enabled: true,
             finished: false,
+            stopped: false,
+            paused_cont: None,
             final_blocks_executed: false,
             print_stdout: false,
             monitors: mons
@@ -373,10 +423,21 @@ impl<'d> Simulator<'d> {
                     last: Vec::new(),
                 })
                 .collect(),
+            strobes: Vec::new(),
+            file_strobes: Vec::new(),
             vcd: None,
             vcd_changes: HashSet::new(),
             vcd_memory_changes: HashSet::new(),
             event_count: 0,
+            random_state: Cell::new(0x9E37_79B9_7F4A_7C15),
+            next_file_descriptor: Cell::new(1),
+            file_paths: RefCell::new(BTreeMap::new()),
+            file_readers: RefCell::new(BTreeMap::new()),
+            file_writers: RefCell::new(BTreeMap::new()),
+            file_pushbacks: RefCell::new(BTreeMap::new()),
+            file_errors: RefCell::new(BTreeMap::new()),
+            file_eof: RefCell::new(BTreeSet::new()),
+            file_write_positions: RefCell::new(BTreeMap::new()),
             has_zero_delay_feedback: !zero_delay_feedback_nets.is_empty(),
             zero_delay_feedback_nets,
             cancellation: FlowCancellation::new(),
@@ -442,6 +503,10 @@ impl<'d> Simulator<'d> {
 
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     pub fn set_print_stdout(&mut self, on: bool) {
@@ -1008,6 +1073,9 @@ impl<'d> Simulator<'d> {
         if self.has_zero_delay_feedback {
             return Err("zero-delay combinational loop detected".into());
         }
+        if self.stopped {
+            return Ok(());
+        }
         loop {
             if self.cancellation.is_cancelled() {
                 return Err("simulation cancelled".into());
@@ -1015,21 +1083,29 @@ impl<'d> Simulator<'d> {
             if self.finished {
                 return Ok(());
             }
+            if self.stopped {
+                return Ok(());
+            }
             self.settle()?;
             if self.finished {
+                return Ok(());
+            }
+            if self.stopped {
                 return Ok(());
             }
             let next = self.events.keys().chain(self.conts.keys()).next().copied();
             match next {
                 None => {
-                    self.now = t;
+                    self.enter_time(t);
+                    self.settle()?;
                     return Ok(());
                 }
                 Some(nt) if nt > t => {
-                    self.now = t;
+                    self.enter_time(t);
+                    self.settle()?;
                     return Ok(());
                 }
-                Some(nt) => self.now = nt,
+                Some(nt) => self.enter_time(nt),
             }
         }
     }
@@ -1044,17 +1120,51 @@ impl<'d> Simulator<'d> {
         self.run_until(t)
     }
 
+    /// Resumes a `$stop` pause and runs until absolute time `t`.
+    pub fn resume_until(&mut self, t: u64) -> Result<(), String> {
+        if !self.stopped {
+            return self.run_until(t);
+        }
+        let continuation = self
+            .paused_cont
+            .take()
+            .ok_or_else(|| "$stop has no resumable procedural continuation".to_string())?;
+        self.stopped = false;
+        self.conts.entry(self.now).or_default().push(continuation);
+        self.run_until(t)
+    }
+
+    fn enter_time(&mut self, next: u64) {
+        if next == self.now {
+            return;
+        }
+        self.now = next;
+        if self
+            .procedural_drivers
+            .iter()
+            .any(|driver| driver.time_dependent)
+        {
+            self.procedural_time_wake = true;
+        }
+    }
+
     /// Advance exactly one time slot; false when quiescent.
     pub fn step(&mut self) -> Result<bool, String> {
         if self.cancellation.is_cancelled() {
             return Err("simulation cancelled".into());
         }
+        if self.stopped {
+            return Ok(false);
+        }
         self.settle()?;
+        if self.stopped {
+            return Ok(false);
+        }
         let next = self.events.keys().chain(self.conts.keys()).next().copied();
         match next {
             None => Ok(false),
             Some(nt) => {
-                self.now = nt;
+                self.enter_time(nt);
                 self.settle()?;
                 Ok(true)
             }
@@ -1096,6 +1206,9 @@ impl<'d> Simulator<'d> {
         if self.cancellation.is_cancelled() {
             return Err("simulation cancelled".into());
         }
+        if self.stopped {
+            return Ok(());
+        }
         let mut steps_this_settle = 0u64;
         loop {
             if self.cancellation.is_cancelled() {
@@ -1130,6 +1243,9 @@ impl<'d> Simulator<'d> {
                 if self.finished {
                     break;
                 }
+                if self.stopped {
+                    break;
+                }
             }
             // Run procedural continuations only after the current zero-delay
             // event wave has drained. Combinational processes then observe a
@@ -1146,6 +1262,26 @@ impl<'d> Simulator<'d> {
                 if self.finished {
                     break;
                 }
+                if self.stopped {
+                    break;
+                }
+            }
+            if self.finished {
+                break;
+            }
+            if !self.procedural_wake_nets.is_empty()
+                || !self.procedural_wake_memories.is_empty()
+                || self.procedural_time_wake
+            {
+                if self.cancellation.is_cancelled() {
+                    return Err("simulation cancelled".into());
+                }
+                steps_this_settle += 1;
+                if steps_this_settle > MAX_STEPS_PER_TIME {
+                    return Err("simulation stalled: zero-delay activity loop".into());
+                }
+                self.refresh_procedural_drivers()?;
+                did = true;
             }
             if self.finished {
                 break;
@@ -1220,6 +1356,7 @@ impl<'d> Simulator<'d> {
                 return Err("simulation stalled: zero-delay activity loop".into());
             }
         }
+        self.flush_strobes()?;
         self.fire_monitors();
         self.flush_vcd();
         Ok(())
@@ -1277,6 +1414,100 @@ impl<'d> Simulator<'d> {
         Ok(())
     }
 
+    fn install_procedural_driver(
+        &mut self,
+        lv: &eda_core::ir::LValue,
+        e: &Expr,
+    ) -> Result<(), String> {
+        let targets = lv_bits(lv);
+        let target_set = targets.iter().copied().collect::<HashSet<_>>();
+        self.procedural_drivers.retain(|driver| {
+            !lv_bits(&driver.lv)
+                .iter()
+                .any(|net| target_set.contains(net))
+        });
+
+        let value = self.eval(e).sized(targets.len());
+        let mut changes = Vec::new();
+        for (bit, net) in targets.iter().copied().enumerate() {
+            let newv = value.bit(bit);
+            let old = self.vals[net];
+            self.forced_saved_values.entry(net).or_insert(old);
+            self.forced_values.insert(net, newv);
+            if old != newv {
+                self.vals[net] = newv;
+                self.mark_vcd_change(net);
+                changes.push((net, old, newv));
+            }
+        }
+        self.procedural_drivers.push(ProceduralDriver {
+            lv: lv.clone(),
+            e: e.clone(),
+            sources: expr_nets(e).into_iter().collect(),
+            source_memories: expr_memories(e)
+                .into_iter()
+                .map(|memory| self.canonical_memory(memory))
+                .collect(),
+            time_dependent: matches!(
+                e,
+                Expr::EventTriggered { .. } | Expr::SimulationTime { .. } | Expr::RealTime { .. }
+            ),
+        });
+        self.notify_direct_changes(changes)
+    }
+
+    fn refresh_procedural_drivers(&mut self) -> Result<(), String> {
+        let wakes = std::mem::take(&mut self.procedural_wake_nets);
+        let memory_wakes = std::mem::take(&mut self.procedural_wake_memories);
+        let time_wake = std::mem::take(&mut self.procedural_time_wake);
+        if wakes.is_empty() && memory_wakes.is_empty() && !time_wake {
+            return Ok(());
+        }
+
+        let mut updates = Vec::new();
+        for driver in &self.procedural_drivers {
+            if (!time_wake || !driver.time_dependent)
+                && driver.sources.is_disjoint(&wakes)
+                && driver.source_memories.is_disjoint(&memory_wakes)
+            {
+                continue;
+            }
+            let value = self.eval(&driver.e);
+            for (bit, net) in lv_bits(&driver.lv).into_iter().enumerate() {
+                let newv = value.bit(bit);
+                let old = self.vals[net];
+                if old == newv {
+                    continue;
+                }
+                updates.push((net, old, newv));
+            }
+        }
+        let mut changes = Vec::new();
+        for (net, old, newv) in updates {
+            {
+                self.forced_values.insert(net, newv);
+                self.vals[net] = newv;
+                self.mark_vcd_change(net);
+                changes.push((net, old, newv));
+            }
+        }
+        self.notify_direct_changes(changes)
+    }
+
+    fn remove_procedural_driver(&mut self, lv: &eda_core::ir::LValue) {
+        let targets = lv_bits(lv);
+        let target_set = targets.iter().copied().collect::<HashSet<_>>();
+        self.procedural_drivers.retain(|driver| {
+            !lv_bits(&driver.lv)
+                .iter()
+                .any(|net| target_set.contains(net))
+        });
+        for net in targets {
+            self.forced_values.remove(&net);
+            self.forced_saved_values.remove(&net);
+        }
+    }
+
     /// Run the event consequences of a value that has already changed.
     /// Splitting this from `apply_update` lets blocking procedural
     /// assignments take effect before the next statement (required by
@@ -1288,6 +1519,7 @@ impl<'d> Simulator<'d> {
         newv: LogicValue,
     ) -> Result<(), String> {
         self.net_change_times.insert(changed_net, self.now);
+        self.procedural_wake_nets.insert(changed_net);
         let pos = newv == LogicValue::One && old != LogicValue::One;
         let neg = newv == LogicValue::Zero && old != LogicValue::Zero;
         self.sample_clocking_inputs(changed_net, pos, neg)?;
@@ -2186,6 +2418,8 @@ impl<'d> Simulator<'d> {
     }
 
     fn notify_memory_write(&mut self, memory: usize) -> Result<(), String> {
+        self.procedural_wake_memories
+            .insert(self.canonical_memory(memory));
         let readers = self.memory_readers.get(memory).cloned().unwrap_or_default();
         for pi in readers {
             let body = &self.design.processes[pi].body;
@@ -2421,7 +2655,11 @@ impl<'d> Simulator<'d> {
     }
 
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
-        let mut work = c.work;
+        let Cont {
+            process,
+            join,
+            mut work,
+        } = c;
         while let Some(s) = work.pop() {
             if self.cancellation.is_cancelled() {
                 return Err("simulation cancelled".into());
@@ -2518,6 +2756,9 @@ impl<'d> Simulator<'d> {
                     }
                     self.notify_direct_changes(changes)?;
                 }
+                Stmt::ProceduralAssign { lv, e } => {
+                    self.install_procedural_driver(lv, e)?;
+                }
                 Stmt::Release { lv } => {
                     let targets = lv_bits(lv);
                     let mut restored = Vec::new();
@@ -2554,6 +2795,9 @@ impl<'d> Simulator<'d> {
                         }
                     }
                     self.notify_direct_changes(changes)?;
+                }
+                Stmt::ProceduralDeassign { lv } => {
+                    self.remove_procedural_driver(lv);
                 }
                 Stmt::Break => {
                     let Some(loop_position) = work.iter().rposition(|statement| {
@@ -3066,12 +3310,21 @@ impl<'d> Simulator<'d> {
                     });
                     return Ok(());
                 }
-                Stmt::Display { parts, args, .. } => {
-                    let line = self.format_display(parts, args);
-                    if self.print_stdout {
-                        println!("{}", line);
+                Stmt::Display {
+                    parts,
+                    args,
+                    strobe,
+                    ..
+                } => {
+                    if *strobe {
+                        self.strobes.push(Strobe { parts, args });
+                    } else {
+                        let line = self.format_display(parts, args);
+                        if self.print_stdout {
+                            println!("{}", line);
+                        }
+                        self.displays.push(line);
                     }
-                    self.displays.push(line);
                 }
                 Stmt::TimeFormat {
                     units,
@@ -3085,6 +3338,9 @@ impl<'d> Simulator<'d> {
                     self.timeformat_min_width = *min_width;
                 }
                 Stmt::Assert { cond, message } => {
+                    if !self.assertions_enabled {
+                        continue;
+                    }
                     let value = self.eval(cond);
                     if value.reduce_or().as_bool() != Some(true) {
                         let detail = message
@@ -3094,6 +3350,9 @@ impl<'d> Simulator<'d> {
                     }
                 }
                 Stmt::Assume { cond, message } => {
+                    if !self.assertions_enabled {
+                        continue;
+                    }
                     let value = self.eval(cond);
                     if value.reduce_or().as_bool() != Some(true) {
                         let detail = message
@@ -3103,6 +3362,9 @@ impl<'d> Simulator<'d> {
                     }
                 }
                 Stmt::Cover { label, cond } => {
+                    if !self.assertions_enabled {
+                        continue;
+                    }
                     let value = self.eval(cond);
                     if value.reduce_or().as_bool() == Some(true) {
                         *self.property_covers.entry(label.clone()).or_insert(0) += 1;
@@ -3117,20 +3379,508 @@ impl<'d> Simulator<'d> {
                 } => {
                     self.write_memory_file(*radix, path, *memory, start.as_ref(), finish.as_ref())?
                 }
+                Stmt::AssertControl(control) => match control {
+                    eda_core::ir::AssertControl::On => self.assertions_enabled = true,
+                    eda_core::ir::AssertControl::Off => self.assertions_enabled = false,
+                    // The current immediate assertion/property model commits each
+                    // attempt synchronously and keeps no resident attempt to abort.
+                    eda_core::ir::AssertControl::Kill => {}
+                },
+                Stmt::ImmediateAssertion {
+                    kind,
+                    cond,
+                    pass_action,
+                    fail_action,
+                } => {
+                    if !self.assertions_enabled {
+                        continue;
+                    }
+                    let value = self.eval(cond);
+                    let is_true = value.reduce_or().as_bool() == Some(true);
+                    match kind {
+                        eda_core::ir::ImmediateAssertionKind::Cover => {
+                            if is_true {
+                                *self
+                                    .property_covers
+                                    .entry("immediate".to_string())
+                                    .or_insert(0) += 1;
+                                if let Some(action) = pass_action {
+                                    work.push(action);
+                                }
+                            }
+                        }
+                        eda_core::ir::ImmediateAssertionKind::Assert
+                        | eda_core::ir::ImmediateAssertionKind::Assume => {
+                            if is_true {
+                                if let Some(action) = pass_action {
+                                    work.push(action);
+                                }
+                            } else if let Some(action) = fail_action {
+                                work.push(action);
+                            } else {
+                                let kind =
+                                    if matches!(kind, eda_core::ir::ImmediateAssertionKind::Assert)
+                                    {
+                                        "assertion"
+                                    } else {
+                                        "assumption"
+                                    };
+                                return Err(format!(
+                                    "{kind} failed at t={}: condition is false or unknown",
+                                    self.now
+                                ));
+                            }
+                        }
+                    }
+                }
+                Stmt::FileClose { fd } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    self.file_readers.borrow_mut().remove(&descriptor);
+                    self.file_writers.borrow_mut().remove(&descriptor);
+                    self.file_pushbacks.borrow_mut().remove(&descriptor);
+                    self.file_errors.borrow_mut().remove(&descriptor);
+                    self.file_eof.borrow_mut().remove(&descriptor);
+                    self.file_write_positions.borrow_mut().remove(&descriptor);
+                    if self.file_paths.borrow_mut().remove(&descriptor).is_none() {
+                        return Err(format!(
+                            "cannot close unknown file descriptor {descriptor} at t={}",
+                            self.now
+                        ));
+                    }
+                }
+                Stmt::RandomSeeded { seed, destination } => {
+                    let old_seed = self.read_lvalue(seed);
+                    let Some(old_seed) = old_seed
+                        .to_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                    else {
+                        return Err(format!(
+                            "seeded $random requires a known 32-bit seed at t={}",
+                            self.now
+                        ));
+                    };
+                    self.random_state.set(u64::from(old_seed));
+                    let sample = self.next_u64();
+                    let result = LogicWord::from_u64(
+                        lv_bits(destination).len().max(1),
+                        u64::from(sample as u32),
+                    );
+                    let next_seed = LogicWord::from_u64(32, sample >> 32);
+                    self.assign_lvalue_word(destination, result)?;
+                    self.assign_lvalue_word(seed, next_seed)?;
+                }
+                Stmt::FileFlush { fd } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    if let Some(writer) = self.file_writers.borrow_mut().get_mut(&descriptor) {
+                        writer.flush().map_err(|error| {
+                            format!(
+                                "cannot flush file descriptor {descriptor} at t={}: {error}",
+                                self.now
+                            )
+                        })?;
+                    } else if !self.file_readers.borrow().contains_key(&descriptor) {
+                        return Err(format!(
+                            "cannot flush unknown file descriptor {descriptor} at t={}",
+                            self.now
+                        ));
+                    }
+                }
+                Stmt::FileGets { fd, string, status } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    let mut bytes = Vec::new();
+                    let mut reached_eof = false;
+                    {
+                        let mut readers = self.file_readers.borrow_mut();
+                        let Some(reader) = readers.get_mut(&descriptor) else {
+                            return Err(format!(
+                                "cannot read write-mode or unknown file descriptor {descriptor} at t={}",
+                                self.now
+                            ));
+                        };
+                        loop {
+                            if bytes.len() >= 63 {
+                                if self.file_pushbacks.borrow().contains_key(&descriptor) {
+                                    return Err(
+                                        "$fgets line exceeds the 63-byte bounded string capacity"
+                                            .into(),
+                                    );
+                                }
+                                let mut overflow = [0_u8; 1];
+                                match reader.read(&mut overflow) {
+                                    Ok(1) => return Err(
+                                        "$fgets line exceeds the 63-byte bounded string capacity"
+                                            .into(),
+                                    ),
+                                    Ok(_) => {
+                                        reached_eof = true;
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        return Err(format!(
+                                            "cannot read file descriptor {descriptor} at t={}: {error}",
+                                            self.now
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(byte) = self.file_pushbacks.borrow_mut().remove(&descriptor)
+                            {
+                                bytes.push(byte);
+                                if byte == b'\n' {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let mut byte = [0_u8; 1];
+                            match reader.read(&mut byte) {
+                                Ok(1) => {
+                                    bytes.push(byte[0]);
+                                    if byte[0] == b'\n' {
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {
+                                    reached_eof = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    return Err(format!(
+                                        "cannot read file descriptor {descriptor} at t={}: {error}",
+                                        self.now
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if reached_eof {
+                        self.file_eof.borrow_mut().insert(descriptor);
+                    } else {
+                        self.file_eof.borrow_mut().remove(&descriptor);
+                    }
+                    let count = bytes.len() as u64;
+                    let string_value = LogicWord::from_bytes_le(string.decl_width, &bytes);
+                    let status_width = lv_bits(status).len();
+                    let status_value = LogicWord::from_u64(status_width, count);
+                    self.assign_lvalue_word(string, string_value)?;
+                    self.assign_lvalue_word(status, status_value)?;
+                }
+                Stmt::FileError {
+                    fd,
+                    message,
+                    status,
+                } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    if !self.file_readers.borrow().contains_key(&descriptor)
+                        && !self.file_writers.borrow().contains_key(&descriptor)
+                    {
+                        return Err(format!(
+                            "cannot query unknown file descriptor {descriptor} at t={}",
+                            self.now
+                        ));
+                    }
+                    let error = self
+                        .file_errors
+                        .borrow()
+                        .get(&descriptor)
+                        .cloned()
+                        .unwrap_or_default();
+                    let message_value =
+                        LogicWord::from_bytes_le(message.decl_width, error.as_bytes());
+                    let status_width = lv_bits(status).len();
+                    let status_value = if error.is_empty() {
+                        LogicWord::zero(status_width)
+                    } else {
+                        LogicWord::from_u64(status_width, u64::from(u32::MAX))
+                    };
+                    self.assign_lvalue_word(message, message_value)?;
+                    self.assign_lvalue_word(status, status_value)?;
+                }
+                Stmt::FileRead { fd, target, status } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    if !self.file_readers.borrow().contains_key(&descriptor) {
+                        self.file_errors.borrow_mut().insert(
+                            descriptor,
+                            "file descriptor is not open for reading".to_string(),
+                        );
+                        let status_width = lv_bits(status).len();
+                        self.assign_lvalue_word(
+                            status,
+                            LogicWord::from_u64(status_width, u64::from(u32::MAX)),
+                        )?;
+                        continue;
+                    }
+                    let byte_count = target.decl_width / 8;
+                    let mut bytes = Vec::with_capacity(byte_count);
+                    let mut reached_eof = false;
+                    let mut read_failed = false;
+                    {
+                        let mut readers = self.file_readers.borrow_mut();
+                        let Some(reader) = readers.get_mut(&descriptor) else {
+                            unreachable!("read descriptor existence was checked");
+                        };
+                        while bytes.len() < byte_count {
+                            if let Some(byte) = self.file_pushbacks.borrow_mut().remove(&descriptor)
+                            {
+                                bytes.push(byte);
+                                continue;
+                            }
+                            let mut byte = [0_u8; 1];
+                            match reader.read(&mut byte) {
+                                Ok(1) => bytes.push(byte[0]),
+                                Ok(_) => {
+                                    reached_eof = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    self.file_errors
+                                        .borrow_mut()
+                                        .insert(descriptor, format!("binary read failed: {error}"));
+                                    read_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if read_failed {
+                        let status_width = lv_bits(status).len();
+                        let failure = LogicWord::from_u64(status_width, u64::from(u32::MAX));
+                        self.assign_lvalue_word(status, failure)?;
+                        continue;
+                    }
+                    if reached_eof {
+                        self.file_eof.borrow_mut().insert(descriptor);
+                    } else {
+                        self.file_eof.borrow_mut().remove(&descriptor);
+                    }
+                    let target_value = LogicWord::from_bytes_le(target.decl_width, &bytes);
+                    let status_width = lv_bits(status).len();
+                    let status_value = LogicWord::from_u64(status_width, bytes.len() as u64);
+                    self.assign_lvalue_word(target, target_value)?;
+                    self.assign_lvalue_word(status, status_value)?;
+                }
+                Stmt::FileReadMemory {
+                    fd,
+                    memory,
+                    start,
+                    count,
+                    status,
+                } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    if !self.file_readers.borrow().contains_key(&descriptor) {
+                        self.file_errors.borrow_mut().insert(
+                            descriptor,
+                            "file descriptor is not open for reading".to_string(),
+                        );
+                        let status_width = lv_bits(status).len();
+                        self.assign_lvalue_word(
+                            status,
+                            LogicWord::from_u64(status_width, u64::from(u32::MAX)),
+                        )?;
+                        continue;
+                    }
+
+                    let declaration = self
+                        .design
+                        .memories
+                        .get(*memory)
+                        .cloned()
+                        .ok_or_else(|| "$fread target memory is missing".to_string())?;
+                    let dimension = declaration.dimensions.first().cloned().ok_or_else(|| {
+                        "$fread target memory has no unpacked dimension".to_string()
+                    })?;
+                    let last_logical =
+                        dimension.base + dimension.step * (dimension.length as i64 - 1);
+                    let lower_logical = dimension.base.min(last_logical);
+                    let upper_logical = dimension.base.max(last_logical);
+                    let logical_start = if let Some(start) = start {
+                        self.eval(start).to_u64().ok_or_else(|| {
+                            "$fread start index is unknown or out of range".to_string()
+                        })? as i64
+                    } else {
+                        dimension.base
+                    };
+                    if logical_start < lower_logical || logical_start > upper_logical {
+                        return Err(format!(
+                            "$fread start index {logical_start} is outside memory '{}'",
+                            declaration.name
+                        ));
+                    }
+                    let remaining = if dimension.step >= 0 {
+                        (upper_logical - logical_start) / dimension.step + 1
+                    } else {
+                        (logical_start - lower_logical) / -dimension.step + 1
+                    };
+                    let requested_elements = if let Some(count) = count {
+                        self.eval(count).to_u64().ok_or_else(|| {
+                            "$fread element count is unknown or out of range".to_string()
+                        })?
+                    } else {
+                        u64::try_from(remaining)
+                            .map_err(|_| "$fread memory length is too large".to_string())?
+                    };
+                    if requested_elements
+                        > u64::try_from(remaining).map_err(|_| {
+                            "$fread element count exceeds the remaining memory elements".to_string()
+                        })?
+                    {
+                        return Err(format!(
+                            "$fread element count {requested_elements} exceeds the {} elements remaining in memory '{}'",
+                            remaining,
+                            declaration.name
+                        ));
+                    }
+
+                    let status_width = lv_bits(status).len();
+                    if requested_elements == 0 {
+                        self.assign_lvalue_word(status, LogicWord::from_u64(status_width, 0))?;
+                        continue;
+                    }
+
+                    let bytes_per_element = declaration.element_width / 8;
+                    let mut byte_count = 0_u64;
+                    for element_offset in 0..requested_elements {
+                        let logical_index = logical_start + dimension.step * element_offset as i64;
+                        let physical_index = declaration
+                            .physical_index(&[logical_index])
+                            .ok_or_else(|| {
+                                "$fread generated an invalid physical memory index".to_string()
+                            })?;
+                        let (mut bytes, reached_eof) =
+                            match self.read_file_bytes(descriptor, bytes_per_element) {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    let failure =
+                                        LogicWord::from_u64(status_width, u64::from(u32::MAX));
+                                    self.assign_lvalue_word(status, failure)?;
+                                    continue;
+                                }
+                            };
+                        byte_count += bytes.len() as u64;
+                        let partial_element = bytes.len() < bytes_per_element;
+                        if bytes.len() < bytes_per_element {
+                            bytes.resize(bytes_per_element, 0);
+                        }
+                        let value = LogicWord::from_bytes_le(declaration.element_width, &bytes);
+                        self.apply_memory_update(*memory, physical_index, value)?;
+                        if partial_element || reached_eof {
+                            break;
+                        }
+                    }
+                    let status_value = LogicWord::from_u64(status_width, byte_count);
+                    self.assign_lvalue_word(status, status_value)?;
+                }
+                Stmt::FileScan {
+                    fd,
+                    format,
+                    targets,
+                    status,
+                } => {
+                    let descriptor = self.file_descriptor(fd)?;
+                    if !self.file_readers.borrow().contains_key(&descriptor) {
+                        self.file_errors.borrow_mut().insert(
+                            descriptor,
+                            "file descriptor is not open for reading".to_string(),
+                        );
+                        let status_width = lv_bits(status).len();
+                        let failure = LogicWord::from_u64(status_width, u64::from(u32::MAX));
+                        self.assign_lvalue_word(status, failure)?;
+                        continue;
+                    }
+                    let targets = targets.clone();
+                    let target_signed = scan_target_signedness(self.design, &targets);
+                    let (converted, input_failure) = {
+                        let mut input = FileScanInput {
+                            simulator: self,
+                            descriptor,
+                        };
+                        scan_fields(&mut input, format, &targets, &target_signed, "$fscanf")?
+                    };
+                    for (target, value) in &converted {
+                        self.assign_lvalue_word(target, value.clone())?;
+                    }
+                    let status_width = lv_bits(status).len();
+                    let return_value = if input_failure && converted.is_empty() {
+                        u64::from(u32::MAX)
+                    } else {
+                        converted.len() as u64
+                    };
+                    self.assign_lvalue_word(
+                        status,
+                        LogicWord::from_u64(status_width, return_value),
+                    )?;
+                }
+                Stmt::StringScan {
+                    source,
+                    format,
+                    targets,
+                    status,
+                } => {
+                    let source_value = self.eval(source);
+                    let Some(mut input) = StringScanInput::new(&source_value) else {
+                        return Err("$sscanf input string contains unknown bits".to_string());
+                    };
+                    let targets = targets.clone();
+                    let target_signed = scan_target_signedness(self.design, &targets);
+                    let (converted, input_failure) =
+                        scan_fields(&mut input, format, &targets, &target_signed, "$sscanf")?;
+                    for (target, value) in &converted {
+                        self.assign_lvalue_word(target, value.clone())?;
+                    }
+                    let status_width = lv_bits(status).len();
+                    let return_value = if input_failure && converted.is_empty() {
+                        u64::from(u32::MAX)
+                    } else {
+                        converted.len() as u64
+                    };
+                    self.assign_lvalue_word(
+                        status,
+                        LogicWord::from_u64(status_width, return_value),
+                    )?;
+                }
+                Stmt::FileDisplay {
+                    fd,
+                    parts,
+                    args,
+                    newline,
+                    strobe,
+                } => {
+                    if *strobe {
+                        self.file_strobes.push(FileStrobe {
+                            fd,
+                            parts,
+                            args,
+                            newline: *newline,
+                        });
+                    } else {
+                        self.write_file_display(fd, parts, args, *newline)?;
+                    }
+                }
                 Stmt::Finish => {
                     self.finished = true;
                     self.run_final_blocks()?;
+                    return Ok(());
+                }
+                Stmt::Stop => {
+                    self.stopped = true;
+                    self.paused_cont = Some(Cont {
+                        process,
+                        join,
+                        work,
+                    });
                     return Ok(());
                 }
             }
             if self.finished {
                 return Ok(());
             }
+            if self.stopped {
+                return Ok(());
+            }
         }
-        if let Some(process) = c.process {
+        if let Some(process) = process {
             self.busy_procs.remove(&process);
         }
-        if let Some(join) = c.join {
+        if let Some(join) = join {
             self.complete_join(join);
         }
         Ok(())
@@ -3171,19 +3921,454 @@ impl<'d> Simulator<'d> {
                 DispPart::Str(s) => out.push_str(s),
                 DispPart::Time(index) => out.push_str(&self.format_time_value(&args[*index])),
                 DispPart::Arg(i, spec) => {
-                    let v = self.eval(&args[*i]);
-                    match spec {
-                        'b' => out.push_str(&v.to_bin_str()),
-                        'h' => out.push_str(&v.to_hex_str()),
-                        's' => {
-                            // 512 位打包字符串：首字符在最低字节，NUL 截断。
-                            out.push_str(&v.to_ascii_string_nul_terminated());
+                    out.push_str(&self.format_display_argument(&args[*i], *spec, None));
+                }
+                DispPart::FormattedArg {
+                    index,
+                    spec,
+                    width,
+                    precision,
+                    left_justify,
+                } => {
+                    let rendered = if *spec == 't' {
+                        self.format_time_value(&args[*index])
+                    } else {
+                        self.format_display_argument(&args[*index], *spec, *precision)
+                    };
+                    let padding = if matches!(spec, 'b' | 'h' | 'o') {
+                        '0'
+                    } else {
+                        ' '
+                    };
+                    let padded = pad_formatted_text(&rendered, *width, *left_justify, padding);
+                    out.push_str(&padded);
+                }
+            }
+        }
+        out
+    }
+
+    fn format_display_argument(
+        &self,
+        argument: &Expr,
+        spec: char,
+        precision: Option<usize>,
+    ) -> String {
+        if let Expr::RealConst(real) = argument {
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'p' | 'P' => format!("{real}"),
+                'e' => format_real_exponent(*real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(*real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if matches!(
+            argument,
+            Expr::ShortRealConst(_)
+                | Expr::ShortRealRef { .. }
+                | Expr::ShortRealBinary { .. }
+                | Expr::ShortRealNeg(_)
+                | Expr::ShortRealToReal(_)
+                | Expr::RealToShortReal(_)
+        ) {
+            let Some(real) = self.eval_real(argument) else {
+                return "x".to_string();
+            };
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'p' | 'P' => format!("{real}"),
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if let Expr::RealRef { .. } = argument {
+            let bits = self.eval(argument);
+            if !bits.is_fully_known() {
+                return "x".to_string();
+            }
+            let real = f64::from_bits(bits.to_u64().unwrap_or_default());
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if let Expr::RealBinary { .. } = argument {
+            let bits = self.eval(argument);
+            if !bits.is_fully_known() {
+                return "x".to_string();
+            }
+            let real = f64::from_bits(bits.to_u64().unwrap_or_default());
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if let Expr::RealNeg(_) = argument {
+            let bits = self.eval(argument);
+            if !bits.is_fully_known() {
+                return "x".to_string();
+            }
+            let real = f64::from_bits(bits.to_u64().unwrap_or_default());
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if let Expr::RealTime { .. } = argument {
+            let bits = self.eval(argument);
+            if !bits.is_fully_known() {
+                return "x".to_string();
+            }
+            let real = f64::from_bits(bits.to_u64().unwrap_or_default());
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if let Expr::EnumPattern {
+            value,
+            values,
+            names,
+        } = argument
+        {
+            let word = self.eval(value);
+            if let Some(index) = values.iter().position(|candidate| *candidate == word) {
+                return names[index].clone();
+            }
+            return format_pattern_word(word.width(), value.is_signed(), &word);
+        }
+        if let Expr::StructPattern {
+            value,
+            fields,
+            abbreviated,
+        } = argument
+        {
+            let word = self.eval(value);
+            let rendered = Self::format_pattern_struct_fields(&word, fields, *abbreviated);
+            return format!("'{{{rendered}}}");
+        }
+        if let Expr::MemoryPattern {
+            memory,
+            element,
+            abbreviated,
+        } = argument
+        {
+            return self.format_pattern_memory(*memory, element, *abbreviated);
+        }
+        if matches!(spec, 'e' | 'E') {
+            let value = self.eval(argument);
+            return format_pattern_integral(argument, &value);
+        }
+        let value = self.eval(argument);
+        match spec {
+            'b' => value.to_bin_str(),
+            'h' => value.to_hex_str(),
+            'o' => value.to_oct_str(),
+            's' => value.to_ascii_string_nul_terminated(),
+            'c' => match value.to_u64() {
+                Some(value) => (u8::try_from(value & 0xff).unwrap_or_default() as char).to_string(),
+                None => "x".to_string(),
+            },
+            'v' => {
+                let mut labels = Vec::with_capacity(value.width());
+                for bit in (0..value.width()).rev() {
+                    labels.push(match value.bit(bit) {
+                        eda_core::logic::LogicValue::Zero => "St0",
+                        eda_core::logic::LogicValue::One => "St1",
+                        eda_core::logic::LogicValue::X => "StX",
+                        eda_core::logic::LogicValue::Z => "HiZ",
+                    });
+                }
+                labels.join(" ")
+            }
+            'q' => format!("{:?}", value.to_ascii_string_nul_terminated()),
+            'p' => format_pattern_integral(argument, &value),
+            _ => match value.to_u64() {
+                Some(value) => {
+                    if argument.is_signed() {
+                        let width = argument.width().min(64);
+                        let sign = 1_u128 << (width - 1);
+                        let magnitude = u128::from(value);
+                        if width > 0 && magnitude & sign != 0 {
+                            let signed = magnitude as i128 - (1_i128 << width);
+                            signed.to_string()
+                        } else {
+                            magnitude.to_string()
                         }
-                        _ => match v.to_u64() {
-                            Some(u) => out.push_str(&u.to_string()),
-                            None => out.push('x'),
-                        },
+                    } else {
+                        value.to_string()
                     }
+                }
+                None => "x".to_string(),
+            },
+        }
+    }
+
+    fn format_pattern_struct_fields(
+        word: &LogicWord,
+        fields: &[eda_core::ir::StructPatternField],
+        abbreviated: bool,
+    ) -> String {
+        let separator = if abbreviated { "," } else { ", " };
+        fields
+            .iter()
+            .map(|field| {
+                let slice = word.slice(field.offset + field.width - 1, field.offset);
+                let rendered = match &field.value {
+                    eda_core::ir::StructPatternValue::Scalar { signed } => {
+                        format_pattern_word(field.width, *signed, &slice)
+                    }
+                    eda_core::ir::StructPatternValue::Struct { fields } => {
+                        format!(
+                            "'{{{}}}",
+                            Self::format_pattern_struct_fields(word, fields, abbreviated)
+                        )
+                    }
+                };
+                if abbreviated {
+                    rendered
+                } else {
+                    format!("{}:{}", field.name, rendered)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(separator)
+    }
+
+    fn format_pattern_memory(
+        &self,
+        memory: usize,
+        element: &eda_core::ir::MemoryPatternElement,
+        abbreviated: bool,
+    ) -> String {
+        let Some(declaration) = self.design.memories.get(memory) else {
+            return "<missing-memory>".to_string();
+        };
+        let canonical_memory = self.canonical_memory(memory);
+        let element_width = declaration.element_width;
+        if declaration.associative {
+            return self.format_pattern_associative_memory(canonical_memory, element, abbreviated);
+        }
+        let length = if declaration.dynamic {
+            self.dynamic_lengths
+                .get(canonical_memory)
+                .copied()
+                .unwrap_or_default()
+        } else {
+            declaration.flat_length
+        };
+        if length > declaration.flat_length {
+            return "<invalid-memory-length>".to_string();
+        }
+        let Some(shape_length) = Self::memory_shape_length(&declaration.dimensions) else {
+            return "<invalid-memory-shape>".to_string();
+        };
+        if shape_length != declaration.flat_length {
+            return "<invalid-memory-shape>".to_string();
+        }
+        self.format_pattern_memory_slice(
+            canonical_memory,
+            element_width,
+            element,
+            &declaration.dimensions,
+            (0, length),
+            abbreviated,
+        )
+    }
+
+    fn memory_shape_length(dimensions: &[eda_core::ir::MemoryDimension]) -> Option<u64> {
+        dimensions.iter().try_fold(1_u64, |length, dimension| {
+            length.checked_mul(dimension.length as u64)
+        })
+    }
+
+    fn format_pattern_associative_memory(
+        &self,
+        memory: usize,
+        element: &eda_core::ir::MemoryPatternElement,
+        abbreviated: bool,
+    ) -> String {
+        let Some(declaration) = self.design.memories.get(memory) else {
+            return "<missing-memory>".to_string();
+        };
+        let Some(elements) = self.associative_elements.get(memory) else {
+            return "<missing-memory>".to_string();
+        };
+        if self
+            .dynamic_lengths
+            .get(memory)
+            .is_some_and(|length| *length != elements.len() as u64)
+        {
+            return "<invalid-memory-length>".to_string();
+        }
+        let mut entries = elements.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left, _), (right, _)| {
+            associative_key_compare(
+                **left,
+                **right,
+                declaration.index_width,
+                declaration.index_signed,
+            )
+        });
+        let rendered = entries
+            .into_iter()
+            .map(|(key, value)| {
+                let key = LogicWord::from_u64(declaration.index_width, *key);
+                let key =
+                    format_pattern_word(declaration.index_width, declaration.index_signed, &key);
+                let value = self.format_pattern_memory_element_value(
+                    declaration.element_width,
+                    element,
+                    value,
+                    abbreviated,
+                );
+                format!("{key}:{value}")
+            })
+            .collect::<Vec<_>>();
+        let separator = if abbreviated { "," } else { ", " };
+        format!("'{{{}}}", rendered.join(separator))
+    }
+
+    fn format_pattern_memory_slice(
+        &self,
+        canonical_memory: usize,
+        element_width: usize,
+        element: &eda_core::ir::MemoryPatternElement,
+        dimensions: &[eda_core::ir::MemoryDimension],
+        range: (u64, u64),
+        abbreviated: bool,
+    ) -> String {
+        let Some(dimension) = dimensions.first() else {
+            return self.format_pattern_memory_element(
+                canonical_memory,
+                element_width,
+                element,
+                range.0,
+                abbreviated,
+            );
+        };
+        let stride = Self::memory_shape_length(&dimensions[1..]).unwrap_or(0);
+        let dimension_length = u64::try_from(dimension.length).unwrap_or(u64::MAX);
+        let count = dimension_length.min(range.1);
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut elements = Vec::with_capacity(count);
+        for index in 0..count {
+            let index = u64::try_from(index).ok().and_then(|index| {
+                index
+                    .checked_mul(stride)
+                    .and_then(|offset| range.0.checked_add(offset))
+            });
+            let Some(index) = index else {
+                return "<invalid-memory-shape>".to_string();
+            };
+            elements.push(self.format_pattern_memory_slice(
+                canonical_memory,
+                element_width,
+                element,
+                &dimensions[1..],
+                (index, range.1),
+                abbreviated,
+            ));
+        }
+        let separator = if abbreviated { "," } else { ", " };
+        format!("'{{{}}}", elements.join(separator))
+    }
+
+    fn format_pattern_memory_element(
+        &self,
+        canonical_memory: usize,
+        element_width: usize,
+        element: &eda_core::ir::MemoryPatternElement,
+        index: u64,
+        abbreviated: bool,
+    ) -> String {
+        let value = self
+            .memory_elements
+            .get(canonical_memory)
+            .and_then(|storage| storage.get(index))
+            .cloned()
+            .unwrap_or_else(|| LogicWord::xes(element_width));
+        self.format_pattern_memory_element_value(element_width, element, &value, abbreviated)
+    }
+
+    fn format_pattern_memory_element_value(
+        &self,
+        element_width: usize,
+        element: &eda_core::ir::MemoryPatternElement,
+        value: &LogicWord,
+        abbreviated: bool,
+    ) -> String {
+        match element {
+            eda_core::ir::MemoryPatternElement::Scalar { signed } => {
+                format_pattern_word(element_width, *signed, value)
+            }
+            eda_core::ir::MemoryPatternElement::Struct { fields } => format!(
+                "'{{{}}}",
+                Self::format_pattern_struct_fields(value, fields, abbreviated)
+            ),
+            eda_core::ir::MemoryPatternElement::PackedUnion { signed } => {
+                format_pattern_word(element_width, *signed, value)
+            }
+            eda_core::ir::MemoryPatternElement::UnpackedUnion { fields } => format!(
+                "'{{{}}}",
+                Self::format_pattern_struct_fields(value, fields, abbreviated)
+            ),
+        }
+    }
+
+    fn format_file_display(&self, parts: &[eda_core::ir::DispPart], args: &[Expr]) -> Vec<u8> {
+        use eda_core::ir::DispPart;
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                DispPart::Str(text) => out.extend_from_slice(text.as_bytes()),
+                DispPart::Time(index) => {
+                    out.extend_from_slice(self.format_time_value(&args[*index]).as_bytes())
+                }
+                DispPart::Arg(index, spec) => match spec {
+                    'u' => out.extend_from_slice(&raw_two_state_bytes(&self.eval(&args[*index]))),
+                    'z' => out.extend_from_slice(&raw_four_state_bytes(&self.eval(&args[*index]))),
+                    _ => out.extend_from_slice(
+                        self.format_display_argument(&args[*index], *spec, None)
+                            .as_bytes(),
+                    ),
+                },
+                DispPart::FormattedArg {
+                    index,
+                    spec,
+                    width,
+                    precision,
+                    left_justify,
+                } => {
+                    let rendered = if *spec == 't' {
+                        self.format_time_value(&args[*index])
+                    } else {
+                        self.format_display_argument(&args[*index], *spec, *precision)
+                    };
+                    let padding = if matches!(spec, 'b' | 'h' | 'o') {
+                        '0'
+                    } else {
+                        ' '
+                    };
+                    out.extend_from_slice(
+                        pad_formatted_text(&rendered, *width, *left_justify, padding).as_bytes(),
+                    );
                 }
             }
         }
@@ -3235,6 +4420,291 @@ impl<'d> Simulator<'d> {
             text = format!("{}{text}", " ".repeat(padding));
         }
         text
+    }
+
+    fn eval_random(
+        &self,
+        function: eda_core::ir::RandomFunction,
+        args: &[Expr],
+        width: usize,
+    ) -> LogicWord {
+        match function {
+            eda_core::ir::RandomFunction::Random | eda_core::ir::RandomFunction::Urandom => {
+                LogicWord::from_u64(width, u64::from(self.next_u32()))
+            }
+            eda_core::ir::RandomFunction::UrandomRange => {
+                let max = args
+                    .first()
+                    .map(|argument| self.eval(argument))
+                    .and_then(|value| value.to_u64())
+                    .and_then(|value| u32::try_from(value).ok());
+                let min = args
+                    .get(1)
+                    .map(|argument| self.eval(argument))
+                    .and_then(|value| value.to_u64())
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(0);
+                let Some(max) = max else {
+                    return LogicWord::xes(width);
+                };
+                let (low, high) = if max < min { (max, min) } else { (min, max) };
+                let modulo = u64::from(high) - u64::from(low) + 1;
+                let rejection_limit = u64::MAX - (u64::MAX % modulo);
+                let mut sample = self.next_u64();
+                while sample >= rejection_limit {
+                    sample = self.next_u64();
+                }
+                LogicWord::from_u64(width, u64::from(low) + sample % modulo)
+            }
+        }
+    }
+
+    fn next_u32(&self) -> u32 {
+        self.next_u64() as u32
+    }
+
+    fn next_u64(&self) -> u64 {
+        let state = self
+            .random_state
+            .replace(self.random_state.get().wrapping_add(0x9E37_79B9_7F4A_7C15));
+        let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn file_descriptor(&self, expression: &Expr) -> Result<u32, String> {
+        let value = self
+            .eval(expression)
+            .to_u64()
+            .and_then(|value| u32::try_from(value).ok());
+        value.filter(|descriptor| *descriptor != 0).ok_or_else(|| {
+            format!(
+                "file operation requires a known nonzero descriptor at t={}",
+                self.now
+            )
+        })
+    }
+
+    fn open_file_descriptor(
+        &self,
+        path: &str,
+        append: bool,
+        read: bool,
+        truncate: bool,
+    ) -> LogicWord {
+        let mixed_read_write = read && (append || truncate);
+        let mut options = std::fs::OpenOptions::new();
+        if mixed_read_write {
+            options.read(true).write(true);
+            if truncate {
+                options.create(true);
+                if append {
+                    options.append(true);
+                } else {
+                    options.truncate(true);
+                }
+            }
+        } else if read {
+            options.read(true);
+        } else {
+            options.write(true).create(true);
+            if append {
+                options.append(true);
+            } else {
+                options.truncate(true);
+            }
+        }
+        let Ok(file) = options.open(path) else {
+            return LogicWord::zero(32);
+        };
+        let (mut reader, mut writer) = if mixed_read_write {
+            let writer = match file.try_clone() {
+                Ok(writer) => writer,
+                Err(_) => return LogicWord::zero(32),
+            };
+            (Some(file), Some(writer))
+        } else if read {
+            (Some(file), None)
+        } else {
+            (None, Some(file))
+        };
+        loop {
+            let candidate = self.next_file_descriptor.get();
+            let Some(next) = candidate.checked_add(1) else {
+                return LogicWord::zero(32);
+            };
+            self.next_file_descriptor.set(next);
+            if candidate != 0
+                && self
+                    .file_paths
+                    .borrow_mut()
+                    .insert(candidate, PathBuf::from(path))
+                    .is_none()
+            {
+                if mixed_read_write {
+                    let Some(read_handle) = reader.take() else {
+                        unreachable!("mixed file reader is inserted once");
+                    };
+                    let Some(write_handle) = writer.take() else {
+                        unreachable!("mixed file writer is inserted once");
+                    };
+                    self.file_readers
+                        .borrow_mut()
+                        .insert(candidate, read_handle);
+                    self.file_writers
+                        .borrow_mut()
+                        .insert(candidate, write_handle);
+                    let initial_position = if append && truncate {
+                        std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default()
+                    } else {
+                        0
+                    };
+                    self.file_write_positions
+                        .borrow_mut()
+                        .insert(candidate, initial_position);
+                    self.file_eof.borrow_mut().remove(&candidate);
+                    self.file_errors.borrow_mut().remove(&candidate);
+                } else if read {
+                    let Some(file) = reader.take() else {
+                        unreachable!("file reader is inserted once");
+                    };
+                    self.file_readers.borrow_mut().insert(candidate, file);
+                    self.file_eof.borrow_mut().remove(&candidate);
+                    self.file_errors.borrow_mut().remove(&candidate);
+                } else {
+                    let Some(file) = writer.take() else {
+                        unreachable!("file writer is inserted once");
+                    };
+                    let position = if append {
+                        std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or_default()
+                    } else {
+                        0
+                    };
+                    self.file_write_positions
+                        .borrow_mut()
+                        .insert(candidate, position);
+                    self.file_writers.borrow_mut().insert(candidate, file);
+                    self.file_errors.borrow_mut().remove(&candidate);
+                }
+                return LogicWord::from_u64(32, u64::from(candidate));
+            }
+        }
+    }
+
+    fn assign_lvalue_word(&mut self, lv: &LValue, word: LogicWord) -> Result<(), String> {
+        let value = word.sized(lv_bits(lv).len());
+        let mut changes = Vec::new();
+        for (index, net) in lv_bits(lv).into_iter().enumerate() {
+            let newv = value.bit(index);
+            if self.forced_values.contains_key(&net) {
+                continue;
+            }
+            let old = self.vals[net];
+            if old != newv {
+                self.vals[net] = newv;
+                self.mark_vcd_change(net);
+                changes.push((net, old, newv));
+            }
+        }
+        for (net, old, newv) in changes {
+            self.event_count += 1;
+            if self.event_count > MAX_EVENTS {
+                return Err("event budget exceeded".into());
+            }
+            self.notify_change(net, old, newv)?;
+        }
+        Ok(())
+    }
+
+    fn read_file_input_byte(&mut self, descriptor: u32) -> Result<Option<u8>, String> {
+        if let Some(byte) = self.file_pushbacks.borrow_mut().remove(&descriptor) {
+            self.file_eof.borrow_mut().remove(&descriptor);
+            return Ok(Some(byte));
+        }
+        let mut readers = self.file_readers.borrow_mut();
+        let Some(reader) = readers.get_mut(&descriptor) else {
+            self.file_errors.borrow_mut().insert(
+                descriptor,
+                "file descriptor is not open for reading".to_string(),
+            );
+            return Ok(None);
+        };
+        let mut byte = [0_u8; 1];
+        match reader.read(&mut byte) {
+            Ok(1) => {
+                self.file_eof.borrow_mut().remove(&descriptor);
+                Ok(Some(byte[0]))
+            }
+            Ok(_) => {
+                self.file_eof.borrow_mut().insert(descriptor);
+                Ok(None)
+            }
+            Err(error) => {
+                self.file_errors
+                    .borrow_mut()
+                    .insert(descriptor, format!("formatted read failed: {error}"));
+                Err(format!(
+                    "cannot read file descriptor {descriptor} at t={}: {error}",
+                    self.now
+                ))
+            }
+        }
+    }
+
+    fn push_file_input_byte(&mut self, descriptor: u32, byte: u8) -> Result<(), String> {
+        let mut pushbacks = self.file_pushbacks.borrow_mut();
+        if pushbacks.contains_key(&descriptor) {
+            return Err(format!(
+                "cannot preserve more than one lookahead byte for file descriptor {descriptor}"
+            ));
+        }
+        pushbacks.insert(descriptor, byte);
+        self.file_eof.borrow_mut().remove(&descriptor);
+        Ok(())
+    }
+
+    fn read_file_bytes(
+        &self,
+        descriptor: u32,
+        byte_count: usize,
+    ) -> Result<(Vec<u8>, bool), String> {
+        let mut bytes = Vec::with_capacity(byte_count);
+        let mut reached_eof = false;
+        let mut readers = self.file_readers.borrow_mut();
+        let Some(reader) = readers.get_mut(&descriptor) else {
+            return Err("file descriptor is not open for reading".to_string());
+        };
+        while bytes.len() < byte_count {
+            if let Some(byte) = self.file_pushbacks.borrow_mut().remove(&descriptor) {
+                bytes.push(byte);
+                continue;
+            }
+            let mut byte = [0_u8; 1];
+            match reader.read(&mut byte) {
+                Ok(1) => bytes.push(byte[0]),
+                Ok(_) => {
+                    reached_eof = true;
+                    break;
+                }
+                Err(error) => {
+                    self.file_errors
+                        .borrow_mut()
+                        .insert(descriptor, format!("binary read failed: {error}"));
+                    return Err(error.to_string());
+                }
+            }
+        }
+        if reached_eof {
+            self.file_eof.borrow_mut().insert(descriptor);
+        } else {
+            self.file_eof.borrow_mut().remove(&descriptor);
+        }
+        Ok((bytes, reached_eof))
     }
 
     // ---------- expression evaluation ----------
@@ -3311,6 +4781,112 @@ impl<'d> Simulator<'d> {
         use eda_core::ir::{BinOp, UnOp};
         match e {
             Expr::Const(w) => w.clone(),
+            Expr::RealConst(real) => LogicWord::from_u64(64, real.to_bits()),
+            Expr::RealRef { net, decl_width } => {
+                let mut bits = Vec::with_capacity(*decl_width);
+                for bit in 0..*decl_width {
+                    bits.push(self.vals[net + bit]);
+                }
+                LogicWord { bits }
+            }
+            Expr::ShortRealConst(real) => LogicWord::from_u64(32, u64::from(real.to_bits())),
+            Expr::ShortRealRef { net } => {
+                let mut bits = Vec::with_capacity(32);
+                for bit in 0..32 {
+                    bits.push(self.vals[net + bit]);
+                }
+                LogicWord { bits }
+            }
+            Expr::ShortRealBinary { .. } => match self.eval_shortreal(e) {
+                Some(real) => LogicWord::from_u64(32, u64::from(real.to_bits())),
+                None => LogicWord::xes(32),
+            },
+            Expr::ShortRealNeg(operand) => match self.eval_shortreal(operand) {
+                Some(real) => LogicWord::from_u64(32, u64::from((-real).to_bits())),
+                None => LogicWord::xes(32),
+            },
+            Expr::ShortRealToReal(operand) => match self.eval_shortreal(operand) {
+                Some(real) => LogicWord::from_u64(64, f64::from(real).to_bits()),
+                None => LogicWord::xes(64),
+            },
+            Expr::RealToShortReal(operand) => match self.eval_real(operand) {
+                Some(real) => LogicWord::from_u64(32, u64::from((real as f32).to_bits())),
+                None => LogicWord::xes(32),
+            },
+            Expr::RealBinary { .. } => match self.eval_real(e) {
+                Some(real) => LogicWord::from_u64(64, real.to_bits()),
+                None => LogicWord::xes(64),
+            },
+            Expr::RealNeg(operand) => match self.eval_real(operand) {
+                Some(real) => LogicWord::from_u64(64, (-real).to_bits()),
+                _ => LogicWord::xes(64),
+            },
+            Expr::RealToInt {
+                value,
+                width,
+                signed,
+            } => match self
+                .eval_real(value)
+                .and_then(|real| real_to_int(real, *width, *signed))
+            {
+                Some(bits) => LogicWord::from_u64(*width, bits),
+                None => LogicWord::xes(*width),
+            },
+            Expr::IntToReal {
+                value,
+                width,
+                signed,
+            } => {
+                let word = self.eval(value);
+                let Some(raw) = word.to_u64() else {
+                    return LogicWord::xes(64);
+                };
+                let real = if *signed {
+                    sext_i64(&word, *width) as f64
+                } else {
+                    let mask = if *width < u64::BITS as usize {
+                        (1_u64 << *width) - 1
+                    } else {
+                        u64::MAX
+                    };
+                    (raw & mask) as f64
+                };
+                LogicWord::from_u64(64, real.to_bits())
+            }
+            Expr::RealTime { unit_exponent } => {
+                let precision = i16::from(self.design.time_scale.precision_exponent);
+                let scale_exponent = i16::from(*unit_exponent) - precision;
+                let real = if scale_exponent <= 0 {
+                    (self.now as f64) * 10_f64.powi(-i32::from(scale_exponent))
+                } else {
+                    (self.now as f64) / 10_f64.powi(i32::from(scale_exponent))
+                };
+                if real.is_finite() {
+                    LogicWord::from_u64(64, real.to_bits())
+                } else {
+                    LogicWord::xes(64)
+                }
+            }
+            Expr::RealCompare { op, left, right } => {
+                let Some(left) = self.eval_real(left) else {
+                    return LogicWord::xes(1);
+                };
+                let Some(right) = self.eval_real(right) else {
+                    return LogicWord::xes(1);
+                };
+                let result = match op {
+                    eda_core::ir::BinOp::Eq => left == right,
+                    eda_core::ir::BinOp::Ne => left != right,
+                    eda_core::ir::BinOp::Lt => left < right,
+                    eda_core::ir::BinOp::Le => left <= right,
+                    eda_core::ir::BinOp::Gt => left > right,
+                    eda_core::ir::BinOp::Ge => left >= right,
+                    _ => return LogicWord::xes(1),
+                };
+                LogicWord {
+                    bits: vec![LogicValue::bit(result)],
+                }
+            }
             Expr::Ref { net, range, .. } => {
                 let (lsb, w) = match range {
                     Range::Bit(b) => (*b, 1),
@@ -3523,6 +5099,17 @@ impl<'d> Simulator<'d> {
                     _ => LogicWord::xes(left.width()),
                 }
             }
+            Expr::StringFormat { parts, args, .. } => {
+                let mut rendered = self.format_file_display(parts, args);
+                // A SystemVerilog string result cannot contain NUL; slang also
+                // removes the zero padding emitted by raw `%u` and `%z`.
+                rendered.retain(|byte| *byte != 0);
+                if rendered.len() > 63 {
+                    LogicWord::xes(512)
+                } else {
+                    LogicWord::from_bytes_le(512, &rendered)
+                }
+            }
             Expr::StringGetByte { e, index } => {
                 let value = self.eval(e);
                 let index = self.eval(index);
@@ -3580,6 +5167,190 @@ impl<'d> Simulator<'d> {
                 };
                 LogicWord::from_u64(*width, value)
             }
+            Expr::Random {
+                function,
+                args,
+                width,
+                ..
+            } => self.eval_random(*function, args, *width),
+            Expr::FileOpen {
+                path,
+                append,
+                read,
+                truncate,
+            } => self.open_file_descriptor(path, *append, *read, *truncate),
+            Expr::FileOpenDynamic { path, mode } => {
+                let path = self.eval(path).to_ascii_string_nul_terminated();
+                let mode = self.eval(mode).to_ascii_string_nul_terminated();
+                if path.is_empty() {
+                    return LogicWord::zero(32);
+                }
+                let (append, read, truncate) = match mode.as_str() {
+                    "r" | "rb" => (false, true, false),
+                    "r+" | "r+b" | "rb+" => (true, true, false),
+                    "w" | "wb" => (false, false, true),
+                    "w+" | "w+b" | "wb+" => (false, true, true),
+                    "a" | "ab" => (true, false, false),
+                    "a+" | "a+b" | "ab+" => (true, true, true),
+                    _ => return LogicWord::zero(32),
+                };
+                self.open_file_descriptor(&path, append, read, truncate)
+            }
+            Expr::FileGetc { fd } => {
+                let Ok(descriptor) = self.file_descriptor(fd) else {
+                    return LogicWord::from_u64(32, u64::from(u32::MAX));
+                };
+                let mut readers = self.file_readers.borrow_mut();
+                let Some(reader) = readers.get_mut(&descriptor) else {
+                    self.file_errors.borrow_mut().insert(
+                        descriptor,
+                        "file descriptor is not open for reading".to_string(),
+                    );
+                    return LogicWord::from_u64(32, u64::from(u32::MAX));
+                };
+                if let Some(byte) = self.file_pushbacks.borrow_mut().remove(&descriptor) {
+                    self.file_eof.borrow_mut().remove(&descriptor);
+                    return LogicWord::from_u64(32, u64::from(byte));
+                }
+                let mut byte = [0_u8; 1];
+                match reader.read(&mut byte) {
+                    Ok(1) => LogicWord::from_u64(32, u64::from(byte[0])),
+                    Ok(_) => {
+                        self.file_eof.borrow_mut().insert(descriptor);
+                        LogicWord::from_u64(32, u64::from(u32::MAX))
+                    }
+                    Err(_) => {
+                        self.file_eof.borrow_mut().insert(descriptor);
+                        LogicWord::from_u64(32, u64::from(u32::MAX))
+                    }
+                }
+            }
+            Expr::FileUngetc { value, fd } => {
+                let failure = LogicWord::from_u64(32, u64::from(u32::MAX));
+                let Ok(descriptor) = self.file_descriptor(fd) else {
+                    return failure;
+                };
+                let Some(raw_value) = self.eval(value).to_u64() else {
+                    return failure;
+                };
+                let Ok(byte) = u8::try_from(raw_value) else {
+                    self.file_errors.borrow_mut().insert(
+                        descriptor,
+                        "$ungetc byte value is outside 0..255".to_string(),
+                    );
+                    return failure;
+                };
+                if !self.file_readers.borrow().contains_key(&descriptor) {
+                    self.file_errors.borrow_mut().insert(
+                        descriptor,
+                        "file descriptor is not open for reading".to_string(),
+                    );
+                    return failure;
+                }
+                let mut pushbacks = self.file_pushbacks.borrow_mut();
+                if pushbacks.contains_key(&descriptor) {
+                    self.file_errors.borrow_mut().insert(
+                        descriptor,
+                        "$ungetc pushback slot is already in use".to_string(),
+                    );
+                    return failure;
+                }
+                pushbacks.insert(descriptor, byte);
+                self.file_eof.borrow_mut().remove(&descriptor);
+                LogicWord::from_u64(32, u64::from(byte))
+            }
+            Expr::FileEof { fd } => {
+                let Ok(descriptor) = self.file_descriptor(fd) else {
+                    return LogicWord::zero(32);
+                };
+                if self.file_readers.borrow().contains_key(&descriptor)
+                    && self.file_eof.borrow().contains(&descriptor)
+                {
+                    LogicWord::from_u64(32, u64::from(u32::MAX))
+                } else {
+                    LogicWord::zero(32)
+                }
+            }
+            Expr::FileTell { fd } => {
+                let Ok(descriptor) = self.file_descriptor(fd) else {
+                    return LogicWord::from_u64(32, u64::from(u32::MAX));
+                };
+                if let Some(reader) = self.file_readers.borrow_mut().get_mut(&descriptor) {
+                    return match reader.stream_position() {
+                        Ok(position) if position <= u64::from(u32::MAX) => {
+                            let logical_position =
+                                if self.file_pushbacks.borrow().contains_key(&descriptor) {
+                                    position.saturating_sub(1)
+                                } else {
+                                    position
+                                };
+                            LogicWord::from_u64(32, logical_position)
+                        }
+                        _ => LogicWord::from_u64(32, u64::from(u32::MAX)),
+                    };
+                }
+                match self
+                    .file_write_positions
+                    .borrow()
+                    .get(&descriptor)
+                    .copied()
+                    .filter(|position| *position <= u64::from(u32::MAX))
+                {
+                    Some(position) => LogicWord::from_u64(32, position),
+                    None => LogicWord::from_u64(32, u64::from(u32::MAX)),
+                }
+            }
+            Expr::FileSeek { fd, offset, whence } => {
+                let failure = LogicWord::from_u64(32, u64::from(u32::MAX));
+                let Ok(descriptor) = self.file_descriptor(fd) else {
+                    return failure;
+                };
+                let Some(raw_offset) = self.eval(offset).to_u64() else {
+                    return failure;
+                };
+                if raw_offset > u64::from(u32::MAX) {
+                    return failure;
+                }
+                let offset = raw_offset as u32 as i32;
+                let Some(whence) = self.eval(whence).to_u64() else {
+                    return failure;
+                };
+                let seek_from = match whence {
+                    0 => {
+                        let Ok(start) = u64::try_from(offset) else {
+                            return failure;
+                        };
+                        SeekFrom::Start(start)
+                    }
+                    1 => SeekFrom::Current(i64::from(offset)),
+                    2 => SeekFrom::End(i64::from(offset)),
+                    _ => return failure,
+                };
+                if let Some(reader) = self.file_readers.borrow_mut().get_mut(&descriptor) {
+                    return match reader.seek(seek_from) {
+                        Ok(_) => {
+                            self.file_pushbacks.borrow_mut().remove(&descriptor);
+                            self.file_eof.borrow_mut().remove(&descriptor);
+                            LogicWord::zero(32)
+                        }
+                        Err(_) => failure,
+                    };
+                }
+                let mut writers = self.file_writers.borrow_mut();
+                let Some(writer) = writers.get_mut(&descriptor) else {
+                    return failure;
+                };
+                match writer.seek(seek_from) {
+                    Ok(position) => {
+                        self.file_pushbacks.borrow_mut().remove(&descriptor);
+                        self.file_write_positions
+                            .borrow_mut()
+                            .insert(descriptor, position);
+                        LogicWord::zero(32)
+                    }
+                    Err(_) => failure,
+                }
+            }
             Expr::StringToRadix { e, radix } => {
                 let string = self.eval(e);
                 match parse_packed_string_radix(&string, *radix) {
@@ -3591,6 +5362,9 @@ impl<'d> Simulator<'d> {
                 let value = self.eval(value);
                 format_packed_string_radix(&value, *radix)
             }
+            Expr::MemoryPattern { .. } => LogicWord::xes(32),
+            Expr::EnumPattern { .. } => LogicWord::xes(32),
+            Expr::StructPattern { .. } => LogicWord::xes(32),
             Expr::MemoryRead {
                 memory,
                 indexes,
@@ -3667,6 +5441,132 @@ impl<'d> Simulator<'d> {
         }
     }
 
+    fn eval_shortreal(&self, e: &Expr) -> Option<f32> {
+        match e {
+            Expr::ShortRealConst(real) => Some(*real),
+            Expr::ShortRealRef { .. } => {
+                let bits = self.eval(e);
+                let raw = u32::try_from(bits.to_u64()?).ok()?;
+                Some(f32::from_bits(raw))
+            }
+            Expr::MemoryRead { width: 32, .. } => {
+                let bits = self.eval(e);
+                let raw = u32::try_from(bits.to_u64()?).ok()?;
+                Some(f32::from_bits(raw))
+            }
+            Expr::Index { msb, lsb, .. } if msb - lsb + 1 == 32 => {
+                let bits = self.eval(e);
+                let raw = u32::try_from(bits.to_u64()?).ok()?;
+                Some(f32::from_bits(raw))
+            }
+            Expr::AssocRead { width: 32, .. } => {
+                let bits = self.eval(e);
+                let raw = u32::try_from(bits.to_u64()?).ok()?;
+                Some(f32::from_bits(raw))
+            }
+            Expr::Signed { e: operand, .. } => self.eval_shortreal(operand),
+            Expr::ShortRealBinary { op, left, right } => {
+                let left = self.eval_shortreal(left)?;
+                let right = self.eval_shortreal(right)?;
+                let result = match op {
+                    eda_core::ir::BinOp::Add => left + right,
+                    eda_core::ir::BinOp::Sub => left - right,
+                    eda_core::ir::BinOp::Mul => left * right,
+                    eda_core::ir::BinOp::Div => left / right,
+                    _ => return None,
+                };
+                Some(result)
+            }
+            Expr::ShortRealNeg(operand) => Some(-self.eval_shortreal(operand)?),
+            Expr::ShortRealToReal(operand) => Some(self.eval_shortreal(operand)?),
+            Expr::RealToShortReal(operand) => Some(self.eval_real(operand)? as f32),
+            _ => None,
+        }
+    }
+
+    fn eval_real(&self, e: &Expr) -> Option<f64> {
+        match e {
+            Expr::RealConst(real) => Some(*real),
+            Expr::RealRef { .. } => {
+                let bits = self.eval(e);
+                bits.to_u64().map(f64::from_bits)
+            }
+            Expr::MemoryRead { width: 64, .. } => {
+                let bits = self.eval(e);
+                bits.to_u64().map(f64::from_bits)
+            }
+            Expr::Index { msb, lsb, .. } if msb - lsb + 1 == 64 => {
+                let bits = self.eval(e);
+                bits.to_u64().map(f64::from_bits)
+            }
+            Expr::AssocRead { width: 64, .. } => {
+                let bits = self.eval(e);
+                bits.to_u64().map(f64::from_bits)
+            }
+            Expr::Signed { e: operand, .. } => self.eval_real(operand),
+            Expr::ShortRealConst(_)
+            | Expr::ShortRealRef { .. }
+            | Expr::ShortRealBinary { .. }
+            | Expr::ShortRealNeg(_)
+            | Expr::ShortRealToReal(_)
+            | Expr::RealToShortReal(_) => self.eval_shortreal(e).map(f64::from),
+            Expr::RealBinary { op, left, right } => {
+                let left = self.eval_real(left)?;
+                let right = self.eval_real(right)?;
+                let result = match op {
+                    eda_core::ir::BinOp::Add => left + right,
+                    eda_core::ir::BinOp::Sub => left - right,
+                    eda_core::ir::BinOp::Mul => left * right,
+                    eda_core::ir::BinOp::Div => left / right,
+                    _ => return None,
+                };
+                Some(result)
+            }
+            Expr::RealCompare { op, left, right } => {
+                let left = self.eval_real(left)?;
+                let right = self.eval_real(right)?;
+                let result = match op {
+                    eda_core::ir::BinOp::Eq => left == right,
+                    eda_core::ir::BinOp::Ne => left != right,
+                    eda_core::ir::BinOp::Lt => left < right,
+                    eda_core::ir::BinOp::Le => left <= right,
+                    eda_core::ir::BinOp::Gt => left > right,
+                    eda_core::ir::BinOp::Ge => left >= right,
+                    _ => return None,
+                };
+                Some(f64::from(result as u8))
+            }
+            Expr::RealNeg(operand) => {
+                let real = self.eval_real(operand)?;
+                Some(-real)
+            }
+            Expr::IntToReal {
+                value,
+                width,
+                signed,
+            } => {
+                let word = self.eval(value);
+                let raw = word.to_u64()?;
+                let real = if *signed {
+                    sext_i64(&word, *width) as f64
+                } else {
+                    let mask = if *width < u64::BITS as usize {
+                        (1_u64 << *width) - 1
+                    } else {
+                        u64::MAX
+                    };
+                    (raw & mask) as f64
+                };
+                real.is_finite().then_some(real)
+            }
+            Expr::RealTime { .. } => {
+                let bits = self.eval(e);
+                bits.to_u64().map(f64::from_bits)
+            }
+            _ => None,
+        }
+    }
+
     fn fire_monitors(&mut self) {
         if self.monitors.is_empty() {
             return;
@@ -3691,6 +5591,85 @@ impl<'d> Simulator<'d> {
             }
             self.displays.push(l);
         }
+    }
+
+    fn flush_strobes(&mut self) -> Result<(), String> {
+        let strobes = std::mem::take(&mut self.strobes);
+        for strobe in strobes {
+            let line = self.format_display(strobe.parts, strobe.args);
+            if self.print_stdout {
+                println!("{}", line);
+            }
+            self.displays.push(line);
+        }
+        let file_strobes = std::mem::take(&mut self.file_strobes);
+        for strobe in file_strobes {
+            self.write_file_display(strobe.fd, strobe.parts, strobe.args, strobe.newline)?;
+        }
+        Ok(())
+    }
+
+    fn write_file_display(
+        &mut self,
+        fd: &Expr,
+        parts: &[eda_core::ir::DispPart],
+        args: &[Expr],
+        newline: bool,
+    ) -> Result<(), String> {
+        let descriptor = self.file_descriptor(fd)?;
+        let Some(path) = self.file_paths.borrow().get(&descriptor).cloned() else {
+            return Err(format!(
+                "cannot write unknown file descriptor {descriptor} at t={}",
+                self.now
+            ));
+        };
+        let is_reader = self.file_readers.borrow().contains_key(&descriptor);
+        let is_writer = self.file_writers.borrow().contains_key(&descriptor);
+        if is_reader && !is_writer {
+            return Err(format!(
+                "cannot write read-mode file descriptor {descriptor} at t={}",
+                self.now
+            ));
+        }
+        if self.file_pushbacks.borrow().contains_key(&descriptor) {
+            return Err(format!(
+                "cannot write mixed file descriptor {descriptor} while an ungetc byte is pending at t={}",
+                self.now
+            ));
+        }
+        let mut output = self.format_file_display(parts, args);
+        if newline {
+            output.push(b'\n');
+        }
+        let mut writers = self.file_writers.borrow_mut();
+        let Some(file) = writers.get_mut(&descriptor) else {
+            return Err(format!(
+                "cannot write unknown file descriptor {descriptor} at t={}",
+                self.now
+            ));
+        };
+        file.write_all(&output).map_err(|error| {
+            format!(
+                "cannot write file '{}' for descriptor {descriptor}: {error}",
+                path.display()
+            )
+        })?;
+        let written = match file.stream_position() {
+            Ok(position) => position,
+            Err(_) => self
+                .file_write_positions
+                .borrow()
+                .get(&descriptor)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(u64::try_from(output.len()).unwrap_or(u64::MAX)),
+        };
+        self.file_write_positions
+            .borrow_mut()
+            .insert(descriptor, written);
+        self.file_eof.borrow_mut().remove(&descriptor);
+        self.file_errors.borrow_mut().remove(&descriptor);
+        Ok(())
     }
 
     fn mark_vcd_change(&mut self, flat: usize) {
@@ -3794,6 +5773,53 @@ fn sext_i64(w: &LogicWord, _width: usize) -> i64 {
     }
 }
 
+fn real_to_int(real: f64, width: usize, signed: bool) -> Option<u64> {
+    if !real.is_finite() || width == 0 || width > u64::BITS as usize {
+        return None;
+    }
+    let magnitude = real.abs();
+    let fractional = magnitude - magnitude.floor();
+    let rounded = if fractional >= 0.5 {
+        magnitude.floor() + 1.0
+    } else {
+        magnitude.floor()
+    };
+    let mut result = rounded as i128;
+    if real < 0.0 {
+        result = -result;
+    }
+    let bits = if signed {
+        let min = if width == u64::BITS as usize {
+            i64::MIN as i128
+        } else {
+            -(1_i128 << (width - 1))
+        };
+        let max = if width == u64::BITS as usize {
+            i64::MAX as i128
+        } else {
+            (1_i128 << (width - 1)) - 1
+        };
+        if result < min || result > max {
+            return None;
+        }
+        (result as u64) & mask_for_width(width)
+    } else {
+        if result < 0 || result > u64::MAX as i128 {
+            return None;
+        }
+        result as u64 & mask_for_width(width)
+    };
+    Some(bits)
+}
+
+fn mask_for_width(width: usize) -> u64 {
+    if width == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1_u64 << width) - 1
+    }
+}
+
 fn compare_known_words(left: &LogicWord, right: &LogicWord, signed: bool) -> std::cmp::Ordering {
     debug_assert_eq!(left.width(), right.width());
     let mut pairs = left.bits.iter().rev().zip(right.bits.iter().rev());
@@ -3823,6 +5849,543 @@ fn sext_word(w: &LogicWord, width: usize) -> LogicWord {
         }
     }
     LogicWord { bits }
+}
+
+fn pad_formatted_text(text: &str, width: usize, left_justify: bool, padding: char) -> String {
+    let length = text.chars().count();
+    if length >= width {
+        return text.to_string();
+    }
+    let padding_count = width - length;
+    if left_justify {
+        format!("{text}{}", padding.to_string().repeat(padding_count))
+    } else {
+        format!("{}{text}", padding.to_string().repeat(padding_count))
+    }
+}
+
+fn format_pattern_integral(argument: &Expr, value: &LogicWord) -> String {
+    format_pattern_word(value.width(), argument.is_signed(), value)
+}
+
+fn format_pattern_word(width: usize, signed: bool, value: &LogicWord) -> String {
+    if !value.is_fully_known() {
+        return format!("{}'b{}", width, value.to_bin_str());
+    }
+    let raw = value.to_u64().unwrap_or_default();
+    if signed {
+        if width == 32 {
+            return (raw as i32).to_string();
+        }
+        let sign = 1_u128 << (width - 1);
+        let magnitude = u128::from(raw);
+        let signed = if magnitude & sign != 0 {
+            magnitude as i128 - (1_i128 << width)
+        } else {
+            magnitude as i128
+        };
+        return format!("{}'sd{}", width, signed);
+    }
+    if width < 8 {
+        return format!("{}'b{}", width, value.to_bin_str());
+    }
+    if width <= 32 {
+        return format!("{}'d{}", width, raw);
+    }
+    format!("{}'h{}", width, value.to_hex_str())
+}
+
+fn format_real_exponent(real: f64, precision: usize) -> String {
+    let scientific = format!("{:.*e}", precision, real);
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return format!("{real:.6}");
+    };
+    let exponent = exponent.parse::<i32>().unwrap_or_default();
+    let sign = if exponent < 0 { '-' } else { '+' };
+    let exponent = exponent.unsigned_abs();
+    format!("{mantissa}e{sign}{exponent:02}")
+}
+
+fn format_real_general(real: f64, precision: usize) -> String {
+    let precision = precision.max(1);
+    if real == 0.0 {
+        return "0".to_string();
+    }
+    let scientific = format!("{:.*e}", precision - 1, real);
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return format!("{real:.6}");
+    };
+    let exponent = exponent.parse::<i32>().unwrap_or_default();
+    if exponent < -4 || exponent >= precision as i32 {
+        let mantissa = trim_real_zeros(mantissa);
+        let sign = if exponent < 0 { '-' } else { '+' };
+        let exponent = exponent.unsigned_abs();
+        return format!("{mantissa}e{sign}{exponent:02}");
+    }
+    let decimals =
+        usize::try_from(i64::try_from(precision).unwrap_or(i64::MAX) - 1 - i64::from(exponent))
+            .unwrap_or_default();
+    trim_real_zeros(&format!("{real:.decimals$}")).to_string()
+}
+
+fn trim_real_zeros(value: &str) -> &str {
+    if value.contains('.') {
+        value.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        value
+    }
+}
+
+fn raw_two_state_bytes(word: &LogicWord) -> Vec<u8> {
+    let width = word.width();
+    if width == 0 {
+        return Vec::new();
+    }
+    let words = width.div_ceil(64);
+    let mut output = Vec::with_capacity(words * 8);
+    for word_index in 0..words {
+        let first_bit = word_index * 64;
+        let chunk_width = (width - first_bit).min(64);
+        let byte_count = if word_index == words - 1 && chunk_width <= 32 {
+            4
+        } else {
+            8
+        };
+        for byte_index in 0..byte_count {
+            let mut byte = 0_u8;
+            for bit in 0..8 {
+                let offset = first_bit + byte_index * 8 + bit;
+                if offset < width && word.bit(offset) == LogicValue::One {
+                    byte |= 1 << bit;
+                }
+            }
+            output.push(byte);
+        }
+    }
+    output
+}
+
+fn append_raw_vpi_entry(output: &mut Vec<u8>, aval: u32, bval: u32) {
+    output.extend_from_slice(&aval.to_le_bytes());
+    output.extend_from_slice(&bval.to_le_bytes());
+}
+
+fn raw_four_state_bytes(word: &LogicWord) -> Vec<u8> {
+    let width = word.width();
+    if width == 0 {
+        return Vec::new();
+    }
+    let words = width.div_ceil(64);
+    let mut output = Vec::with_capacity(words * 8);
+    for word_index in 0..words {
+        let first_bit = word_index * 64;
+        let chunk_width = (width - first_bit).min(64);
+        let entry = |entry_first_bit: usize| {
+            let mut aval = 0_u32;
+            let mut bval = 0_u32;
+            for entry_bit in 0..32 {
+                let offset = entry_first_bit + entry_bit;
+                if offset >= width {
+                    break;
+                }
+                let bit = 1_u32 << entry_bit;
+                match word.bit(offset) {
+                    LogicValue::Zero => {}
+                    LogicValue::One => aval |= bit,
+                    LogicValue::X => {
+                        aval |= bit;
+                        bval |= bit;
+                    }
+                    LogicValue::Z => bval |= bit,
+                }
+            }
+            (aval, bval)
+        };
+
+        let (aval, bval) = entry(first_bit);
+        append_raw_vpi_entry(&mut output, aval, bval);
+        if word_index != words - 1 || chunk_width > 32 {
+            let (aval, bval) = entry(first_bit + 32);
+            append_raw_vpi_entry(&mut output, aval, bval);
+        }
+    }
+    output
+}
+
+trait ScanInput {
+    fn read_byte(&mut self) -> Result<Option<u8>, String>;
+    fn push_byte(&mut self, byte: u8) -> Result<(), String>;
+}
+
+struct FileScanInput<'a, 'd> {
+    simulator: &'a mut Simulator<'d>,
+    descriptor: u32,
+}
+
+impl ScanInput for FileScanInput<'_, '_> {
+    fn read_byte(&mut self) -> Result<Option<u8>, String> {
+        self.simulator.read_file_input_byte(self.descriptor)
+    }
+
+    fn push_byte(&mut self, byte: u8) -> Result<(), String> {
+        self.simulator.push_file_input_byte(self.descriptor, byte)
+    }
+}
+
+struct StringScanInput {
+    bytes: Vec<u8>,
+    position: usize,
+    pushback: Option<u8>,
+}
+
+impl StringScanInput {
+    fn new(word: &LogicWord) -> Option<Self> {
+        let length = ascii_string_length(word)?;
+        let mut bytes = Vec::with_capacity(length);
+        for index in 0..length {
+            let byte = packed_string_byte(word, index)
+                .to_u64()
+                .map(|byte| byte as u8)?;
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
+        }
+        Some(Self {
+            bytes,
+            position: 0,
+            pushback: None,
+        })
+    }
+}
+
+impl ScanInput for StringScanInput {
+    fn read_byte(&mut self) -> Result<Option<u8>, String> {
+        if let Some(byte) = self.pushback.take() {
+            return Ok(Some(byte));
+        }
+        if self.position >= self.bytes.len() {
+            return Ok(None);
+        }
+        let byte = self.bytes[self.position];
+        self.position += 1;
+        Ok(Some(byte))
+    }
+
+    fn push_byte(&mut self, byte: u8) -> Result<(), String> {
+        if self.pushback.is_some() {
+            return Err("cannot preserve more than one formatted-input lookahead byte".into());
+        }
+        self.pushback = Some(byte);
+        Ok(())
+    }
+}
+
+fn scan_target_signedness(design: &eda_core::ir::Design, targets: &[LValue]) -> Vec<bool> {
+    targets
+        .iter()
+        .map(|target| {
+            design
+                .net_decls
+                .iter()
+                .find(|declaration| declaration.base == target.net)
+                .is_some_and(|declaration| declaration.is_signed)
+        })
+        .collect()
+}
+
+fn scan_fields(
+    input: &mut dyn ScanInput,
+    format: &str,
+    targets: &[LValue],
+    targets_signed: &[bool],
+    task_name: &str,
+) -> Result<(Vec<(LValue, LogicWord)>, bool), String> {
+    fn scan_digit_is_valid(byte: u8, specifier: char) -> bool {
+        match specifier {
+            'd' => byte.is_ascii_digit(),
+            'h' => byte.is_ascii_hexdigit(),
+            'o' => (b'0'..=b'7').contains(&byte),
+            _ => byte == b'0' || byte == b'1',
+        }
+    }
+
+    fn scan_radix(specifier: char) -> u32 {
+        match specifier {
+            'h' => 16,
+            'o' => 8,
+            'b' => 2,
+            _ => 10,
+        }
+    }
+
+    fn scan_word(width: usize, value: i128) -> LogicWord {
+        let raw = value as u128;
+        let mut bits = Vec::with_capacity(width);
+        for bit in 0..width {
+            bits.push(LogicValue::bit(
+                bit < u128::BITS as usize && (raw >> bit) & 1 == 1,
+            ));
+        }
+        LogicWord { bits }
+    }
+
+    fn next_scan_specifier(
+        characters: &mut std::str::Chars<'_>,
+        task_name: &str,
+    ) -> Result<(char, Option<usize>), String> {
+        let mut width = String::new();
+        while matches!(characters.clone().next(), Some(c) if c.is_ascii_digit()) {
+            width.push(characters.next().expect("peeked width digit"));
+        }
+        let field_width = if width.is_empty() {
+            None
+        } else {
+            let parsed = width
+                .parse::<usize>()
+                .map_err(|_| format!("{task_name} width is too large"))?;
+            if parsed == 0 || parsed > 64 {
+                return Err(format!("{task_name} width must be 1..=64"));
+            }
+            Some(parsed)
+        };
+        let Some(specifier) = characters.next() else {
+            return Err(format!(
+                "{task_name} format ends with an incomplete conversion"
+            ));
+        };
+        if field_width.is_some() && specifier == '%' {
+            return Err(format!("{task_name} literal % cannot take a width"));
+        }
+        Ok((specifier, field_width))
+    }
+
+    let mut converted: Vec<(LValue, LogicWord)> = Vec::new();
+    let mut target_index = 0_usize;
+    let mut input_failure = false;
+    let mut characters = format.chars();
+
+    'format_loop: while let Some(part) = characters.next() {
+        if part.is_whitespace() {
+            loop {
+                match input.read_byte()? {
+                    Some(byte) if (byte as char).is_ascii_whitespace() => {}
+                    Some(byte) => {
+                        input.push_byte(byte)?;
+                        break;
+                    }
+                    None => {
+                        input_failure = true;
+                        break 'format_loop;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if part != '%' {
+            match input.read_byte()? {
+                Some(byte) if byte.to_ascii_lowercase() as char == part.to_ascii_lowercase() => {}
+                Some(byte) => {
+                    input.push_byte(byte)?;
+                    break;
+                }
+                None => {
+                    input_failure = true;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        let (specifier, field_width) = next_scan_specifier(&mut characters, task_name)?;
+        if specifier == '%' {
+            match input.read_byte()? {
+                Some(b'%') => {}
+                Some(byte) => {
+                    input.push_byte(byte)?;
+                    break;
+                }
+                None => {
+                    input_failure = true;
+                    break;
+                }
+            }
+            continue;
+        }
+        if !matches!(specifier, 'd' | 'h' | 'o' | 'b' | 's') {
+            return Err(format!(
+                "unsupported {task_name} conversion '%{specifier}' reached simulation"
+            ));
+        }
+        let Some(target) = targets.get(target_index).cloned() else {
+            return Err(format!("{task_name} has no target for a format conversion"));
+        };
+        let target_signed = targets_signed.get(target_index).copied().unwrap_or(false);
+        target_index += 1;
+
+        if specifier == 's' {
+            if target.decl_width != 512 {
+                return Err(format!("{task_name} %s requires a 512-bit string target"));
+            }
+            loop {
+                match input.read_byte()? {
+                    Some(byte) if (byte as char).is_ascii_whitespace() => {}
+                    Some(byte) => {
+                        input.push_byte(byte)?;
+                        break;
+                    }
+                    None => {
+                        input_failure = true;
+                        break 'format_loop;
+                    }
+                }
+            }
+            let byte_limit = field_width.unwrap_or(63).min(63);
+            let mut bytes = Vec::new();
+            loop {
+                match input.read_byte()? {
+                    Some(byte) if (byte as char).is_ascii_whitespace() => {
+                        input.push_byte(byte)?;
+                        break;
+                    }
+                    Some(byte) => {
+                        if bytes.len() >= byte_limit {
+                            input.push_byte(byte)?;
+                            break;
+                        }
+                        bytes.push(byte);
+                    }
+                    None => break,
+                }
+            }
+            if bytes.is_empty() {
+                break;
+            }
+            let value = LogicWord::from_bytes_le(target.decl_width, &bytes);
+            converted.push((target, value));
+            continue;
+        }
+
+        loop {
+            match input.read_byte()? {
+                Some(byte) if (byte as char).is_ascii_whitespace() => {}
+                Some(byte) => {
+                    input.push_byte(byte)?;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        let first = input.read_byte()?;
+        let Some(first) = first else {
+            input_failure = true;
+            break;
+        };
+        let byte_limit = field_width.unwrap_or(usize::MAX);
+        let mut consumed = 1_usize;
+        let mut negative = false;
+        let first = if first == b'-' || first == b'+' {
+            negative = first == b'-';
+            let next = match input.read_byte()? {
+                Some(byte) => byte,
+                None => {
+                    input_failure = true;
+                    break;
+                }
+            };
+            if consumed >= byte_limit {
+                input.push_byte(next)?;
+                break;
+            }
+            consumed += 1;
+            next
+        } else {
+            first
+        };
+
+        if !scan_digit_is_valid(first, specifier) {
+            input.push_byte(first)?;
+            break;
+        }
+
+        let mut digits = String::new();
+        if specifier == 'h' && first == b'0' {
+            match input.read_byte()? {
+                Some(b'x') | Some(b'X') => {
+                    if consumed >= byte_limit {
+                        input.push_byte(b'x')?;
+                    } else {
+                        consumed += 1;
+                    }
+                }
+                Some(byte) => {
+                    digits.push(first as char);
+                    input.push_byte(byte)?;
+                }
+                None => {
+                    digits.push(first as char);
+                    input_failure = true;
+                }
+            }
+        } else {
+            digits.push(first as char);
+        }
+
+        loop {
+            if consumed >= byte_limit {
+                break;
+            }
+            let Some(byte) = input.read_byte()? else {
+                input_failure = true;
+                break;
+            };
+            if byte == b'_' && !digits.is_empty() {
+                consumed += 1;
+                continue;
+            }
+            if scan_digit_is_valid(byte, specifier) {
+                digits.push(byte as char);
+                consumed += 1;
+            } else {
+                input.push_byte(byte)?;
+                break;
+            }
+        }
+
+        if digits.is_empty() {
+            break;
+        }
+        let magnitude = u128::from_str_radix(&digits, scan_radix(specifier))
+            .map_err(|_| format!("{task_name} integer field overflows the parser"))?;
+        let magnitude = i128::try_from(magnitude)
+            .map_err(|_| format!("{task_name} integer field overflows the parser"))?;
+        let signed_min = -1_i128 << (target.decl_width - 1);
+        let signed_max = (1_i128 << (target.decl_width - 1)) - 1;
+        let unsigned_max = (1_i128 << target.decl_width) - 1;
+        let value = if negative { -magnitude } else { magnitude };
+        let in_range = if target_signed {
+            (signed_min..=signed_max).contains(&value)
+        } else {
+            value >= 0 && value <= unsigned_max
+        };
+        if !in_range {
+            return Err(format!(
+                "{task_name} field {} does not fit the {}-bit target",
+                if negative {
+                    format!("-{magnitude}")
+                } else {
+                    magnitude.to_string()
+                },
+                target.decl_width
+            ));
+        }
+        let target_width = target.decl_width;
+        converted.push((target, scan_word(target_width, value)));
+    }
+
+    Ok((converted, input_failure))
 }
 
 fn ascii_string_length(word: &LogicWord) -> Option<usize> {
@@ -4093,7 +6656,27 @@ fn expr_nets(e: &Expr) -> Vec<usize> {
 
 fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
     match e {
-        Expr::Const(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
+        Expr::RealRef { net, decl_width } => out.extend(*net..*net + decl_width),
+        Expr::ShortRealRef { net } => out.extend(*net..*net + 32),
+        Expr::RealBinary { left, right, .. } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
+        Expr::RealCompare { left, right, .. } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
+        Expr::RealNeg(operand) => walk_expr(operand, out),
+        Expr::ShortRealBinary { left, right, .. } => {
+            walk_expr(left, out);
+            walk_expr(right, out);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => walk_expr(operand, out),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => walk_expr(value, out),
+        Expr::RealTime { .. } => {}
         Expr::Ref { net, range, .. } => match range {
             Range::Bit(b) => out.push(net + b),
             Range::Span { msb, lsb } => {
@@ -4135,6 +6718,9 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
             walk_expr(index, out);
             walk_expr(value, out);
         }
+        Expr::StringFormat { args, .. } => {
+            args.iter().for_each(|argument| walk_expr(argument, out))
+        }
         Expr::StringSubstr { e, left, right } => {
             walk_expr(e, out);
             walk_expr(left, out);
@@ -4146,6 +6732,9 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         Expr::SimulationTime { .. } => {}
         Expr::StringToRadix { e, .. } => walk_expr(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr(value, out),
+        Expr::MemoryPattern { .. } => {}
+        Expr::EnumPattern { value, .. } => walk_expr(value, out),
+        Expr::StructPattern { value, .. } => walk_expr(value, out),
         Expr::MemoryRead { indexes, .. } => indexes.iter().for_each(|x| walk_expr(x, out)),
         Expr::MemoryReadPart { indexes, start, .. } => {
             indexes.iter().for_each(|x| walk_expr(x, out));
@@ -4153,6 +6742,24 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         }
         Expr::MemorySize { .. } => {}
         Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => walk_expr(index, out),
+        Expr::Random { args, .. } => args.iter().for_each(|argument| walk_expr(argument, out)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            walk_expr(path, out);
+            walk_expr(mode, out);
+        }
+        Expr::FileGetc { fd } => walk_expr(fd, out),
+        Expr::FileUngetc { value, fd } => {
+            walk_expr(value, out);
+            walk_expr(fd, out);
+        }
+        Expr::FileEof { fd } => walk_expr(fd, out),
+        Expr::FileTell { fd } => walk_expr(fd, out),
+        Expr::FileSeek { fd, offset, whence } => {
+            walk_expr(fd, out);
+            walk_expr(offset, out);
+            walk_expr(whence, out);
+        }
     }
 }
 
@@ -4245,7 +6852,27 @@ fn simulation_time_unit(expression: &Expr) -> Option<i8> {
 
 fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
     match e {
-        Expr::Const(_) => {}
+        Expr::Const(_)
+        | Expr::RealConst(_)
+        | Expr::RealTime { .. }
+        | Expr::RealRef { .. }
+        | Expr::ShortRealConst(_)
+        | Expr::ShortRealRef { .. } => {}
+        Expr::RealBinary { left, right, .. } | Expr::RealCompare { left, right, .. } => {
+            walk_expr_memories(left, out);
+            walk_expr_memories(right, out);
+        }
+        Expr::RealNeg(operand) => walk_expr_memories(operand, out),
+        Expr::ShortRealBinary { left, right, .. } => {
+            walk_expr_memories(left, out);
+            walk_expr_memories(right, out);
+        }
+        Expr::ShortRealNeg(operand)
+        | Expr::ShortRealToReal(operand)
+        | Expr::RealToShortReal(operand) => walk_expr_memories(operand, out),
+        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+            walk_expr_memories(value, out)
+        }
         Expr::Ref { .. } => {}
         Expr::MemoryRead {
             memory, indexes, ..
@@ -4286,6 +6913,9 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             walk_expr_memories(index, out);
             walk_expr_memories(value, out);
         }
+        Expr::StringFormat { args, .. } => args
+            .iter()
+            .for_each(|argument| walk_expr_memories(argument, out)),
         Expr::StringSubstr { e, left, right } => {
             walk_expr_memories(e, out);
             walk_expr_memories(left, out);
@@ -4294,6 +6924,9 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         Expr::EventTriggered { .. } | Expr::SimulationTime { .. } => {}
         Expr::StringToRadix { e, .. } => walk_expr_memories(e, out),
         Expr::StringFromRadix { value, .. } => walk_expr_memories(value, out),
+        Expr::MemoryPattern { memory, .. } => out.push(*memory),
+        Expr::EnumPattern { value, .. } => walk_expr_memories(value, out),
+        Expr::StructPattern { value, .. } => walk_expr_memories(value, out),
         Expr::MemoryReadPart {
             memory,
             indexes,
@@ -4308,6 +6941,26 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         Expr::AssocRead { memory, index, .. } | Expr::AssocExists { memory, index } => {
             out.push(*memory);
             walk_expr_memories(index, out);
+        }
+        Expr::Random { args, .. } => args
+            .iter()
+            .for_each(|argument| walk_expr_memories(argument, out)),
+        Expr::FileOpen { .. } => {}
+        Expr::FileOpenDynamic { path, mode } => {
+            walk_expr_memories(path, out);
+            walk_expr_memories(mode, out);
+        }
+        Expr::FileGetc { fd } => walk_expr_memories(fd, out),
+        Expr::FileUngetc { value, fd } => {
+            walk_expr_memories(value, out);
+            walk_expr_memories(fd, out);
+        }
+        Expr::FileEof { fd } => walk_expr_memories(fd, out),
+        Expr::FileTell { fd } => walk_expr_memories(fd, out),
+        Expr::FileSeek { fd, offset, whence } => {
+            walk_expr_memories(fd, out);
+            walk_expr_memories(offset, out);
+            walk_expr_memories(whence, out);
         }
     }
 }
@@ -4451,10 +7104,46 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt_memories(body, out)
         }
         Stmt::Force { e, .. } => walk_expr_memories(e, out),
+        Stmt::ProceduralAssign { e, .. } => walk_expr_memories(e, out),
         Stmt::Release { .. } => {}
+        Stmt::ProceduralDeassign { .. } => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => walk_stmt_memories(body, out),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr_memories(a, out)),
+        Stmt::FileClose { fd } => walk_expr_memories(fd, out),
+        Stmt::RandomSeeded { .. } => {}
+        Stmt::FileFlush { fd } => walk_expr_memories(fd, out),
+        Stmt::FileGets { fd, .. }
+        | Stmt::FileError { fd, .. }
+        | Stmt::FileRead { fd, .. }
+        | Stmt::FileScan { fd, .. } => walk_expr_memories(fd, out),
+        Stmt::StringScan { source, .. } => walk_expr_memories(source, out),
+        Stmt::FileReadMemory {
+            fd, start, count, ..
+        } => {
+            walk_expr_memories(fd, out);
+            if let Some(start) = start {
+                walk_expr_memories(start, out);
+            }
+            if let Some(count) = count {
+                walk_expr_memories(count, out);
+            }
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            walk_expr_memories(cond, out);
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                walk_stmt_memories(action, out);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            walk_expr_memories(fd, out);
+            args.iter().for_each(|a| walk_expr_memories(a, out));
+        }
         Stmt::Assert { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Assume { cond, .. } => walk_expr_memories(cond, out),
         Stmt::Cover { cond, .. } => walk_expr_memories(cond, out),
@@ -4472,7 +7161,7 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr_memories(finish, out);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -4601,10 +7290,93 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             collect_stmt_access(body, reads, writes);
         }
         Stmt::Force { e, .. } => reads.extend(expr_nets(e)),
+        Stmt::ProceduralAssign { e, .. } => reads.extend(expr_nets(e)),
         Stmt::Release { .. } => {}
+        Stmt::ProceduralDeassign { .. } => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => collect_stmt_access(body, reads, writes),
         Stmt::Display { args, .. } => reads.extend(args.iter().flat_map(expr_nets)),
+        Stmt::FileClose { fd } => reads.extend(expr_nets(fd)),
+        Stmt::RandomSeeded { seed, destination } => {
+            reads.extend(lv_bits(seed));
+            writes.extend(lv_bits(seed));
+            writes.extend(lv_bits(destination));
+        }
+        Stmt::FileFlush { fd } => reads.extend(expr_nets(fd)),
+        Stmt::FileGets { fd, string, status } => {
+            reads.extend(expr_nets(fd));
+            writes.extend(lv_bits(string));
+            writes.extend(lv_bits(status));
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            reads.extend(expr_nets(fd));
+            writes.extend(lv_bits(message));
+            writes.extend(lv_bits(status));
+        }
+        Stmt::FileRead { fd, target, status } => {
+            reads.extend(expr_nets(fd));
+            writes.extend(lv_bits(target));
+            writes.extend(lv_bits(status));
+        }
+        Stmt::FileReadMemory {
+            fd,
+            start,
+            count,
+            status,
+            ..
+        } => {
+            reads.extend(expr_nets(fd));
+            if let Some(start) = start {
+                reads.extend(expr_nets(start));
+            }
+            if let Some(count) = count {
+                reads.extend(expr_nets(count));
+            }
+            writes.extend(lv_bits(status));
+        }
+        Stmt::FileScan {
+            fd,
+            targets,
+            status,
+            ..
+        } => {
+            reads.extend(expr_nets(fd));
+            for target in targets {
+                writes.extend(lv_bits(target));
+            }
+            writes.extend(lv_bits(status));
+        }
+        Stmt::StringScan {
+            source,
+            targets,
+            status,
+            ..
+        } => {
+            reads.extend(expr_nets(source));
+            for target in targets {
+                writes.extend(lv_bits(target));
+            }
+            writes.extend(lv_bits(status));
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            reads.extend(expr_nets(cond));
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                collect_stmt_access(action, reads, writes);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            reads.extend(expr_nets(fd));
+            reads.extend(args.iter().flat_map(expr_nets));
+        }
         Stmt::Assert { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Assume { cond, .. } => reads.extend(expr_nets(cond)),
         Stmt::Cover { cond, .. } => reads.extend(expr_nets(cond)),
@@ -4616,7 +7388,7 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
                 reads.extend(expr_nets(finish));
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -4725,10 +7497,92 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             walk_stmt(body, out)
         }
         Stmt::Force { e, .. } => walk_expr(e, out),
+        Stmt::ProceduralAssign { e, .. } => walk_expr(e, out),
         Stmt::Release { .. } => {}
+        Stmt::ProceduralDeassign { .. } => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => walk_stmt(body, out),
         Stmt::Display { args, .. } => args.iter().for_each(|a| walk_expr(a, out)),
+        Stmt::FileClose { fd } => walk_expr(fd, out),
+        Stmt::RandomSeeded { seed, destination } => {
+            out.extend(lv_bits(seed));
+            out.extend(lv_bits(destination));
+        }
+        Stmt::FileFlush { fd } => walk_expr(fd, out),
+        Stmt::FileGets { fd, string, status } => {
+            walk_expr(fd, out);
+            out.extend(lv_bits(string));
+            out.extend(lv_bits(status));
+        }
+        Stmt::FileError {
+            fd,
+            message,
+            status,
+        } => {
+            walk_expr(fd, out);
+            out.extend(lv_bits(message));
+            out.extend(lv_bits(status));
+        }
+        Stmt::FileRead { fd, target, status } => {
+            walk_expr(fd, out);
+            out.extend(lv_bits(target));
+            out.extend(lv_bits(status));
+        }
+        Stmt::FileReadMemory {
+            fd,
+            start,
+            count,
+            status,
+            ..
+        } => {
+            walk_expr(fd, out);
+            if let Some(start) = start {
+                walk_expr(start, out);
+            }
+            if let Some(count) = count {
+                walk_expr(count, out);
+            }
+            out.extend(lv_bits(status));
+        }
+        Stmt::FileScan {
+            fd,
+            targets,
+            status,
+            ..
+        } => {
+            walk_expr(fd, out);
+            for target in targets {
+                out.extend(lv_bits(target));
+            }
+            out.extend(lv_bits(status));
+        }
+        Stmt::StringScan {
+            source,
+            targets,
+            status,
+            ..
+        } => {
+            walk_expr(source, out);
+            for target in targets {
+                out.extend(lv_bits(target));
+            }
+            out.extend(lv_bits(status));
+        }
+        Stmt::ImmediateAssertion {
+            cond,
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            walk_expr(cond, out);
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                walk_stmt(action, out);
+            }
+        }
+        Stmt::FileDisplay { fd, args, .. } => {
+            walk_expr(fd, out);
+            args.iter().for_each(|a| walk_expr(a, out));
+        }
         Stmt::Assert { cond, .. } => walk_expr(cond, out),
         Stmt::Assume { cond, .. } => walk_expr(cond, out),
         Stmt::Cover { cond, .. } => walk_expr(cond, out),
@@ -4740,7 +7594,7 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr(finish, out);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::Finish => {}
+        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
     }
 }
 
@@ -4750,6 +7604,7 @@ fn collect_monitors<'d>(s: &'d Stmt, out: &mut Vec<(&'d [eda_core::ir::DispPart]
             parts,
             args,
             monitor,
+            ..
         } if *monitor => {
             out.push((parts, args));
         }

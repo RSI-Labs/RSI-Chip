@@ -262,6 +262,37 @@ impl LogicWord {
         format!("{:x}", self.to_u64().unwrap_or(0))
     }
 
+    /// MSB-first octal string (width rounded up to three-bit groups).
+    pub fn to_oct_str(&self) -> String {
+        if self.bits.is_empty() {
+            return "0".into();
+        }
+        if !self.is_fully_known() {
+            let mut result = String::new();
+            let mut end = self.width();
+            while end > 0 {
+                let start = end.saturating_sub(3);
+                let group = &self.bits[start..end];
+                if group.iter().all(|bit| bit.is_01()) {
+                    let mut value = 0_u8;
+                    for (bit_index, bit) in group.iter().enumerate() {
+                        if bit.as_bool() == Some(true) {
+                            value |= 1 << bit_index;
+                        }
+                    }
+                    result.push(char::from_digit(value as u32, 8).unwrap());
+                } else if group.iter().all(|bit| *bit == LogicValue::Z) {
+                    result.push('z');
+                } else {
+                    result.push('x');
+                }
+                end = start;
+            }
+            return result;
+        }
+        format!("{:o}", self.to_u64().unwrap_or(0))
+    }
+
     /// Parse a user-supplied literal: "10" (decimal), "0b1010", "0x1f",
     /// "'h1f" or "'b1010". Truncates / zero-extends to `width`.
     pub fn parse(width: usize, text: &str) -> Option<Self> {
@@ -625,5 +656,13 @@ mod tests {
         let xx = LogicWord::parse(8, "'h2x").unwrap();
         assert_eq!(xx.to_hex_str(), "2x");
         assert!(!xx.is_fully_known());
+    }
+
+    #[test]
+    fn octal_formatting_preserves_unknown_groups() {
+        assert_eq!(LogicWord::from_u64(4, 0b1011).to_oct_str(), "13");
+        assert_eq!(LogicWord::from_u64(6, 0b101101).to_oct_str(), "55");
+        assert_eq!(LogicWord::xes(4).to_oct_str(), "xx");
+        assert_eq!(LogicWord::parse(3, "'bzzz").unwrap().to_oct_str(), "z");
     }
 }

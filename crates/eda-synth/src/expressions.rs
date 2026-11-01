@@ -142,6 +142,9 @@ impl<'a> Synth<'a> {
             Expr::StringConcat { .. } => {
                 return Err("bounded string concatenation is not synthesizable yet".into())
             }
+            Expr::StringFormat { .. } => {
+                return Err("bounded string formatting is not synthesizable yet".into())
+            }
             Expr::StringGetByte { .. } => {
                 return Err("bounded string indexing is not synthesizable yet".into())
             }
@@ -163,12 +166,56 @@ impl<'a> Synth<'a> {
             Expr::StringFromRadix { .. } => {
                 return Err("bounded string radix formatting is not synthesizable yet".into())
             }
+            Expr::MemoryPattern { .. } => {
+                return Err("aggregate pattern formatting is not synthesizable".into())
+            }
+            Expr::EnumPattern { .. } => {
+                return Err("enum pattern formatting is not synthesizable".into())
+            }
+            Expr::StructPattern { .. } => {
+                return Err("aggregate pattern formatting is not synthesizable".into())
+            }
+            Expr::RealConst(_) => return Err("real display literals are not synthesizable".into()),
+            Expr::RealRef { .. } => return Err("real variables are not synthesizable".into()),
+            Expr::ShortRealRef { .. } => {
+                return Err("shortreal variables are not synthesizable".into())
+            }
+            Expr::RealBinary { .. } => return Err("real arithmetic is not synthesizable".into()),
+            Expr::RealCompare { .. } => return Err("real comparisons are not synthesizable".into()),
+            Expr::RealNeg(_) => return Err("real negation is not synthesizable".into()),
+            Expr::ShortRealConst(_) => {
+                return Err("shortreal literals are not synthesizable".into())
+            }
+            Expr::ShortRealBinary { .. } => {
+                return Err("shortreal arithmetic is not synthesizable".into())
+            }
+            Expr::ShortRealNeg(_) => return Err("shortreal negation is not synthesizable".into()),
+            Expr::ShortRealToReal(_) | Expr::RealToShortReal(_) => {
+                return Err("floating conversions are not synthesizable".into())
+            }
+            Expr::RealToInt { .. } => {
+                return Err("real-to-integer conversion is not synthesizable".into())
+            }
+            Expr::IntToReal { .. } => {
+                return Err("integer-to-real conversion is not synthesizable".into())
+            }
+            Expr::RealTime { .. } => return Err("$realtime is not synthesizable".into()),
             Expr::EventTriggered { .. } => {
                 return Err("event triggered checks are not synthesizable".into())
             }
             Expr::SimulationTime { .. } => {
                 return Err("simulation time is not synthesizable".into())
             }
+            Expr::Random { .. } => {
+                return Err("random system functions are not synthesizable".into())
+            }
+            Expr::FileOpen { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileOpenDynamic { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileGetc { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileUngetc { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileEof { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileTell { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::FileSeek { .. } => return Err("file I/O is not synthesizable".into()),
         })
     }
 

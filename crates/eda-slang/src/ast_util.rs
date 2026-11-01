@@ -72,7 +72,17 @@ pub(super) fn canonical_detailed_type(value: &Value) -> Option<String> {
             let split = element.find('[').unwrap_or(element.len());
             Some(format!("{}{range}{}", &element[..split], &element[split..]))
         }
-        "PredefinedIntegerType" | "FloatingType" | "StringType" | "EventType" => value
+        "PredefinedIntegerType" => {
+            let name = value.get("name").and_then(Value::as_str)?;
+            if value.get("isSigned").and_then(Value::as_bool) == Some(false)
+                && matches!(name, "byte" | "shortint" | "int" | "integer" | "longint")
+            {
+                Some(format!("{name} unsigned"))
+            } else {
+                Some(name.to_string())
+            }
+        }
+        "FloatingType" | "StringType" | "EventType" => value
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string),

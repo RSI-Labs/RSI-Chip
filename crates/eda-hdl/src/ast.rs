@@ -528,6 +528,7 @@ pub enum Stmt {
         fmt: Vec<DispPartSrc>,
         args: Vec<Expr>,
         monitor: bool,
+        strobe: bool,
     },
     /// Compile-time two-argument `$readmemh`/`$readmemb` load.
     ReadMem {
@@ -546,6 +547,7 @@ pub enum Stmt {
         finish: Option<Expr>,
     },
     Finish,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

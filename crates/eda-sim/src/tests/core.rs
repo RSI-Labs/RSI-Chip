@@ -155,7 +155,7 @@ fn testbench_display_and_finish() {
     assert!(sim.finished());
     let out = sim.take_displays();
     assert!(out.iter().any(|l| l.starts_with("a=1 t=1")));
-    assert!(out.iter().any(|l| l == "done"));
+    assert!(out.iter().any(|l| l == "done\n"));
 }
 
 #[test]

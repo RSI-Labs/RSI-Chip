@@ -11,7 +11,9 @@ fn cache(src: &'static str) -> &'static Design {
         std::sync::Mutex<std::collections::HashMap<&'static str, &'static Design>>,
     > = OnceLock::new();
     let m = DESIGNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut g = m.lock().unwrap();
+    // A compile panic in one registered case must not turn every later case in
+    // this shared fixture cache into a secondary `PoisonError` failure.
+    let mut g = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     g.entry(src)
         .or_insert_with(|| Box::leak(Box::new(eda_hdl::compile(src, None).expect("compile"))))
 }
@@ -177,7 +179,7 @@ fn displays(c: &mut CaseList) {
     });
     c.add("misc_display_time", || {
         let src: &'static str =
-            "module tb; initial begin #12 $display(\"t=%t\"); $finish; end endmodule";
+            "module tb; initial begin #12 $display(\"t=%t\", $time); $finish; end endmodule";
         let d = cache(src);
         let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         sim.run_until(20).map_err(|e| e.to_string())?;

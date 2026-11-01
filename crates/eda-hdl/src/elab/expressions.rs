@@ -600,6 +600,18 @@ impl<'a> Elaborator<'a> {
                     signed: name == "$signed",
                 }
             }
+            ast::Expr::Call(name, arguments) if matches!(name.as_str(), "$time" | "$stime") => {
+                if !arguments.is_empty() {
+                    return Err(format!("'{name}' does not take arguments"));
+                }
+                ExprIR::SimulationTime {
+                    width: if name == "$time" { 64 } else { 32 },
+                    signed: name == "$time",
+                    // The bounded path has not modeled module timescales; use
+                    // the same canonical nanosecond tick as `Design::default`.
+                    unit_exponent: -9,
+                }
+            }
             ast::Expr::Call(name, arguments) if name == "$sformatf" => {
                 self.elab_sformatf(arguments, env)?
             }

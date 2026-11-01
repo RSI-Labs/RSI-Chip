@@ -911,7 +911,12 @@ impl<'a> Elaborator<'a> {
                 ns: *ns,
                 body: Box::new(self.elab_stmt(body, env)?),
             },
-            ast::Stmt::Display { fmt, args, monitor } => {
+            ast::Stmt::Display {
+                fmt,
+                args,
+                monitor,
+                strobe,
+            } => {
                 let mut parts = Vec::new();
                 let mut args_ir = Vec::new();
                 for part in fmt {
@@ -933,9 +938,11 @@ impl<'a> Elaborator<'a> {
                     parts,
                     args: args_ir,
                     monitor: *monitor,
+                    strobe: *strobe,
                 }
             }
             ast::Stmt::Finish => StmtIR::Finish,
+            ast::Stmt::Stop => StmtIR::Stop,
             ast::Stmt::ReadMem {
                 radix,
                 path,

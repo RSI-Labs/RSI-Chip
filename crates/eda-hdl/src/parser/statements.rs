@@ -284,33 +284,66 @@ impl Parser {
             if s == "$display"
                 || s == "$write"
                 || s == "$monitor"
+                || s == "$displayo"
                 || s == "$displayb"
                 || s == "$displayh"
                 || s == "$displayd"
+                || s == "$writeo"
+                || s == "$writeb"
+                || s == "$writeh"
+                || s == "$monitoro"
+                || s == "$monitorb"
+                || s == "$monitorh"
+                || s == "$strobe"
+                || s == "$strobeo"
+                || s == "$strobeb"
+                || s == "$strobeh"
             {
-                let monitor = s == "$monitor";
+                let monitor = s.starts_with("$monitor");
+                let strobe = s.starts_with("$strobe");
                 self.bump();
                 let default_spec = match s.as_str() {
-                    "$displayb" => 'b',
-                    "$displayh" => 'h',
+                    "$displayo" | "$writeo" | "$monitoro" | "$strobeo" => 'o',
+                    "$displayb" | "$strobeb" => 'b',
+                    "$displayh" | "$strobeh" => 'h',
+                    "$writeb" | "$monitorb" => 'b',
+                    "$writeh" | "$monitorh" => 'h',
                     _ => 'd',
                 };
                 self.expect_punct("(")?;
-                let fmt_str = match self.peek().clone() {
-                    Tok::Str(x) => {
-                        self.bump();
-                        x
-                    }
-                    _ => String::new(),
+                let fmt_str = if let Tok::Str(x) = self.peek().clone() {
+                    self.bump();
+                    x
+                } else {
+                    String::new()
                 };
                 let mut args = Vec::new();
+                if fmt_str.is_empty() && !self.at_punct(")") {
+                    args.push(self.parse_expr()?);
+                }
                 while self.eat_punct(",") {
                     args.push(self.parse_expr()?);
+                }
+                let mut fmt_str = if fmt_str.is_empty() && !args.is_empty() {
+                    args.iter()
+                        .map(|_| format!("%{default_spec}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    fmt_str
+                };
+                if !monitor && !s.starts_with("$write") {
+                    fmt_str.push('\n');
                 }
                 self.expect_punct(")")?;
                 self.expect_punct(";")?;
                 let fmt = parse_format(&fmt_str, default_spec, &args, line)?;
-                return Ok(Stmt::Display { fmt, args, monitor });
+                return Ok(Stmt::Display {
+                    fmt,
+                    args,
+                    monitor,
+                    strobe,
+                });
             }
             if s == "$uvm_info" || s == "$uvm_warning" || s == "$uvm_error" || s == "$uvm_fatal" {
                 let severity = s[1..].to_uppercase();
@@ -381,6 +414,7 @@ impl Parser {
                     fmt,
                     args: value_args,
                     monitor: false,
+                    strobe: false,
                 };
                 if s == "$uvm_fatal" {
                     // UVM 语义：fatal 消息后结束仿真。
@@ -394,7 +428,11 @@ impl Parser {
                     self.expect_punct(")")?;
                 }
                 self.expect_punct(";")?;
-                return Ok(Stmt::Finish);
+                return Ok(if s == "$stop" {
+                    Stmt::Stop
+                } else {
+                    Stmt::Finish
+                });
             }
         }
         // assignment statements
@@ -584,6 +622,9 @@ impl Parser {
                     return Err(format!("line {}: unexpected keyword '{}'", line, name));
                 }
                 self.bump();
+                if matches!(name.as_str(), "$time" | "$stime") {
+                    return Ok(Expr::Call(name, Vec::new()));
+                }
                 if self.eat_punct("::") {
                     let scoped_name = self.ident()?;
                     return Ok(Expr::ScopedIdent {

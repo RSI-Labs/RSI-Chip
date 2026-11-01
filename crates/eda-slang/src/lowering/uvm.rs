@@ -946,7 +946,13 @@ impl SlangAstLowerer {
                 };
             }
             selection = Stmt::If {
-                c: Self::plusarg_string_equals(selected, ""),
+                // An explicit `+UVM_TESTNAME=test` must take the same factory
+                // override path as the absent-plusarg default.
+                c: Expr::Bin {
+                    op: eda_core::ir::BinOp::Or,
+                    a: Box::new(Self::plusarg_string_equals(selected.clone(), "")),
+                    b: Box::new(Self::plusarg_string_equals(selected, "test")),
+                },
                 t: Box::new(default_statement),
                 f: Some(Box::new(selection)),
             };
@@ -1011,6 +1017,7 @@ impl SlangAstLowerer {
             parts: vec![eda_core::ir::DispPart::Str(text)],
             args: Vec::new(),
             monitor: false,
+            strobe: false,
         }
     }
 
@@ -2160,6 +2167,7 @@ impl SlangAstLowerer {
                 ))],
                 args: Vec::new(),
                 monitor: false,
+                strobe: false,
             });
         }
         if let Some(selected) = selected {
@@ -2661,6 +2669,7 @@ impl SlangAstLowerer {
         let report_action =
             action_override.unwrap_or_else(|| self.uvm_report_action(severity, &id));
         let mut finish_after_report = false;
+        let mut stop_after_report = false;
         if report_action != 0 {
             let mut controls = self.uvm_report_controls.borrow_mut();
             *controls
@@ -2671,6 +2680,9 @@ impl SlangAstLowerer {
             if report_action & 4 != 0 && controls.max_quit_count != 0 {
                 controls.quit_count = controls.quit_count.saturating_add(1);
                 finish_after_report = controls.quit_count >= controls.max_quit_count;
+            }
+            if report_action & UVM_STOP_ACTION != 0 {
+                stop_after_report = true;
             }
         }
         if report_action == 0 {
@@ -2685,10 +2697,14 @@ impl SlangAstLowerer {
                     ))],
                     args: Vec::new(),
                     monitor: false,
+                    strobe: false,
                 });
             }
             if report_action & 8 != 0 || finish_after_report {
                 fatal_statements.push(Stmt::Finish);
+            }
+            if stop_after_report && !(report_action & 8 != 0 || finish_after_report) {
+                fatal_statements.push(Stmt::Stop);
             }
             return Ok(Some(Stmt::Block(fatal_statements)));
         }
@@ -2701,10 +2717,14 @@ impl SlangAstLowerer {
                 ))],
                 args: Vec::new(),
                 monitor: false,
+                strobe: false,
             }
         };
         if finish_after_report {
             return Ok(Some(Stmt::Block(vec![display, Stmt::Finish])));
+        }
+        if stop_after_report {
+            return Ok(Some(Stmt::Block(vec![display, Stmt::Stop])));
         }
         Ok(Some(display))
     }
@@ -3052,20 +3072,38 @@ impl SlangAstLowerer {
         }) else {
             return Ok(None);
         };
-        if method_name != "add" {
+        if !matches!(method_name.as_str(), "add" | "add_by_name") {
             return Ok(None);
         }
+
         let empty_arguments = Vec::new();
         let arguments = call
             .get("arguments")
             .and_then(Value::as_array)
             .unwrap_or(&empty_arguments);
-        if arguments.len() != 2 && arguments.len() != 3 {
-            return Ok(None);
-        }
+        let ordering_index = match method_name.as_str() {
+            "add" if arguments.len() == 2 || arguments.len() == 3 => 2,
+            "add_by_name" if arguments.len() == 3 || arguments.len() == 4 => 3,
+            _ => return Ok(None),
+        };
+
+        let component_pattern = if method_name == "add_by_name" {
+            if string_field(unwrap_conversion(&arguments[2]), "kind").as_deref()
+                != Some("NullLiteral")
+            {
+                return Err("non-null UVM callback add_by_name roots are unsupported".into());
+            }
+            Some(
+                string_literal(unwrap_conversion(&arguments[0])).ok_or_else(|| {
+                    "UVM callback add_by_name names must be string literals".to_string()
+                })?,
+            )
+        } else {
+            None
+        };
 
         let mut prepend = false;
-        if let Some(ordering) = arguments.get(2) {
+        if let Some(ordering) = arguments.get(ordering_index) {
             let ordering_name = string_field(unwrap_conversion(ordering), "symbol")
                 .map(|symbol| {
                     symbol
@@ -3078,9 +3116,7 @@ impl SlangAstLowerer {
             match ordering_name.as_str() {
                 "UVM_APPEND" => prepend = false,
                 "UVM_PREPEND" => prepend = true,
-                other => {
-                    return Err(format!("unsupported UVM callback ordering '{other}'"));
-                }
+                other => return Err(format!("unsupported UVM callback ordering '{other}'")),
             }
         }
 
@@ -3098,54 +3134,89 @@ impl SlangAstLowerer {
             return Ok(None);
         }
         let (target_type, callback_type) =
-            uvm_callback_specialization(call, &self.class_definitions, "add").ok_or_else(|| {
-                "UVM callback registration has no specialized T/CB pair".to_string()
-            })?;
+            uvm_callback_specialization(call, &self.class_definitions, &method_name).ok_or_else(
+                || "UVM callback registration has no specialized T/CB pair".to_string(),
+            )?;
 
-        let context_argument = unwrap_conversion(&arguments[0]);
-        let context_key = if string_field(context_argument, "kind").as_deref()
-            == Some("NullLiteral")
-        {
-            None
-        } else if is_this_reference(context_argument) {
-            Some(
-                self.active_class_objects
+        let context_keys = if let Some(component_pattern) = component_pattern {
+            let matching_contexts = self
+                .class_object_declared_full_names
+                .borrow()
+                .iter()
+                .filter(|(_, full_name)| wildcard_matches(&component_pattern, full_name))
+                .map(|(context_key, _)| context_key.clone())
+                .collect::<Vec<_>>();
+            if matching_contexts.is_empty() {
+                return Err(format!(
+                    "UVM callback name '{component_pattern}' matches no component"
+                ));
+            }
+
+            let target_key = self.class_type_key(&target_type);
+            for context_key in &matching_contexts {
+                let context_class = self
+                    .class_object_types
+                    .get(context_key)
+                    .ok_or_else(|| format!("class object '{context_key}' has no type"))?;
+                let context_chain = self.class_chain(context_class)?;
+                if !context_chain.iter().any(|(owner, _)| {
+                    owner == &target_key || owner.split('@').next() == Some(target_key.as_str())
+                }) {
+                    return Err(format!(
+                        "UVM callback name '{component_pattern}' matched non-'{target_type}' component"
+                    ));
+                }
+            }
+            matching_contexts
+        } else {
+            let context_argument = unwrap_conversion(&arguments[0]);
+            if string_field(context_argument, "kind").as_deref() == Some("NullLiteral") {
+                Vec::new()
+            } else if is_this_reference(context_argument) {
+                vec![self
+                    .active_class_objects
                     .borrow()
                     .last()
                     .cloned()
-                    .ok_or_else(|| "UVM callback registration has no active object".to_string())?,
-            )
-        } else {
-            Some(
-                self.class_object_key_for_value(context_argument)?
+                    .ok_or_else(|| "UVM callback registration has no active object".to_string())?]
+            } else {
+                vec![self
+                    .class_object_key_for_value(context_argument)?
                     .ok_or_else(|| {
                         "UVM callback registration requires an initialized object handle"
                             .to_string()
-                    })?,
-            )
+                    })?]
+            }
         };
-        if let Some(context_key) = &context_key {
+        let context_keys = if context_keys.is_empty() {
+            vec![None]
+        } else {
+            context_keys.into_iter().map(Some).collect::<Vec<_>>()
+        };
+        for context_key in context_keys.iter().flatten() {
             self.require_initialized_class_object(context_key)?;
         }
 
         let mut callbacks = self.uvm_callbacks.borrow_mut();
-        if callbacks.iter().any(|existing| {
-            existing.context_key == context_key && existing.object_key == object_key
-        }) {
-            return Err("duplicate direct-lowering UVM callback registration".into());
-        }
-        let callback = super::AstUvmCallback {
-            context_key,
-            target_type,
-            callback_type,
-            object_key,
-            class_name,
-            enabled: true,
-        };
-        if prepend {
-            callbacks.insert(0, callback);
-        } else {
-            callbacks.push(callback);
+        for context_key in context_keys {
+            if callbacks.iter().any(|existing| {
+                existing.context_key == context_key && existing.object_key == object_key
+            }) {
+                return Err("duplicate direct-lowering UVM callback registration".into());
+            }
+            let callback = super::AstUvmCallback {
+                context_key,
+                target_type: target_type.clone(),
+                callback_type: callback_type.clone(),
+                object_key: object_key.clone(),
+                class_name: class_name.clone(),
+                enabled: true,
+            };
+            if prepend {
+                callbacks.insert(0, callback);
+            } else {
+                callbacks.push(callback);
+            }
         }
         Ok(Some(Stmt::Block(Vec::new())))
     }
@@ -6648,6 +6719,7 @@ const UVM_LOG_ACTION: u64 = 2;
 const UVM_COUNT_ACTION: u64 = 4;
 const UVM_EXIT_ACTION: u64 = 8;
 const UVM_CALL_HOOK_ACTION: u64 = 16;
+const UVM_STOP_ACTION: u64 = 32;
 
 fn is_uvm_tlm_endpoint_class(class_name: &str) -> bool {
     matches!(
@@ -6820,10 +6892,11 @@ fn uvm_report_action_value(value: &Value) -> Result<u64, String> {
         | UVM_LOG_ACTION
         | UVM_COUNT_ACTION
         | UVM_EXIT_ACTION
-        | UVM_CALL_HOOK_ACTION;
+        | UVM_CALL_HOOK_ACTION
+        | UVM_STOP_ACTION;
     if action & !supported_actions != 0 {
         return Err(
-            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_LOG, UVM_COUNT, UVM_EXIT, UVM_CALL_HOOK, and their combinations are supported"
+            "only UVM_NO_ACTION, UVM_DISPLAY, UVM_LOG, UVM_COUNT, UVM_EXIT, UVM_CALL_HOOK, UVM_STOP, and their combinations are supported"
                 .into(),
         );
     }

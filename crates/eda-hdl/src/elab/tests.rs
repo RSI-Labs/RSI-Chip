@@ -1738,6 +1738,56 @@ fn monitor_flag_propagates() {
 }
 
 #[test]
+fn strobe_flag_propagates() {
+    let d = compile_ok("module tb; reg a; initial $strobe(\"a=%b\", a); endmodule");
+    match &d.initials[0] {
+        Stmt::Display {
+            monitor, strobe, ..
+        } => {
+            assert!(!*monitor);
+            assert!(*strobe);
+        }
+        other => panic!("expected display, got {:?}", other),
+    }
+}
+
+#[test]
+fn display_time_consumes_simulation_time_expression() {
+    let d = compile_ok("module tb; initial $display(\"t=%t\", $time); endmodule");
+    match &d.initials[0] {
+        Stmt::Display { args, .. } => match &args[0] {
+            Expr::SimulationTime {
+                width,
+                signed,
+                unit_exponent,
+            } => {
+                assert_eq!((*width, *signed, *unit_exponent), (64, true, -9));
+            }
+            other => panic!("expected simulation time, got {:?}", other),
+        },
+        other => panic!("expected display, got {:?}", other),
+    }
+}
+
+#[test]
+fn display_stime_uses_unsigned_simulation_time() {
+    let d = compile_ok("module tb; initial $display(\"s=%t\", $stime); endmodule");
+    match &d.initials[0] {
+        Stmt::Display { args, .. } => match &args[0] {
+            Expr::SimulationTime {
+                width,
+                signed,
+                unit_exponent,
+            } => {
+                assert_eq!((*width, *signed, *unit_exponent), (32, false, -9));
+            }
+            other => panic!("expected simulation time, got {:?}", other),
+        },
+        other => panic!("expected display, got {:?}", other),
+    }
+}
+
+#[test]
 fn net_init_becomes_assign() {
     let d = compile_ok("module m(output y); wire w = 1'b1; assign y = w; endmodule");
     assert_eq!(d.assigns.len(), 2);

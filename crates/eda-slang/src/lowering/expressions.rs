@@ -2,7 +2,7 @@
 
 use crate::ast_util::{
     constant_json_word, expression_symbol, expression_symbol_id, integer_literal_word,
-    named_constant_word, string_field, usize_field, with_source_span,
+    named_constant_word, string_field, unwrap_conversion, usize_field, with_source_span,
 };
 use crate::types::AstPackedDimension;
 use crate::types::{simple_type_signed, simple_type_width};
@@ -18,7 +18,7 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
         Some("Subtract") => Ok(eda_core::ir::BinOp::Sub),
         Some("Multiply") => Ok(eda_core::ir::BinOp::Mul),
         Some("Divide") => Ok(eda_core::ir::BinOp::Div),
-        Some("Modulus") => Ok(eda_core::ir::BinOp::Mod),
+        Some("Mod" | "Modulus") => Ok(eda_core::ir::BinOp::Mod),
         Some("Power") => Ok(eda_core::ir::BinOp::Pow),
         Some("BinaryAnd") => Ok(eda_core::ir::BinOp::And),
         Some("BinaryOr") => Ok(eda_core::ir::BinOp::Or),
@@ -44,12 +44,22 @@ pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::Bi
     }
 }
 
-pub(super) fn continuous_assignment_delay(member: &Value) -> Result<u64, String> {
+pub(super) fn type_is_realtime_compatible(type_name: impl AsRef<str>) -> bool {
+    matches!(type_name.as_ref().trim(), "real" | "realtime")
+}
+
+fn value_type_is_realtime_compatible(value: &Value) -> bool {
+    string_field(value, "type").is_some_and(type_is_realtime_compatible)
+}
+
+pub(super) fn continuous_assignment_delay(
+    member: &Value,
+) -> Result<Option<super::DelayConstant>, String> {
     let Some(delay) = member.get("delay") else {
-        return Ok(0);
+        return Ok(None);
     };
     if delay.is_null() {
-        return Ok(0);
+        return Ok(None);
     }
     if string_field(delay, "kind").as_deref() != Some("Delay") {
         return Err("continuous assignment has an unsupported delay form".to_string());
@@ -63,11 +73,20 @@ pub(super) fn continuous_assignment_delay(member: &Value) -> Result<u64, String>
     let expression = delay
         .get("expr")
         .ok_or_else(|| "continuous-assignment delay has no expression".to_string())?;
+    if string_field(expression, "kind").as_deref() == Some("RealLiteral") {
+        let real = expression
+            .get("value")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                "fractional continuous-assignment delay has no numeric value".to_string()
+            })?;
+        return Ok(Some(super::DelayConstant::Real(real)));
+    }
     let word = integer_literal_word(expression)
         .or_else(|| named_constant_word(expression))
         .and_then(|word| word.to_u64())
-        .ok_or_else(|| "continuous-assignment delay must be an integer constant".to_string())?;
-    Ok(word)
+        .ok_or_else(|| "continuous assignment delay must be a constant".to_string())?;
+    Ok(Some(super::DelayConstant::Integer(word)))
 }
 
 pub(super) fn constant_index(value: &serde_json::Value) -> Result<usize, String> {
@@ -278,6 +297,51 @@ impl super::SlangAstLowerer {
             .map_err(|error| with_source_span(value, error))
     }
 
+    pub(super) fn lower_real_assignment_expression(
+        &self,
+        target: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let target_is_real = string_field(target, "type")
+            .as_deref()
+            .is_some_and(type_is_realtime_compatible);
+        let right_is_real_literal =
+            string_field(unwrap_conversion(right), "kind").as_deref() == Some("RealLiteral");
+        if target_is_real && right_is_real_literal {
+            return self.lower_real_pattern(unwrap_conversion(right));
+        }
+        self.lower_expression(right)
+    }
+
+    pub(super) fn lower_real_arithmetic_operand(
+        &self,
+        value: &Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let operand = unwrap_conversion(value);
+        if string_field(operand, "kind").as_deref() == Some("RealLiteral") {
+            return self.lower_real_pattern(operand);
+        }
+        self.lower_expression(value)
+    }
+
+    pub(super) fn lower_shortreal_arithmetic_operand(
+        &self,
+        value: &Value,
+    ) -> Result<eda_core::ir::Expr, String> {
+        let operand = unwrap_conversion(value);
+        if string_field(operand, "kind").as_deref() == Some("RealLiteral") {
+            let real = operand
+                .get("value")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| "shortreal literal has no numeric value".to_string())?;
+            if !real.is_finite() {
+                return Err("shortreal literals must be finite".to_string());
+            }
+            return Ok(eda_core::ir::Expr::ShortRealConst(real as f32));
+        }
+        self.lower_expression(value)
+    }
+
     fn lower_expression_inner(
         &self,
         value: &serde_json::Value,
@@ -295,6 +359,23 @@ impl super::SlangAstLowerer {
                         range: full_range(symbol.width),
                         signed: symbol.signed,
                     });
+                }
+                if string_field(value, "type")
+                    .as_deref()
+                    .is_some_and(type_is_realtime_compatible)
+                {
+                    let symbol = self.named_symbol(value)?;
+                    return Ok(Expr::RealRef {
+                        net: symbol.base,
+                        decl_width: symbol.width,
+                    });
+                }
+                if string_field(value, "type")
+                    .as_deref()
+                    .is_some_and(|type_name| type_name.trim() == "shortreal")
+                {
+                    let symbol = self.named_symbol(value)?;
+                    return Ok(Expr::ShortRealRef { net: symbol.base });
                 }
                 if let Some(symbol_id) = expression_symbol_id(value) {
                     if let Some(symbol) = self.external_symbols.get(&symbol_id) {
@@ -432,6 +513,85 @@ impl super::SlangAstLowerer {
                         .ok_or_else(|| "string concatenation has no operands".to_string())?;
                     return self.lower_string_concatenation(operands);
                 }
+                let target_type = string_field(value, "type").unwrap_or_default();
+                let source_type = string_field(operand, "type").unwrap_or_default();
+                let target_is_real = type_is_realtime_compatible(&target_type);
+                let source_is_real = type_is_realtime_compatible(&source_type);
+                let target_is_shortreal = target_type.trim() == "shortreal";
+                let source_is_shortreal = source_type.trim() == "shortreal";
+                if target_is_real && source_is_real {
+                    return self.lower_real_arithmetic_operand(operand);
+                }
+                if target_is_shortreal && source_is_shortreal {
+                    return self.lower_shortreal_arithmetic_operand(operand);
+                }
+                if target_is_real && source_is_shortreal {
+                    return Ok(Expr::ShortRealToReal(Box::new(
+                        self.lower_shortreal_arithmetic_operand(operand)?,
+                    )));
+                }
+                if target_is_shortreal && source_is_real {
+                    return Ok(Expr::RealToShortReal(Box::new(
+                        self.lower_real_arithmetic_operand(operand)?,
+                    )));
+                }
+                if target_is_real {
+                    let (source_shape, signed, _) =
+                        self.net_type(&source_type).map_err(|error| {
+                            format!("real conversion source type '{source_type}': {error}")
+                        })?;
+                    let width = source_shape.width;
+                    return Ok(Expr::IntToReal {
+                        value: Box::new(self.lower_expression(operand)?),
+                        width,
+                        signed,
+                    });
+                }
+                if target_is_shortreal {
+                    let (source_shape, signed, _) =
+                        self.net_type(&source_type).map_err(|error| {
+                            format!("shortreal conversion source type '{source_type}': {error}")
+                        })?;
+                    let width = source_shape.width;
+                    return Ok(Expr::RealToShortReal(Box::new(Expr::IntToReal {
+                        value: Box::new(self.lower_expression(operand)?),
+                        width,
+                        signed,
+                    })));
+                }
+                if source_is_real {
+                    let width = simple_type_width(&target_type).ok_or_else(|| {
+                        format!(
+                            "integer conversion target type '{target_type}' has unresolved width"
+                        )
+                    })?;
+                    let signed = simple_type_signed(&target_type)
+                        .ok_or_else(|| format!("integer conversion target type '{target_type}' has unresolved signedness"))?;
+                    return Ok(Expr::RealToInt {
+                        value: Box::new(self.lower_real_arithmetic_operand(operand)?),
+                        width,
+                        signed,
+                    });
+                }
+                if source_is_shortreal {
+                    let width = simple_type_width(&target_type).ok_or_else(|| {
+                        format!(
+                            "integer conversion target type '{target_type}' has unresolved width"
+                        )
+                    })?;
+                    let signed = simple_type_signed(&target_type).ok_or_else(|| {
+                        format!(
+                            "integer conversion target type '{target_type}' has unresolved signedness"
+                        )
+                    })?;
+                    return Ok(Expr::RealToInt {
+                        value: Box::new(Expr::ShortRealToReal(Box::new(
+                            self.lower_shortreal_arithmetic_operand(operand)?,
+                        ))),
+                        width,
+                        signed,
+                    });
+                }
                 self.lower_integral_conversion(value)
             }
             "UnaryOp" => {
@@ -472,8 +632,34 @@ impl super::SlangAstLowerer {
                             }),
                         })
                     }
+                    Some("Plus")
+                        if string_field(value, "type").as_deref() == Some("shortreal")
+                            || string_field(operand, "type").as_deref() == Some("shortreal") =>
+                    {
+                        self.lower_shortreal_arithmetic_operand(operand)
+                    }
+                    Some("Plus")
+                        if value_type_is_realtime_compatible(value)
+                            || value_type_is_realtime_compatible(operand) =>
+                    {
+                        self.lower_real_arithmetic_operand(operand)
+                    }
                     Some("Plus") => self.lower_expression(operand),
                     Some("Minus") => {
+                        if string_field(value, "type").as_deref() == Some("shortreal")
+                            || string_field(operand, "type").as_deref() == Some("shortreal")
+                        {
+                            return Ok(Expr::ShortRealNeg(Box::new(
+                                self.lower_shortreal_arithmetic_operand(operand)?,
+                            )));
+                        }
+                        if value_type_is_realtime_compatible(value)
+                            || value_type_is_realtime_compatible(operand)
+                        {
+                            return Ok(Expr::RealNeg(Box::new(
+                                self.lower_real_arithmetic_operand(operand)?,
+                            )));
+                        }
                         let expression = self.lower_expression(operand)?;
                         let type_name = string_field(value, "type").unwrap_or_default();
                         let width = simple_type_width(&type_name)
@@ -634,6 +820,74 @@ impl super::SlangAstLowerer {
                 let right = value
                     .get("right")
                     .ok_or_else(|| "binary expression has no right operand".to_string())?;
+                if matches!(
+                    op,
+                    eda_core::ir::BinOp::Add
+                        | eda_core::ir::BinOp::Sub
+                        | eda_core::ir::BinOp::Mul
+                        | eda_core::ir::BinOp::Div
+                ) && [left, right]
+                    .iter()
+                    .all(|operand| value_type_is_realtime_compatible(operand))
+                {
+                    return Ok(Expr::RealBinary {
+                        op,
+                        left: Box::new(self.lower_real_arithmetic_operand(left)?),
+                        right: Box::new(self.lower_real_arithmetic_operand(right)?),
+                    });
+                }
+                if matches!(
+                    op,
+                    eda_core::ir::BinOp::Add
+                        | eda_core::ir::BinOp::Sub
+                        | eda_core::ir::BinOp::Mul
+                        | eda_core::ir::BinOp::Div
+                ) && [left, right]
+                    .iter()
+                    .all(|operand| string_field(operand, "type").as_deref() == Some("shortreal"))
+                {
+                    return Ok(Expr::ShortRealBinary {
+                        op,
+                        left: Box::new(self.lower_shortreal_arithmetic_operand(left)?),
+                        right: Box::new(self.lower_shortreal_arithmetic_operand(right)?),
+                    });
+                }
+                if matches!(
+                    op,
+                    eda_core::ir::BinOp::Eq
+                        | eda_core::ir::BinOp::Ne
+                        | eda_core::ir::BinOp::Lt
+                        | eda_core::ir::BinOp::Le
+                        | eda_core::ir::BinOp::Gt
+                        | eda_core::ir::BinOp::Ge
+                ) && [left, right]
+                    .iter()
+                    .all(|operand| value_type_is_realtime_compatible(operand))
+                {
+                    return Ok(Expr::RealCompare {
+                        op,
+                        left: Box::new(self.lower_real_arithmetic_operand(left)?),
+                        right: Box::new(self.lower_real_arithmetic_operand(right)?),
+                    });
+                }
+                if string_field(value, "op").as_deref() == Some("LogicalShiftRight") {
+                    let shifted = self.lower_expression(left)?;
+                    let logical = Expr::Bin {
+                        op,
+                        a: Box::new(Expr::Signed {
+                            e: Box::new(shifted.clone()),
+                            signed: false,
+                        }),
+                        b: Box::new(self.lower_expression(right)?),
+                    };
+                    if shifted.is_signed() {
+                        return Ok(Expr::Signed {
+                            e: Box::new(logical),
+                            signed: true,
+                        });
+                    }
+                    return Ok(logical);
+                }
                 Ok(Expr::Bin {
                     op,
                     a: Box::new(self.lower_expression(left)?),
@@ -716,10 +970,21 @@ impl super::SlangAstLowerer {
                         let [index] = indexes.as_slice() else {
                             return Err("associative array select requires one index".into());
                         };
-                        return Ok(Expr::AssocRead {
+                        let read = Expr::AssocRead {
                             memory,
                             index: Box::new(index.clone()),
                             width: symbol.element_width,
+                        };
+                        let signed = string_field(value, "type")
+                            .and_then(|type_name| simple_type_signed(&type_name))
+                            .unwrap_or(false);
+                        return Ok(if signed {
+                            Expr::Signed {
+                                e: Box::new(read),
+                                signed: true,
+                            }
+                        } else {
+                            read
                         });
                     }
                     let signed = self
@@ -794,6 +1059,31 @@ impl super::SlangAstLowerer {
             "MemberAccess" => {
                 if let Some(expression) = self.lower_class_property_access(value)? {
                     return Ok(expression);
+                }
+                if let Some(selected) = value.get("value") {
+                    let member = string_field(value, "member")
+                        .and_then(|member| {
+                            member.split_whitespace().next_back().map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    if let Ok(field) = self.struct_field_for_type(selected, &member) {
+                        let member_type = string_field(value, "type").unwrap_or_default();
+                        if field.offset == 0 {
+                            if type_is_realtime_compatible(&member_type) && field.width == 64 {
+                                if let Expr::Ref { net, .. } = self.lower_expression(selected)? {
+                                    return Ok(Expr::RealRef {
+                                        net,
+                                        decl_width: 64,
+                                    });
+                                }
+                            }
+                            if member_type.trim() == "shortreal" && field.width == 32 {
+                                if let Expr::Ref { net, .. } = self.lower_expression(selected)? {
+                                    return Ok(Expr::ShortRealRef { net });
+                                }
+                            }
+                        }
+                    }
                 }
                 let (base, msb, lsb) = self.lower_struct_member(value)?;
                 Ok(Expr::Index {
@@ -1120,10 +1410,7 @@ impl super::SlangAstLowerer {
         if definition.is_union {
             return Err("packed union assignment patterns are not supported".into());
         }
-        if definition.is_unpacked {
-            return Err("unpacked aggregate assignment patterns are not supported".into());
-        }
-        let mut fields = definition.fields.values().copied().collect::<Vec<_>>();
+        let mut fields = definition.fields.values().cloned().collect::<Vec<_>>();
         fields.sort_by(|left, right| right.offset.cmp(&left.offset));
 
         let mut elements_by_field = std::collections::BTreeMap::new();
@@ -1187,7 +1474,18 @@ impl super::SlangAstLowerer {
             let element = elements_by_field
                 .get(&field.offset)
                 .ok_or_else(|| "packed struct assignment pattern is missing a field".to_string())?;
-            let expression = self.lower_expression(element)?;
+            let element_type = string_field(element, "type").unwrap_or_default();
+            let expression = if type_is_realtime_compatible(&element_type) {
+                self.lower_real_arithmetic_operand(element)?
+            } else if element_type.trim() == "shortreal" {
+                if string_field(element, "kind").as_deref() == Some("Conversion") {
+                    self.lower_expression(element)?
+                } else {
+                    self.lower_shortreal_arithmetic_operand(element)?
+                }
+            } else {
+                self.lower_expression(element)?
+            };
             if expression.width() != field.width {
                 return Err(format!(
                     "packed struct assignment-pattern field width {} does not match field width {}",
@@ -1253,7 +1551,7 @@ impl super::SlangAstLowerer {
             return definition
                 .fields
                 .get(member)
-                .copied()
+                .cloned()
                 .ok_or_else(|| format!("struct type has no member '{member}'"));
         }
         if matches!(
@@ -1264,7 +1562,7 @@ impl super::SlangAstLowerer {
                 return symbol
                     .struct_fields
                     .get(member)
-                    .copied()
+                    .cloned()
                     .ok_or_else(|| format!("struct has no member '{member}'"));
             }
         }
