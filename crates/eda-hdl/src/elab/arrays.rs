@@ -1653,6 +1653,7 @@ impl<'a> Elaborator<'a> {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

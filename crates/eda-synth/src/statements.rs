@@ -57,6 +57,17 @@ impl<'a> Synth<'a> {
             Stmt::While { .. } => Err("while loops are not synthesizable".into()),
             Stmt::Repeat { .. } => Err("repeat loops are not synthesizable".into()),
             Stmt::Force { .. } => Err("force statements are not synthesizable".into()),
+            Stmt::DisableFork => Err("disable fork is not synthesizable".into()),
+            Stmt::WaitFork => Err("wait fork is not synthesizable".into()),
+            Stmt::NamedBlock { body, .. } => self.exec_stmt(body),
+            Stmt::NamedBlockEnd => Ok(()),
+            Stmt::DisableNamedBlock { .. } => {
+                Err("named-block disable is not synthesizable".into())
+            }
+            Stmt::ProcessKill { .. } => Err("process kill is not synthesizable".into()),
+            Stmt::ProcessAwait { .. } => Err("process await is not synthesizable".into()),
+            Stmt::ProcessSuspend { .. } => Err("process suspend is not synthesizable".into()),
+            Stmt::ProcessResume { .. } => Err("process resume is not synthesizable".into()),
             Stmt::TimeFormat { .. } => Err("time formatting is not synthesizable".into()),
             Stmt::Release { .. } => Err("release statements are not synthesizable".into()),
             Stmt::ProceduralAssign { .. } => {
@@ -312,6 +323,12 @@ impl<'a> Synth<'a> {
             | Stmt::FileDisplay { .. } => Err("file I/O is not synthesizable".into()),
             Stmt::RandomSeeded { .. } => Err("seeded randomization is not synthesizable".into()),
             Stmt::ImmediateAssertion {
+                deferred:
+                    eda_core::ir::ImmediateAssertionDeferred::Observed
+                    | eda_core::ir::ImmediateAssertionDeferred::Final,
+                ..
+            } => Err("deferred assertions are not synthesizable".into()),
+            Stmt::ImmediateAssertion {
                 pass_action,
                 fail_action,
                 ..
@@ -496,5 +513,89 @@ fn lv_bits(lv: &LValue) -> Vec<usize> {
     match &lv.range {
         Range::Bit(b) => vec![lv.net + b],
         Range::Span { msb, lsb } => (*lsb..=*msb).map(|i| lv.net + i).collect(),
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use eda_core::ir::Design;
+    use eda_core::logic::LogicWord;
+
+    #[test]
+    fn process_control_statements_fail_closed_in_synthesis() {
+        let design = Design::default();
+        let mut synthesizer = Synth::new(&design).expect("create empty synthesizer");
+        let handle = Expr::Const(LogicWord::from_u64(64, 1));
+        for (statement, diagnostic) in [
+            (
+                Stmt::ProcessSuspend(Box::new(handle.clone())),
+                "process suspend is not synthesizable",
+            ),
+            (
+                Stmt::ProcessResume(Box::new(handle.clone())),
+                "process resume is not synthesizable",
+            ),
+        ] {
+            assert_eq!(synthesizer.exec_stmt(&statement).unwrap_err(), diagnostic);
+        }
+    }
+
+    #[test]
+    fn past_sampled_values_fail_closed_in_synthesis() {
+        let design = Design::default();
+        let mut synthesizer = Synth::new(&design).expect("create empty synthesizer");
+        let expression = Expr::Past {
+            value: Box::new(Expr::Const(LogicWord::from_u64(8, 0xa5))),
+            ticks: 1,
+            gating: None,
+        };
+        assert_eq!(
+            synthesizer.blast_nat(&expression).unwrap_err(),
+            "$past is not synthesizable"
+        );
+        let expression = Expr::Sampled(Box::new(Expr::Const(LogicWord::from_u64(8, 0xa5))));
+        assert_eq!(
+            synthesizer.blast_nat(&expression).unwrap_err(),
+            "$sampled is not synthesizable"
+        );
+        for op in [
+            eda_core::ir::SampledValueOp::Rose,
+            eda_core::ir::SampledValueOp::Fell,
+            eda_core::ir::SampledValueOp::Stable,
+            eda_core::ir::SampledValueOp::Changed,
+        ] {
+            let expression = Expr::SampledValue {
+                op,
+                value: Box::new(Expr::Const(LogicWord::from_u64(1, 1))),
+            };
+            assert_eq!(
+                synthesizer.blast_nat(&expression).unwrap_err(),
+                "sampled-value functions are not synthesizable"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_assertions_fail_closed_in_synthesis() {
+        let design = Design::default();
+        let mut synthesizer = Synth::new(&design).expect("create empty synthesizer");
+        for deferred in [
+            eda_core::ir::ImmediateAssertionDeferred::Observed,
+            eda_core::ir::ImmediateAssertionDeferred::Final,
+        ] {
+            let statement = Stmt::ImmediateAssertion {
+                kind: eda_core::ir::ImmediateAssertionKind::Assert,
+                deferred,
+                scope: None,
+                cond: Expr::Const(LogicWord::from_u64(1, 1)),
+                pass_action: None,
+                fail_action: None,
+            };
+            assert_eq!(
+                synthesizer.exec_stmt(&statement).unwrap_err(),
+                "deferred assertions are not synthesizable"
+            );
+        }
     }
 }

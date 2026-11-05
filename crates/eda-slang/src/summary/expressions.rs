@@ -1,9 +1,10 @@
 //! Expression summaries, fingerprints, and IR-shape comparison helpers.
 
 use crate::ast_util::{
-    bool_field, expression_symbol, expression_symbol_id, expression_target_names,
-    instance_parameters, integer_literal_word, literal_word, named_constant_word,
-    parameter_summary, slang_constant_u64, string_field, string_literal,
+    bool_field, constant_system_real, expression_symbol, expression_symbol_id,
+    expression_target_names, instance_parameters, integer_literal_word, literal_word,
+    named_constant_word, parameter_summary, slang_constant_u64, string_field, string_literal,
+    unwrap_conversion,
 };
 use crate::types::{
     associative_memory_type, dynamic_memory_type, memory_type, memory_type_with_element,
@@ -21,6 +22,18 @@ use super::{
 };
 
 pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
+    if let Some(summary) = constant_typename_summary(value) {
+        return summary;
+    }
+    if let Some(summary) = constant_isunbounded_summary(value) {
+        return summary;
+    }
+    if let Some(summary) = constant_real_math_summary(value) {
+        return summary;
+    }
+    if let Some(summary) = constant_clog2_summary(value) {
+        return summary;
+    }
     let kind = string_field(value, "kind").unwrap_or_default();
     let operator = string_field(value, "op").or_else(|| {
         (kind == "Call")
@@ -64,6 +77,35 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
     } else {
         string_field(value, "type").and_then(|type_name| simple_type_width(&type_name))
     };
+    let mut type_width = type_width;
+    let mut type_signed = type_signed;
+    let mut symbol = expression_symbol(value);
+    if kind == "Call"
+        && operator
+            .as_deref()
+            .is_some_and(|name| name.split_whitespace().next_back() == Some("self"))
+        && string_field(value, "type")
+            .is_some_and(|type_name| type_name.split_whitespace().next_back() == Some("process"))
+    {
+        type_width = Some(64);
+        type_signed = Some(false);
+    }
+    if kind == "Call"
+        && operator.as_deref().is_some_and(|name| {
+            matches!(
+                name.split_whitespace().next_back(),
+                Some("kill") | Some("await") | Some("status")
+            )
+        })
+    {
+        if let Some(receiver) = value.get("thisClass") {
+            if string_field(receiver, "type").is_some_and(|type_name| {
+                type_name.split_whitespace().next_back() == Some("process")
+            }) {
+                symbol = expression_symbol(receiver);
+            }
+        }
+    }
     let plusarg_name = if kind == "Call"
         && matches!(
             operator.as_deref(),
@@ -80,7 +122,7 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         selection_kind: string_field(value, "selectionKind").unwrap_or_default(),
         type_width,
         type_signed,
-        symbol: expression_symbol(value),
+        symbol,
         symbol_id: expression_symbol_id(value),
         literal,
         repeat_count: repeat_count(value),
@@ -93,6 +135,160 @@ pub(crate) fn expression_summary(value: &Value) -> SlangExpressionSummary {
         plusarg_name,
         operands: expression_operands(value),
     }
+}
+
+fn constant_typename_summary(value: &Value) -> Option<SlangExpressionSummary> {
+    if string_field(value, "kind").as_deref() != Some("Call")
+        || string_field(value, "subroutine")
+            .as_deref()?
+            .split_whitespace()
+            .next_back()
+            != Some("$typename")
+    {
+        return None;
+    }
+    let argument = value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())?;
+    let argument = unwrap_conversion(argument);
+    let type_name = string_field(argument, "type")?;
+    simple_type_shape(&type_name)?;
+    if type_name.contains('$') {
+        return None;
+    }
+    let word = string_literal_word(&type_name)?;
+    let mut summary = empty_expression_summary();
+    summary.operands = vec![expression_summary(argument)];
+    summary.kind = "StringLiteral".into();
+    summary.operator = "$typename".into();
+    summary.type_name = "string".into();
+    summary.type_width = Some(STRING_WIDTH);
+    summary.type_signed = Some(false);
+    summary.literal = Some(format!("{STRING_WIDTH}:{}", word.to_bin_str()));
+    Some(summary)
+}
+
+pub(crate) fn annotate_typename_alias_canonical_names(
+    expression: &mut SlangExpressionSummary,
+    aliases: &std::collections::BTreeMap<String, String>,
+) {
+    if expression.kind == "StringLiteral" && expression.operator == "$typename" {
+        if let Some(operand) = expression.operands.first() {
+            let source_type = operand.type_name.clone();
+            if let Some(type_name) = resolve_simple_type_alias_name(&source_type, aliases) {
+                if let Some(word) = string_literal_word(&type_name) {
+                    expression.literal = Some(format!("{STRING_WIDTH}:{}", word.to_bin_str()));
+                    if let Some(operand) = expression.operands.first_mut() {
+                        operand.type_name = type_name;
+                    }
+                }
+            }
+        }
+    }
+    for operand in &mut expression.operands {
+        annotate_typename_alias_canonical_names(operand, aliases);
+    }
+}
+
+fn resolve_simple_type_alias_name(
+    type_name: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let type_reference = type_name.split('$').next()?.trim();
+    let mut current = if type_reference.is_empty() {
+        type_name.to_string()
+    } else {
+        aliases
+            .get(type_reference)
+            .cloned()
+            .unwrap_or_else(|| type_reference.to_string())
+    };
+    for _ in 0..64 {
+        if simple_type_shape(&current).is_some() {
+            return Some(current);
+        }
+        let scoped_name = current.split_whitespace().next_back()?.to_string();
+        let next = aliases
+            .get(&scoped_name)
+            .or_else(|| {
+                let name = scoped_name.rsplit(['.', '#', ':']).next()?;
+                aliases.get(name)
+            })?
+            .clone();
+        if next == current {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
+fn constant_isunbounded_summary(value: &Value) -> Option<SlangExpressionSummary> {
+    if string_field(value, "kind").as_deref() != Some("Call")
+        || string_field(value, "subroutine")
+            .as_deref()?
+            .split_whitespace()
+            .next_back()
+            != Some("$isunbounded")
+    {
+        return None;
+    }
+    let argument = value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())?;
+    let argument = unwrap_conversion(argument);
+    let unbounded = string_field(argument, "type").as_deref() == Some("$");
+    let mut summary = empty_expression_summary();
+    summary.kind = "IntegerLiteral".into();
+    summary.type_name = "bit".into();
+    summary.type_width = Some(1);
+    summary.type_signed = Some(false);
+    summary.literal = Some(format!("1:{}", if unbounded { "1" } else { "0" }));
+    Some(summary)
+}
+
+fn constant_real_math_summary(value: &Value) -> Option<SlangExpressionSummary> {
+    let result = constant_system_real(value)?;
+    let mut summary = empty_expression_summary();
+    summary.kind = "RealLiteral".into();
+    summary.type_name = "real".into();
+    summary.type_width = Some(64);
+    summary.type_signed = Some(false);
+    summary.literal = Some(result.to_string());
+    Some(summary)
+}
+
+fn constant_clog2_summary(value: &Value) -> Option<SlangExpressionSummary> {
+    if string_field(value, "kind").as_deref() != Some("Call")
+        || string_field(value, "subroutine")
+            .as_deref()?
+            .split_whitespace()
+            .next_back()
+            != Some("$clog2")
+    {
+        return None;
+    }
+    let argument = value
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|arguments| arguments.first())?;
+    let word = integer_literal_word(unwrap_conversion(argument))?;
+    let input = word.to_u64()?;
+    let result = if input <= 1 {
+        0_u32
+    } else {
+        (u128::from(input) - 1).ilog2() + 1
+    };
+    let word = LogicWord::from_u64(32, u64::from(result));
+    let mut summary = empty_expression_summary();
+    summary.kind = "IntegerLiteral".into();
+    summary.type_name = "int".into();
+    summary.type_width = Some(32);
+    summary.type_signed = Some(true);
+    summary.literal = Some(format!("32:{}", word.to_bin_str()));
+    Some(summary)
 }
 
 pub(crate) fn empty_expression_summary() -> SlangExpressionSummary {
@@ -857,6 +1053,18 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("Concatenation", _) if expression.type_name == "string" => None,
         ("NamedValue", _) if expression.literal.is_some() => Some("Const"),
         ("NamedValue", _) => Some("Ref"),
+        ("Call", "self")
+            if expression.type_name.split_whitespace().next_back() == Some("process") =>
+        {
+            Some("ProcessSelf")
+        }
+        ("Call", "status") if expression.symbol.is_some() => Some("ProcessStatus"),
+        ("Call", "$past") => Some("Past"),
+        ("Call", "$sampled") => Some("Sampled"),
+        ("Call", "$rose") => Some("Rose"),
+        ("Call", "$fell") => Some("Fell"),
+        ("Call", "$stable") => Some("Stable"),
+        ("Call", "$changed") => Some("Changed"),
         ("IntegerLiteral" | "RealLiteral" | "StringLiteral", _) => Some("Const"),
         // Selects are canonicalized differently by the bounded frontend:
         // constant selects may become direct references while dynamic selects
@@ -892,6 +1100,27 @@ pub(crate) fn slang_expression_shape(expression: &SlangExpressionSummary) -> Opt
         ("BinaryOp", "GreaterThanEqual") => Some("Ge"),
         _ => None,
     }
+}
+
+fn expression_arity_is_malformed(expression: &SlangExpressionSummary) -> bool {
+    let malformed = match expression.kind.as_str() {
+        "UnaryOp" | "Conversion" | "Replication" => expression.operands.len() != 1,
+        "BinaryOp" => expression.operands.len() != 2,
+        "ConditionalOp" => expression.operands.len() != 3,
+        _ => false,
+    };
+    malformed
+        || expression
+            .operands
+            .iter()
+            .any(expression_arity_is_malformed)
+}
+
+pub(crate) fn contains_malformed_expression_arity(expression: &SlangExpressionSummary) -> bool {
+    expression
+        .operands
+        .iter()
+        .any(expression_arity_is_malformed)
 }
 
 pub(crate) fn contains_expected_shapes(actual: &[String], expected: &[String]) -> bool {
@@ -1215,12 +1444,26 @@ fn type_is_realtime_compatible(type_name: &str) -> bool {
     matches!(type_name.trim(), "real" | "realtime")
 }
 
+fn type_is_process_handle(type_name: &str) -> bool {
+    type_name.split_whitespace().next_back() == Some("process")
+}
+
 fn conversion_fingerprint(
     expression: &SlangExpressionSummary,
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
     let operand = expression.operands.first()?;
+    if type_is_process_handle(&expression.type_name) && type_is_process_handle(&operand.type_name) {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
+    if expression.kind == "Conversion"
+        && operand.kind == "Call"
+        && operand.operator.split_whitespace().next_back() == Some("status")
+        && operand.symbol.is_some()
+    {
+        return slang_expression_fingerprint_with_parameters(operand, parameters, mode);
+    }
     if expression.type_name == "string"
         && mode == ExpressionFingerprintMode::BoundedCompatibility
         && operand.kind == "StringLiteral"
@@ -1627,7 +1870,7 @@ fn direct_lowered_signed(
     parameters: &[SlangParameterSummary],
 ) -> Option<bool> {
     match expression.kind.as_str() {
-        "IntegerLiteral" => expression.type_signed,
+        "IntegerLiteral" | "RealLiteral" => expression.type_signed,
         "NamedValue" | "HierarchicalValue" => {
             let symbol = expression.symbol.as_deref()?;
             if let Some(parameter) = parameters.iter().find(|parameter| parameter.name == symbol) {
@@ -1686,6 +1929,10 @@ fn direct_lowered_signed(
         }
         "Concatenation" | "StringLiteral" | "NewArray" => Some(false),
         "Replication" => direct_lowered_signed(expression.operands.first()?, parameters),
+        "ElementSelect" | "RangeSelect" => Some(false),
+        // slang's result type is authoritative for system/method calls;
+        // examples include signed `$size`-family integers and simulation time.
+        "Call" => expression.type_signed,
         _ => None,
     }
 }
@@ -2033,6 +2280,11 @@ fn array_system_query_fingerprint(expression: &SlangExpressionSummary) -> Option
         return None;
     }
     let selected = expression.operands.first()?;
+    if selected.kind == "DataType" {
+        let width = selected.type_width?;
+        let bits = format!("{width:032b}");
+        return Some(format!("Const:32:u[32:{bits}]"));
+    }
     let packed_type = selected
         .type_name
         .split('$')
@@ -2110,30 +2362,30 @@ fn array_system_query_fingerprint(expression: &SlangExpressionSummary) -> Option
                 .unwrap_or(1);
             let index = usize::try_from(index).ok()?;
             let physical_index = index.checked_sub(1)?;
-            let (base, step, length) = if let Some(dimension) = dimensions.get(physical_index) {
+            let (left, right, increment) = if let Some(dimension) = dimensions.get(physical_index) {
+                let length = i64::try_from(dimension.length).ok()?;
                 (
                     dimension.base,
-                    dimension.step,
-                    i64::try_from(dimension.length).ok()?,
+                    dimension
+                        .base
+                        .saturating_add(dimension.step.saturating_mul(length - 1)),
+                    -dimension.step,
                 )
             } else {
                 let dimension = packed_shape.dimensions.get(physical_index)?;
-                (
-                    dimension.msb,
-                    if dimension.msb >= dimension.lsb {
-                        1
-                    } else {
-                        -1
-                    },
-                    i64::try_from(dimension.length).ok()?,
-                )
+                let increment = if dimension.msb >= dimension.lsb {
+                    1
+                } else {
+                    -1
+                };
+                (dimension.msb, dimension.lsb, increment)
             };
             let value = match method {
-                "$left" => base,
-                "$right" => base + step * (length - 1),
-                "$low" => base.min(base + step * (length - 1)),
-                "$high" => base.max(base + step * (length - 1)),
-                _ => step,
+                "$left" => left,
+                "$right" => right,
+                "$low" => left.min(right),
+                "$high" => left.max(right),
+                _ => increment,
             };
             const32(value)
         }
@@ -2264,6 +2516,156 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             "Ref:512:u[{}]",
             eda_core::ir::plusarg_value_net_name(name)
         ));
+    }
+    if expression.kind == "Call"
+        && expression.operator.split_whitespace().next_back() == Some("self")
+        && expression.type_name.split_whitespace().next_back() == Some("process")
+    {
+        return Some("ProcessSelf:64:u[]".to_string());
+    }
+    if expression.kind == "Call"
+        && expression.operator.split_whitespace().next_back() == Some("status")
+    {
+        if let Some(receiver) = expression.symbol.as_deref() {
+            return Some(format!("ProcessStatus:32:s[Ref:64:u[{receiver}]]"));
+        }
+    }
+    if expression.kind == "Call" && expression.operator == "$past" {
+        let width = expression.type_width?;
+        let signed = expression.type_signed.unwrap_or(false);
+        let value = expression.operands.first().and_then(|operand| {
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)
+        })?;
+        let ticks = expression
+            .operands
+            .get(1)
+            .and_then(|operand| operand.literal.as_deref())
+            .and_then(|literal| literal.rsplit(':').next())
+            .and_then(|bits| u32::from_str_radix(bits, 2).ok())
+            .unwrap_or(1);
+        let mut operands = vec![ticks.to_string(), value];
+        if let Some(gating) = expression.operands.get(2) {
+            operands.push(slang_expression_fingerprint_with_parameters(
+                gating, parameters, mode,
+            )?);
+        }
+        let signed_label = if signed { "s" } else { "u" };
+        return Some(format!(
+            "Past:{width}:{signed_label}[{}]",
+            operands.join(",")
+        ));
+    }
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$rose" | "$fell" | "$stable" | "$changed"
+        )
+    {
+        let shape = match expression.operator.as_str() {
+            "$rose" => "Rose",
+            "$fell" => "Fell",
+            "$stable" => "Stable",
+            _ => "Changed",
+        };
+        let value = expression.operands.first().and_then(|operand| {
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)
+        })?;
+        return Some(format!("{shape}:1:u[{value}]"));
+    }
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$itor"
+                | "$rtoi"
+                | "$realtobits"
+                | "$bitstoreal"
+                | "$shortrealtobits"
+                | "$bitstoshortreal"
+        )
+    {
+        let operand = expression.operands.first()?;
+        let operand_fingerprint =
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)?;
+        return Some(match expression.operator.as_str() {
+            "$itor" => format!("IntToReal:64:s[{operand_fingerprint}]"),
+            "$rtoi" => {
+                let width = expression.type_width?;
+                let signed_label = if expression.type_signed? { "s" } else { "u" };
+                if operand.type_name.trim() == "shortreal" {
+                    format!(
+                        "RealTruncToInt:{width}:{signed_label}[ShortRealToReal:64:s[{operand_fingerprint}]]"
+                    )
+                } else {
+                    format!("RealTruncToInt:{width}:{signed_label}[{operand_fingerprint}]")
+                }
+            }
+            "$realtobits" => operand_fingerprint,
+            "$shortrealtobits" => {
+                if type_is_realtime_compatible(&operand.type_name) {
+                    format!("RealToShortReal:32:s[{operand_fingerprint}]")
+                } else {
+                    operand_fingerprint
+                }
+            }
+            "$bitstoreal" => format!("BitsToReal:64:s[{operand_fingerprint}]"),
+            _ => format!("BitsToShortReal:32:s[{operand_fingerprint}]"),
+        });
+    }
+    if expression.kind == "Call" && expression.operator == "$sampled" {
+        let width = expression.type_width?;
+        let signed = expression.type_signed.unwrap_or(false);
+        let value = expression.operands.first().and_then(|operand| {
+            slang_expression_fingerprint_with_parameters(operand, parameters, mode)
+        })?;
+        return Some(format!(
+            "Sampled:{width}:{}[{value}]",
+            if signed { "s" } else { "u" }
+        ));
+    }
+    if expression.kind == "Call" && expression.operator == "$countbits" {
+        let value = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        let mut controls = 0_u8;
+        for control in expression.operands.iter().skip(1) {
+            let literal = control.literal.as_deref()?;
+            let bit = literal.rsplit(':').next()?;
+            controls |= match bit {
+                "0" => 1,
+                "1" => 2,
+                "x" => 4,
+                "z" => 8,
+                _ => return None,
+            };
+        }
+        return Some(format!("CountBits:32:s[Controls{controls},{value}]"));
+    }
+    if expression.kind == "Call" && expression.operator == "$countones" {
+        let value = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        return Some(format!("CountBits:32:s[Controls2,{value}]"));
+    }
+    if expression.kind == "Call"
+        && matches!(
+            expression.operator.as_str(),
+            "$isunknown" | "$onehot" | "$onehot0"
+        )
+    {
+        let value = slang_expression_fingerprint_with_parameters(
+            expression.operands.first()?,
+            parameters,
+            mode,
+        )?;
+        return Some(match expression.operator.as_str() {
+            "$isunknown" => format!("IsUnknown:1:u[{value}]"),
+            "$onehot" => format!("OneHot:1:u[{value}]"),
+            _ => format!("OneHot0:1:u[{value}]"),
+        });
     }
     if expression.kind == "RealLiteral" {
         let literal = expression.literal.as_deref()?;
@@ -2920,6 +3322,35 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
             return Some(format!("Ref:{width}:{signed_label}[{path}]"));
         }
     }
+    if matches!(expression.kind.as_str(), "NamedValue" | "HierarchicalValue") {
+        let symbol = expression.symbol.as_deref()?;
+        if expression.type_name.trim() == "shortreal" {
+            return Some(format!("Ref:32:s[{symbol}]"));
+        }
+        if type_is_realtime_compatible(&expression.type_name) {
+            return Some(format!("Ref:64:s[{symbol}]"));
+        }
+    }
+    if expression.kind == "BinaryOp"
+        && matches!(
+            expression.operator.as_str(),
+            "Add" | "Subtract" | "Multiply" | "Divide"
+        )
+    {
+        let left = expression.operands.first()?;
+        let right = expression.operands.get(1)?;
+        let all_realtime = type_is_realtime_compatible(&left.type_name)
+            && type_is_realtime_compatible(&right.type_name);
+        let all_shortreal =
+            left.type_name.trim() == "shortreal" && right.type_name.trim() == "shortreal";
+        if all_realtime || all_shortreal {
+            let root = slang_expression_shape(expression)?;
+            let width = if all_shortreal { 32 } else { 64 };
+            let left = slang_expression_fingerprint_with_parameters(left, parameters, mode)?;
+            let right = slang_expression_fingerprint_with_parameters(right, parameters, mode)?;
+            return Some(format!("{root}:{width}:s[{left},{right}]"));
+        }
+    }
     let root = slang_expression_shape(expression)?;
     let enum_definition = expression.enum_definition.as_ref();
     let width = expression
@@ -3144,6 +3575,13 @@ pub(crate) fn collect_generate_summary(
                     assignments,
                 });
             }
+            "ConcurrentAssertion" => {
+                procedural_blocks.push(SlangProceduralBlockSummary {
+                    procedure_kind: "ConcurrentAssertion".into(),
+                    assignment_targets: Vec::new(),
+                    assignments: Vec::new(),
+                });
+            }
             nested if nested.starts_with("GenerateBlock") => {
                 collect_generate_summary(
                     member,
@@ -3204,6 +3642,16 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::Const(_) => "Const",
         Expr::RealConst(_) => "RealConst",
         Expr::RealRef { .. } => "Ref",
+        Expr::ProcessSelf => "ProcessSelf",
+        Expr::ProcessStatus(_) => "ProcessStatus",
+        Expr::Past { .. } => "Past",
+        Expr::Sampled(_) => "Sampled",
+        Expr::SampledValue { op, .. } => match op {
+            eda_core::ir::SampledValueOp::Rose => "Rose",
+            eda_core::ir::SampledValueOp::Fell => "Fell",
+            eda_core::ir::SampledValueOp::Stable => "Stable",
+            eda_core::ir::SampledValueOp::Changed => "Changed",
+        },
         Expr::ShortRealConst(_) => "ShortRealConst",
         Expr::ShortRealRef { .. } => "Ref",
         Expr::ShortRealBinary { op, .. } => match op {
@@ -3233,7 +3681,10 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::ShortRealNeg(_) => "ShortRealNeg",
         Expr::ShortRealToReal(_) => "ShortRealToReal",
         Expr::RealToShortReal(_) => "RealToShortReal",
+        Expr::BitsToReal(_) => "BitsToReal",
+        Expr::BitsToShortReal(_) => "BitsToShortReal",
         Expr::RealToInt { .. } => "RealToInt",
+        Expr::RealTruncToInt { .. } => "RealTruncToInt",
         Expr::IntToReal { .. } => "IntToReal",
         Expr::RealTime { .. } => "RealTime",
         Expr::Ref { .. } | Expr::MemoryRead { .. } | Expr::MemoryReadPart { .. } => "Ref",
@@ -3287,6 +3738,10 @@ pub(crate) fn design_expr_shape(expression: &eda_core::ir::Expr) -> &'static str
         Expr::EventTriggered { .. } => "EventTriggered",
         Expr::SimulationTime { .. } => "SimulationTime",
         Expr::Random { .. } => "Random",
+        Expr::CountBits { .. } => "CountBits",
+        Expr::IsUnknown(_) => "IsUnknown",
+        Expr::OneHot(_) => "OneHot",
+        Expr::OneHot0(_) => "OneHot0",
         Expr::FileOpen { .. } => "FileOpen",
         Expr::FileOpenDynamic { .. } => "FileOpenDynamic",
         Expr::FileGetc { .. } => "FileGetc",
@@ -3464,6 +3919,15 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         let name = design_expr_symbol(design, expression).unwrap_or_else(|| design.net_name(*net));
         return format!("Ref:64:s[{name}]");
     }
+    if let Expr::ProcessSelf = expression {
+        return "ProcessSelf:64:u[]".to_string();
+    }
+    if let Expr::ProcessStatus(handle) = expression {
+        return format!(
+            "ProcessStatus:32:s[{}]",
+            design_expr_fingerprint(design, handle)
+        );
+    }
     if let Expr::ShortRealRef { net } = expression {
         let name = design_expr_symbol(design, expression).unwrap_or_else(|| design.net_name(*net));
         return format!("Ref:32:s[{name}]");
@@ -3554,6 +4018,21 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
                 .collect::<Vec<_>>()
                 .join(",")
         );
+    }
+    if let Expr::CountBits { value, controls } = expression {
+        return format!(
+            "CountBits:32:s[Controls{controls},{}]",
+            design_expr_fingerprint(design, value)
+        );
+    }
+    if let Expr::IsUnknown(value) = expression {
+        return format!("IsUnknown:1:u[{}]", design_expr_fingerprint(design, value));
+    }
+    if let Expr::OneHot(value) = expression {
+        return format!("OneHot:1:u[{}]", design_expr_fingerprint(design, value));
+    }
+    if let Expr::OneHot0(value) = expression {
+        return format!("OneHot0:1:u[{}]", design_expr_fingerprint(design, value));
     }
     if let Expr::FileOpen {
         path,
@@ -3720,11 +4199,30 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         | Expr::RealRef { .. }
         | Expr::ShortRealConst(_)
         | Expr::ShortRealRef { .. }
+        | Expr::ProcessSelf
         | Expr::Ref { .. }
         | Expr::MemoryRead { .. }
         | Expr::SimulationTime { .. }
         | Expr::RealTime { .. }
-        | Expr::MemorySize { .. } => Vec::new(),
+        | Expr::MemorySize { .. }
+        | Expr::CountBits { .. }
+        | Expr::IsUnknown(_)
+        | Expr::OneHot(_)
+        | Expr::OneHot0(_) => Vec::new(),
+        Expr::ProcessStatus(handle) => vec![design_expr_fingerprint(design, handle)],
+        Expr::Past {
+            value,
+            ticks,
+            gating,
+        } => {
+            let mut operands = vec![ticks.to_string(), design_expr_fingerprint(design, value)];
+            if let Some(gating) = gating {
+                operands.push(design_expr_fingerprint(design, gating));
+            }
+            operands
+        }
+        Expr::Sampled(value) => vec![design_expr_fingerprint(design, value)],
+        Expr::SampledValue { value, .. } => vec![design_expr_fingerprint(design, value)],
         Expr::RealBinary { left, right, .. } => vec![
             design_expr_fingerprint(design, left),
             design_expr_fingerprint(design, right),
@@ -3740,8 +4238,12 @@ pub(crate) fn design_expr_fingerprint(design: &Design, expression: &eda_core::ir
         ],
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => vec![design_expr_fingerprint(design, operand)],
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => vec![design_expr_fingerprint(design, operand)],
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => {
             vec![design_expr_fingerprint(design, value)]
         }
         Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => {
@@ -3866,6 +4368,17 @@ pub(crate) fn design_expr_symbol(
 }
 
 fn canonical_ref_symbol_name(name: &str) -> String {
+    if let Some(local) = name.strip_prefix("__foreach_iterator_") {
+        let mut segments = local.split('_');
+        let address_skipped = segments.next().is_some();
+        let dimension_skipped = segments.next().is_some();
+        if address_skipped && dimension_skipped {
+            let iterator_name = segments.collect::<Vec<_>>().join("_");
+            if !iterator_name.is_empty() {
+                return iterator_name;
+            }
+        }
+    }
     if let Some(local) = name.strip_prefix("__class_static_") {
         let skip_address = local.find('_').map(|end| end + 1);
         if let Some(start) = skip_address {
@@ -3940,6 +4453,9 @@ fn design_stmt_assignments_guarded(
         Stmt::Forever(body) | Stmt::Delay { body, .. } => {
             assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
+        Stmt::NamedBlock { body, .. } => {
+            assignments.extend(design_stmt_assignments_guarded(design, body, guard));
+        }
         Stmt::Wait { body, .. } => {
             assignments.extend(design_stmt_assignments_guarded(design, body, guard));
         }
@@ -3972,6 +4488,12 @@ fn design_stmt_assignments_guarded(
         | Stmt::Release { .. }
         | Stmt::ProceduralAssign { .. }
         | Stmt::ProceduralDeassign { .. } => {}
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(_)
+        | Stmt::ProcessAwait(_)
+        | Stmt::ProcessSuspend(_)
+        | Stmt::ProcessResume(_) => {}
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
         Stmt::Scope(body) => {
             assignments.extend(design_stmt_assignments_guarded(design, body, guard));

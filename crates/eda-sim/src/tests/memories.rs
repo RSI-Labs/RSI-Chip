@@ -22,6 +22,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
     Design {
         name: "sparse_memory".into(),
         recorded_type_mismatches: Vec::new(),
+        assertion_attempts: Vec::new(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
         array_ports: Vec::new(),
@@ -49,6 +50,7 @@ fn sparse_memory_design(nonblocking: bool) -> Design {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: eda_core::ir::MemoryStorage::Sparse,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,
@@ -98,6 +100,7 @@ fn ordinary_array_design() -> Design {
     Design {
         name: "ordinary_array".into(),
         recorded_type_mismatches: Vec::new(),
+        assertion_attempts: Vec::new(),
         time_scale: Default::default(),
         memory_ports: Vec::new(),
         array_ports: Vec::new(),
@@ -125,6 +128,7 @@ fn ordinary_array_design() -> Design {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: MemoryStorage::Ordinary,
             kind: Default::default(),
             template: Default::default(),

@@ -497,6 +497,21 @@ impl super::SlangAstLowerer {
                 let operand = value
                     .get("operand")
                     .ok_or_else(|| "conversion has no operand".to_string())?;
+                if string_field(operand, "kind").as_deref() == Some("Call")
+                    && operand
+                        .get("subroutine")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.split_whitespace().next_back() == Some("status"))
+                    && operand
+                        .get("thisClass")
+                        .and_then(|receiver| receiver.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|type_name| {
+                            type_name.split_whitespace().next_back() == Some("process")
+                        })
+                {
+                    return self.lower_expression(operand);
+                }
                 if string_field(operand, "kind").as_deref() == Some("Streaming") {
                     let target_type = string_field(value, "type").unwrap_or_default();
                     let target_width = simple_type_width(&target_type).ok_or_else(|| {

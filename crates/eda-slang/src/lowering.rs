@@ -306,11 +306,19 @@ pub(crate) fn lower_root(root: &serde_json::Value) -> Result<Design, String> {
     SlangAstLowerer::lower(root, None)
 }
 
-pub(crate) fn lower_root_with_unit_ir_cache(
+pub(crate) fn lower_root_with_recursive_depth(
+    root: &serde_json::Value,
+    recursive_property_depth: usize,
+) -> Result<Design, String> {
+    SlangAstLowerer::lower_with_recursive_depth(root, None, recursive_property_depth)
+}
+
+pub(crate) fn lower_root_with_unit_ir_cache_and_recursive_depth(
     root: &serde_json::Value,
     cache: std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>,
+    recursive_property_depth: usize,
 ) -> Result<Design, String> {
-    SlangAstLowerer::lower_with_unit_ir_cache(root, cache)
+    SlangAstLowerer::lower_with_recursive_depth(root, Some(cache), recursive_property_depth)
 }
 
 fn collect_class_types(value: &serde_json::Value, classes: &mut Vec<serde_json::Value>) {
@@ -688,6 +696,22 @@ pub(super) struct AstClockingVariable {
     pub(super) symbol: AstLoweredSymbol,
 }
 
+pub(super) struct AstManualCovergroupBin {
+    pub(super) name: String,
+    pub(super) values: Vec<LogicWord>,
+}
+
+pub(super) struct AstManualCoverpoint {
+    pub(super) sample_name: String,
+    pub(super) bins: Vec<AstManualCovergroupBin>,
+}
+
+pub(super) struct AstManualCovergroup {
+    pub(super) name: String,
+    pub(super) sample_names: Vec<String>,
+    pub(super) coverpoints: Vec<AstManualCoverpoint>,
+}
+
 pub(super) struct AstInterfaceModportSymbol {
     pub(super) direction: eda_core::ir::Dir,
     pub(super) symbol: AstLoweredSymbol,
@@ -744,12 +768,16 @@ pub(super) struct SlangAstLowerer {
     local_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     external_symbols: std::collections::BTreeMap<String, AstLoweredSymbol>,
     external_symbol_directions: std::collections::BTreeMap<String, eda_core::ir::Dir>,
-    local_initializers: std::collections::BTreeMap<String, serde_json::Value>,
+    local_initializers: std::collections::BTreeMap<String, Option<serde_json::Value>>,
     local_blocks: std::collections::BTreeMap<String, Vec<String>>,
+    local_static_symbols: std::collections::BTreeSet<String>,
+    unbounded_parameters: std::collections::BTreeSet<String>,
     constants: std::collections::BTreeMap<String, LogicWord>,
     subroutines: std::collections::BTreeMap<String, serde_json::Value>,
     type_aliases: std::collections::BTreeMap<String, AstStructType>,
+    type_alias_type_names: std::collections::BTreeMap<String, String>,
     package_type_aliases: std::collections::BTreeMap<String, AstStructType>,
+    package_type_alias_type_names: std::collections::BTreeMap<String, String>,
     type_enums: std::collections::BTreeMap<String, AstEnumType>,
     ambiguous_type_aliases: std::collections::BTreeSet<String>,
     ambiguous_type_enums: std::collections::BTreeSet<String>,
@@ -823,11 +851,19 @@ pub(super) struct SlangAstLowerer {
     time_scale: AstTimeScale,
     global_time_precision: i8,
     active_named_blocks: std::cell::RefCell<Vec<String>>,
+    active_assertion_scopes: std::cell::RefCell<Vec<String>>,
+    known_assertion_scopes: std::collections::BTreeSet<String>,
+    manual_covergroups: std::collections::BTreeMap<String, AstManualCovergroup>,
+    covergroup_instances: std::collections::BTreeMap<String, String>,
+    constructed_covergroups: std::cell::RefCell<std::collections::BTreeSet<String>>,
     generate_path: Vec<String>,
     scope_path: String,
     library_scopes: std::collections::BTreeMap<String, String>,
     format_library_scope: String,
     inline_stack: std::cell::RefCell<Vec<String>>,
+    past_sampling_allowed: bool,
+    past_sampling_event: Option<eda_core::ir::Sens>,
+    recursive_property_depth: usize,
 }
 
 impl SlangAstLowerer {
@@ -1033,6 +1069,17 @@ impl SlangAstLowerer {
         root: &serde_json::Value,
         unit_ir_cache: Option<std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>>,
     ) -> Result<Design, String> {
+        Self::lower_with_recursive_depth(root, unit_ir_cache, 2)
+    }
+
+    pub(super) fn lower_with_recursive_depth(
+        root: &serde_json::Value,
+        unit_ir_cache: Option<std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>>,
+        recursive_property_depth: usize,
+    ) -> Result<Design, String> {
+        if recursive_property_depth > 16 {
+            return Err("recursive property depth must stay within 0..=16".into());
+        }
         let body = root
             .get("body")
             .ok_or_else(|| "slang AST Instance has no body".to_string())?;
@@ -1067,10 +1114,14 @@ impl SlangAstLowerer {
             external_symbol_directions: std::collections::BTreeMap::new(),
             local_initializers: std::collections::BTreeMap::new(),
             local_blocks: std::collections::BTreeMap::new(),
+            local_static_symbols: std::collections::BTreeSet::new(),
+            unbounded_parameters: std::collections::BTreeSet::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: std::collections::BTreeMap::new(),
+            type_alias_type_names: std::collections::BTreeMap::new(),
             package_type_aliases: std::collections::BTreeMap::new(),
+            package_type_alias_type_names: std::collections::BTreeMap::new(),
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
@@ -1144,11 +1195,19 @@ impl SlangAstLowerer {
                 .and_then(|value| i8::try_from(value).ok())
                 .unwrap_or(-9),
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
+            active_assertion_scopes: std::cell::RefCell::new(Vec::new()),
+            known_assertion_scopes: std::collections::BTreeSet::new(),
+            manual_covergroups: std::collections::BTreeMap::new(),
+            covergroup_instances: std::collections::BTreeMap::new(),
+            constructed_covergroups: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             generate_path: Vec::new(),
             scope_path: top_name.clone(),
             library_scopes,
             format_library_scope,
             inline_stack: std::cell::RefCell::new(Vec::new()),
+            past_sampling_allowed: false,
+            past_sampling_event: None,
+            recursive_property_depth,
         };
         let root_hierarchy_index = lowerer.design.hierarchy.len();
         lowerer
@@ -1184,13 +1243,6 @@ impl SlangAstLowerer {
         Ok(lowerer.design)
     }
 
-    pub(super) fn lower_with_unit_ir_cache(
-        root: &serde_json::Value,
-        cache: std::sync::Arc<std::sync::Mutex<crate::SlangUnitIrCache>>,
-    ) -> Result<Design, String> {
-        Self::lower(root, Some(cache))
-    }
-
     fn lower_body(&mut self, body: &serde_json::Value) -> Result<(), String> {
         if string_field(body, "kind").as_deref() != Some("InstanceBody") {
             return Err("slang AST Instance body has unexpected kind".into());
@@ -1210,9 +1262,14 @@ impl SlangAstLowerer {
         loop {
             let type_alias_count = self.type_aliases.len();
             for member in members {
-                if string_field(member, "kind").as_deref() == Some("TypeAlias") {
-                    self.collect_type_alias(member)
-                        .map_err(|error| with_source_span(member, error))?;
+                match string_field(member, "kind").as_deref() {
+                    Some("TypeAlias") => self
+                        .collect_type_alias(member)
+                        .map_err(|error| with_source_span(member, error))?,
+                    Some("TypeParameter") => self
+                        .collect_type_parameter(member)
+                        .map_err(|error| with_source_span(member, error))?,
+                    _ => {}
                 }
             }
             if self.type_aliases.len() == type_alias_count {
@@ -1229,6 +1286,9 @@ impl SlangAstLowerer {
                     .map_err(|error| with_source_span(member, error))?,
                 Some("StatementBlock") => self
                     .collect_procedure_locals(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                Some("CovergroupType") => self
+                    .collect_manual_covergroup(member)
                     .map_err(|error| with_source_span(member, error))?,
                 _ => {}
             }
@@ -1252,6 +1312,19 @@ impl SlangAstLowerer {
                 "ProceduralBlock" => self
                     .lower_procedural_block(member)
                     .map_err(|error| with_source_span(member, error))?,
+                "ConcurrentAssertion" => self
+                    .lower_concurrent_assertion(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                "CovergroupType" => self
+                    .lower_covergroup(member)
+                    .map_err(|error| with_source_span(member, error))?,
+                // slang inlines safe assertion instances into their use sites;
+                // the declaration itself has no independent runtime behavior.
+                "Sequence" | "Property" => {}
+                "Checker" => {}
+                "CheckerInstance" => self
+                    .lower_checker_instance(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 "Instance" => self
                     .lower_instance(member)
                     .map_err(|error| with_source_span(member, error))?,
@@ -1260,6 +1333,11 @@ impl SlangAstLowerer {
                     .map_err(|error| with_source_span(member, error))?,
                 "Subroutine" => {}
                 "ClassType" => {}
+                "TypeParameter" => {}
+                // slang resolves defparam targets during elaboration and emits
+                // the specialized child body/value; the residual member is not
+                // a runtime statement.
+                "DefParam" => {}
                 "TypeAlias" => {}
                 "ForwardingTypedef" => {}
                 "EnumType" => {}

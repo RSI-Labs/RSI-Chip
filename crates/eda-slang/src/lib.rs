@@ -26,6 +26,7 @@ pub const SUPPORTED_SLANG_AST_SCHEMA: &str = lowering::SUPPORTED_SLANG_AST_SCHEM
 use lowering::{
     annotate_interface_array_port_connections, interface_array_port_member_count,
     interface_array_port_plan_has_members, interface_array_port_scope_paths, lower_root,
+    lower_root_with_recursive_depth, lower_root_with_unit_ir_cache_and_recursive_depth,
     parse_ast_root, plan_interface_array_port_scopes,
 };
 pub use summary::{
@@ -343,7 +344,7 @@ impl PreprocessOptions {
 /// Paths are interpreted relative to the manifest file. Unknown fields,
 /// heterogeneous arrays, empty paths, and extensions without a leading dot are
 /// rejected rather than silently ignored.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlangProjectManifest {
     pub top: Option<String>,
     pub sources: Vec<PathBuf>,
@@ -352,6 +353,22 @@ pub struct SlangProjectManifest {
     pub undefines: Vec<String>,
     pub library_directories: Vec<PathBuf>,
     pub library_extensions: Vec<String>,
+    pub recursive_property_depth: usize,
+}
+
+impl Default for SlangProjectManifest {
+    fn default() -> Self {
+        Self {
+            top: None,
+            sources: Vec::new(),
+            include_directories: Vec::new(),
+            defines: Vec::new(),
+            undefines: Vec::new(),
+            library_directories: Vec::new(),
+            library_extensions: Vec::new(),
+            recursive_property_depth: 2,
+        }
+    }
 }
 
 impl SlangProjectManifest {
@@ -396,6 +413,17 @@ impl SlangProjectManifest {
                 "library_extensions" => {
                     manifest.library_extensions =
                         parse_string_array(value, "library_extensions", true)?
+                }
+                "recursive_property_depth" => {
+                    let depth = value
+                        .as_u64()
+                        .ok_or("recursive_property_depth must be a nonnegative integer")?;
+                    let depth = usize::try_from(depth)
+                        .map_err(|_| "recursive_property_depth is too large".to_string())?;
+                    if depth > 16 {
+                        return Err("recursive_property_depth must stay within 0..=16".into());
+                    }
+                    manifest.recursive_property_depth = depth;
                 }
                 other => return Err(format!("unknown project manifest field '{other}'")),
             }
@@ -512,6 +540,7 @@ struct SlangProjectCacheRecord {
     undefines: Vec<String>,
     library_directories: Vec<PathBuf>,
     library_extensions: Vec<String>,
+    recursive_property_depth: usize,
     roots: Vec<SlangProjectFileRecord>,
     dependencies: Vec<SlangProjectFileRecord>,
     compilation_units: Vec<SlangCompilationUnitRecord>,
@@ -520,10 +549,10 @@ struct SlangProjectCacheRecord {
     ast_sha256: String,
 }
 
-const SLANG_PROJECT_CACHE_SCHEMA: u32 = 8;
+const SLANG_PROJECT_CACHE_SCHEMA: u32 = 113;
 const SLANG_PROJECT_DATABASE_SCHEMA: u32 = 1;
-const SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA: u32 = 32;
-const SLANG_LEAF_IR_ARTIFACT_SCHEMA: u32 = 32;
+const SLANG_COMPOSITE_IR_ARTIFACT_SCHEMA: u32 = 107;
+const SLANG_LEAF_IR_ARTIFACT_SCHEMA: u32 = 107;
 
 fn parse_path_array(
     value: &serde_json::Value,
@@ -877,6 +906,7 @@ fn project_cache_record_json(record: &SlangProjectCacheRecord) -> String {
         "undefines": record.undefines,
         "library_directories": record.library_directories,
         "library_extensions": record.library_extensions,
+        "recursive_property_depth": record.recursive_property_depth,
         "roots": record.roots.iter().map(|file| serde_json::json!({
             "path": file.path,
             "sha256": file.sha256,
@@ -1032,6 +1062,8 @@ fn parse_project_cache_record(value: &serde_json::Value) -> Option<SlangProjectC
         undefines: json_string_array_value(value, "undefines")?,
         library_directories: json_path_array(value, "library_directories")?,
         library_extensions: json_string_array_value(value, "library_extensions")?,
+        recursive_property_depth: usize::try_from(value.get("recursive_property_depth")?.as_u64()?)
+            .ok()?,
         roots: json_file_records(value, "roots")?,
         dependencies: json_file_records(value, "dependencies")?,
         compilation_units: json_compilation_units(value, "compilation_units")?,
@@ -1062,6 +1094,7 @@ fn project_cache_record_matches(
         && record.undefines == manifest.undefines
         && record.library_directories == canonical_paths(&manifest.library_directories)
         && record.library_extensions == manifest.library_extensions
+        && record.recursive_property_depth == manifest.recursive_property_depth
         && record.roots == roots
         && record.library_inventory == library_inventory
         && record.dependencies.iter().all(|dependency| {
@@ -1176,8 +1209,14 @@ fn project_unit_artifacts_are_valid(directory: &Path, record: &SlangProjectCache
     }) && record.unit_artifacts.len() == record.compilation_units.len()
 }
 
-fn unit_ir_cache_key(program: &str, semantic: &str) -> String {
-    sha256_hex(format!("{program}\0{SLANG_LANGUAGE_STANDARD}\0{semantic}").as_bytes())
+fn unit_ir_cache_key(program: &str, semantic: &str, recursive_depth: usize) -> String {
+    sha256_hex(
+        format!(
+            "{program}\0{SLANG_LANGUAGE_STANDARD}\0{semantic}\
+             \0recursive-depth-{recursive_depth}"
+        )
+        .as_bytes(),
+    )
 }
 
 fn save_composite_ir_artifact(path: &Path, cache_key: &str, design: &Design) -> Result<(), String> {
@@ -1310,6 +1349,7 @@ fn cacheable_child_ir_keys(
     program: &str,
     artifacts: &[serde_json::Value],
     root_name: &str,
+    recursive_depth: usize,
 ) -> Result<BTreeSet<String>, String> {
     let mut keys = BTreeSet::new();
     for artifact in artifacts {
@@ -1320,7 +1360,9 @@ fn cacheable_child_ir_keys(
         if name == root_name {
             continue;
         }
-        if let Some(key) = unit_artifact_ir_key(name, artifact, artifacts, program)? {
+        if let Some(key) =
+            unit_artifact_ir_key(name, artifact, artifacts, program, recursive_depth)?
+        {
             keys.insert(key);
         }
     }
@@ -1332,15 +1374,16 @@ fn unit_artifact_ir_key(
     artifact: &serde_json::Value,
     artifacts: &[serde_json::Value],
     program: &str,
+    recursive_depth: usize,
 ) -> Result<Option<String>, String> {
     if unit_artifact_is_standalone_leaf(artifact) {
         let semantic = artifact
             .get("semantic_sha256")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("unit artifact '{name}' has no semantic fingerprint"))?;
-        Ok(Some(unit_ir_cache_key(program, semantic)))
+        Ok(Some(unit_ir_cache_key(program, semantic, recursive_depth)))
     } else if unit_artifact_is_cacheable_composite(artifact) {
-        unit_closure_ir_cache_key(name, artifacts, program).map(Some)
+        unit_closure_ir_cache_key(name, artifacts, program, recursive_depth).map(Some)
     } else {
         Ok(None)
     }
@@ -1371,7 +1414,12 @@ fn composite_unit_ir_cache_key(
     program: &str,
 ) -> Result<String, String> {
     let root_name = project_root_unit_name(record, artifacts)?;
-    unit_closure_ir_cache_key(&root_name, artifacts, program)
+    unit_closure_ir_cache_key(
+        &root_name,
+        artifacts,
+        program,
+        record.recursive_property_depth,
+    )
 }
 
 fn project_root_unit_name(
@@ -1491,6 +1539,7 @@ fn unit_closure_ir_cache_key(
     root_name: &str,
     artifacts: &[serde_json::Value],
     program: &str,
+    recursive_depth: usize,
 ) -> Result<String, String> {
     let semantics = artifact_semantics(artifacts)?;
     let dependencies = artifact_dependencies(artifacts)?;
@@ -1502,7 +1551,10 @@ fn unit_closure_ir_cache_key(
 
     let mut closure = BTreeSet::new();
     visit_unit_dependencies(root_name, &dependencies, &mut closure, &mut Vec::new())?;
-    let mut identity = format!("composite-unit-ir-v1\0{program}\0{root_name}");
+    let mut identity = format!(
+        "composite-unit-ir-v1\0{program}\0{root_name}\
+         \0recursive-depth-{recursive_depth}"
+    );
     for unit in closure {
         let semantic = semantics
             .get(&unit)
@@ -1564,9 +1616,13 @@ fn reconstruct_ast_from_unit_artifacts(
             let semantic = artifact
                 .get("semantic_sha256")
                 .and_then(serde_json::Value::as_str)?;
-            Some(unit_ir_cache_key(program, semantic))
+            Some(unit_ir_cache_key(
+                program,
+                semantic,
+                record.recursive_property_depth,
+            ))
         } else if unit_artifact_is_cacheable_composite(artifact) {
-            unit_closure_ir_cache_key(&name, artifacts, program)
+            unit_closure_ir_cache_key(&name, artifacts, program, record.recursive_property_depth)
                 .ok()
                 .map(Some)?
         } else {
@@ -1957,7 +2013,19 @@ impl SlangFrontend {
 
     /// Used by tests so machines without slang can still run the workspace.
     pub fn discover_optional() -> Option<Self> {
-        Self::discover().ok()
+        match Self::discover() {
+            Ok(frontend) => Some(frontend),
+            Err(error) => {
+                if std::env::var_os("EDA_REQUIRE_EXTERNAL_ORACLES")
+                    .is_some_and(|value| value != "0")
+                {
+                    panic!(
+                        "EDA_REQUIRE_EXTERNAL_ORACLES is set, but slang is unavailable: {error}"
+                    );
+                }
+                None
+            }
+        }
     }
 
     pub fn program(&self) -> &Path {
@@ -2418,8 +2486,32 @@ impl SlangFrontend {
         let manifest = SlangProjectManifest::parse_file(manifest_path)?;
         let options = manifest.preprocess_options();
         let Some(cache_directory) = cache_directory else {
+            let json = self
+                .ast_json_with_options(&manifest.sources, manifest.top.as_deref(), &[], &options)
+                .map_err(|error| error.to_string())?;
+            let root = parse_ast_root(&json)?;
+            let interface_plan = plan_interface_array_port_scopes(&root)?;
+            if interface_array_port_plan_has_members(&interface_plan) {
+                if manifest.recursive_property_depth != 2 {
+                    return Err(
+                        "configurable recursive-property depth does not support interface-array scopes"
+                            .into(),
+                    );
+                }
+                let design = self.lower_ast_json_with_interface_array_scopes(
+                    &json,
+                    &manifest.sources,
+                    manifest.top.as_deref(),
+                    &options,
+                )?;
+                return Ok(SlangCachedDesign {
+                    design,
+                    cache_hit: false,
+                    rebuilt_units: Vec::new(),
+                });
+            }
             let design =
-                self.compile_files(&manifest.sources, manifest.top.as_deref(), &options)?;
+                self.lower_ast_json_with_recursive_depth(&json, manifest.recursive_property_depth)?;
             return Ok(SlangCachedDesign {
                 design,
                 cache_hit: false,
@@ -2453,7 +2545,10 @@ impl SlangFrontend {
                             == Some(&record.compilation_units)
                             && project_unit_artifacts_are_valid(cache_directory, &record)
                         {
-                            if let Ok(design) = self.lower_ast_json(&ast) {
+                            if let Ok(design) = self.lower_ast_json_with_recursive_depth(
+                                &ast,
+                                manifest.recursive_property_depth,
+                            ) {
                                 return Ok(SlangCachedDesign {
                                     design,
                                     cache_hit: true,
@@ -2478,6 +2573,12 @@ impl SlangFrontend {
         let root = parse_ast_root(&ast)?;
         let interface_plan = plan_interface_array_port_scopes(&root)?;
         if interface_array_port_plan_has_members(&interface_plan) {
+            if manifest.recursive_property_depth != 2 {
+                return Err(
+                    "configurable recursive-property depth does not support interface-array scopes"
+                        .into(),
+                );
+            }
             let design = self.lower_ast_json_with_interface_array_scopes(
                 &ast,
                 &manifest.sources,
@@ -2491,7 +2592,8 @@ impl SlangFrontend {
             });
         }
 
-        let design = self.lower_ast_json(&ast)?;
+        let design =
+            self.lower_ast_json_with_recursive_depth(&ast, manifest.recursive_property_depth)?;
         let rebuilt_units;
         {
             let root_paths = manifest
@@ -2550,6 +2652,7 @@ impl SlangFrontend {
                 undefines: manifest.undefines.clone(),
                 library_directories: canonical_paths(&manifest.library_directories),
                 library_extensions: manifest.library_extensions.clone(),
+                recursive_property_depth: manifest.recursive_property_depth,
                 roots,
                 dependencies,
                 compilation_units,
@@ -2664,7 +2767,14 @@ impl SlangFrontend {
             if name == root_name {
                 continue;
             }
-            let Some(key) = unit_artifact_ir_key(name, artifact, &artifacts, &program)? else {
+            let Some(key) = unit_artifact_ir_key(
+                name,
+                artifact,
+                &artifacts,
+                &program,
+                record.recursive_property_depth,
+            )?
+            else {
                 continue;
             };
             if preload_cache.entries.contains_key(&key) {
@@ -2685,7 +2795,12 @@ impl SlangFrontend {
             .unit_ir_persistence_lock
             .lock()
             .map_err(|_| "slang unit IR persistence lock is poisoned".to_string())?;
-        let persistence_keys = cacheable_child_ir_keys(&program, &artifacts, &root_name)?;
+        let persistence_keys = cacheable_child_ir_keys(
+            &program,
+            &artifacts,
+            &root_name,
+            record.recursive_property_depth,
+        )?;
         let lower_result = (|| {
             let mut cache = self
                 .unit_ir_cache
@@ -2697,9 +2812,10 @@ impl SlangFrontend {
             let ast = reconstruct_ast_from_unit_artifacts(&record, &artifacts, &program)
                 .ok_or_else(|| "cannot reconstruct AST from project unit artifacts".to_string())?;
             let root = parse_ast_root(&ast)?;
-            let design = Arc::new(lowering::lower_root_with_unit_ir_cache(
+            let design = Arc::new(lower_root_with_unit_ir_cache_and_recursive_depth(
                 &root,
                 self.unit_ir_cache.clone(),
+                record.recursive_property_depth,
             )?);
             let mut cache = self
                 .unit_ir_cache
@@ -2741,7 +2857,7 @@ impl SlangFrontend {
         cache_directory: &Path,
         unit_name: &str,
     ) -> Result<SlangCachedUnitDesign, String> {
-        let (_record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
+        let (record, artifacts) = self.validated_project_unit_artifacts(cache_directory)?;
         let artifact = artifacts
             .iter()
             .find(|artifact| {
@@ -2773,7 +2889,7 @@ impl SlangFrontend {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("unit artifact '{unit_name}' has no semantic fingerprint"))?;
         let program = self.program.to_string_lossy().into_owned();
-        let cache_key = unit_ir_cache_key(&program, semantic);
+        let cache_key = unit_ir_cache_key(&program, semantic, record.recursive_property_depth);
         if let Ok(mut cache) = self.unit_ir_cache.lock() {
             if let Some(design) = cache.get(&cache_key) {
                 return Ok(SlangCachedUnitDesign {
@@ -2807,7 +2923,8 @@ impl SlangFrontend {
             "connections": [],
         })
         .to_string();
-        let mut partial_design = self.lower_ast_json(&ast)?;
+        let mut partial_design =
+            self.lower_ast_json_with_recursive_depth(&ast, record.recursive_property_depth)?;
         // Standalone root metadata belongs to the composite relink context;
         // cached child fragments contain only their own declarations and body.
         partial_design.hierarchy.clear();
@@ -2892,10 +3009,52 @@ impl SlangFrontend {
         self.lower_ast_json_with_interface_array_scopes(&json, files, top, options)
     }
 
+    /// Compiles through the direct AST path with a configurable bounded depth
+    /// for supported self-recursive tail properties.
+    ///
+    /// The depth changes only direct lowering; slang's cached AST bytes remain
+    /// valid. Interface-array projects requiring additional AST scopes are not
+    /// supported by this explicit-depth entry point and fail closed.
+    pub fn compile_files_via_ast_with_recursive_depth(
+        &self,
+        files: &[PathBuf],
+        top: Option<&str>,
+        options: &PreprocessOptions,
+        recursive_property_depth: usize,
+    ) -> Result<Design, String> {
+        let json = self
+            .ast_json_with_options(files, top, &[], options)
+            .map_err(|error| error.to_string())?;
+        let root = parse_ast_root(&json)?;
+        let interface_plan = plan_interface_array_port_scopes(&root)?;
+        if interface_array_port_plan_has_members(&interface_plan) {
+            return Err(
+                "configurable recursive-property depth does not support interface-array scopes"
+                    .into(),
+            );
+        }
+        self.lower_ast_json_with_recursive_depth(&json, recursive_property_depth)
+    }
+
     /// Directly lowers the current simple-module AST subset into `Design`.
     pub fn lower_ast_json(&self, json: &str) -> Result<Design, String> {
         let root = parse_ast_root(json)?;
         let mut design = lower_root(&root)?;
+        design.infer_memory_kinds();
+        let authoritative = SlangAstSummary::parse(&root.to_string())?;
+        authoritative.validate_against_design(&design)?;
+        Ok(design)
+    }
+
+    /// Directly lowers an AST with an explicit bounded self-recursive-tail
+    /// property depth in `0..=16`.
+    pub fn lower_ast_json_with_recursive_depth(
+        &self,
+        json: &str,
+        recursive_property_depth: usize,
+    ) -> Result<Design, String> {
+        let root = parse_ast_root(json)?;
+        let mut design = lower_root_with_recursive_depth(&root, recursive_property_depth)?;
         design.infer_memory_kinds();
         let authoritative = SlangAstSummary::parse(&root.to_string())?;
         authoritative.validate_against_design(&design)?;
@@ -3535,9 +3694,14 @@ fn annotate_unsigned_integer_type_addresses(
     json: &str,
     files: &[PathBuf],
 ) -> Result<String, SlangFailure> {
-    let mut document = serde_json::from_str::<serde_json::Value>(json).map_err(|error| {
+    let mut documents = parse_concatenated_json_objects(json).map_err(|error| {
         unsigned_annotation_failure(format!("invalid detailed AST JSON: {error}"))
     })?;
+    if documents.is_empty() {
+        return Err(unsigned_annotation_failure(
+            "detailed AST JSON contained no objects".into(),
+        ));
+    }
     let mut source_lines = BTreeMap::new();
     for path in files {
         let contents = std::fs::read_to_string(path).map_err(|error| {
@@ -3548,21 +3712,32 @@ fn annotate_unsigned_integer_type_addresses(
         })?;
         source_lines.insert(canonical_path(path), contents);
     }
-    let mut unsigned_addresses = BTreeSet::new();
     let mut port_internal_symbols = BTreeSet::new();
-    collect_port_internal_symbols(&document, &mut port_internal_symbols);
-    collect_unsigned_integer_addresses(
-        &document,
-        &mut source_lines,
-        &mut unsigned_addresses,
-        &port_internal_symbols,
-    )
-    .map_err(unsigned_annotation_failure)?;
-    if unsigned_addresses.is_empty() {
-        return Ok(document.to_string());
+    for document in &documents {
+        collect_port_internal_symbols(document, &mut port_internal_symbols);
     }
-    insert_unsigned_type_markers(&mut document, &unsigned_addresses);
-    Ok(document.to_string())
+    for document in &mut documents {
+        let mut document_addresses = BTreeSet::new();
+        collect_unsigned_integer_addresses(
+            document,
+            &mut source_lines,
+            &mut document_addresses,
+            &port_internal_symbols,
+        )
+        .map_err(unsigned_annotation_failure)?;
+        if document_addresses.is_empty() {
+            continue;
+        }
+        insert_unsigned_type_markers(document, &document_addresses);
+    }
+    Ok(documents
+        .iter()
+        .map(serde_json::to_string_pretty)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            unsigned_annotation_failure(format!("cannot serialize detailed AST JSON: {error}"))
+        })?
+        .join(""))
 }
 
 fn collect_unsigned_integer_addresses(

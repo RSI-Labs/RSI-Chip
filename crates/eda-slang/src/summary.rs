@@ -5,11 +5,11 @@ use super::ast_util::{
     instance_parameters, integer_literal_word, literal_word, normalize_detailed_types,
     normalize_instance_bodies, parameter_summary, source_span, string_field,
 };
-use crate::types::{simple_type_signed, simple_type_width};
+use crate::types::{simple_type_shape, simple_type_signed, simple_type_width};
 use eda_core::ir::Design;
 use expressions::{
-    collect_generate_summary, collect_kinds, empty_expression_summary, expression_summary,
-    procedural_assignments, ClassHandleTypes,
+    annotate_typename_alias_canonical_names, collect_generate_summary, collect_kinds,
+    empty_expression_summary, expression_summary, procedural_assignments, ClassHandleTypes,
 };
 
 mod classes;
@@ -1485,6 +1485,39 @@ fn collect_simple_type_alias_widths(aliases: &[Value], widths: &mut SimpleTypeAl
     }
 }
 
+fn collect_simple_type_alias_names(
+    aliases: &[Value],
+    names: &mut std::collections::BTreeMap<String, String>,
+) {
+    for alias in aliases {
+        let Some(name) = string_field(alias, "name").filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let Some(target) = alias.get("target") else {
+            continue;
+        };
+        let canonical_name = if let Some(target_name) = target.as_str() {
+            target_name.to_string()
+        } else {
+            let Some(canonical_name) = canonical_detailed_type(target) else {
+                continue;
+            };
+            canonical_name
+        };
+        if simple_type_shape(&canonical_name).is_none() {
+            continue;
+        }
+        names
+            .entry(name.clone())
+            .or_insert_with(|| canonical_name.clone());
+        if let Some(unqualified_name) = name.rsplit(['.', ':']).next() {
+            names
+                .entry(unqualified_name.to_string())
+                .or_insert_with(|| canonical_name.clone());
+        }
+    }
+}
+
 fn lookup_simple_type_alias_width(
     type_name: &str,
     widths: &SimpleTypeAliasWidths,
@@ -1841,6 +1874,11 @@ fn annotate_packed_member_shapes(
         expression.type_signed.get_or_insert(
             crate::types::simple_type_signed(&expression.type_name).unwrap_or(false),
         );
+    }
+    if expression.kind == "DataType" {
+        if let Some(layout) = lookup_type_layout(&expression.type_name, type_layouts) {
+            expression.type_width = Some(layout.element_width);
+        }
     }
     if expression.kind == "MemberAccess" {
         let selected = expression.operands.first_mut()?;
@@ -2469,6 +2507,8 @@ impl SlangAstSummary {
         collect_type_alias_members(root_ref, &mut type_alias_members);
         let mut simple_type_alias_widths = SimpleTypeAliasWidths::default();
         collect_simple_type_alias_widths(&type_alias_members, &mut simple_type_alias_widths);
+        let mut simple_type_alias_names = std::collections::BTreeMap::new();
+        collect_simple_type_alias_names(&type_alias_members, &mut simple_type_alias_names);
         loop {
             let mut changed = false;
             for member in &type_alias_members {
@@ -2680,6 +2720,7 @@ impl SlangAstSummary {
         collect_instance_member_paths(root, root, &mut interface_members);
         for target in &mut continuous_targets {
             annotate_simple_type_alias_widths(&mut target.rhs, &simple_type_alias_widths);
+            annotate_typename_alias_canonical_names(&mut target.rhs, &simple_type_alias_names);
             annotate_simulation_time_units(
                 &mut target.rhs,
                 time_unit_exponent,
@@ -2694,6 +2735,10 @@ impl SlangAstSummary {
         for block in &mut procedural_blocks {
             for assignment in &mut block.assignments {
                 annotate_simple_type_alias_widths(&mut assignment.rhs, &simple_type_alias_widths);
+                annotate_typename_alias_canonical_names(
+                    &mut assignment.rhs,
+                    &simple_type_alias_names,
+                );
                 annotate_simulation_time_units(
                     &mut assignment.rhs,
                     time_unit_exponent,

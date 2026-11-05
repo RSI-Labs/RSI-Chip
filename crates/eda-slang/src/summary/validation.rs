@@ -1,8 +1,9 @@
 //! Compare authoritative slang summaries against the repository IR.
 
 use super::expressions::{
-    contains_expected_shapes, design_expr_fingerprint, design_lvalue_name, design_stmt_assignments,
-    slang_expression_fingerprint_with_parameters, summary_literal_i64, ExpressionFingerprintMode,
+    contains_expected_shapes, contains_malformed_expression_arity, design_expr_fingerprint,
+    design_lvalue_name, design_stmt_assignments, slang_expression_fingerprint_with_parameters,
+    summary_literal_i64, ExpressionFingerprintMode,
 };
 use super::*;
 use crate::types::{memory_type, simple_type_shape};
@@ -215,6 +216,12 @@ impl SlangAstSummary {
                 &self.parameters,
                 fingerprint_mode,
             ) else {
+                if contains_malformed_expression_arity(&target.rhs) {
+                    return Err(format!(
+                        "bounded elaborator continuous assignment shape for '{}' does not match slang",
+                        target.name
+                    ) + &self.span_note(&format!("continuous:{}:", target.name)));
+                }
                 return Err(format!(
                     "unsupported continuous expression for '{}': slang expression kind '{}' has no exact fingerprint",
                     target.name, target.rhs.kind
@@ -311,6 +318,9 @@ impl SlangAstSummary {
             .collect();
         for block in &self.procedural_blocks {
             for assignment in &block.assignments {
+                if assignment.rhs.kind == "NewCovergroup" {
+                    continue;
+                }
                 for target in &assignment.target_names {
                     if declaration_names.contains(target) {
                         if !assignment.class_handle_dynamic_targets.is_empty() {

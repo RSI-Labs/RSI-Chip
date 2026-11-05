@@ -1195,6 +1195,7 @@ mod tests {
         Design {
             name: "m".into(),
             recorded_type_mismatches: Vec::new(),
+            assertion_attempts: Vec::new(),
             time_scale: Default::default(),
             memory_ports: Vec::new(),
             array_ports: Vec::new(),

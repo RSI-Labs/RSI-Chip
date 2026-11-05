@@ -342,6 +342,64 @@ pub(super) fn constant_json_word(value: &serde_json::Value) -> Option<eda_core::
     literal_word(&type_name, &raw)
 }
 
+pub(super) fn constant_system_real(value: &serde_json::Value) -> Option<f64> {
+    const ONE_ARGUMENT: &[&str] = &["$ln", "$log10", "$exp", "$sqrt", "$ceil", "$floor"];
+    const TWO_ARGUMENTS: &[&str] = &["$pow", "$hypot", "$atan2"];
+    if string_field(value, "kind").as_deref() != Some("Call") {
+        return None;
+    }
+    let subroutine = string_field(value, "subroutine")?;
+    let name = subroutine.split_whitespace().next_back()?;
+    let arguments = value.get("arguments").and_then(Value::as_array)?;
+    let expected_count = if ONE_ARGUMENT.contains(&name) {
+        1
+    } else if TWO_ARGUMENTS.contains(&name) {
+        2
+    } else {
+        return None;
+    };
+    if arguments.len() != expected_count {
+        return None;
+    }
+
+    fn operand(value: &serde_json::Value) -> Option<f64> {
+        let value = unwrap_conversion(value);
+        match string_field(value, "kind").as_deref() {
+            Some("RealLiteral") => value.get("value").and_then(Value::as_f64),
+            Some("IntegerLiteral") => {
+                let word = integer_literal_word(value)?;
+                let raw = word.to_u64()?;
+                if string_field(value, "type")
+                    .as_deref()
+                    .is_some_and(|name| name.split_whitespace().any(|token| token == "signed"))
+                {
+                    return Some(raw as i64 as f64);
+                }
+                Some(raw as f64)
+            }
+            Some("UnaryOp") if string_field(value, "op").as_deref() == Some("Minus") => {
+                Some(-operand(value.get("operand")?)?)
+            }
+            _ => None,
+        }
+    }
+
+    let first = operand(arguments.first()?)?;
+    let result = match name {
+        "$ln" => first.ln(),
+        "$log10" => first.log10(),
+        "$exp" => first.exp(),
+        "$sqrt" => first.sqrt(),
+        "$ceil" => first.ceil(),
+        "$floor" => first.floor(),
+        "$pow" => first.powf(operand(arguments.get(1)?)?),
+        "$hypot" => first.hypot(operand(arguments.get(1)?)?),
+        "$atan2" => first.atan2(operand(arguments.get(1)?)?),
+        _ => return None,
+    };
+    result.is_finite().then_some(result)
+}
+
 pub(super) fn slang_constant_u64(value: &serde_json::Value) -> Result<u64, String> {
     integer_literal_word(value)
         .or_else(|| named_constant_word(value))
@@ -363,8 +421,13 @@ pub(super) fn memory_initializer_statements(
         statements: &mut Vec<eda_core::ir::Stmt>,
     ) -> Result<(), String> {
         if indexes.len() == dimensions.len() {
-            let word = constant_json_word(pattern).ok_or_else(|| {
-                "sparse-memory initializer elements must be integer constants".to_string()
+            let literal_pattern = unwrap_conversion(pattern);
+            let word = constant_json_word(literal_pattern).or_else(|| {
+                string_literal(literal_pattern)
+                    .and_then(|literal| crate::types::string_literal_word(&literal))
+            });
+            let word = word.ok_or_else(|| {
+                "sparse-memory initializer elements must be integer or string constants".to_string()
             })?;
             statements.push(eda_core::ir::Stmt::MemoryBl {
                 memory,

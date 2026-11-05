@@ -190,10 +190,16 @@ impl<'a> Synth<'a> {
                 return Err("shortreal arithmetic is not synthesizable".into())
             }
             Expr::ShortRealNeg(_) => return Err("shortreal negation is not synthesizable".into()),
-            Expr::ShortRealToReal(_) | Expr::RealToShortReal(_) => {
+            Expr::ShortRealToReal(_)
+            | Expr::RealToShortReal(_)
+            | Expr::BitsToReal(_)
+            | Expr::BitsToShortReal(_) => {
                 return Err("floating conversions are not synthesizable".into())
             }
             Expr::RealToInt { .. } => {
+                return Err("real-to-integer conversion is not synthesizable".into())
+            }
+            Expr::RealTruncToInt { .. } => {
                 return Err("real-to-integer conversion is not synthesizable".into())
             }
             Expr::IntToReal { .. } => {
@@ -209,6 +215,12 @@ impl<'a> Synth<'a> {
             Expr::Random { .. } => {
                 return Err("random system functions are not synthesizable".into())
             }
+            Expr::CountBits { .. } => {
+                return Err("$countbits/$countones are not synthesizable yet".into())
+            }
+            Expr::IsUnknown(_) => return Err("$isunknown is not synthesizable yet".into()),
+            Expr::OneHot(_) => return Err("$onehot is not synthesizable yet".into()),
+            Expr::OneHot0(_) => return Err("$onehot0 is not synthesizable yet".into()),
             Expr::FileOpen { .. } => return Err("file I/O is not synthesizable".into()),
             Expr::FileOpenDynamic { .. } => return Err("file I/O is not synthesizable".into()),
             Expr::FileGetc { .. } => return Err("file I/O is not synthesizable".into()),
@@ -216,6 +228,14 @@ impl<'a> Synth<'a> {
             Expr::FileEof { .. } => return Err("file I/O is not synthesizable".into()),
             Expr::FileTell { .. } => return Err("file I/O is not synthesizable".into()),
             Expr::FileSeek { .. } => return Err("file I/O is not synthesizable".into()),
+            Expr::ProcessSelf | Expr::ProcessStatus(_) => {
+                return Err("process handles are not synthesizable".into())
+            }
+            Expr::Past { .. } => return Err("$past is not synthesizable".into()),
+            Expr::Sampled(_) => return Err("$sampled is not synthesizable".into()),
+            Expr::SampledValue { .. } => {
+                return Err("sampled-value functions are not synthesizable".into())
+            }
         })
     }
 

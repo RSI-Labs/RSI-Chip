@@ -254,6 +254,10 @@ pub struct MemoryDecl {
     pub associative: bool,
     pub index_width: usize,
     pub index_signed: bool,
+    /// True when initialization came from the declaration rather than a
+    /// procedural `initial` block. Declaration-initialized aggregates retain
+    /// value-array semantics unless another runtime access needs a macro port.
+    pub declaration_initialized: bool,
     pub storage: MemoryStorage,
     /// Inferred storage contract. RAM is the conservative default.
     pub kind: MemoryKind,
@@ -423,11 +427,14 @@ pub enum RandomFunction {
     UrandomRange,
 }
 
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AssertControl {
     On,
     Off,
     Kill,
+    ScopedOn(Vec<String>),
+    ScopedOff(Vec<String>),
+    ScopedKill(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -435,6 +442,34 @@ pub enum ImmediateAssertionKind {
     Assert,
     Assume,
     Cover,
+}
+
+/// Severity level emitted by a SystemVerilog severity system task.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Ord,
+    PartialOrd,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum SimulationSeverity {
+    Info,
+    Warning,
+    Error,
+    Fatal,
+}
+
+/// Deferred immediate assertions postpone condition evaluation and action
+/// execution until the current time slot's observed/re-active or final region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ImmediateAssertionDeferred {
+    None,
+    Observed,
+    Final,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -557,6 +592,18 @@ pub enum Expr {
         width: usize,
         signed: bool,
     },
+    /// Counts value bits matching the selected 0/1/X/Z control set.
+    /// Control bits are, from least to most significant, 0, 1, X, and Z.
+    CountBits {
+        value: Box<Expr>,
+        controls: u8,
+    },
+    /// Returns one when the operand contains any X or Z bit.
+    IsUnknown(Box<Expr>),
+    /// Returns one when exactly one operand bit is one.
+    OneHot(Box<Expr>),
+    /// Returns one when at most one operand bit is one.
+    OneHot0(Box<Expr>),
     /// Opens a literal write/append file at evaluation time and returns a
     /// simulator-owned 32-bit file descriptor. A failed open evaluates to zero.
     /// `append && read` represents a mixed read/write mode: `"r+"` when
@@ -674,6 +721,25 @@ pub enum Expr {
     ShortRealRef {
         net: usize,
     },
+    /// Runtime identity of the currently executing process.
+    ProcessSelf,
+    /// State of the process identified by a runtime handle.
+    ProcessStatus(Box<Expr>),
+    /// Value sampled on prior activations of the enclosing edge-clocked
+    /// process. `ticks == 1` is `$past(value)`.
+    Past {
+        value: Box<Expr>,
+        ticks: u32,
+        gating: Option<Box<Expr>>,
+    },
+    /// One-bit current-versus-previous sample comparison such as `$rose`.
+    SampledValue {
+        op: SampledValueOp,
+        value: Box<Expr>,
+    },
+    /// Value sampled by `$sampled` in the preponed region of the enclosing
+    /// edge-clocked procedure.
+    Sampled(Box<Expr>),
     /// Floating-point arithmetic on real operands. Comparison operators are
     /// intentionally excluded until their one-bit result semantics are modeled.
     RealBinary {
@@ -704,8 +770,21 @@ pub enum Expr {
     ShortRealToReal(Box<Expr>),
     /// Round a binary64 real value to IEEE-754 binary32.
     RealToShortReal(Box<Expr>),
+    /// Reinterpret a 64-bit packed value as the IEEE-754 binary64 `real`
+    /// representation used by `$bitstoreal`.
+    BitsToReal(Box<Expr>),
+    /// Reinterpret a 32-bit packed value as the IEEE-754 binary32
+    /// `shortreal` representation used by `$bitstoshortreal`.
+    BitsToShortReal(Box<Expr>),
     /// Convert a real operand to a packed integer representation.
     RealToInt {
+        value: Box<Expr>,
+        width: usize,
+        signed: bool,
+    },
+    /// `$rtoi` conversion, which truncates toward zero rather than using the
+    /// assignment-context rounding rules of `RealToInt`.
+    RealTruncToInt {
         value: Box<Expr>,
         width: usize,
         signed: bool,
@@ -721,6 +800,16 @@ pub enum Expr {
     RealTime {
         unit_exponent: i8,
     },
+}
+
+/// One-bit comparison between the current and previous samples of an
+/// expression in an edge-clocked procedure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SampledValueOp {
+    Rose,
+    Fell,
+    Stable,
+    Changed,
 }
 
 impl Expr {
@@ -767,6 +856,8 @@ impl Expr {
             Expr::EventTriggered { .. } => 1,
             Expr::SimulationTime { width, .. } => *width,
             Expr::Random { width, .. } => *width,
+            Expr::CountBits { .. } => 32,
+            Expr::IsUnknown(_) | Expr::OneHot(_) | Expr::OneHot0(_) => 1,
             Expr::FileOpen { .. } => 32,
             Expr::FileOpenDynamic { .. } => 32,
             Expr::FileGetc { .. } => 32,
@@ -785,6 +876,11 @@ impl Expr {
             Expr::RealConst(_) => 64,
             Expr::RealRef { decl_width, .. } => *decl_width,
             Expr::ShortRealRef { .. } => 32,
+            Expr::ProcessSelf => 64,
+            Expr::ProcessStatus(_) => 32,
+            Expr::Past { value, .. } => value.width(),
+            Expr::SampledValue { .. } => 1,
+            Expr::Sampled(value) => value.width(),
             Expr::RealBinary { .. } => 64,
             Expr::RealCompare { .. } => 1,
             Expr::RealNeg(_) => 64,
@@ -793,7 +889,10 @@ impl Expr {
             Expr::ShortRealNeg(_) => 32,
             Expr::ShortRealToReal(_) => 64,
             Expr::RealToShortReal(_) => 32,
+            Expr::BitsToReal(_) => 64,
+            Expr::BitsToShortReal(_) => 32,
             Expr::RealToInt { width, .. } => *width,
+            Expr::RealTruncToInt { width, .. } => *width,
             Expr::IntToReal { .. } => 64,
             Expr::RealTime { .. } => 64,
         }
@@ -840,6 +939,8 @@ impl Expr {
             Expr::EventTriggered { .. } => false,
             Expr::SimulationTime { signed, .. } => *signed,
             Expr::Random { signed, .. } => *signed,
+            Expr::CountBits { .. } => true,
+            Expr::IsUnknown(_) | Expr::OneHot(_) | Expr::OneHot0(_) => false,
             Expr::FileOpen { .. } => false,
             Expr::FileOpenDynamic { .. } => false,
             Expr::FileGetc { .. } => true,
@@ -858,6 +959,11 @@ impl Expr {
             Expr::RealConst(_) => true,
             Expr::RealRef { .. } => true,
             Expr::ShortRealRef { .. } => true,
+            Expr::ProcessSelf => false,
+            Expr::ProcessStatus(_) => true,
+            Expr::Past { value, .. } => value.is_signed(),
+            Expr::SampledValue { .. } => false,
+            Expr::Sampled(value) => value.is_signed(),
             Expr::RealBinary { .. } => true,
             Expr::RealCompare { .. } => false,
             Expr::RealNeg(_) => true,
@@ -866,7 +972,10 @@ impl Expr {
             Expr::ShortRealNeg(_) => true,
             Expr::ShortRealToReal(_) => true,
             Expr::RealToShortReal(_) => true,
+            Expr::BitsToReal(_) => true,
+            Expr::BitsToShortReal(_) => true,
             Expr::RealToInt { signed, .. } => *signed,
+            Expr::RealTruncToInt { signed, .. } => *signed,
             Expr::IntToReal { .. } => true,
             Expr::RealTime { .. } => true,
         }
@@ -1135,6 +1244,38 @@ pub enum Stmt {
     ProceduralDeassign {
         lv: LValue,
     },
+    /// Disable all still-running descendant processes of the process that
+    /// executes this statement.
+    DisableFork,
+    /// Suspend the current process until every immediate child process that it
+    /// forked has terminated.
+    WaitFork,
+    /// A named sequential or concurrency block whose dynamic execution can be
+    /// terminated by `DisableNamedBlock`.
+    NamedBlock {
+        name: String,
+        body: Box<Stmt>,
+    },
+    /// Dynamic completion marker for the innermost active named block. It is
+    /// emitted immediately after the lowered block body.
+    NamedBlockEnd,
+    /// Terminate every currently active execution of the named lexical block.
+    DisableNamedBlock {
+        name: String,
+        flag: usize,
+    },
+    /// Terminate the process identified by a runtime handle and all of its
+    /// descendants.
+    ProcessKill(Box<Expr>),
+    /// Suspend the current process until the process identified by a runtime
+    /// handle terminates.
+    ProcessAwait(Box<Expr>),
+    /// Request that the process identified by a runtime handle pause without
+    /// terminating.  A self-suspend preserves the remainder of the current
+    /// activation for a later resume.
+    ProcessSuspend(Box<Expr>),
+    /// Continue a previously suspended process from its saved continuation.
+    ProcessResume(Box<Expr>),
     /// Exit the nearest runtime loop.
     Break,
     /// Start the next iteration of the nearest runtime loop.
@@ -1183,6 +1324,8 @@ pub enum Stmt {
         label: String,
         cond: Expr,
     },
+    /// Records one SystemVerilog severity task for simulation accounting.
+    Severity(SimulationSeverity),
     /// Runtime `$writememh`/`$writememb` dump. The frontend resolves the path;
     /// start/finish are sampled when the task executes.
     WriteMem {
@@ -1205,6 +1348,8 @@ pub enum Stmt {
     /// Assert/Assume; an absent action retains the existing fail-closed result.
     ImmediateAssertion {
         kind: ImmediateAssertionKind,
+        deferred: ImmediateAssertionDeferred,
+        scope: Option<String>,
         cond: Expr,
         pass_action: Option<Box<Stmt>>,
         fail_action: Option<Box<Stmt>>,
@@ -1805,6 +1950,14 @@ pub struct Design {
     pub plusargs: std::collections::BTreeMap<String, usize>,
     /// Bounded string state containing the value part of a plusarg.
     pub plusarg_values: std::collections::BTreeMap<String, usize>,
+    /// Resident temporal-assertion state that `$assertkill` must clear.
+    pub assertion_attempts: Vec<AssertionAttempt>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AssertionAttempt {
+    pub scope: Option<String>,
+    pub nets: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1839,8 +1992,18 @@ fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
     match expression {
         Expr::Const(_)
         | Expr::RealConst(_)
+        | Expr::ProcessSelf
         | Expr::SimulationTime { .. }
         | Expr::MemorySize { .. } => {}
+        Expr::ProcessStatus(handle) => lint_expression_nets(handle, output),
+        Expr::Past { value, gating, .. } => {
+            lint_expression_nets(value, output);
+            if let Some(gating) = gating {
+                lint_expression_nets(gating, output);
+            }
+        }
+        Expr::SampledValue { value, .. } => lint_expression_nets(value, output),
+        Expr::Sampled(value) => lint_expression_nets(value, output),
         Expr::RealRef { net, decl_width } => output.extend(*net..*net + decl_width),
         Expr::ShortRealRef { net } => output.extend(*net..*net + 32),
         Expr::RealBinary { left, right, .. } => {
@@ -1859,10 +2022,12 @@ fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => lint_expression_nets(operand, output),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
-            lint_expression_nets(value, output)
-        }
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => lint_expression_nets(operand, output),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => lint_expression_nets(value, output),
         Expr::RealTime { .. } => {}
         Expr::Ref { net, range, .. } => match range {
             Range::Bit(bit) => output.push(net + bit),
@@ -1932,6 +2097,10 @@ fn lint_expression_nets(expression: &Expr, output: &mut Vec<usize>) {
         Expr::Random { args, .. } => args
             .iter()
             .for_each(|argument| lint_expression_nets(argument, output)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => lint_expression_nets(value, output),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             lint_expression_nets(path, output);
@@ -2496,7 +2665,19 @@ fn lint_statement_touched_nets(statement: &Stmt, touched: &mut std::collections:
             touched.extend(bits);
         }
         Stmt::ProceduralDeassign { lv } => touched.extend(lint_lvalue_bits(lv)),
+        Stmt::NamedBlock { body, .. } => lint_statement_touched_nets(body, touched),
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => {
+            let mut bits = Vec::new();
+            lint_expression_nets(handle, &mut bits);
+            touched.extend(bits);
+        }
         Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
+        Stmt::Severity(_) => {}
         Stmt::Display { args, .. } => {
             for argument in args {
                 let mut bits = Vec::new();
@@ -3018,6 +3199,13 @@ impl Design {
             collect_memory_expr_reads(&assignment.e, false, true, &mut accesses);
         }
         let aliases = self.memory_alias_roots();
+        let initializer_writes = self
+            .initializer_memory_writes()
+            .into_iter()
+            .filter(|(_, deterministic)| *deterministic)
+            .map(|(memory, _)| aliases.get(memory).copied().unwrap_or(memory))
+            .collect::<std::collections::HashSet<_>>();
+        let ordinary_port_roots = self.ordinary_port_memory_roots(&aliases);
         let accesses = accesses.canonicalize(&aliases);
         for (index, memory) in self.memories.iter_mut().enumerate() {
             if memory.associative {
@@ -3045,7 +3233,11 @@ impl Design {
                 || accesses.sync_writes.contains(&root)
                 || accesses.async_writes.contains(&root)
                 || accesses.sync_reads.contains(&root)
-                || accesses.async_reads.contains(&root);
+                || accesses.async_reads.contains(&root)
+                || (accesses.continuous_reads.contains(&root)
+                    && initializer_writes.contains(&root)
+                    && !memory.declaration_initialized
+                    && !ordinary_port_roots.contains(&root));
             memory.storage = if sparse {
                 MemoryStorage::Sparse
             } else {
@@ -3130,6 +3322,33 @@ impl Design {
                     .push(MemoryConnection { child, parent });
             }
         }
+    }
+
+    fn initializer_memory_writes(&self) -> std::collections::HashMap<usize, bool> {
+        let mut memories = std::collections::HashMap::new();
+        for initial in &self.initials {
+            collect_memory_initializer_writes(initial, true, &mut memories);
+        }
+        memories
+    }
+
+    fn ordinary_port_memory_roots(&self, aliases: &[usize]) -> std::collections::HashSet<usize> {
+        self.array_ports
+            .iter()
+            .map(|port| port.array)
+            .chain(
+                self.array_connections
+                    .iter()
+                    .flat_map(|connection| [connection.child, connection.parent]),
+            )
+            .chain(self.memory_ports.iter().map(|port| port.memory))
+            .chain(
+                self.memory_connections
+                    .iter()
+                    .flat_map(|connection| [connection.child, connection.parent]),
+            )
+            .map(|memory| aliases.get(memory).copied().unwrap_or(memory))
+            .collect()
     }
 
     fn memory_alias_roots(&self) -> Vec<usize> {
@@ -3332,6 +3551,11 @@ fn collect_memory_accesses(
             collect_memory_expr_reads(e, synchronous, false, accesses)
         }
         Stmt::ProceduralDeassign { .. } => {}
+        Stmt::NamedBlock { body, .. } => {
+            collect_memory_accesses(body, synchronous, memory_widths, accesses)
+        }
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
         Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
             for index in indexes {
                 collect_memory_expr_reads(index, synchronous, false, accesses);
@@ -3465,6 +3689,7 @@ fn collect_memory_accesses(
         Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {
             collect_memory_expr_reads(cond, synchronous, false, accesses)
         }
+        Stmt::Severity(_) => {}
         Stmt::Display { args, .. } => {
             for argument in args {
                 collect_memory_expr_reads(argument, synchronous, false, accesses);
@@ -3532,6 +3757,111 @@ fn collect_memory_accesses(
         | Stmt::Finish
         | Stmt::Stop => {}
         Stmt::RandomSeeded { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => {
+            collect_memory_expr_reads(handle, synchronous, false, accesses)
+        }
+    }
+}
+
+fn collect_memory_initializer_writes(
+    statement: &Stmt,
+    unconditional: bool,
+    memories: &mut std::collections::HashMap<usize, bool>,
+) {
+    fn merge_write(
+        memory: usize,
+        deterministic: bool,
+        memories: &mut std::collections::HashMap<usize, bool>,
+    ) {
+        let state = memories.entry(memory).or_insert(true);
+        *state = *state && deterministic;
+    }
+    match statement {
+        Stmt::Block(statements) => statements.iter().for_each(|statement| {
+            collect_memory_initializer_writes(statement, unconditional, memories)
+        }),
+        Stmt::Scope(body) | Stmt::NamedBlock { body, .. } => {
+            collect_memory_initializer_writes(body, unconditional, memories)
+        }
+        Stmt::MemoryBl { memory, indexes, e } | Stmt::MemoryNBl { memory, indexes, e } => {
+            let deterministic = unconditional
+                && indexes
+                    .iter()
+                    .all(|index| constant_expression_i64(index).is_some())
+                && constant_expression_i64(e).is_some();
+            merge_write(*memory, deterministic, memories);
+        }
+        Stmt::MemoryBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        }
+        | Stmt::MemoryNBlPart {
+            memory,
+            indexes,
+            start,
+            e,
+            ..
+        } => {
+            let deterministic = unconditional
+                && indexes
+                    .iter()
+                    .all(|index| constant_expression_i64(index).is_some())
+                && constant_expression_i64(start).is_some()
+                && constant_expression_i64(e).is_some();
+            merge_write(*memory, deterministic, memories);
+        }
+        Stmt::MemoryCopy { destination, .. } => merge_write(*destination, false, memories),
+        Stmt::Forever(body)
+        | Stmt::Delay { body, .. }
+        | Stmt::EventWait { body, .. }
+        | Stmt::Wait { body, .. }
+        | Stmt::Repeat { body, .. } => collect_memory_initializer_writes(body, false, memories),
+        Stmt::WaitOrder {
+            success, failure, ..
+        } => {
+            for action in success.iter().chain(failure.iter()) {
+                collect_memory_initializer_writes(action, false, memories);
+            }
+        }
+        Stmt::Fork { branches, .. } => branches
+            .iter()
+            .for_each(|branch| collect_memory_initializer_writes(branch, false, memories)),
+        Stmt::While { body, steps, .. } => {
+            collect_memory_initializer_writes(body, false, memories);
+            steps
+                .iter()
+                .for_each(|step| collect_memory_initializer_writes(step, false, memories));
+        }
+        Stmt::If { t, f, .. } => {
+            collect_memory_initializer_writes(t, false, memories);
+            if let Some(f) = f {
+                collect_memory_initializer_writes(f, false, memories);
+            }
+        }
+        Stmt::Case { arms, dflt, .. } => {
+            for (_, body) in arms {
+                collect_memory_initializer_writes(body, false, memories);
+            }
+            if let Some(body) = dflt {
+                collect_memory_initializer_writes(body, false, memories);
+            }
+        }
+        Stmt::ImmediateAssertion {
+            pass_action,
+            fail_action,
+            ..
+        } => {
+            for action in pass_action.iter().chain(fail_action.iter()) {
+                collect_memory_initializer_writes(action, false, memories);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3544,8 +3874,22 @@ fn collect_memory_expr_reads(
     match expression {
         Expr::Const(_)
         | Expr::Ref { .. }
+        | Expr::ProcessSelf
         | Expr::SimulationTime { .. }
         | Expr::MemorySize { .. } => {}
+        Expr::ProcessStatus(handle) => {
+            collect_memory_expr_reads(handle, synchronous, continuous, accesses)
+        }
+        Expr::Past { value, gating, .. } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses);
+            if let Some(gating) = gating {
+                collect_memory_expr_reads(gating, synchronous, continuous, accesses);
+            }
+        }
+        Expr::SampledValue { value, .. } => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses)
+        }
+        Expr::Sampled(value) => collect_memory_expr_reads(value, synchronous, continuous, accesses),
         Expr::AssocRead { memory, index, .. } | Expr::AssocExists { memory, index } => {
             if continuous {
                 accesses.continuous_reads.insert(*memory);
@@ -3677,10 +4021,14 @@ fn collect_memory_expr_reads(
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => {
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => {
             collect_memory_expr_reads(operand, synchronous, continuous, accesses)
         }
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => {
             collect_memory_expr_reads(value, synchronous, continuous, accesses)
         }
         Expr::RealTime { .. } => {}
@@ -3688,6 +4036,12 @@ fn collect_memory_expr_reads(
             for argument in args {
                 collect_memory_expr_reads(argument, synchronous, continuous, accesses);
             }
+        }
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => {
+            collect_memory_expr_reads(value, synchronous, continuous, accesses)
         }
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
@@ -4396,6 +4750,7 @@ mod tests {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -4482,6 +4837,7 @@ mod tests {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,
@@ -4524,6 +4880,7 @@ mod tests {
             associative: false,
             index_width: 0,
             index_signed: false,
+            declaration_initialized: false,
             storage: MemoryStorage::Ordinary,
             kind: MemoryKind::Ram,
             template: MemoryTemplate::Unmapped,

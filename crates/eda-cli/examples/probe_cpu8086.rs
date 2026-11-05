@@ -10,7 +10,12 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         Expr::RealConst(_)
         | Expr::RealRef { .. }
         | Expr::ShortRealConst(_)
-        | Expr::ShortRealRef { .. } => {}
+        | Expr::ShortRealRef { .. }
+        | Expr::ProcessSelf => {}
+        Expr::ProcessStatus(handle) => expr_nets(handle, out),
+        Expr::Past { value, .. } => expr_nets(value, out),
+        Expr::Sampled(value) => expr_nets(value, out),
+        Expr::SampledValue { value, .. } => expr_nets(value, out),
         Expr::RealBinary { left, right, .. } => {
             expr_nets(left, out);
             expr_nets(right, out);
@@ -26,8 +31,12 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => expr_nets(operand, out),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => expr_nets(value, out),
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => expr_nets(operand, out),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => expr_nets(value, out),
         Expr::RealTime { .. } => {}
         Expr::AssocRead { index, .. } => expr_nets(index, out),
         Expr::Ref { net, .. } => {
@@ -90,6 +99,10 @@ fn expr_nets(e: &Expr, out: &mut HashSet<usize>) {
             expr_nets(start, out);
         }
         Expr::Random { args, .. } => args.iter().for_each(|e| expr_nets(e, out)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => expr_nets(value, out),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             expr_nets(path, out);
@@ -225,6 +238,7 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::Fork { branches, .. } => branches
                 .iter()
                 .for_each(|branch| walk(branch, reads, writes)),
+            Stmt::NamedBlock { body, .. } => walk(body, reads, writes),
             Stmt::While { cond, body, .. } => {
                 expr_nets(cond, reads);
                 walk(body, reads, writes);
@@ -237,6 +251,12 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::ProceduralAssign { e, .. } => expr_nets(e, reads),
             Stmt::Release { .. } => {}
             Stmt::ProceduralDeassign { .. } => {}
+            Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+            Stmt::DisableNamedBlock { .. } => {}
+            Stmt::ProcessKill(handle)
+            | Stmt::ProcessAwait(handle)
+            | Stmt::ProcessSuspend(handle)
+            | Stmt::ProcessResume(handle) => expr_nets(handle, reads),
             Stmt::Break | Stmt::Continue | Stmt::ReturnBarrier | Stmt::Return => {}
             Stmt::Scope(body) => walk(body, reads, writes),
             Stmt::Assert { cond, .. } | Stmt::Assume { cond, .. } | Stmt::Cover { cond, .. } => {

@@ -323,10 +323,19 @@ pub(super) fn remap_assignment(assignment: &mut eda_core::ir::Assign, offset: us
 pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usize) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) | Expr::ProcessSelf => {}
         Expr::Ref { net, .. } => *net += offset,
         Expr::RealRef { net, .. } => *net += offset,
         Expr::ShortRealRef { net } => *net += offset,
+        Expr::ProcessStatus(handle) => remap_expression(handle, offset),
+        Expr::Past { value, gating, .. } => {
+            remap_expression(value, offset);
+            if let Some(gating) = gating {
+                remap_expression(gating, offset);
+            }
+        }
+        Expr::Sampled(value) => remap_expression(value, offset),
+        Expr::SampledValue { value, .. } => remap_expression(value, offset),
         Expr::RealBinary { left, right, .. } => {
             remap_expression(left, offset);
             remap_expression(right, offset);
@@ -342,10 +351,12 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => remap_expression(operand, offset),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
-            remap_expression(value, offset)
-        }
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => remap_expression(operand, offset),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => remap_expression(value, offset),
         Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => remap_expression(a, offset),
         Expr::Bin { a, b, .. } => {
@@ -415,6 +426,10 @@ pub(super) fn remap_expression(expression: &mut eda_core::ir::Expr, offset: usiz
         Expr::Random { args, .. } => args
             .iter_mut()
             .for_each(|argument| remap_expression(argument, offset)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => remap_expression(value, offset),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             remap_expression(path, offset);
@@ -446,6 +461,7 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             .iter_mut()
             .for_each(|statement| remap_statement(statement, offset)),
         Stmt::Forever(body) => remap_statement(body, offset),
+        Stmt::NamedBlock { body, .. } => remap_statement(body, offset),
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             lv.net += offset;
             remap_expression(e, offset);
@@ -562,6 +578,12 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             remap_expression(e, offset);
         }
         Stmt::ProceduralDeassign { lv } => lv.net += offset,
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { flag, .. } => *flag += offset,
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => remap_expression(handle, offset),
         Stmt::Display { args, .. } => {
             args.iter_mut()
                 .for_each(|argument| remap_expression(argument, offset));
@@ -699,10 +721,19 @@ fn rewrite_lvalue_nets(lvalue: &mut eda_core::ir::LValue, rewrites: &[NetRewrite
 fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetRewrite]) {
     use eda_core::ir::Expr;
     match expression {
-        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) | Expr::ProcessSelf => {}
         Expr::Ref { net, .. } => *net = rewrite_net(*net, rewrites),
         Expr::RealRef { net, .. } => *net = rewrite_net(*net, rewrites),
         Expr::ShortRealRef { net } => *net = rewrite_net(*net, rewrites),
+        Expr::ProcessStatus(handle) => rewrite_expression_nets(handle, rewrites),
+        Expr::Past { value, gating, .. } => {
+            rewrite_expression_nets(value, rewrites);
+            if let Some(gating) = gating {
+                rewrite_expression_nets(gating, rewrites);
+            }
+        }
+        Expr::Sampled(value) => rewrite_expression_nets(value, rewrites),
+        Expr::SampledValue { value, .. } => rewrite_expression_nets(value, rewrites),
         Expr::RealBinary { left, right, .. } => {
             rewrite_expression_nets(left, rewrites);
             rewrite_expression_nets(right, rewrites);
@@ -718,10 +749,12 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => rewrite_expression_nets(operand, rewrites),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
-            rewrite_expression_nets(value, rewrites)
-        }
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => rewrite_expression_nets(operand, rewrites),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => rewrite_expression_nets(value, rewrites),
         Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => rewrite_expression_nets(a, rewrites),
         Expr::Bin { a, b, .. } => {
@@ -789,6 +822,10 @@ fn rewrite_expression_nets(expression: &mut eda_core::ir::Expr, rewrites: &[NetR
         Expr::Random { args, .. } => args
             .iter_mut()
             .for_each(|argument| rewrite_expression_nets(argument, rewrites)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => rewrite_expression_nets(value, rewrites),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             rewrite_expression_nets(path, rewrites);
@@ -820,6 +857,7 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
             .iter_mut()
             .for_each(|statement| rewrite_statement_nets(statement, rewrites)),
         Stmt::Forever(body) => rewrite_statement_nets(body, rewrites),
+        Stmt::NamedBlock { body, .. } => rewrite_statement_nets(body, rewrites),
         Stmt::NBl { lv, e } | Stmt::Bl { lv, e } => {
             rewrite_lvalue_nets(lv, rewrites);
             rewrite_expression_nets(e, rewrites);
@@ -940,6 +978,12 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
             rewrite_expression_nets(e, rewrites);
         }
         Stmt::ProceduralDeassign { lv } => rewrite_lvalue_nets(lv, rewrites),
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { flag, .. } => *flag = rewrite_net(*flag, rewrites),
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => rewrite_expression_nets(handle, rewrites),
         Stmt::Display { args, .. } => args
             .iter_mut()
             .for_each(|argument| rewrite_expression_nets(argument, rewrites)),
@@ -1064,7 +1108,17 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         | Expr::ShortRealConst(_)
         | Expr::Ref { .. }
         | Expr::RealRef { .. }
-        | Expr::ShortRealRef { .. } => {}
+        | Expr::ShortRealRef { .. }
+        | Expr::ProcessSelf => {}
+        Expr::ProcessStatus(handle) => remap_expression_memory_ids(handle, offset),
+        Expr::Past { value, gating, .. } => {
+            remap_expression_memory_ids(value, offset);
+            if let Some(gating) = gating {
+                remap_expression_memory_ids(gating, offset);
+            }
+        }
+        Expr::Sampled(value) => remap_expression_memory_ids(value, offset),
+        Expr::SampledValue { value, .. } => remap_expression_memory_ids(value, offset),
         Expr::RealBinary { left, right, .. } => {
             remap_expression_memory_ids(left, offset);
             remap_expression_memory_ids(right, offset);
@@ -1080,10 +1134,12 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => remap_expression_memory_ids(operand, offset),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
-            remap_expression_memory_ids(value, offset)
-        }
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => remap_expression_memory_ids(operand, offset),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => remap_expression_memory_ids(value, offset),
         Expr::RealTime { .. } => {}
         Expr::Un { a, .. } => remap_expression_memory_ids(a, offset),
         Expr::Bin { a, b, .. } => {
@@ -1162,6 +1218,10 @@ pub(super) fn remap_expression_memory_ids(expression: &mut eda_core::ir::Expr, o
         Expr::Random { args, .. } => args
             .iter_mut()
             .for_each(|argument| remap_expression_memory_ids(argument, offset)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => remap_expression_memory_ids(value, offset),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             remap_expression_memory_ids(path, offset);
@@ -1193,6 +1253,7 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             .iter_mut()
             .for_each(|statement| remap_statement_memory_ids(statement, offset)),
         Stmt::Forever(body) => remap_statement_memory_ids(body, offset),
+        Stmt::NamedBlock { body, .. } => remap_statement_memory_ids(body, offset),
         Stmt::NBl { e, .. } | Stmt::Bl { e, .. } => remap_expression_memory_ids(e, offset),
         Stmt::MemoryBl {
             memory, indexes, e, ..
@@ -1331,6 +1392,12 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
         Stmt::Release { .. } => {}
         Stmt::ProceduralAssign { e, .. } => remap_expression_memory_ids(e, offset),
         Stmt::ProceduralDeassign { .. } => {}
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => remap_expression_memory_ids(handle, offset),
         Stmt::Display { args, .. } => {
             args.iter_mut()
                 .for_each(|argument| remap_expression_memory_ids(argument, offset));
@@ -1552,10 +1619,14 @@ impl super::SlangAstLowerer {
             external_symbol_directions: std::collections::BTreeMap::new(),
             local_initializers: std::collections::BTreeMap::new(),
             local_blocks: std::collections::BTreeMap::new(),
+            local_static_symbols: std::collections::BTreeSet::new(),
+            unbounded_parameters: std::collections::BTreeSet::new(),
             constants: std::collections::BTreeMap::new(),
             subroutines: std::collections::BTreeMap::new(),
             type_aliases: self.package_type_aliases.clone(),
+            type_alias_type_names: self.package_type_alias_type_names.clone(),
             package_type_aliases: self.package_type_aliases.clone(),
+            package_type_alias_type_names: self.package_type_alias_type_names.clone(),
             type_enums: std::collections::BTreeMap::new(),
             ambiguous_type_aliases: std::collections::BTreeSet::new(),
             ambiguous_type_enums: std::collections::BTreeSet::new(),
@@ -1625,11 +1696,19 @@ impl super::SlangAstLowerer {
             time_scale: super::body_time_scale(body),
             global_time_precision: self.global_time_precision,
             active_named_blocks: std::cell::RefCell::new(Vec::new()),
+            active_assertion_scopes: std::cell::RefCell::new(Vec::new()),
+            known_assertion_scopes: std::collections::BTreeSet::new(),
+            manual_covergroups: std::collections::BTreeMap::new(),
+            covergroup_instances: std::collections::BTreeMap::new(),
+            constructed_covergroups: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             generate_path: Vec::new(),
             scope_path: child_scope_path,
             library_scopes: self.library_scopes.clone(),
             format_library_scope,
             inline_stack: std::cell::RefCell::new(Vec::new()),
+            past_sampling_allowed: false,
+            past_sampling_event: None,
+            recursive_property_depth: self.recursive_property_depth,
         };
         let empty_connections = Vec::new();
         let mut lowered_connections = Vec::new();

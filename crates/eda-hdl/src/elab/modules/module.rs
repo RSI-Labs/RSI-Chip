@@ -1419,26 +1419,26 @@ impl<'a> Elaborator<'a> {
                         let mut statements = Vec::new();
 
                         if *kind == ast::PropertyKind::Cover {
-                            let any_candidate = (start..=end)
-                                .map(&candidate)
-                                .reduce(|left, right| ExprIR::Bin {
-                                    op: BinOp::Or,
-                                    a: Box::new(left),
-                                    b: Box::new(right),
-                                })
-                                .expect("property delay range is nonempty");
-                            statements.push(StmtIR::If {
-                                c: ExprIR::Bin {
-                                    op: BinOp::And,
-                                    a: Box::new(any_candidate),
-                                    b: Box::new(consequent.clone()),
-                                },
-                                t: Box::new(StmtIR::Cover {
-                                    label: cover_label.clone(),
-                                    cond: ExprIR::Const(LogicWord::from_u64(1, 1)),
-                                }),
-                                f: None,
-                            });
+                            // A range window can have one pending attempt per
+                            // start edge.  Collapsing the candidates with OR
+                            // would record only one hit when, for example,
+                            // delay-1 and delay-2 attempts complete together.
+                            // Emit one cover check per candidate so distinct
+                            // attempts remain distinct coverage events.
+                            for delay in start..=end {
+                                statements.push(StmtIR::If {
+                                    c: ExprIR::Bin {
+                                        op: BinOp::And,
+                                        a: Box::new(candidate(delay)),
+                                        b: Box::new(consequent.clone()),
+                                    },
+                                    t: Box::new(StmtIR::Cover {
+                                        label: cover_label.clone(),
+                                        cond: ExprIR::Const(LogicWord::from_u64(1, 1)),
+                                    }),
+                                    f: None,
+                                });
+                            }
                         }
 
                         for delay in start..=end {

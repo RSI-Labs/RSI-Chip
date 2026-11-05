@@ -62,10 +62,62 @@ enum AssocNbaUpdate {
     },
 }
 
+#[derive(Clone)]
 struct Cont<'d> {
+    // Static process identity is used only for zero-delay reentrancy control
+    // of `always` procedures.  Every runnable continuation additionally has a
+    // runtime process identity, including initial blocks and fork children.
     process: Option<usize>,
+    runtime_process: usize,
     join: Option<usize>,
+    fork: Option<usize>,
+    named_scopes: Vec<usize>,
     work: Vec<&'d Stmt>,
+}
+
+#[derive(Clone)]
+struct ProcessState {
+    children: Vec<usize>,
+    active: bool,
+    cancelled: bool,
+    suspended: bool,
+}
+
+const PROCESS_STATE_FINISHED: u64 = 0;
+const PROCESS_STATE_RUNNING: u64 = 1;
+const PROCESS_STATE_WAITING: u64 = 2;
+const PROCESS_STATE_SUSPENDED: u64 = 3;
+const PROCESS_STATE_KILLED: u64 = 4;
+
+struct ProcessWaiter<'d> {
+    process: usize,
+    target: Option<usize>,
+    continuation: Cont<'d>,
+}
+
+#[derive(Clone)]
+struct PastSample {
+    time: u64,
+    values: Vec<LogicWord>,
+    last_result: Option<LogicWord>,
+}
+
+#[derive(Clone)]
+struct DeferredAssertion<'d> {
+    kind: eda_core::ir::ImmediateAssertionKind,
+    scope: Option<String>,
+    cond: &'d Expr,
+    pass_action: Option<&'d Stmt>,
+    fail_action: Option<&'d Stmt>,
+}
+
+struct NamedScopeState<'d> {
+    name: String,
+    owner: usize,
+    continuation: Cont<'d>,
+    processes: Vec<usize>,
+    active: bool,
+    owner_resumed: bool,
 }
 
 struct ForkJoin<'d> {
@@ -116,6 +168,7 @@ struct FileStrobe<'d> {
 const MAX_STEPS_PER_TIME: u64 = 200_000;
 const MAX_EVENTS: u64 = 20_000_000;
 static RETURN_BARRIER: Stmt = Stmt::ReturnBarrier;
+static NAMED_BLOCK_END: Stmt = Stmt::NamedBlockEnd;
 
 pub(crate) struct OrdinaryArrayElements {
     words: Vec<LogicWord>,
@@ -200,8 +253,14 @@ pub struct Simulator<'d> {
     now: u64,
     nba: Vec<(usize, LogicValue)>,
     busy_procs: HashSet<usize>,
+    process_states: Vec<ProcessState>,
+    process_waiters: Vec<ProcessWaiter<'d>>,
+    suspended_conts: Vec<Cont<'d>>,
+    current_runtime_process: usize,
+    named_scopes: Vec<NamedScopeState<'d>>,
     fork_joins: Vec<Option<ForkJoin<'d>>>,
     while_iterations: HashMap<usize, u64>,
+    forever_iterations: HashMap<usize, (u64, u64)>,
     repeat_remaining: HashMap<usize, u64>,
     waiters: Vec<Waiter<'d>>,
     event_waiters: Vec<EventWaiter<'d>>,
@@ -230,7 +289,10 @@ pub struct Simulator<'d> {
     timeformat_suffix: String,
     timeformat_min_width: usize,
     property_covers: BTreeMap<String, u64>,
+    severity_counts:
+        BTreeMap<eda_core::ir::SimulationSeverity, u64>,
     assertions_enabled: bool,
+    scoped_assertions_enabled: BTreeMap<String, bool>,
     finished: bool,
     stopped: bool,
     paused_cont: Option<Cont<'d>>,
@@ -244,6 +306,9 @@ pub struct Simulator<'d> {
     vcd_memory_changes: HashSet<(usize, u64)>,
     event_count: u64,
     random_state: Cell<u64>,
+    past_samples: RefCell<HashMap<usize, PastSample>>,
+    deferred_assertions: Vec<DeferredAssertion<'d>>,
+    final_assertions: Vec<DeferredAssertion<'d>>,
     next_file_descriptor: Cell<u32>,
     file_paths: RefCell<BTreeMap<u32, PathBuf>>,
     file_readers: RefCell<BTreeMap<u32, std::fs::File>>,
@@ -355,6 +420,22 @@ impl<'d> Simulator<'d> {
                 }
             }
         }
+        let foreach_iterator_nets = design
+            .net_decls
+            .iter()
+            .filter(|declaration| declaration.name.starts_with("__foreach_iterator_"))
+            .flat_map(|declaration| declaration.base..declaration.base + declaration.width)
+            .collect::<HashSet<_>>();
+        for net in &foreach_iterator_nets {
+            if *net < n {
+                proc_edges[*net].clear();
+            }
+        }
+        for attempt in &design.assertion_attempts {
+            if attempt.nets.iter().any(|&net| net >= n) {
+                return Err("assertion attempt state refers to a missing net".into());
+            }
+        }
         let mut mons = Vec::new();
         for init in &design.initials {
             collect_monitors(init, &mut mons);
@@ -367,6 +448,8 @@ impl<'d> Simulator<'d> {
                 let mut reads = HashSet::new();
                 let mut writes = HashSet::new();
                 collect_stmt_access(&process.body, &mut reads, &mut writes);
+                reads.retain(|net| !foreach_iterator_nets.contains(net));
+                writes.retain(|net| !foreach_iterator_nets.contains(net));
                 reads.intersection(&writes).copied().collect::<Vec<_>>()
             })
             .map(|net| design.net_name(net))
@@ -379,8 +462,23 @@ impl<'d> Simulator<'d> {
             now: 0,
             nba: Vec::new(),
             busy_procs: HashSet::new(),
+            process_states: design
+                .processes
+                .iter()
+                .map(|_| ProcessState {
+                    children: Vec::new(),
+                    active: false,
+                    cancelled: false,
+                    suspended: false,
+                })
+                .collect(),
+            process_waiters: Vec::new(),
+            suspended_conts: Vec::new(),
+            current_runtime_process: 0,
+            named_scopes: Vec::new(),
             fork_joins: Vec::new(),
             while_iterations: HashMap::new(),
+            forever_iterations: HashMap::new(),
             repeat_remaining: HashMap::new(),
             waiters: Vec::new(),
             event_waiters: Vec::new(),
@@ -409,7 +507,9 @@ impl<'d> Simulator<'d> {
             timeformat_suffix: String::new(),
             timeformat_min_width: 0,
             property_covers: BTreeMap::new(),
+            severity_counts: BTreeMap::new(),
             assertions_enabled: true,
+            scoped_assertions_enabled: BTreeMap::new(),
             finished: false,
             stopped: false,
             paused_cont: None,
@@ -430,6 +530,9 @@ impl<'d> Simulator<'d> {
             vcd_memory_changes: HashSet::new(),
             event_count: 0,
             random_state: Cell::new(0x9E37_79B9_7F4A_7C15),
+            past_samples: RefCell::new(HashMap::new()),
+            deferred_assertions: Vec::new(),
+            final_assertions: Vec::new(),
             next_file_descriptor: Cell::new(1),
             file_paths: RefCell::new(BTreeMap::new()),
             file_readers: RefCell::new(BTreeMap::new()),
@@ -457,9 +560,13 @@ impl<'d> Simulator<'d> {
             }
         }
         for init in &design.initials {
+            let runtime_process = sim.new_process(None);
             sim.conts.entry(0).or_default().push(Cont {
                 process: None,
+                runtime_process,
                 join: None,
+                fork: None,
+                named_scopes: Vec::new(),
                 work: vec![init],
             });
         }
@@ -487,7 +594,10 @@ impl<'d> Simulator<'d> {
             if matches!(p.sens, Sens::Comb | Sens::Timed) {
                 sim.conts.entry(0).or_default().push(Cont {
                     process: Some(pi),
+                    runtime_process: pi,
                     join: None,
+                    fork: None,
+                    named_scopes: Vec::new(),
                     work: vec![&p.body],
                 });
             }
@@ -1059,6 +1169,92 @@ impl<'d> Simulator<'d> {
         std::mem::take(&mut self.property_covers)
     }
 
+    pub fn severity_hits(&self, severity: eda_core::ir::SimulationSeverity) -> u64 {
+        self.severity_counts.get(&severity).copied().unwrap_or(0)
+    }
+
+    pub fn take_severity_counts(
+        &mut self,
+    ) -> BTreeMap<eda_core::ir::SimulationSeverity, u64> {
+        std::mem::take(&mut self.severity_counts)
+    }
+
+    /// Deterministic in-process status for severity accounting: fatal or error
+    /// reports are nonzero; warnings and informational reports are zero.
+    pub fn severity_exit_status(&self) -> i32 {
+        if self.severity_hits(eda_core::ir::SimulationSeverity::Fatal) > 0
+            || self.severity_hits(eda_core::ir::SimulationSeverity::Error) > 0
+        {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn assertion_enabled(&self, scope: Option<&str>) -> bool {
+        self.assertions_enabled
+            && scope
+                .and_then(|scope| self.scoped_assertions_enabled.get(scope).copied())
+                .unwrap_or(true)
+    }
+
+    fn kill_assertion_attempts(&mut self, scopes: Option<&[String]>) {
+        let targets = self
+            .design
+            .assertion_attempts
+            .iter()
+            .filter(|attempt| {
+                scopes.is_none_or(|scopes| {
+                    attempt
+                        .scope
+                        .as_deref()
+                        .is_some_and(|scope| scopes.iter().any(|selected| selected == scope))
+                })
+            })
+            .flat_map(|attempt| attempt.nets.iter().copied())
+            .collect::<HashSet<_>>();
+        let target_bits = targets
+            .iter()
+            .flat_map(|&net| {
+                let width = self
+                    .design
+                    .net_decls
+                    .iter()
+                    .find(|declaration| declaration.base == net)
+                    .map(|declaration| declaration.width)
+                    .unwrap_or(1);
+                net..net + width
+            })
+            .collect::<HashSet<_>>();
+        self.deferred_assertions.retain(|assertion| {
+            !scopes.is_some_and(|scopes| {
+                assertion
+                    .scope
+                    .as_deref()
+                    .is_some_and(|scope| scopes.iter().any(|selected| selected == scope))
+            })
+        });
+        self.final_assertions.retain(|assertion| {
+            !scopes.is_some_and(|scopes| {
+                assertion
+                    .scope
+                    .as_deref()
+                    .is_some_and(|scope| scopes.iter().any(|selected| selected == scope))
+            })
+        });
+        self.nba.retain(|(net, _)| !target_bits.contains(net));
+        if let Some(queue) = self.events.get_mut(&self.now) {
+            queue.retain(|update| !target_bits.contains(&update.net));
+        }
+        for net in target_bits {
+            self.schedule(Update {
+                net,
+                val: LogicValue::Zero,
+                driver: None,
+            });
+        }
+    }
+
     /// Names of nets conservatively detected as same-process combinational
     /// read/write feedback. Empty when no such process exists.
     pub fn zero_delay_feedback_nets(&self) -> &[String] {
@@ -1356,10 +1552,85 @@ impl<'d> Simulator<'d> {
                 return Err("simulation stalled: zero-delay activity loop".into());
             }
         }
+        self.run_deferred_assertions(false)?;
+        self.run_deferred_assertions(true)?;
         self.flush_strobes()?;
         self.fire_monitors();
         self.flush_vcd();
         Ok(())
+    }
+
+    fn run_deferred_assertions(&mut self, final_region: bool) -> Result<(), String> {
+        loop {
+            let queue = if final_region {
+                std::mem::take(&mut self.final_assertions)
+            } else {
+                std::mem::take(&mut self.deferred_assertions)
+            };
+            if queue.is_empty() {
+                return Ok(());
+            }
+            for assertion in queue {
+                if self.cancellation.is_cancelled() {
+                    return Err("simulation cancelled".into());
+                }
+                if !self.assertion_enabled(assertion.scope.as_deref()) {
+                    continue;
+                }
+                let value = self.eval(assertion.cond);
+                let is_true = value.reduce_or().as_bool() == Some(true);
+                let action = match assertion.kind {
+                    eda_core::ir::ImmediateAssertionKind::Cover => {
+                        if is_true {
+                            *self
+                                .property_covers
+                                .entry("immediate".to_string())
+                                .or_insert(0) += 1;
+                            assertion.pass_action
+                        } else {
+                            None
+                        }
+                    }
+                    eda_core::ir::ImmediateAssertionKind::Assert
+                    | eda_core::ir::ImmediateAssertionKind::Assume => {
+                        if is_true {
+                            assertion.pass_action
+                        } else {
+                            assertion.fail_action
+                        }
+                    }
+                };
+                let Some(action) = action else {
+                    if !is_true {
+                        let kind = if matches!(
+                            assertion.kind,
+                            eda_core::ir::ImmediateAssertionKind::Assert
+                        ) {
+                            "assertion"
+                        } else {
+                            "assumption"
+                        };
+                        return Err(format!(
+                            "deferred {kind} failed at t={}: condition is false or unknown",
+                            self.now
+                        ));
+                    }
+                    continue;
+                };
+                let runtime_process = self.new_process(None);
+                self.run_cont(Cont {
+                    process: None,
+                    runtime_process,
+                    join: None,
+                    fork: None,
+                    named_scopes: Vec::new(),
+                    work: vec![action],
+                })?;
+                if self.finished || self.stopped {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     fn apply_update(&mut self, u: Update) -> Result<(), String> {
@@ -1555,7 +1826,10 @@ impl<'d> Simulator<'d> {
                         self.busy_procs.insert(pi);
                         self.run_cont(Cont {
                             process: Some(pi),
+                            runtime_process: pi,
                             join: None,
+                            fork: None,
+                            named_scopes: Vec::new(),
                             work: vec![body],
                         })?;
                     }
@@ -1566,7 +1840,10 @@ impl<'d> Simulator<'d> {
             let body = &self.design.processes[pi].body;
             self.conts.entry(self.now).or_default().push(Cont {
                 process: Some(pi),
+                runtime_process: pi,
                 join: None,
+                fork: None,
+                named_scopes: Vec::new(),
                 work: vec![body],
             });
         }
@@ -2425,7 +2702,10 @@ impl<'d> Simulator<'d> {
             let body = &self.design.processes[pi].body;
             self.conts.entry(self.now).or_default().push(Cont {
                 process: Some(pi),
+                runtime_process: pi,
                 join: None,
+                fork: None,
+                named_scopes: Vec::new(),
                 work: vec![body],
             });
         }
@@ -2533,7 +2813,10 @@ impl<'d> Simulator<'d> {
                     work.extend(continuation.work);
                     Cont {
                         process: continuation.process,
+                        runtime_process: continuation.runtime_process,
                         join: continuation.join,
+                        fork: continuation.fork,
+                        named_scopes: continuation.named_scopes,
                         work,
                     }
                 }
@@ -2640,9 +2923,13 @@ impl<'d> Simulator<'d> {
             if self.cancellation.is_cancelled() {
                 return Err("simulation cancelled".into());
             }
+            let runtime_process = self.new_process(None);
             self.run_cont(Cont {
                 process: None,
+                runtime_process,
                 join: None,
+                fork: None,
+                named_scopes: Vec::new(),
                 work: vec![body],
             })?;
         }
@@ -2654,12 +2941,371 @@ impl<'d> Simulator<'d> {
         self.design.final_blocks.as_slice()
     }
 
+    fn new_process(&mut self, parent: Option<usize>) -> usize {
+        let id = self.process_states.len();
+        self.process_states.push(ProcessState {
+            children: Vec::new(),
+            active: true,
+            cancelled: false,
+            suspended: false,
+        });
+        if let Some(parent) = parent {
+            if let Some(state) = self.process_states.get_mut(parent) {
+                state.children.push(id);
+            }
+        }
+        id
+    }
+
+    fn new_named_scope(&mut self, name: String, owner: usize, continuation: Cont<'d>) -> usize {
+        let id = self.named_scopes.len();
+        self.named_scopes.push(NamedScopeState {
+            name,
+            owner,
+            continuation,
+            processes: Vec::new(),
+            active: true,
+            owner_resumed: false,
+        });
+        id
+    }
+
+    fn close_named_scope(&mut self, scope: usize) {
+        if let Some(state) = self.named_scopes.get_mut(scope) {
+            state.active = false;
+        }
+    }
+
+    fn close_named_scopes(&mut self, scopes: &[usize]) {
+        for scope in scopes {
+            self.close_named_scope(*scope);
+        }
+    }
+
+    fn named_scope_has_active_processes(&self, scope: usize) -> bool {
+        self.named_scopes.get(scope).is_some_and(|state| {
+            state.processes.iter().any(|process| {
+                self.process_states
+                    .get(*process)
+                    .is_some_and(|state| state.active)
+            })
+        })
+    }
+
+    fn retire_named_scopes(&mut self, scopes: &[usize], process: usize) {
+        for scope in scopes {
+            let Some(state) = self.named_scopes.get(*scope) else {
+                continue;
+            };
+            let owned = state.owner == process;
+            let member = state.processes.contains(&process);
+            if owned {
+                if let Some(state) = self.named_scopes.get_mut(*scope) {
+                    state.owner_resumed = true;
+                }
+            }
+            if !owned && !member {
+                continue;
+            }
+            if !self.named_scope_has_active_processes(*scope) {
+                if let Some(state) = self.named_scopes.get_mut(*scope) {
+                    state.active = false;
+                }
+            }
+        }
+    }
+
+    fn process_is_cancelled(&self, process: usize) -> bool {
+        self.process_states
+            .get(process)
+            .is_some_and(|state| state.cancelled)
+    }
+
+    fn process_is_suspended(&self, process: usize) -> bool {
+        self.process_states
+            .get(process)
+            .is_some_and(|state| state.suspended)
+    }
+
+    fn process_is_waiting(&self, process: usize) -> bool {
+        self.conts
+            .values()
+            .any(|continuations| continuations.iter().any(|c| c.runtime_process == process))
+            || self
+                .waiters
+                .iter()
+                .any(|w| w.continuation.runtime_process == process)
+            || self
+                .event_waiters
+                .iter()
+                .any(|w| w.continuation.runtime_process == process)
+            || self
+                .ordered_event_waiters
+                .iter()
+                .any(|w| w.continuation.runtime_process == process)
+            || self
+                .process_waiters
+                .iter()
+                .any(|w| w.continuation.runtime_process == process)
+            || self
+                .fork_joins
+                .iter()
+                .flatten()
+                .any(|state| state.continuation.runtime_process == process)
+            || self
+                .paused_cont
+                .as_ref()
+                .is_some_and(|c| c.runtime_process == process)
+    }
+
+    fn set_process_active(&mut self, process: usize, active: bool) {
+        if let Some(state) = self.process_states.get_mut(process) {
+            state.active = active;
+            if !active {
+                state.suspended = false;
+            }
+        }
+    }
+
+    fn active_immediate_children(&self, process: usize) -> bool {
+        self.process_states.get(process).is_some_and(|state| {
+            state.children.iter().any(|child| {
+                self.process_states
+                    .get(*child)
+                    .is_some_and(|state| state.active && !state.cancelled)
+            })
+        })
+    }
+
+    fn process_is_active(&self, process: usize) -> bool {
+        self.process_states
+            .get(process)
+            .is_some_and(|state| state.active && !state.cancelled)
+    }
+
+    fn process_handle(&self, handle: &Expr) -> Result<usize, String> {
+        let word = self.eval(handle);
+        let raw = word
+            .to_u64()
+            .ok_or_else(|| "process handle is unknown".to_string())?;
+        let process =
+            usize::try_from(raw).map_err(|_| "process handle is out of range".to_string())?;
+        if process >= self.process_states.len() {
+            return Err(format!("process handle {raw} does not identify a process"));
+        }
+        Ok(process)
+    }
+
+    fn suspend_process(&mut self, process: usize) {
+        if let Some(state) = self.process_states.get_mut(process) {
+            if state.active && !state.cancelled {
+                state.suspended = true;
+            }
+        }
+    }
+
+    fn resume_process(&mut self, process: usize) {
+        if let Some(state) = self.process_states.get_mut(process) {
+            if state.active && !state.cancelled && state.suspended {
+                state.suspended = false;
+            } else {
+                return;
+            }
+        }
+
+        let mut index = 0;
+        while index < self.suspended_conts.len() {
+            if self.suspended_conts[index].runtime_process == process {
+                let continuation = self.suspended_conts.remove(index);
+                self.conts.entry(self.now).or_default().push(continuation);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn process_tree(&self, process: usize) -> Vec<usize> {
+        let mut tree = vec![process];
+        let mut index = 0;
+        while index < tree.len() {
+            let current = tree[index];
+            if let Some(state) = self.process_states.get(current) {
+                let children = state.children.clone();
+                let new_children = children
+                    .into_iter()
+                    .filter(|child| !tree.contains(child))
+                    .collect::<Vec<_>>();
+                tree.extend(new_children);
+            }
+            index += 1;
+        }
+        tree
+    }
+
+    fn cancel_process_tree(&mut self, process: usize) {
+        let owned_scopes = self
+            .named_scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.owner == process && state.active)
+            .map(|(scope, _)| scope)
+            .collect::<Vec<_>>();
+        self.close_named_scopes(&owned_scopes);
+        let Some(state) = self.process_states.get_mut(process) else {
+            return;
+        };
+        state.cancelled = true;
+        state.active = false;
+        state.suspended = false;
+        let children = self
+            .process_states
+            .get(process)
+            .map(|state| state.children.clone());
+        for child in children.into_iter().flatten() {
+            self.cancel_process_tree(child);
+        }
+        let tree = self.process_tree(process);
+        self.suspended_conts
+            .retain(|continuation| !tree.contains(&continuation.runtime_process));
+    }
+
+    fn wake_process_waiters(&mut self) {
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.process_waiters.len() {
+            let owner_cancelled = self.process_is_cancelled(self.process_waiters[index].process);
+            if owner_cancelled {
+                self.process_waiters.remove(index);
+            } else if match self.process_waiters[index].target {
+                None => self.active_immediate_children(self.process_waiters[index].process),
+                Some(target) => self.process_is_active(target),
+            } {
+                index += 1;
+            } else {
+                ready.push(self.process_waiters.remove(index).continuation);
+            }
+        }
+        for continuation in ready {
+            self.conts.entry(self.now).or_default().push(continuation);
+        }
+    }
+
+    fn continuation_belongs_to_named_scope(
+        continuation: &Cont<'d>,
+        owner: usize,
+        scope: usize,
+    ) -> bool {
+        continuation.runtime_process == owner && continuation.named_scopes.contains(&scope)
+    }
+
+    fn remove_named_scope_wakeups(&mut self, owner: usize, scope: usize) {
+        for continuations in self.conts.values_mut() {
+            continuations.retain(|continuation| {
+                !Self::continuation_belongs_to_named_scope(continuation, owner, scope)
+            });
+        }
+        self.waiters.retain(|waiter| {
+            !Self::continuation_belongs_to_named_scope(&waiter.continuation, owner, scope)
+        });
+        self.event_waiters.retain(|waiter| {
+            !Self::continuation_belongs_to_named_scope(&waiter.continuation, owner, scope)
+        });
+        self.ordered_event_waiters.retain(|waiter| {
+            !Self::continuation_belongs_to_named_scope(&waiter.continuation, owner, scope)
+        });
+        self.process_waiters.retain(|waiter| {
+            !Self::continuation_belongs_to_named_scope(&waiter.continuation, owner, scope)
+        });
+        self.suspended_conts.retain(|continuation| {
+            !Self::continuation_belongs_to_named_scope(continuation, owner, scope)
+        });
+        if self.paused_cont.as_ref().is_some_and(|continuation| {
+            Self::continuation_belongs_to_named_scope(continuation, owner, scope)
+        }) {
+            self.paused_cont = None;
+        }
+    }
+
+    fn disable_named_block(&mut self, name: &str, flag: usize, current_process: usize) -> bool {
+        let targets = self
+            .named_scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.active && state.name == name)
+            .map(|(scope, state)| {
+                (
+                    scope,
+                    state.owner,
+                    state.continuation.clone(),
+                    state.processes.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return false;
+        }
+
+        if flag < self.vals.len() {
+            self.vals[flag] = LogicValue::One;
+            self.mark_vcd_change(flag);
+        }
+        let mut terminate_current = false;
+        for (scope, owner, continuation, processes) in targets {
+            let should_resume_owner = self
+                .named_scopes
+                .get(scope)
+                .is_some_and(|state| state.active && !state.owner_resumed);
+            let owner_was_resumed = !should_resume_owner;
+            self.close_named_scope(scope);
+            self.remove_named_scope_wakeups(owner, scope);
+            for process in processes {
+                if process != owner {
+                    self.cancel_process_tree(process);
+                }
+            }
+            if should_resume_owner && !self.process_is_cancelled(owner) {
+                if let Some(state) = self.named_scopes.get_mut(scope) {
+                    state.owner_resumed = true;
+                }
+                self.conts.entry(self.now).or_default().push(continuation);
+            }
+            if (owner == current_process && !owner_was_resumed)
+                || self.process_is_cancelled(current_process)
+            {
+                terminate_current = true;
+            }
+        }
+        self.wake_process_waiters();
+        terminate_current
+    }
+
     fn run_cont(&mut self, c: Cont<'d>) -> Result<(), String> {
         let Cont {
             process,
+            runtime_process,
             join,
+            mut fork,
+            mut named_scopes,
             mut work,
         } = c;
+        if self.process_is_cancelled(runtime_process) {
+            self.retire_named_scopes(&named_scopes, runtime_process);
+            return Ok(());
+        }
+        if self.process_is_suspended(runtime_process) {
+            self.suspended_conts.push(Cont {
+                process,
+                runtime_process,
+                join,
+                fork,
+                named_scopes,
+                work,
+            });
+            return Ok(());
+        }
+        self.set_process_active(runtime_process, true);
+        self.current_runtime_process = runtime_process;
+        let mut terminate_current = false;
         while let Some(s) = work.pop() {
             if self.cancellation.is_cancelled() {
                 return Err("simulation cancelled".into());
@@ -2671,6 +3317,18 @@ impl<'d> Simulator<'d> {
                     }
                 }
                 Stmt::Forever(inner) => {
+                    const MAX_FOREVER_ITERATIONS: u64 = 65_536;
+                    let key = s as *const Stmt as usize;
+                    let iterations = self.forever_iterations.entry(key).or_insert((self.now, 0));
+                    if iterations.0 != self.now {
+                        *iterations = (self.now, 0);
+                    }
+                    iterations.1 += 1;
+                    if iterations.1 > MAX_FOREVER_ITERATIONS {
+                        return Err(
+                            "forever loop exceeds the 65536-iteration execution limit".into()
+                        );
+                    }
                     work.push(s);
                     work.push(inner);
                 }
@@ -2845,6 +3503,112 @@ impl<'d> Simulator<'d> {
                     } else {
                         work.clear();
                     }
+                }
+                Stmt::NamedBlock { name, body } => {
+                    let continuation = Cont {
+                        process,
+                        runtime_process,
+                        join,
+                        fork,
+                        named_scopes: named_scopes.clone(),
+                        work: work.clone(),
+                    };
+                    let scope = self.new_named_scope(name.clone(), runtime_process, continuation);
+                    named_scopes.push(scope);
+                    work.push(&NAMED_BLOCK_END);
+                    work.push(body);
+                }
+                Stmt::NamedBlockEnd => {
+                    if let Some(scope) = named_scopes.pop() {
+                        if let Some(state) = self.named_scopes.get_mut(scope) {
+                            state.owner_resumed = true;
+                        }
+                        if !self.named_scope_has_active_processes(scope) {
+                            self.close_named_scope(scope);
+                        }
+                    }
+                }
+                Stmt::DisableNamedBlock { name, flag } => {
+                    if self.disable_named_block(name, *flag, runtime_process) {
+                        terminate_current = true;
+                    }
+                }
+                Stmt::DisableFork => self.disable_fork(runtime_process)?,
+                Stmt::WaitFork => {
+                    if self.active_immediate_children(runtime_process) {
+                        let continuation = Cont {
+                            process,
+                            runtime_process,
+                            join,
+                            fork,
+                            named_scopes,
+                            work,
+                        };
+                        if let Some(process) = process {
+                            self.busy_procs.remove(&process);
+                        }
+                        self.process_waiters.push(ProcessWaiter {
+                            process: runtime_process,
+                            target: None,
+                            continuation,
+                        });
+                        return Ok(());
+                    }
+                }
+                Stmt::ProcessKill(handle) => {
+                    let target = self.process_handle(handle)?;
+                    self.cancel_process_tree(target);
+                    self.wake_process_waiters();
+                    if target == runtime_process {
+                        terminate_current = true;
+                    }
+                }
+                Stmt::ProcessAwait(handle) => {
+                    let target = self.process_handle(handle)?;
+                    if self.process_is_active(target) {
+                        let continuation = Cont {
+                            process,
+                            runtime_process,
+                            join,
+                            fork,
+                            named_scopes,
+                            work,
+                        };
+                        if let Some(process) = process {
+                            self.busy_procs.remove(&process);
+                        }
+                        self.process_waiters.push(ProcessWaiter {
+                            process: runtime_process,
+                            target: Some(target),
+                            continuation,
+                        });
+                        return Ok(());
+                    }
+                }
+                Stmt::ProcessSuspend(handle) => {
+                    let target = self.process_handle(handle)?;
+                    if target == runtime_process {
+                        self.suspend_process(target);
+                        let continuation = Cont {
+                            process,
+                            runtime_process,
+                            join,
+                            fork,
+                            named_scopes,
+                            work,
+                        };
+                        if let Some(process) = process {
+                            self.busy_procs.remove(&process);
+                        }
+                        self.suspended_conts.push(continuation);
+                        return Ok(());
+                    }
+                    self.suspend_process(target);
+                }
+                Stmt::ProcessResume(handle) => {
+                    let target = self.process_handle(handle)?;
+                    self.resume_process(target);
+                    self.wake_process_waiters();
                 }
                 Stmt::Bl { lv, e } => {
                     let v = self.eval(e);
@@ -3190,7 +3954,10 @@ impl<'d> Simulator<'d> {
                     }
                     self.conts.entry(self.now + ns).or_default().push(Cont {
                         process: c.process,
+                        runtime_process,
                         join: c.join,
+                        fork,
+                        named_scopes,
                         work: exec_order,
                     });
                     return Ok(());
@@ -3202,10 +3969,34 @@ impl<'d> Simulator<'d> {
                     // join_none does not suspend the parent. Its children are
                     // queued behind the parent continuation and retain any
                     // enclosing join obligation.
+                    let join_index = self.fork_joins.len();
+                    self.fork_joins.push(Some(ForkJoin {
+                        mode: ForkMode::JoinNone,
+                        released: true,
+                        remaining: branches.len(),
+                        continuation: Cont {
+                            process: None,
+                            runtime_process,
+                            join: None,
+                            fork: None,
+                            named_scopes: named_scopes.clone(),
+                            work: Vec::new(),
+                        },
+                    }));
+                    fork = Some(join_index);
                     for branch in branches {
+                        let child_process = self.new_process(Some(runtime_process));
+                        for scope in &named_scopes {
+                            if let Some(state) = self.named_scopes.get_mut(*scope) {
+                                state.processes.push(child_process);
+                            }
+                        }
                         self.conts.entry(self.now).or_default().push(Cont {
                             process: None,
+                            runtime_process: child_process,
                             join: c.join,
+                            fork: Some(join_index),
+                            named_scopes: named_scopes.clone(),
                             work: vec![branch],
                         });
                     }
@@ -3219,14 +4010,26 @@ impl<'d> Simulator<'d> {
                         remaining: branches.len(),
                         continuation: Cont {
                             process,
+                            runtime_process,
                             join: c.join,
+                            fork: Some(join_index),
+                            named_scopes: named_scopes.clone(),
                             work,
                         },
                     }));
                     for branch in branches {
+                        let child_process = self.new_process(Some(runtime_process));
+                        for scope in &named_scopes {
+                            if let Some(state) = self.named_scopes.get_mut(*scope) {
+                                state.processes.push(child_process);
+                            }
+                        }
                         self.conts.entry(self.now).or_default().push(Cont {
                             process: None,
+                            runtime_process: child_process,
                             join: Some(join_index),
+                            fork: Some(join_index),
+                            named_scopes: named_scopes.clone(),
                             work: vec![branch],
                         });
                     }
@@ -3255,7 +4058,10 @@ impl<'d> Simulator<'d> {
                             .collect();
                         let continuation = Cont {
                             process: c.process,
+                            runtime_process,
                             join: c.join,
+                            fork,
+                            named_scopes,
                             work: exec_order,
                         };
                         if let Some(process) = c.process {
@@ -3276,7 +4082,10 @@ impl<'d> Simulator<'d> {
                     exec_order.reverse();
                     let continuation = Cont {
                         process: c.process,
+                        runtime_process,
                         join: c.join,
+                        fork,
+                        named_scopes,
                         work: exec_order,
                     };
                     if let Some(process) = c.process {
@@ -3295,7 +4104,10 @@ impl<'d> Simulator<'d> {
                 } => {
                     let continuation = Cont {
                         process: c.process,
+                        runtime_process,
                         join: c.join,
+                        fork,
+                        named_scopes,
                         work,
                     };
                     if let Some(process) = c.process {
@@ -3370,6 +4182,9 @@ impl<'d> Simulator<'d> {
                         *self.property_covers.entry(label.clone()).or_insert(0) += 1;
                     }
                 }
+                Stmt::Severity(severity) => {
+                    *self.severity_counts.entry(*severity).or_insert(0) += 1;
+                }
                 Stmt::WriteMem {
                     radix,
                     path,
@@ -3382,17 +4197,51 @@ impl<'d> Simulator<'d> {
                 Stmt::AssertControl(control) => match control {
                     eda_core::ir::AssertControl::On => self.assertions_enabled = true,
                     eda_core::ir::AssertControl::Off => self.assertions_enabled = false,
-                    // The current immediate assertion/property model commits each
-                    // attempt synchronously and keeps no resident attempt to abort.
-                    eda_core::ir::AssertControl::Kill => {}
+                    eda_core::ir::AssertControl::ScopedOn(scopes) => {
+                        for scope in scopes {
+                            self.scoped_assertions_enabled.insert(scope.clone(), true);
+                        }
+                    }
+                    eda_core::ir::AssertControl::ScopedOff(scopes) => {
+                        for scope in scopes {
+                            self.scoped_assertions_enabled.insert(scope.clone(), false);
+                        }
+                    }
+                    eda_core::ir::AssertControl::ScopedKill(scopes) => {
+                        for scope in scopes {
+                            self.scoped_assertions_enabled.insert(scope.clone(), false);
+                        }
+                        self.kill_assertion_attempts(Some(scopes));
+                    }
+                    eda_core::ir::AssertControl::Kill => {
+                        self.assertions_enabled = false;
+                        self.kill_assertion_attempts(None);
+                    }
                 },
                 Stmt::ImmediateAssertion {
                     kind,
+                    deferred,
+                    scope,
                     cond,
                     pass_action,
                     fail_action,
                 } => {
-                    if !self.assertions_enabled {
+                    if !self.assertion_enabled(scope.as_deref()) {
+                        continue;
+                    }
+                    if *deferred != eda_core::ir::ImmediateAssertionDeferred::None {
+                        let assertion = DeferredAssertion {
+                            kind: *kind,
+                            scope: scope.clone(),
+                            cond,
+                            pass_action: pass_action.as_deref(),
+                            fail_action: fail_action.as_deref(),
+                        };
+                        if *deferred == eda_core::ir::ImmediateAssertionDeferred::Final {
+                            self.final_assertions.push(assertion);
+                        } else {
+                            self.deferred_assertions.push(assertion);
+                        }
                         continue;
                     }
                     let value = self.eval(cond);
@@ -3857,6 +4706,9 @@ impl<'d> Simulator<'d> {
                 }
                 Stmt::Finish => {
                     self.finished = true;
+                    self.close_named_scopes(&named_scopes);
+                    self.set_process_active(runtime_process, false);
+                    self.wake_process_waiters();
                     self.run_final_blocks()?;
                     return Ok(());
                 }
@@ -3864,7 +4716,10 @@ impl<'d> Simulator<'d> {
                     self.stopped = true;
                     self.paused_cont = Some(Cont {
                         process,
+                        runtime_process,
                         join,
+                        fork,
+                        named_scopes,
                         work,
                     });
                     return Ok(());
@@ -3876,6 +4731,9 @@ impl<'d> Simulator<'d> {
             if self.stopped {
                 return Ok(());
             }
+            if terminate_current {
+                break;
+            }
         }
         if let Some(process) = process {
             self.busy_procs.remove(&process);
@@ -3883,6 +4741,11 @@ impl<'d> Simulator<'d> {
         if let Some(join) = join {
             self.complete_join(join);
         }
+        self.set_process_active(runtime_process, false);
+        if self.process_is_cancelled(runtime_process) || !terminate_current {
+            self.retire_named_scopes(&named_scopes, runtime_process);
+        }
+        self.wake_process_waiters();
         Ok(())
     }
 
@@ -3904,13 +4767,32 @@ impl<'d> Simulator<'d> {
         };
         if release_parent {
             state.released = true;
-            if let Some(state) = self.fork_joins[index].take() {
-                self.conts
-                    .entry(self.now)
-                    .or_default()
-                    .push(state.continuation);
+            let mode = state.mode;
+            let continuation = state.continuation.clone();
+            if mode != ForkMode::JoinAny {
+                self.fork_joins[index] = None;
+            }
+            {
+                self.conts.entry(self.now).or_default().push(continuation);
             }
         }
+    }
+
+    fn disable_fork(&mut self, current_process: usize) -> Result<(), String> {
+        // IEEE 1800 process semantics are broader than the innermost lexical
+        // fork: `disable fork` terminates every direct or indirect descendant
+        // of the process executing the statement.  It does not terminate the
+        // current process itself.
+        let children = self
+            .process_states
+            .get(current_process)
+            .map(|state| state.children.clone())
+            .unwrap_or_default();
+        for child in children {
+            self.cancel_process_tree(child);
+        }
+        self.wake_process_waiters();
+        Ok(())
     }
 
     fn format_display(&self, parts: &[eda_core::ir::DispPart], args: &[Expr]) -> String {
@@ -3972,7 +4854,21 @@ impl<'d> Simulator<'d> {
                 | Expr::ShortRealNeg(_)
                 | Expr::ShortRealToReal(_)
                 | Expr::RealToShortReal(_)
+                | Expr::BitsToShortReal(_)
         ) {
+            let Some(real) = self.eval_real(argument) else {
+                return "x".to_string();
+            };
+            let precision = precision.unwrap_or(6);
+            return match spec {
+                'p' | 'P' => format!("{real}"),
+                'e' => format_real_exponent(real, precision),
+                'f' => format!("{real:.*}", precision),
+                'g' => format_real_general(real, precision),
+                _ => format!("{real}"),
+            };
+        }
+        if matches!(argument, Expr::IntToReal { .. } | Expr::BitsToReal(_)) {
             let Some(real) = self.eval_real(argument) else {
                 return "x".to_string();
             };
@@ -4005,6 +4901,9 @@ impl<'d> Simulator<'d> {
                 return "x".to_string();
             }
             let real = f64::from_bits(bits.to_u64().unwrap_or_default());
+            if !real.is_finite() {
+                return "x".to_string();
+            }
             let precision = precision.unwrap_or(6);
             return match spec {
                 'e' => format_real_exponent(real, precision),
@@ -4797,6 +5696,155 @@ impl<'d> Simulator<'d> {
                 }
                 LogicWord { bits }
             }
+            Expr::ProcessSelf => LogicWord::from_u64(
+                64,
+                u64::try_from(self.current_runtime_process).unwrap_or(u64::MAX),
+            ),
+            Expr::ProcessStatus(handle) => {
+                let process = match self
+                    .eval(handle)
+                    .to_u64()
+                    .and_then(|raw| usize::try_from(raw).ok())
+                    .filter(|process| *process < self.process_states.len())
+                {
+                    Some(process) => process,
+                    None => return LogicWord::xes(32),
+                };
+                let state = &self.process_states[process];
+                let status = if state.cancelled {
+                    PROCESS_STATE_KILLED
+                } else if !state.active {
+                    PROCESS_STATE_FINISHED
+                } else if state.suspended {
+                    PROCESS_STATE_SUSPENDED
+                } else if process == self.current_runtime_process {
+                    PROCESS_STATE_RUNNING
+                } else if self.process_is_waiting(process) {
+                    PROCESS_STATE_WAITING
+                } else {
+                    PROCESS_STATE_RUNNING
+                };
+                LogicWord::from_u64(32, status)
+            }
+            Expr::Past {
+                value,
+                ticks,
+                gating,
+            } => {
+                let current = self.eval(value);
+                let gating = gating
+                    .as_deref()
+                    .map(|gating| self.eval(gating).reduce_or().as_bool());
+                let key = e as *const Expr as usize;
+                let mut samples = self.past_samples.borrow_mut();
+                let sample = samples.entry(key).or_insert(PastSample {
+                    time: u64::MAX,
+                    values: Vec::new(),
+                    last_result: None,
+                });
+                if sample.time != self.now {
+                    sample.time = self.now;
+                    match gating {
+                        Some(Some(true)) => {
+                            sample.values.push(current.clone());
+                            let retained = usize::try_from(*ticks)
+                                .map(|ticks| ticks + 1)
+                                .unwrap_or(sample.values.len());
+                            while sample.values.len() > retained {
+                                sample.values.remove(0);
+                            }
+                            let offset = usize::try_from(*ticks)
+                                .map(|ticks| ticks + 1)
+                                .unwrap_or(usize::MAX);
+                            sample.last_result = sample
+                                .values
+                                .len()
+                                .checked_sub(offset)
+                                .and_then(|index| sample.values.get(index).cloned());
+                        }
+                        Some(Some(false)) => {}
+                        Some(None) => {
+                            sample.last_result = Some(LogicWord::xes(current.width()));
+                        }
+                        None => {
+                            sample.values.push(current.clone());
+                            let offset = usize::try_from(*ticks)
+                                .map(|ticks| ticks + 1)
+                                .unwrap_or(usize::MAX);
+                            sample.last_result = Some(
+                                sample
+                                    .values
+                                    .len()
+                                    .checked_sub(offset)
+                                    .and_then(|index| sample.values.get(index).cloned())
+                                    .unwrap_or_else(|| LogicWord::xes(current.width())),
+                            );
+                        }
+                    }
+                }
+                sample
+                    .last_result
+                    .clone()
+                    .unwrap_or_else(|| LogicWord::xes(current.width()))
+            }
+            Expr::Sampled(value) => self.eval(value),
+            Expr::SampledValue { op, value } => {
+                let current = self.eval(value);
+                let key = e as *const Expr as usize;
+                let mut samples = self.past_samples.borrow_mut();
+                let sample = samples.entry(key).or_insert(PastSample {
+                    time: u64::MAX,
+                    values: Vec::new(),
+                    last_result: None,
+                });
+                if sample.time != self.now {
+                    sample.time = self.now;
+                    sample.values.push(current.clone());
+                    while sample.values.len() > 2 {
+                        sample.values.remove(0);
+                    }
+                }
+                if sample.values.len() < 2 {
+                    return LogicWord::xes(1);
+                }
+                let previous = &sample.values[sample.values.len() - 2];
+                let current = &sample.values[sample.values.len() - 1];
+                let result = match op {
+                    eda_core::ir::SampledValueOp::Rose => {
+                        let previous = previous.reduce_or().as_bool();
+                        let current = current.reduce_or().as_bool();
+                        match (previous, current) {
+                            (Some(false), Some(true)) => Some(true),
+                            (Some(_), Some(_)) => Some(false),
+                            _ => None,
+                        }
+                    }
+                    eda_core::ir::SampledValueOp::Fell => {
+                        let previous = previous.reduce_or().as_bool();
+                        let current = current.reduce_or().as_bool();
+                        match (previous, current) {
+                            (Some(true), Some(false)) => Some(true),
+                            (Some(_), Some(_)) => Some(false),
+                            _ => None,
+                        }
+                    }
+                    eda_core::ir::SampledValueOp::Stable => {
+                        let known = previous.bits.iter().all(|bit| bit.is_01())
+                            && current.bits.iter().all(|bit| bit.is_01());
+                        known.then(|| previous == current)
+                    }
+                    eda_core::ir::SampledValueOp::Changed => {
+                        let known = previous.bits.iter().all(|bit| bit.is_01())
+                            && current.bits.iter().all(|bit| bit.is_01());
+                        known.then(|| previous != current)
+                    }
+                };
+                match result {
+                    Some(true) => LogicWord::from_u64(1, 1),
+                    Some(false) => LogicWord::from_u64(1, 0),
+                    None => LogicWord::xes(1),
+                }
+            }
             Expr::ShortRealBinary { .. } => match self.eval_shortreal(e) {
                 Some(real) => LogicWord::from_u64(32, u64::from(real.to_bits())),
                 None => LogicWord::xes(32),
@@ -4811,6 +5859,14 @@ impl<'d> Simulator<'d> {
             },
             Expr::RealToShortReal(operand) => match self.eval_real(operand) {
                 Some(real) => LogicWord::from_u64(32, u64::from((real as f32).to_bits())),
+                None => LogicWord::xes(32),
+            },
+            Expr::BitsToReal(_) => match self.eval_real(e) {
+                Some(real) => LogicWord::from_u64(64, real.to_bits()),
+                None => LogicWord::xes(64),
+            },
+            Expr::BitsToShortReal(_) => match self.eval_shortreal(e) {
+                Some(real) => LogicWord::from_u64(32, u64::from(real.to_bits())),
                 None => LogicWord::xes(32),
             },
             Expr::RealBinary { .. } => match self.eval_real(e) {
@@ -4828,6 +5884,17 @@ impl<'d> Simulator<'d> {
             } => match self
                 .eval_real(value)
                 .and_then(|real| real_to_int(real, *width, *signed))
+            {
+                Some(bits) => LogicWord::from_u64(*width, bits),
+                None => LogicWord::xes(*width),
+            },
+            Expr::RealTruncToInt {
+                value,
+                width,
+                signed,
+            } => match self
+                .eval_real(value)
+                .and_then(|real| real_trunc_to_int(real, *width, *signed))
             {
                 Some(bits) => LogicWord::from_u64(*width, bits),
                 None => LogicWord::xes(*width),
@@ -5173,6 +6240,58 @@ impl<'d> Simulator<'d> {
                 width,
                 ..
             } => self.eval_random(*function, args, *width),
+            Expr::CountBits { value, controls } => {
+                let value = self.eval(value);
+                let count = value
+                    .bits
+                    .iter()
+                    .filter(|bit| match bit {
+                        LogicValue::Zero => controls & 1 != 0,
+                        LogicValue::One => controls & 2 != 0,
+                        LogicValue::X => controls & 4 != 0,
+                        LogicValue::Z => controls & 8 != 0,
+                    })
+                    .count();
+                LogicWord::from_u64(32, count as u64)
+            }
+            Expr::IsUnknown(value) => {
+                let value = self.eval(value);
+                LogicWord::from_u64(1, u64::from(value.bits.iter().any(|bit| bit.is_unknown())))
+            }
+            Expr::OneHot(value) => {
+                let evaluated = self.eval(value);
+                let ones = evaluated
+                    .bits
+                    .iter()
+                    .filter(|bit| **bit == LogicValue::One)
+                    .count();
+                let unknown = evaluated
+                    .bits
+                    .iter()
+                    .any(|bit| matches!(bit, LogicValue::X | LogicValue::Z));
+                if unknown {
+                    LogicWord::xes(1)
+                } else {
+                    LogicWord::from_u64(1, u64::from(ones == 1))
+                }
+            }
+            Expr::OneHot0(value) => {
+                let evaluated = self.eval(value);
+                let ones = evaluated
+                    .bits
+                    .iter()
+                    .filter(|bit| **bit == LogicValue::One)
+                    .count();
+                let unknown = evaluated
+                    .bits
+                    .iter()
+                    .any(|bit| matches!(bit, LogicValue::X | LogicValue::Z));
+                if unknown {
+                    LogicWord::xes(1)
+                } else {
+                    LogicWord::from_u64(1, u64::from(ones <= 1))
+                }
+            }
             Expr::FileOpen {
                 path,
                 append,
@@ -5480,6 +6599,11 @@ impl<'d> Simulator<'d> {
             Expr::ShortRealNeg(operand) => Some(-self.eval_shortreal(operand)?),
             Expr::ShortRealToReal(operand) => Some(self.eval_shortreal(operand)?),
             Expr::RealToShortReal(operand) => Some(self.eval_real(operand)? as f32),
+            Expr::BitsToShortReal(operand) => {
+                let bits = self.eval(operand);
+                let raw = u32::try_from(bits.to_u64()?).ok()?;
+                Some(f32::from_bits(raw))
+            }
             _ => None,
         }
     }
@@ -5509,7 +6633,13 @@ impl<'d> Simulator<'d> {
             | Expr::ShortRealBinary { .. }
             | Expr::ShortRealNeg(_)
             | Expr::ShortRealToReal(_)
-            | Expr::RealToShortReal(_) => self.eval_shortreal(e).map(f64::from),
+            | Expr::RealToShortReal(_)
+            | Expr::BitsToShortReal(_) => self.eval_shortreal(e).map(f64::from),
+            Expr::BitsToReal(operand) => {
+                let bits = self.eval(operand);
+                let raw = bits.to_u64()?;
+                Some(f64::from_bits(raw))
+            }
             Expr::RealBinary { op, left, right } => {
                 let left = self.eval_real(left)?;
                 let right = self.eval_real(right)?;
@@ -5774,12 +6904,20 @@ fn sext_i64(w: &LogicWord, _width: usize) -> i64 {
 }
 
 fn real_to_int(real: f64, width: usize, signed: bool) -> Option<u64> {
+    real_to_int_with(real, width, signed, true)
+}
+
+fn real_trunc_to_int(real: f64, width: usize, signed: bool) -> Option<u64> {
+    real_to_int_with(real, width, signed, false)
+}
+
+fn real_to_int_with(real: f64, width: usize, signed: bool, round: bool) -> Option<u64> {
     if !real.is_finite() || width == 0 || width > u64::BITS as usize {
         return None;
     }
     let magnitude = real.abs();
     let fractional = magnitude - magnitude.floor();
-    let rounded = if fractional >= 0.5 {
+    let rounded = if round && fractional >= 0.5 {
         magnitude.floor() + 1.0
     } else {
         magnitude.floor()
@@ -6656,7 +7794,16 @@ fn expr_nets(e: &Expr) -> Vec<usize> {
 
 fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
     match e {
-        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) => {}
+        Expr::Const(_) | Expr::RealConst(_) | Expr::ShortRealConst(_) | Expr::ProcessSelf => {}
+        Expr::ProcessStatus(handle) => walk_expr(handle, out),
+        Expr::Past { value, gating, .. } => {
+            walk_expr(value, out);
+            if let Some(gating) = gating {
+                walk_expr(gating, out);
+            }
+        }
+        Expr::Sampled(value) => walk_expr(value, out),
+        Expr::SampledValue { value, .. } => walk_expr(value, out),
         Expr::RealRef { net, decl_width } => out.extend(*net..*net + decl_width),
         Expr::ShortRealRef { net } => out.extend(*net..*net + 32),
         Expr::RealBinary { left, right, .. } => {
@@ -6674,8 +7821,12 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => walk_expr(operand, out),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => walk_expr(value, out),
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => walk_expr(operand, out),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => walk_expr(value, out),
         Expr::RealTime { .. } => {}
         Expr::Ref { net, range, .. } => match range {
             Range::Bit(b) => out.push(net + b),
@@ -6743,6 +7894,10 @@ fn walk_expr(e: &Expr, out: &mut Vec<usize>) {
         Expr::MemorySize { .. } => {}
         Expr::AssocRead { index, .. } | Expr::AssocExists { index, .. } => walk_expr(index, out),
         Expr::Random { args, .. } => args.iter().for_each(|argument| walk_expr(argument, out)),
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => walk_expr(value, out),
         Expr::FileOpen { .. } => {}
         Expr::FileOpenDynamic { path, mode } => {
             walk_expr(path, out);
@@ -6857,7 +8012,17 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         | Expr::RealTime { .. }
         | Expr::RealRef { .. }
         | Expr::ShortRealConst(_)
-        | Expr::ShortRealRef { .. } => {}
+        | Expr::ShortRealRef { .. }
+        | Expr::ProcessSelf => {}
+        Expr::ProcessStatus(handle) => walk_expr_memories(handle, out),
+        Expr::Past { value, gating, .. } => {
+            walk_expr_memories(value, out);
+            if let Some(gating) = gating {
+                walk_expr_memories(gating, out);
+            }
+        }
+        Expr::Sampled(value) => walk_expr_memories(value, out),
+        Expr::SampledValue { value, .. } => walk_expr_memories(value, out),
         Expr::RealBinary { left, right, .. } | Expr::RealCompare { left, right, .. } => {
             walk_expr_memories(left, out);
             walk_expr_memories(right, out);
@@ -6869,10 +8034,12 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
         }
         Expr::ShortRealNeg(operand)
         | Expr::ShortRealToReal(operand)
-        | Expr::RealToShortReal(operand) => walk_expr_memories(operand, out),
-        Expr::RealToInt { value, .. } | Expr::IntToReal { value, .. } => {
-            walk_expr_memories(value, out)
-        }
+        | Expr::RealToShortReal(operand)
+        | Expr::BitsToReal(operand)
+        | Expr::BitsToShortReal(operand) => walk_expr_memories(operand, out),
+        Expr::RealToInt { value, .. }
+        | Expr::RealTruncToInt { value, .. }
+        | Expr::IntToReal { value, .. } => walk_expr_memories(value, out),
         Expr::Ref { .. } => {}
         Expr::MemoryRead {
             memory, indexes, ..
@@ -6942,6 +8109,10 @@ fn walk_expr_memories(e: &Expr, out: &mut Vec<usize>) {
             out.push(*memory);
             walk_expr_memories(index, out);
         }
+        Expr::CountBits { value, .. }
+        | Expr::IsUnknown(value)
+        | Expr::OneHot(value)
+        | Expr::OneHot0(value) => walk_expr_memories(value, out),
         Expr::Random { args, .. } => args
             .iter()
             .for_each(|argument| walk_expr_memories(argument, out)),
@@ -7162,6 +8333,13 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
             }
         }
         Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::NamedBlock { body, .. } => walk_stmt_memories(body, out),
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => walk_expr_memories(handle, out),
     }
 }
 
@@ -7389,6 +8567,13 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
             }
         }
         Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::NamedBlock { body, .. } => collect_stmt_access(body, reads, writes),
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => reads.extend(expr_nets(handle)),
     }
 }
 
@@ -7595,6 +8780,13 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
             }
         }
         Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::NamedBlock { body, .. } => walk_stmt(body, out),
+        Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
+        Stmt::DisableNamedBlock { .. } => {}
+        Stmt::ProcessKill(handle)
+        | Stmt::ProcessAwait(handle)
+        | Stmt::ProcessSuspend(handle)
+        | Stmt::ProcessResume(handle) => walk_expr(handle, out),
     }
 }
 

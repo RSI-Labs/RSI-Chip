@@ -3,6 +3,7 @@
 use super::{
     declaration_name, AstEnumType, AstLoweredSymbol, AstStructField, AstStructType, SlangAstLowerer,
 };
+use crate::ast_util::canonical_detailed_type;
 use crate::ast_util::{
     bool_field, literal_word, memory_initializer_statements, string_field, string_literal,
     usize_field, with_source_span,
@@ -108,6 +109,7 @@ impl SlangAstLowerer {
         name: String,
         member: &serde_json::Value,
         definition: AstStructType,
+        canonical_type_name: Option<String>,
     ) {
         let address = member.get("addr").and_then(serde_json::Value::as_u64);
         let scoped_name = if let Some(package) =
@@ -126,9 +128,28 @@ impl SlangAstLowerer {
         if string_field(member, "eda_package_scope").is_some() {
             self.package_type_aliases
                 .insert(name.clone(), definition.clone());
+            if let Some(canonical_type_name) = canonical_type_name.clone() {
+                self.package_type_alias_type_names
+                    .insert(name.clone(), canonical_type_name);
+            }
         }
-        self.type_aliases.insert(scoped_name, definition.clone());
+        self.type_aliases
+            .insert(scoped_name.clone(), definition.clone());
+        if let Some(canonical_type_name) = canonical_type_name {
+            self.type_alias_type_names
+                .insert(scoped_name, canonical_type_name.clone());
+            self.type_alias_type_names
+                .insert(name.clone(), canonical_type_name);
+        }
         self.type_aliases.insert(name, definition);
+    }
+
+    fn canonical_type_alias_target(target: &serde_json::Value) -> Option<String> {
+        if target.is_string() {
+            return target.as_str().map(str::to_string);
+        }
+        let type_name = canonical_detailed_type(target)?;
+        simple_type_shape(&type_name).map(|_| type_name)
     }
 
     pub(super) fn type_alias_definition(&self, type_name: &str) -> Option<&AstStructType> {
@@ -146,6 +167,37 @@ impl SlangAstLowerer {
         self.type_aliases.get(alias_name)
     }
 
+    pub(super) fn canonical_type_alias_name(&self, type_name: &str) -> Option<String> {
+        let type_reference = type_name.split('$').next()?.trim();
+        let mut current = if !type_reference.is_empty() {
+            self.type_alias_type_names
+                .get(type_reference)
+                .cloned()
+                .unwrap_or_else(|| type_reference.to_string())
+        } else {
+            type_name.to_string()
+        };
+        for _ in 0..64 {
+            if simple_type_shape(&current).is_some() {
+                return Some(current);
+            }
+            let scoped_alias_name = current.split_whitespace().next_back()?.to_string();
+            let next = self
+                .type_alias_type_names
+                .get(&scoped_alias_name)
+                .or_else(|| {
+                    let alias_name = scoped_alias_name.rsplit(['.', '#', ':']).next()?;
+                    self.type_alias_type_names.get(alias_name)
+                })?
+                .clone();
+            if next == current {
+                return None;
+            }
+            current = next;
+        }
+        None
+    }
+
     pub(super) fn collect_procedure_locals(
         &mut self,
         member: &serde_json::Value,
@@ -153,6 +205,10 @@ impl SlangAstLowerer {
         let Some(block_address) = usize_field(member, "addr") else {
             return Err("procedure-local block has no symbol address".into());
         };
+        if let Some(block_name) = string_field(member, "name").filter(|name| !name.is_empty()) {
+            self.known_assertion_scopes
+                .insert(format!("{block_address} {block_name}"));
+        }
         let empty_members = Vec::new();
         let variables = member
             .get("members")
@@ -160,20 +216,19 @@ impl SlangAstLowerer {
             .unwrap_or(&empty_members);
         let mut symbol_ids = Vec::new();
         for variable in variables {
-            if string_field(variable, "kind").as_deref() != Some("Variable") {
+            let member_kind = string_field(variable, "kind");
+            if !matches!(member_kind.as_deref(), Some("Variable") | Some("Parameter")) {
                 continue;
             }
             let name = declaration_name(variable, "local Variable")?;
-            if string_field(variable, "lifetime").as_deref() != Some("Automatic") {
+            let lifetime = string_field(variable, "lifetime");
+            if member_kind.as_deref() == Some("Variable")
+                && !matches!(lifetime.as_deref(), Some("Automatic") | Some("Static"))
+            {
                 return Err(format!(
                     "procedure-local variable '{name}' must be automatic"
                 ));
             }
-            let Some(initializer) = variable.get("initializer") else {
-                return Err(format!(
-                    "procedure-local variable '{name}' must have an initializer in this subset"
-                ));
-            };
             let Some(address) = usize_field(variable, "addr") else {
                 return Err(format!(
                     "procedure-local variable '{name}' has no symbol address"
@@ -210,7 +265,10 @@ impl SlangAstLowerer {
                 },
             );
             self.local_initializers
-                .insert(symbol_id.clone(), initializer.clone());
+                .insert(symbol_id.clone(), variable.get("initializer").cloned());
+            if member_kind.as_deref() == Some("Variable") && lifetime.as_deref() == Some("Static") {
+                self.local_static_symbols.insert(symbol_id.clone());
+            }
             symbol_ids.push(symbol_id);
         }
         self.local_blocks
@@ -252,6 +310,7 @@ impl SlangAstLowerer {
                         is_unpacked: false,
                         flat_pattern: true,
                     },
+                    Some(target_type.to_string()),
                 );
                 return Ok(());
             }
@@ -302,6 +361,7 @@ impl SlangAstLowerer {
                     is_unpacked: false,
                     flat_pattern: true,
                 },
+                Self::canonical_type_alias_target(target),
             );
             return Ok(());
         }
@@ -407,8 +467,26 @@ impl SlangAstLowerer {
             is_unpacked,
             flat_pattern,
         };
-        self.insert_type_alias(name, member, definition);
+        let canonical_type_name = Self::canonical_type_alias_target(target);
+        self.insert_type_alias(name, member, definition, canonical_type_name);
         Ok(())
+    }
+
+    pub(super) fn collect_type_parameter(
+        &mut self,
+        member: &serde_json::Value,
+    ) -> Result<(), String> {
+        let name = declaration_name(member, "TypeParameter")?;
+        let target = member
+            .get("type")
+            .ok_or_else(|| format!("type parameter '{name}' has no resolved type"))?;
+        let alias_member = serde_json::json!({
+            "kind": "TypeAlias",
+            "name": name,
+            "addr": member.get("addr").cloned().unwrap_or(serde_json::Value::Null),
+            "target": target,
+        });
+        self.collect_type_alias(&alias_member)
     }
 
     fn inline_struct_pattern_type(&self, target: &serde_json::Value) -> Option<AstStructType> {
@@ -755,6 +833,35 @@ impl SlangAstLowerer {
         let kind = string_field(member, "kind").unwrap_or_default();
         let name = declaration_name(member, &kind)?;
         let type_name = string_field(member, "type").unwrap_or_default();
+        if kind == "Variable" && self.manual_covergroups.contains_key(&type_name) {
+            if member.get("initializer").is_some() {
+                return Err(format!(
+                    "covergroup instance '{name}' does not support an initializer"
+                ));
+            }
+            let address = member
+                .get("addr")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("covergroup instance '{name}' has no symbol address"))?;
+            self.covergroup_instances
+                .insert(format!("{address} {name}"), type_name);
+            return Ok(());
+        }
+        if type_is_process_handle(&type_name) && kind == "Variable" {
+            let mut integral = member.clone();
+            if let Some(fields) = integral.as_object_mut() {
+                fields.insert(
+                    "type".into(),
+                    serde_json::Value::String("logic[63:0]".into()),
+                );
+            }
+            self.declare_net(&integral, &name, &kind)?;
+            if let Some(initializer) = member.get("initializer") {
+                let rhs = self.lower_real_assignment_expression(member, initializer)?;
+                self.push_assignment(name, rhs);
+            }
+            return Ok(());
+        }
         if type_name.contains("uvm_sequencer") {
             self.declare_uvm_sequencer(member, &name)?;
             return Ok(());
@@ -863,6 +970,7 @@ impl SlangAstLowerer {
             associative: memory.associative,
             index_width: memory.index_width,
             index_signed: memory.index_signed,
+            declaration_initialized: initializer.is_some(),
             storage: eda_core::ir::MemoryStorage::Ordinary,
             kind: eda_core::ir::MemoryKind::Ram,
             template: eda_core::ir::MemoryTemplate::Unmapped,
@@ -917,6 +1025,20 @@ impl SlangAstLowerer {
                 {
                     declaration.is_reg = true;
                 }
+            } else if kind == "Net" {
+                // Slang elaborates an ANSI port such as `input a` into a Port
+                // symbol followed by its internal Net symbol. The companion Net
+                // proves that storage is net storage, even when the data type
+                // is implicit `logic`; do not leave the provisional port mark
+                // as procedural storage metadata.
+                if let Some(declaration) = self
+                    .design
+                    .net_decls
+                    .iter_mut()
+                    .find(|declaration| declaration.name == name)
+                {
+                    declaration.is_reg = false;
+                }
             }
             return Ok(existing);
         }
@@ -958,6 +1080,10 @@ impl SlangAstLowerer {
         } else {
             format!("logic[{}:0]", shape.width.saturating_sub(1))
         };
+        if value == "$" {
+            self.unbounded_parameters.insert(name);
+            return Ok(());
+        }
         let word = if type_name == "string" {
             let literal = value.trim().trim_matches('"');
             string_literal_word(literal)
@@ -975,6 +1101,10 @@ impl SlangAstLowerer {
         self.constants.insert(name, word);
         Ok(())
     }
+}
+
+fn type_is_process_handle(type_name: &str) -> bool {
+    type_name.split_whitespace().next_back() == Some("process")
 }
 
 fn detailed_type_width(type_value: &serde_json::Value) -> Result<usize, String> {

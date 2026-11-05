@@ -839,10 +839,26 @@ impl SlangAstLowerer {
         let Some(class) = self.class_definitions.get(&class_key).cloned() else {
             return Ok(false);
         };
+        let official_uvm_source = string_field(member, "source_file")
+            .is_some_and(|source| source.contains("uvm-") && source.contains("/src/"));
+        let deferred_uninitialized_uvm_global =
+            member.get("initializer").is_none() && official_uvm_source;
+        if deferred_uninitialized_uvm_global {
+            return Ok(true);
+        }
         if bool_field(&class, "isAbstract")
             || bool_field(&class, "isInterface")
             || bool_field(&class, "isFinal")
         {
+            // Official UVM contains declarations of opaque abstract handles
+            // (notably the deferred-initialization queue) that do not need to
+            // be materialized unless user code references them.  Defer such
+            // uninitialized declarations and retain fail-closed behavior at
+            // reference/lowering sites instead of rejecting compilation of the
+            // entire library.
+            if member.get("initializer").is_none() {
+                return Ok(true);
+            }
             return Err(format!("class '{class_name}' qualifiers are not supported"));
         }
         if class

@@ -1,11 +1,13 @@
 //! Straight-line function inlining from slang's elaborated AST.
 
+use super::expressions::{constant_i64, type_is_realtime_compatible};
 use super::statements::event_array_condition;
 use super::{declaration_name, SlangAstLowerer};
 use crate::ast_util::{
-    bool_field, expression_symbol, string_field, string_literal, unwrap_conversion,
+    bool_field, constant_system_real, expression_symbol, literal_word, slang_constant_u64,
+    string_field, string_literal, unwrap_conversion,
 };
-use crate::types::{memory_type, simple_type_shape};
+use crate::types::{memory_type, simple_type_shape, STRING_WIDTH};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -14,7 +16,166 @@ struct TaskLocal {
     initializer: Option<Value>,
 }
 
+#[derive(Clone, Copy)]
+struct FixedArrayQueryDimension {
+    left: i64,
+    right: i64,
+    increment: i64,
+    length: usize,
+}
+
+impl FixedArrayQueryDimension {
+    fn from_memory(dimension: eda_core::ir::MemoryDimension) -> Self {
+        let last = dimension
+            .base
+            .saturating_add(dimension.step.saturating_mul(dimension.length as i64 - 1));
+        Self {
+            left: dimension.base,
+            right: last,
+            increment: -dimension.step,
+            length: dimension.length,
+        }
+    }
+}
+
 impl SlangAstLowerer {
+    fn lower_covergroup_sample_call(
+        &self,
+        value: &Value,
+    ) -> Result<Option<eda_core::ir::Stmt>, String> {
+        let Some(subroutine) = string_field(value, "subroutine") else {
+            return Ok(None);
+        };
+        if subroutine
+            .split_whitespace()
+            .next_back()
+            .is_none_or(|name| name != "sample")
+        {
+            return Ok(None);
+        }
+        let Some(receiver) = value.get("thisClass") else {
+            return Ok(None);
+        };
+        let Some(instance) = string_field(receiver, "symbol").filter(|symbol| !symbol.is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(group_type) = self.covergroup_instances.get(&instance).cloned() else {
+            return Ok(None);
+        };
+        if !self.constructed_covergroups.borrow().contains(&instance) {
+            return Err(format!(
+                "covergroup instance '{instance}' must be constructed before sample()"
+            ));
+        }
+        let definition = self
+            .manual_covergroups
+            .get(&group_type)
+            .ok_or_else(|| format!("covergroup type '{group_type}' is not supported"))?;
+        let group_name = definition.name.clone();
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        if arguments.len() != definition.sample_names.len() {
+            return Err(format!(
+                "covergroup '{group_name}' sample() requires {} argument(s)",
+                definition.sample_names.len()
+            ));
+        }
+        let sampled_values = arguments
+            .iter()
+            .map(|argument| self.lower_expression(argument))
+            .collect::<Result<Vec<_>, String>>()?;
+        let instance_name = instance.split_whitespace().next_back().unwrap_or_default();
+        let mut statements = Vec::new();
+        for coverpoint in &definition.coverpoints {
+            let Some(sample_index) = definition
+                .sample_names
+                .iter()
+                .position(|name| name == &coverpoint.sample_name)
+            else {
+                return Err(format!(
+                    "covergroup '{group_name}' coverpoint '{}' has no matching sample argument",
+                    coverpoint.sample_name
+                ));
+            };
+            let sampled = &sampled_values[sample_index];
+            for bin in &coverpoint.bins {
+                let mut matches = Vec::with_capacity(bin.values.len());
+                for constant in &bin.values {
+                    matches.push(eda_core::ir::Expr::Bin {
+                        op: eda_core::ir::BinOp::Eq,
+                        a: Box::new(sampled.clone()),
+                        b: Box::new(eda_core::ir::Expr::Const(constant.clone())),
+                    });
+                }
+                let condition = matches
+                    .into_iter()
+                    .reduce(|left, right| eda_core::ir::Expr::Bin {
+                        op: eda_core::ir::BinOp::LogOr,
+                        a: Box::new(left),
+                        b: Box::new(right),
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "coverage bin '{}.{}.{}' has no values",
+                            definition.name, coverpoint.sample_name, bin.name
+                        )
+                    })?;
+                statements.push(eda_core::ir::Stmt::Cover {
+                    label: format!(
+                        "{group_name}.{instance_name}.{}.{}",
+                        coverpoint.sample_name, bin.name
+                    ),
+                    cond: condition,
+                });
+            }
+        }
+        if statements.is_empty() {
+            return Err(format!(
+                "covergroup '{group_name}' sample() has no simple coverage bins"
+            ));
+        }
+        Ok(Some(eda_core::ir::Stmt::Block(statements)))
+    }
+
+    fn same_single_clock_edge(
+        &self,
+        expected: &eda_core::ir::Sens,
+        actual: &eda_core::ir::Sens,
+    ) -> bool {
+        matches!(
+            (expected, actual),
+            (
+                eda_core::ir::Sens::Posedge(expected),
+                eda_core::ir::Sens::Posedge(actual)
+            ) | (
+                eda_core::ir::Sens::Negedge(expected),
+                eda_core::ir::Sens::Negedge(actual)
+            ) if expected == actual
+        )
+    }
+
+    fn validate_explicit_sample_clock(&self, clocking_event: &Value) -> Result<(), String> {
+        let timing = clocking_event
+            .get("timingControl")
+            .ok_or_else(|| "sampled-value clocking event has no timing control".to_string())?;
+        let explicit = self.lower_sensitivity(timing)?;
+        if self
+            .past_sampling_event
+            .as_ref()
+            .is_some_and(|enclosing| self.same_single_clock_edge(enclosing, &explicit))
+        {
+            return Ok(());
+        }
+        Err(
+            "direct lowering supports a sampled-value clocking event only when it exactly matches the single enclosing clock edge"
+                .into(),
+        )
+    }
+
     pub(super) fn collect_subroutine(&mut self, member: &Value) -> Result<(), String> {
         let name = declaration_name(member, "Subroutine")?;
         if self.subroutines.contains_key(&name) {
@@ -32,6 +193,350 @@ impl SlangAstLowerer {
             .split_whitespace()
             .next_back()
             .unwrap_or_default();
+        if function_name == "self" && process_return_type(value) {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err("process::self does not take arguments".into());
+            }
+            return Ok(eda_core::ir::Expr::ProcessSelf);
+        }
+        if function_name == "status" && process_this_class(value).is_some() {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if !arguments.is_empty() {
+                return Err("process::status does not take arguments".into());
+            }
+            let receiver = process_this_class(value).expect("process receiver was checked");
+            return Ok(eda_core::ir::Expr::ProcessStatus(Box::new(
+                self.lower_expression(receiver)?,
+            )));
+        }
+        if function_name == "$clog2" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$clog2 requires exactly one constant argument".into());
+            }
+            let input = constant_i64(&arguments[0])
+                .map_err(|error| format!("$clog2 argument must be an integer constant: {error}"))?;
+            if input < 0 {
+                return Err("$clog2 requires a nonnegative integer constant".into());
+            }
+            let result = if input <= 1 {
+                0_u32
+            } else {
+                let input = u128::try_from(input)
+                    .map_err(|_| "$clog2 result is out of range".to_string())?;
+                (input - 1).ilog2() + 1
+            };
+            return Ok(eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_u64(32, u64::from(result)),
+            ));
+        }
+        if matches!(
+            function_name,
+            "$countbits" | "$countones" | "$isunknown" | "$onehot" | "$onehot0"
+        ) {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            match function_name {
+                "$countbits" => {
+                    if !(2..=5).contains(&arguments.len()) {
+                        return Err(
+                            "$countbits requires one value and one to four control values".into(),
+                        );
+                    }
+                    let mut controls = 0_u8;
+                    for control in &arguments[1..] {
+                        let control = unwrap_conversion(control);
+                        let type_name = string_field(control, "type").unwrap_or_default();
+                        let raw_value = string_field(control, "value").unwrap_or_default();
+                        let word = literal_word(&type_name, &raw_value)
+                            .ok_or("$countbits control values must be unbased unsized literals")?;
+                        let Some(bit) = word.bits.first() else {
+                            return Err("$countbits control value has no value".into());
+                        };
+                        controls |= match bit {
+                            eda_core::logic::LogicValue::Zero => 1,
+                            eda_core::logic::LogicValue::One => 2,
+                            eda_core::logic::LogicValue::X => 4,
+                            eda_core::logic::LogicValue::Z => 8,
+                        };
+                    }
+                    if controls == 0 {
+                        return Err("$countbits requires at least one control value".into());
+                    }
+                    return Ok(eda_core::ir::Expr::CountBits {
+                        value: Box::new(self.lower_expression(&arguments[0])?),
+                        controls,
+                    });
+                }
+                "$countones" => {
+                    if arguments.len() != 1 {
+                        return Err("$countones requires exactly one argument".into());
+                    }
+                    return Ok(eda_core::ir::Expr::CountBits {
+                        value: Box::new(self.lower_expression(&arguments[0])?),
+                        controls: 2,
+                    });
+                }
+                "$isunknown" => {
+                    if arguments.len() != 1 {
+                        return Err("$isunknown requires exactly one argument".into());
+                    }
+                    return Ok(eda_core::ir::Expr::IsUnknown(Box::new(
+                        self.lower_expression(&arguments[0])?,
+                    )));
+                }
+                "$onehot" => {
+                    if arguments.len() != 1 {
+                        return Err("$onehot requires exactly one argument".into());
+                    }
+                    return Ok(eda_core::ir::Expr::OneHot(Box::new(
+                        self.lower_expression(&arguments[0])?,
+                    )));
+                }
+                _ => {
+                    if arguments.len() != 1 {
+                        return Err("$onehot0 requires exactly one argument".into());
+                    }
+                    return Ok(eda_core::ir::Expr::OneHot0(Box::new(
+                        self.lower_expression(&arguments[0])?,
+                    )));
+                }
+            }
+        }
+        if let Some(result) = constant_system_real(value) {
+            return Ok(eda_core::ir::Expr::RealConst(result));
+        }
+        if matches!(
+            function_name,
+            "$itor"
+                | "$rtoi"
+                | "$realtobits"
+                | "$bitstoreal"
+                | "$shortrealtobits"
+                | "$bitstoshortreal"
+        ) {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err(format!("{function_name} requires exactly one argument"));
+            }
+            let argument = unwrap_conversion(&arguments[0]);
+            let source_type = string_field(argument, "type").unwrap_or_default();
+            match function_name {
+                "$itor" => {
+                    let (source_shape, signed, _) = self
+                        .net_type(&source_type)
+                        .map_err(|error| format!("$itor source type '{source_type}': {error}"))?;
+                    return Ok(eda_core::ir::Expr::IntToReal {
+                        value: Box::new(self.lower_expression(argument)?),
+                        width: source_shape.width,
+                        signed,
+                    });
+                }
+                "$rtoi" => {
+                    let target_type = string_field(value, "type").unwrap_or_default();
+                    let (target_shape, signed, _) = self
+                        .net_type(&target_type)
+                        .map_err(|error| format!("$rtoi result type '{target_type}': {error}"))?;
+                    let real = if source_type.trim() == "shortreal" {
+                        eda_core::ir::Expr::ShortRealToReal(Box::new(
+                            self.lower_shortreal_arithmetic_operand(argument)?,
+                        ))
+                    } else if type_is_realtime_compatible(&source_type) {
+                        self.lower_real_arithmetic_operand(argument)?
+                    } else {
+                        return Err(format!(
+                            "$rtoi requires a real or shortreal operand, found '{source_type}'"
+                        ));
+                    };
+                    return Ok(eda_core::ir::Expr::RealTruncToInt {
+                        value: Box::new(real),
+                        width: target_shape.width,
+                        signed,
+                    });
+                }
+                "$realtobits" => {
+                    if !type_is_realtime_compatible(&source_type) {
+                        return Err(format!(
+                            "$realtobits requires a real operand, found '{source_type}'"
+                        ));
+                    }
+                    return self.lower_real_arithmetic_operand(argument);
+                }
+                "$shortrealtobits" => {
+                    if source_type.trim() == "shortreal" {
+                        return self.lower_shortreal_arithmetic_operand(argument);
+                    }
+                    if !type_is_realtime_compatible(&source_type) {
+                        return Err(format!(
+                            "$shortrealtobits requires a real or shortreal operand, found '{source_type}'"
+                        ));
+                    }
+                    return Ok(eda_core::ir::Expr::RealToShortReal(Box::new(
+                        self.lower_real_arithmetic_operand(argument)?,
+                    )));
+                }
+                "$bitstoreal" => {
+                    let (source_shape, _, _) = self.net_type(&source_type).map_err(|error| {
+                        format!("$bitstoreal source type '{source_type}': {error}")
+                    })?;
+                    if source_shape.width != 64 {
+                        return Err(format!(
+                            "$bitstoreal requires a 64-bit operand, found {} bits",
+                            source_shape.width
+                        ));
+                    }
+                    return Ok(eda_core::ir::Expr::BitsToReal(Box::new(
+                        self.lower_expression(&arguments[0])?,
+                    )));
+                }
+                _ => {
+                    let (source_shape, _, _) = self.net_type(&source_type).map_err(|error| {
+                        format!("$bitstoshortreal source type '{source_type}': {error}")
+                    })?;
+                    if source_shape.width != 32 {
+                        return Err(format!(
+                            "$bitstoshortreal requires a 32-bit operand, found {} bits",
+                            source_shape.width
+                        ));
+                    }
+                    return Ok(eda_core::ir::Expr::BitsToShortReal(Box::new(
+                        self.lower_expression(&arguments[0])?,
+                    )));
+                }
+            }
+        }
+        if function_name == "$past" {
+            if !self.past_sampling_allowed {
+                return Err("$past requires an edge-clocked process".into());
+            }
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            let (arguments, explicit_clock) =
+                if string_field(arguments.last().unwrap_or(&serde_json::Value::Null), "kind")
+                    .as_deref()
+                    == Some("ClockingEvent")
+                {
+                    let (values, clock) = arguments.split_at(arguments.len() - 1);
+                    (values, Some(&clock[0]))
+                } else {
+                    (arguments.as_slice(), None)
+                };
+            if let Some(explicit_clock) = explicit_clock {
+                self.validate_explicit_sample_clock(explicit_clock)?;
+            }
+            if !(1..=3).contains(&arguments.len()) {
+                return Err(
+                    "$past supports one value, an optional tick count, and optional gating only"
+                        .into(),
+                );
+            }
+            let sampled = self.lower_expression(&arguments[0])?;
+            let ticks = if arguments.len() >= 2
+                && string_field(&arguments[1], "kind").as_deref() != Some("EmptyArgument")
+            {
+                arguments[1]
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .ok_or_else(|| "$past tick count must be an integer constant".to_string())?
+            } else {
+                1
+            };
+            if !(1..=256).contains(&ticks) {
+                return Err("$past tick count must be between 1 and 256".into());
+            }
+            let gating = if arguments.len() == 3 {
+                if string_field(&arguments[2], "kind").as_deref() == Some("EmptyArgument") {
+                    None
+                } else {
+                    Some(Box::new(self.lower_expression(&arguments[2])?))
+                }
+            } else {
+                None
+            };
+            return Ok(eda_core::ir::Expr::Past {
+                value: Box::new(sampled),
+                ticks,
+                gating,
+            });
+        }
+        if matches!(function_name, "$rose" | "$fell" | "$stable" | "$changed") {
+            if !self.past_sampling_allowed {
+                return Err(format!("{function_name} requires an edge-clocked process"));
+            }
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            let (arguments, explicit_clock) =
+                if string_field(arguments.last().unwrap_or(&serde_json::Value::Null), "kind")
+                    .as_deref()
+                    == Some("ClockingEvent")
+                {
+                    let (values, clock) = arguments.split_at(arguments.len() - 1);
+                    (values, Some(&clock[0]))
+                } else {
+                    (arguments.as_slice(), None)
+                };
+            if let Some(explicit_clock) = explicit_clock {
+                self.validate_explicit_sample_clock(explicit_clock)?;
+            }
+            if arguments.len() != 1 {
+                return Err(format!(
+                    "{function_name} requires one sampled expression and an optional matching clocking event"
+                ));
+            }
+            let op = match function_name {
+                "$rose" => eda_core::ir::SampledValueOp::Rose,
+                "$fell" => eda_core::ir::SampledValueOp::Fell,
+                "$stable" => eda_core::ir::SampledValueOp::Stable,
+                _ => eda_core::ir::SampledValueOp::Changed,
+            };
+            let sampled = self.lower_expression(&arguments[0])?;
+            return Ok(eda_core::ir::Expr::SampledValue {
+                op,
+                value: Box::new(sampled),
+            });
+        }
+        if function_name == "$sampled" {
+            if !self.past_sampling_allowed {
+                return Err("$sampled requires an edge-clocked process".into());
+            }
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$sampled requires exactly one expression".into());
+            }
+            let sampled = self.lower_expression(&arguments[0])?;
+            return Ok(eda_core::ir::Expr::Sampled(Box::new(sampled)));
+        }
         if function_name == "$test$plusargs" {
             let empty_arguments = Vec::new();
             let arguments = value
@@ -67,6 +572,46 @@ impl SlangAstLowerer {
                 range: eda_core::ir::Range::Bit(0),
                 signed: false,
             });
+        }
+        if function_name == "$typename" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$typename requires exactly one argument".into());
+            }
+            let argument = unwrap_conversion(&arguments[0]);
+            let type_name = string_field(argument, "type").unwrap_or_default();
+            let type_name = self
+                .canonical_type_alias_name(&type_name)
+                .unwrap_or(type_name);
+            if simple_type_shape(&type_name).is_none() || type_name.contains('$') {
+                return Err(format!(
+                    "$typename supports only simple predefined integral types, found '{type_name}'"
+                ));
+            }
+            return Ok(eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_bytes_le(STRING_WIDTH, type_name.as_bytes()),
+            ));
+        }
+        if function_name == "$isunbounded" {
+            let empty_arguments = Vec::new();
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_arguments);
+            if arguments.len() != 1 {
+                return Err("$isunbounded requires exactly one argument".into());
+            }
+            let argument = unwrap_conversion(&arguments[0]);
+            let unbounded = string_field(argument, "type").as_deref() == Some("$")
+                || expression_symbol(argument)
+                    .is_some_and(|name| self.unbounded_parameters.contains(&name));
+            return Ok(eda_core::ir::Expr::Const(
+                eda_core::logic::LogicWord::from_u64(1, u64::from(unbounded)),
+            ));
         }
         if matches!(
             function_name,
@@ -501,6 +1046,31 @@ impl SlangAstLowerer {
             .next_back()
             .unwrap_or_default()
             .to_string();
+        if let Some(statement) = self.lower_covergroup_sample_call(value)? {
+            return Ok(Some(statement));
+        }
+        if let Some(receiver) = process_this_class(value) {
+            if task_name == "kill" {
+                return Ok(Some(eda_core::ir::Stmt::ProcessKill(Box::new(
+                    self.lower_expression(receiver)?,
+                ))));
+            }
+            if task_name == "await" {
+                return Ok(Some(eda_core::ir::Stmt::ProcessAwait(Box::new(
+                    self.lower_expression(receiver)?,
+                ))));
+            }
+            if task_name == "suspend" {
+                return Ok(Some(eda_core::ir::Stmt::ProcessSuspend(Box::new(
+                    self.lower_expression(receiver)?,
+                ))));
+            }
+            if task_name == "resume" {
+                return Ok(Some(eda_core::ir::Stmt::ProcessResume(Box::new(
+                    self.lower_expression(receiver)?,
+                ))));
+            }
+        }
         if task_name == "delete" {
             if let Some(statement) = self.lower_associative_array_delete(value)? {
                 return Ok(Some(statement));
@@ -545,18 +1115,51 @@ impl SlangAstLowerer {
                 .get("arguments")
                 .and_then(Value::as_array)
                 .unwrap_or(&empty_arguments);
-            if !arguments.is_empty() {
-                return Err(format!(
-                    "argument-scoped '{task_name}' is not supported; use the no-argument global form"
-                ));
-            }
-            return Ok(Some(eda_core::ir::Stmt::AssertControl(
+            let control = if arguments.is_empty() {
                 match task_name.as_str() {
                     "$asserton" => eda_core::ir::AssertControl::On,
                     "$assertoff" => eda_core::ir::AssertControl::Off,
                     _ => eda_core::ir::AssertControl::Kill,
-                },
-            )));
+                }
+            } else {
+                let levels = slang_constant_u64(&arguments[0]).map_err(|error| {
+                    format!("'{task_name}' levels must be an integer constant: {error}")
+                })?;
+                if levels != 0 {
+                    return Err(format!(
+                        "'{task_name}' supports only level 0 for named assertion scopes"
+                    ));
+                }
+                let mut scopes = Vec::new();
+                for argument in &arguments[1..] {
+                    let scope = string_field(argument, "symbol").filter(|scope| !scope.is_empty());
+                    let Some(scope) = scope else {
+                        return Err(format!(
+                            "'{task_name}' supports only named assertion scopes; hierarchy scopes remain unsupported"
+                        ));
+                    };
+                    if !self.known_assertion_scopes.contains(&scope) {
+                        return Err(format!(
+                            "'{task_name}' target '{scope}' is not a visible named assertion scope"
+                        ));
+                    }
+                    scopes.push(scope);
+                }
+                if scopes.is_empty() {
+                    match task_name.as_str() {
+                        "$asserton" => eda_core::ir::AssertControl::On,
+                        "$assertoff" => eda_core::ir::AssertControl::Off,
+                        _ => eda_core::ir::AssertControl::Kill,
+                    }
+                } else {
+                    match task_name.as_str() {
+                        "$asserton" => eda_core::ir::AssertControl::ScopedOn(scopes),
+                        "$assertoff" => eda_core::ir::AssertControl::ScopedOff(scopes),
+                        _ => eda_core::ir::AssertControl::ScopedKill(scopes),
+                    }
+                }
+            };
+            return Ok(Some(eda_core::ir::Stmt::AssertControl(control)));
         }
         if task_name == "$cast" {
             return self.lower_class_cast_call(value);
@@ -684,6 +1287,12 @@ impl SlangAstLowerer {
                 | "$strobeh"
         ) {
             return self.lower_display_call(value, &task_name).map(Some);
+        }
+        if matches!(
+            task_name.as_str(),
+            "$error" | "$warning" | "$info" | "$fatal"
+        ) {
+            return self.lower_severity_call(value, &task_name).map(Some);
         }
         if task_name == "$timeformat" {
             return self.lower_timeformat_call(value).map(Some);
@@ -853,7 +1462,26 @@ impl SlangAstLowerer {
         }
         let result = self.lower_statement(&body);
         self.inline_stack.borrow_mut().pop();
-        result.map(|statement| Some(eda_core::ir::Stmt::Scope(Box::new(statement))))
+        result.map(|statement| {
+            let scoped = eda_core::ir::Stmt::Scope(Box::new(statement));
+            let Some(&flag) = self.named_block_flags.get(&subroutine) else {
+                return Some(scoped);
+            };
+            Some(eda_core::ir::Stmt::NamedBlock {
+                name: subroutine.clone(),
+                body: Box::new(eda_core::ir::Stmt::Block(vec![
+                    eda_core::ir::Stmt::Bl {
+                        lv: eda_core::ir::LValue {
+                            net: flag,
+                            decl_width: 1,
+                            range: eda_core::ir::Range::Bit(0),
+                        },
+                        e: eda_core::ir::Expr::Const(eda_core::logic::LogicWord::zero(1)),
+                    },
+                    scoped,
+                ])),
+            })
+        })
     }
 
     fn lower_file_display_call(
@@ -969,6 +1597,106 @@ impl SlangAstLowerer {
             monitor: task_name.starts_with("$monitor"),
             strobe: task_name.starts_with("$strobe"),
         })
+    }
+
+    fn lower_severity_call(
+        &self,
+        value: &Value,
+        task_name: &str,
+    ) -> Result<eda_core::ir::Stmt, String> {
+        let severity = match task_name {
+            "$error" => "Error",
+            "$warning" => "Warning",
+            "$fatal" => "Fatal",
+            _ => "Info",
+        };
+        let severity_level = match task_name {
+            "$error" => eda_core::ir::SimulationSeverity::Error,
+            "$warning" => eda_core::ir::SimulationSeverity::Warning,
+            "$fatal" => eda_core::ir::SimulationSeverity::Fatal,
+            _ => eda_core::ir::SimulationSeverity::Info,
+        };
+        let empty_arguments = Vec::new();
+        let arguments = value
+            .get("arguments")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_arguments);
+        let arguments = if task_name == "$fatal" {
+            if let Some(finish_number) = arguments.first() {
+                let finish_number = constant_i64(finish_number).map_err(|error| {
+                    format!("$fatal finish number must be an integer constant: {error}")
+                })?;
+                if !(0..=2).contains(&finish_number) {
+                    return Err("$fatal finish number must be 0, 1, or 2".into());
+                }
+                &arguments[1..]
+            } else {
+                &[]
+            }
+        } else {
+            arguments
+        };
+        let mut literal = String::new();
+        let mut has_format_literal = false;
+        let value_arguments;
+        if let Some(first) = arguments.first() {
+            if string_field(first, "kind").as_deref() == Some("StringLiteral") {
+                has_format_literal = true;
+                literal = string_field(first, "literal").unwrap_or_default();
+                value_arguments = &arguments[1..];
+            } else if string_field(first, "kind").as_deref() == Some("Call")
+                && string_field(first, "subroutine").as_deref() == Some("$sformatf")
+            {
+                let inner = first
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "$sformatf severity argument has no arguments".to_string())?;
+                let Some(format) = inner.first() else {
+                    return Err("$sformatf severity argument has no format".into());
+                };
+                if string_field(format, "kind").as_deref() != Some("StringLiteral") {
+                    return Err("severity $sformatf argument requires a literal format".to_string());
+                }
+                has_format_literal = true;
+                literal = string_field(format, "literal").unwrap_or_default();
+                value_arguments = &inner[1..];
+            } else {
+                value_arguments = arguments;
+            }
+        } else {
+            value_arguments = arguments;
+        }
+        if !has_format_literal && !value_arguments.is_empty() {
+            literal = value_arguments
+                .iter()
+                .map(|_| "%d".to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        let formatted = format!("{severity}: {literal}\n");
+        let parts = parse_display_format(
+            &formatted,
+            value_arguments.len(),
+            false,
+            &self.current_format_hierarchy_path(),
+            &self.current_format_library_scope(),
+            value_arguments,
+        )?;
+        let args = self.lower_display_arguments(&parts, value_arguments)?;
+        let display = eda_core::ir::Stmt::Display {
+            parts,
+            args,
+            monitor: false,
+            strobe: false,
+        };
+        let mut severity_statements = vec![
+            eda_core::ir::Stmt::Severity(severity_level),
+            display,
+        ];
+        if task_name == "$fatal" {
+            severity_statements.push(eda_core::ir::Stmt::Finish);
+        }
+        Ok(eda_core::ir::Stmt::Block(severity_statements))
     }
 
     fn lower_display_arguments(
@@ -2059,13 +2787,12 @@ impl SlangAstLowerer {
         }
         let (dimensions, dimension) = self.fixed_array_dimension(arguments, function_name)?;
         let dimension = dimensions[dimension as usize - 1];
-        let last = dimension.base + dimension.step * (dimension.length as i64 - 1);
         let result = match function_name {
-            "$left" => dimension.base,
-            "$right" => last,
-            "$low" => dimension.base.min(last),
-            "$high" => dimension.base.max(last),
-            "$increment" => dimension.step,
+            "$left" => dimension.left,
+            "$right" => dimension.right,
+            "$low" => dimension.left.min(dimension.right),
+            "$high" => dimension.left.max(dimension.right),
+            "$increment" => dimension.increment,
             _ => unreachable!("fixed-array bound function dispatch"),
         };
         Ok(eda_core::ir::Expr::Signed {
@@ -2126,6 +2853,19 @@ impl SlangAstLowerer {
             .first()
             .ok_or_else(|| "$bits has no receiver".to_string())?;
         let receiver_type = string_field(receiver, "type").unwrap_or_default();
+        if string_field(receiver, "kind").as_deref() == Some("DataType") {
+            let definition = self.type_alias_definition(&receiver_type).ok_or_else(|| {
+                format!("$bits type argument has unsupported type: '{receiver_type}'")
+            })?;
+            let bits = u32::try_from(definition.width)
+                .map_err(|_| format!("$bits result is too large: {}", definition.width))?;
+            return Ok(eda_core::ir::Expr::Signed {
+                e: Box::new(eda_core::ir::Expr::Const(
+                    eda_core::logic::LogicWord::from_u64(32, u64::from(bits)),
+                )),
+                signed: true,
+            });
+        }
         if let Some(array) = self.declared_memory_type(&receiver_type) {
             if array.dynamic {
                 let name = expression_symbol(receiver)
@@ -2175,17 +2915,54 @@ impl SlangAstLowerer {
         &self,
         arguments: &[Value],
         function_name: &str,
-    ) -> Result<(Vec<eda_core::ir::MemoryDimension>, i64), String> {
+    ) -> Result<(Vec<FixedArrayQueryDimension>, i64), String> {
         let receiver = arguments
             .first()
             .ok_or_else(|| format!("{function_name} has no array receiver"))?;
         let receiver_type = string_field(receiver, "type").unwrap_or_default();
-        let array = self.declared_memory_type(&receiver_type).ok_or_else(|| {
-            format!("{function_name} receiver is not a fixed unpacked array: '{receiver_type}'")
-        })?;
-        if array.dynamic {
+        let separator = receiver_type.find('$');
+        let packed_type = separator
+            .map(|separator| &receiver_type[..separator])
+            .unwrap_or(receiver_type.as_str());
+        let packed_shape = simple_type_shape(packed_type);
+        let memory = self.declared_memory_type(&receiver_type);
+        if memory.as_ref().is_some_and(|memory| memory.dynamic) {
             return Err(format!(
-                "{function_name} requires a fixed unpacked array, found a dynamic array"
+                "{function_name} requires a fixed array, found a dynamic array"
+            ));
+        }
+        let memory_dimensions = memory
+            .map(|memory| {
+                memory
+                    .dimensions
+                    .into_iter()
+                    .map(FixedArrayQueryDimension::from_memory)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let packed_dimensions = packed_shape
+            .map(|shape| {
+                shape
+                    .dimensions
+                    .iter()
+                    .map(|dimension| FixedArrayQueryDimension {
+                        left: dimension.msb,
+                        right: dimension.lsb,
+                        increment: if dimension.msb >= dimension.lsb {
+                            1
+                        } else {
+                            -1
+                        },
+                        length: dimension.length,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut dimensions = memory_dimensions;
+        dimensions.extend(packed_dimensions);
+        if dimensions.is_empty() {
+            return Err(format!(
+                "{function_name} receiver is not a fixed array: '{receiver_type}'"
             ));
         }
         let mut dimension = 1_i64;
@@ -2193,13 +2970,13 @@ impl SlangAstLowerer {
             dimension = constant_ast_i64(argument)
                 .map_err(|_| format!("{function_name} dimension must be an integer constant"))?;
         }
-        if dimension < 1 || dimension as usize > array.dimensions.len() {
+        if dimension < 1 || dimension as usize > dimensions.len() {
             return Err(format!(
                 "{function_name} dimension {dimension} is outside 1..={}",
-                array.dimensions.len()
+                dimensions.len()
             ));
         }
-        Ok((array.dimensions, dimension))
+        Ok((dimensions, dimension))
     }
 
     fn lower_enum_first_last(
@@ -3453,6 +4230,19 @@ fn signed_time_exponent_const(exponent: i8) -> eda_core::ir::Expr {
         )),
         signed: true,
     }
+}
+
+fn process_return_type(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|type_name| type_name.split_whitespace().next_back() == Some("process"))
+}
+
+fn process_this_class(value: &Value) -> Option<&Value> {
+    let receiver = value.get("thisClass")?;
+    let type_name = receiver.get("type").and_then(Value::as_str)?;
+    (type_name.split_whitespace().next_back() == Some("process")).then_some(receiver)
 }
 
 fn word_i64(word: &eda_core::logic::LogicWord, type_name: &str) -> Result<i64, String> {

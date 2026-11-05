@@ -76,6 +76,7 @@ fn ordinary_arrays_do_not_become_sparse_memory_macro_plans() {
         associative: false,
         index_width: 0,
         index_signed: false,
+        declaration_initialized: false,
         storage: MemoryStorage::Ordinary,
         kind: Default::default(),
         template: Default::default(),

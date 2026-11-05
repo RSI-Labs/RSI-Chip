@@ -477,6 +477,41 @@ fn delay_range_property_accepts_any_cycle_in_window() {
 }
 
 #[test]
+fn delay_range_cover_counts_overlapping_attempts() {
+    let source = "module m(input clk, req, grant);
+        window: cover property (@(posedge clk) req |-> ##[1:2] grant);
+     endmodule";
+
+    let mut cover = sim_for(source);
+    cover.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    cover.set_input("req", &LogicWord::from_u64(1, 1)).unwrap();
+    cover
+        .set_input("grant", &LogicWord::from_u64(1, 0))
+        .unwrap();
+    cover.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+
+    cover.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    cover.set_input("req", &LogicWord::from_u64(1, 1)).unwrap();
+    cover
+        .set_input("grant", &LogicWord::from_u64(1, 0))
+        .unwrap();
+    cover.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+
+    cover.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    cover.set_input("req", &LogicWord::from_u64(1, 0)).unwrap();
+    cover
+        .set_input("grant", &LogicWord::from_u64(1, 1))
+        .unwrap();
+    cover.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+
+    assert_eq!(
+        cover.property_cover_hits("window"),
+        2,
+        "delay-1 and delay-2 attempts completing on the same edge are distinct coverage attempts"
+    );
+}
+
+#[test]
 fn consecutive_repetition_requires_successive_samples() {
     let source = "module m(input clk, req, grant);
         assert property (@(posedge clk) req |-> grant[*3])
