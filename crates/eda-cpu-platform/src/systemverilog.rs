@@ -36,6 +36,10 @@ pub struct I8086SvResult {
     pub bp: u16,
     pub si: u16,
     pub di: u16,
+    pub es: u16,
+    pub cs: u16,
+    pub ss: u16,
+    pub ds: u16,
     pub ip: u16,
     pub flags: u16,
     pub memory: SparseMemory,
@@ -88,6 +92,12 @@ impl I8086InitialState {
 }
 
 impl I8086SvRunner {
+    /// Wrap an already-elaborated runtime design (for example a slang-lowered
+    /// or externally compiled design).
+    pub fn from_design(design: Design) -> Self {
+        Self { design }
+    }
+
     pub fn new() -> Result<Self, String> {
         let source = format!("{PREFIX}\n{OPCODE}\n{MODRM}\n{I8086_CORE}\n{I8086_TB}");
         let design =
@@ -312,6 +322,10 @@ fn execute_i8086(
                     bp: output_u64(&simulator, "bp")? as u16,
                     si: output_u64(&simulator, "si")? as u16,
                     di: output_u64(&simulator, "di")? as u16,
+                    es: output_u64(&simulator, "es")? as u16,
+                    cs: output_u64(&simulator, "cs")? as u16,
+                    ss: output_u64(&simulator, "ss")? as u16,
+                    ds: output_u64(&simulator, "ds")? as u16,
                     ip: output_u64(&simulator, "ip")? as u16,
                     flags: output_u64(&simulator, "flags")? as u16,
                     memory,
@@ -456,4 +470,171 @@ fn bus_u64(simulator: &Simulator<'_>, name: &str) -> Result<u64, String> {
         .read_port(name)
         .and_then(|word| word.to_u64())
         .unwrap_or(0))
+}
+
+/// Result of running a bare-metal RV32I program on the RTL platform with
+/// memory-mapped console and shutdown devices.
+#[derive(Clone, Debug)]
+pub struct Rv32iPlatformResult {
+    pub console: Vec<u8>,
+    pub exit_code: Option<u32>,
+    pub halted: bool,
+    pub trap: bool,
+    pub trap_cause: u32,
+    pub pc: u32,
+    pub regs: [u32; 32],
+    pub instructions: u64,
+    pub cycles: u64,
+    pub vcd: Option<String>,
+}
+
+/// RV32I RTL platform: full sparse instruction/data memory plus a byte console
+/// at `0x1000_0000`, shutdown at `0x1000_0004`, and TX-ready status at
+/// `0x1000_0008`. Arbitrary bare-metal programs (including MiniOS) run here
+/// without a testbench `$finish`.
+pub struct Rv32iPlatformRunner {
+    design: Design,
+}
+
+impl Rv32iPlatformRunner {
+    pub fn new() -> Result<Self, String> {
+        let source = format!("{RV_CORE}\n{RV_TB}");
+        let design =
+            eda_hdl::compile(&source, Some("rv32i_full_runtime_tb")).map_err(|e| e.to_string())?;
+        Ok(Self { design })
+    }
+
+    pub fn from_design(design: Design) -> Self {
+        Self { design }
+    }
+
+    pub fn run_binary(
+        &self,
+        entry: u32,
+        initial_memory: SparseMemory,
+        max_cycles: u64,
+        capture_vcd: bool,
+    ) -> Result<Rv32iPlatformResult, String> {
+        execute_rv32i_platform(&self.design, entry, initial_memory, max_cycles, capture_vcd)
+    }
+}
+
+/// Load a flat binary at address 0 and run it on the RTL platform.
+pub fn run_rv32i_platform(bytes: &[u8], max_cycles: u64) -> Result<Rv32iPlatformResult, String> {
+    let mut memory = SparseMemory::new();
+    memory.write_slice(0, bytes);
+    Rv32iPlatformRunner::new()?.run_binary(0, memory, max_cycles, false)
+}
+
+const PLATFORM_UART_TX: u32 = 0x1000_0000;
+const PLATFORM_SHUTDOWN: u32 = 0x1000_0004;
+const PLATFORM_UART_STATUS: u32 = 0x1000_0008;
+
+fn execute_rv32i_platform(
+    design: &Design,
+    entry: u32,
+    mut memory: SparseMemory,
+    max_cycles: u64,
+    capture_vcd: bool,
+) -> Result<Rv32iPlatformResult, String> {
+    let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
+    // Platform runs are long-lived (OS boots, syscalls, console output). The
+    // default 20M-event guard is sized for unit tests; scale it with the
+    // requested cycle budget instead.
+    simulator.set_event_limit(max_cycles.saturating_mul(4096).max(100_000_000));
+    if capture_vcd {
+        simulator.enable_vcd();
+    }
+    simulator.set_input("init_pc", &LogicWord::from_u64(32, u64::from(entry)))?;
+    simulator.set_input("init_sp", &LogicWord::from_u64(32, 0))?;
+
+    let mut console = Vec::new();
+    let mut exit_code = None;
+    let mut cycles = 0u64;
+
+    for time in 0..max_cycles {
+        let clock = output_bool(&simulator, "clock")?;
+        let instruction_address = bus_u64(&simulator, "imem_addr")? as u32;
+        let data_address = bus_u64(&simulator, "dmem_addr")? as u32;
+        let dmem_req = bus_u64(&simulator, "dmem_req")? == 1;
+        let dmem_we = bus_u64(&simulator, "dmem_we")? == 1;
+        let dmem_width = bus_u64(&simulator, "dmem_width")?;
+        let dmem_wdata = bus_u64(&simulator, "dmem_wdata")? as u32;
+        let dmem_rdata = if data_address == PLATFORM_UART_STATUS {
+            1u32
+        } else if data_address == PLATFORM_UART_TX || data_address == PLATFORM_SHUTDOWN {
+            0
+        } else {
+            memory.read_le_u32(data_address & 0xffff_fffc)
+        };
+        simulator.set_input(
+            "imem_rdata",
+            &LogicWord::from_u64(32, u64::from(memory.read_le_u32(instruction_address))),
+        )?;
+        simulator.set_input(
+            "dmem_rdata",
+            &LogicWord::from_u64(32, u64::from(dmem_rdata)),
+        )?;
+
+        let write_address = data_address;
+        let write_value = dmem_wdata;
+        let write_width = dmem_width;
+        let pending_write = dmem_req && dmem_we;
+
+        simulator.run_until(time + 1)?;
+        let clock_now = output_bool(&simulator, "clock")?;
+        if clock_now && !clock {
+            cycles += 1;
+            if pending_write {
+                match write_address {
+                    PLATFORM_UART_TX => console.push(write_value as u8),
+                    PLATFORM_SHUTDOWN => exit_code = Some(write_value),
+                    address => match write_width {
+                        0 => memory.write_u8(address, write_value as u8),
+                        1 => memory.write_le_u16(address, write_value as u16),
+                        _ => memory.write_le_u32(address, write_value),
+                    },
+                }
+            }
+            if exit_code.is_some() || output_bool(&simulator, "halted")? {
+                break;
+            }
+            if output_bool(&simulator, "trap")? && output_bool(&simulator, "halted")? {
+                break;
+            }
+        }
+    }
+
+    let mut regs = [0u32; 32];
+    for (index, register) in regs.iter_mut().enumerate().skip(1) {
+        *register = simulator
+            .read(&format!("core.x{index}"))
+            .and_then(|word| word.to_u64())
+            .map(|value| value as u32)
+            .ok_or_else(|| format!("missing RTL register x{index}"))?;
+    }
+    let instructions = simulator
+        .read("core.instret_count")
+        .and_then(|word| word.to_u64())
+        .or_else(|| {
+            simulator
+                .read("core.cycle_count")
+                .and_then(|word| word.to_u64())
+        })
+        .unwrap_or(0);
+    let vcd = if capture_vcd { simulator.vcd() } else { None };
+    Ok(Rv32iPlatformResult {
+        console,
+        exit_code,
+        halted: output_bool(&simulator, "halted")?,
+        // `trap` in the core is sticky for any exception, including handled
+        // ecall traps. A clean MMIO shutdown is not a fatal trap.
+        trap: output_bool(&simulator, "trap")? && exit_code.is_none(),
+        trap_cause: output_u64(&simulator, "trap_cause")? as u32,
+        pc: output_u64(&simulator, "dbg_pc")? as u32,
+        regs,
+        instructions,
+        cycles,
+        vcd,
+    })
 }

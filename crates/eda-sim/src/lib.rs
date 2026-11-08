@@ -289,8 +289,8 @@ pub struct Simulator<'d> {
     timeformat_suffix: String,
     timeformat_min_width: usize,
     property_covers: BTreeMap<String, u64>,
-    severity_counts:
-        BTreeMap<eda_core::ir::SimulationSeverity, u64>,
+    severity_counts: BTreeMap<eda_core::ir::SimulationSeverity, u64>,
+    event_limit: u64,
     assertions_enabled: bool,
     scoped_assertions_enabled: BTreeMap<String, bool>,
     finished: bool,
@@ -508,6 +508,7 @@ impl<'d> Simulator<'d> {
             timeformat_min_width: 0,
             property_covers: BTreeMap::new(),
             severity_counts: BTreeMap::new(),
+            event_limit: MAX_EVENTS,
             assertions_enabled: true,
             scoped_assertions_enabled: BTreeMap::new(),
             finished: false,
@@ -617,6 +618,11 @@ impl<'d> Simulator<'d> {
 
     pub fn stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// Override the total event budget for long-running platform simulations.
+    pub fn set_event_limit(&mut self, limit: u64) {
+        self.event_limit = limit.max(1);
     }
 
     pub fn set_print_stdout(&mut self, on: bool) {
@@ -1173,9 +1179,7 @@ impl<'d> Simulator<'d> {
         self.severity_counts.get(&severity).copied().unwrap_or(0)
     }
 
-    pub fn take_severity_counts(
-        &mut self,
-    ) -> BTreeMap<eda_core::ir::SimulationSeverity, u64> {
+    pub fn take_severity_counts(&mut self) -> BTreeMap<eda_core::ir::SimulationSeverity, u64> {
         std::mem::take(&mut self.severity_counts)
     }
 
@@ -1637,13 +1641,13 @@ impl<'d> Simulator<'d> {
         if self.forced_values.contains_key(&u.net) {
             return Ok(());
         }
-        self.event_count += 1;
-        if self.event_count > MAX_EVENTS {
-            return Err("event budget exceeded".into());
-        }
         let old = self.vals[u.net];
         if old == u.val {
             return Ok(());
+        }
+        self.event_count += 1;
+        if self.event_count > self.event_limit {
+            return Err("event budget exceeded".into());
         }
         let mut newv = u.val;
         if u.driver.is_some() {
@@ -1677,7 +1681,7 @@ impl<'d> Simulator<'d> {
     ) -> Result<(), String> {
         for (net, old, newv) in changes {
             self.event_count += 1;
-            if self.event_count > MAX_EVENTS {
+            if self.event_count > self.event_limit {
                 return Err("event budget exceeded".into());
             }
             self.notify_change(net, old, newv)?;
@@ -1865,7 +1869,14 @@ impl<'d> Simulator<'d> {
                         driver: Some(ai),
                     });
                 } else {
-                    self.events.entry(t).or_default().push(Update {
+                    // Delayed continuous-assign updates must also keep only
+                    // the newest value for a (net, driver) pair. Two input
+                    // changes in the same delta wave can queue two updates at
+                    // the same future time; without this the older value may
+                    // be applied last (LIFO) and clobber the newer one.
+                    let queue = self.events.entry(t).or_default();
+                    queue.retain(|existing| !(existing.net == net && existing.driver == Some(ai)));
+                    queue.push(Update {
                         net,
                         val,
                         driver: Some(ai),
@@ -1908,7 +1919,7 @@ impl<'d> Simulator<'d> {
                 self.vals[sample] = newv;
                 self.mark_vcd_change(sample);
                 self.event_count += 1;
-                if self.event_count > MAX_EVENTS {
+                if self.event_count > self.event_limit {
                     return Err("event budget exceeded".into());
                 }
                 self.notify_change(sample, old, newv)?;
@@ -2433,7 +2444,7 @@ impl<'d> Simulator<'d> {
         }
         self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
-        if self.event_count > MAX_EVENTS {
+        if self.event_count > self.event_limit {
             return Err("event budget exceeded".into());
         }
         self.notify_memory_write(memory)
@@ -2688,7 +2699,7 @@ impl<'d> Simulator<'d> {
         }
         self.mark_vcd_memory_change(memory, index);
         self.event_count += 1;
-        if self.event_count > MAX_EVENTS {
+        if self.event_count > self.event_limit {
             return Err("event budget exceeded".into());
         }
         self.notify_memory_write(memory)
@@ -3634,7 +3645,7 @@ impl<'d> Simulator<'d> {
                     }
                     for (net, old, newv) in changes {
                         self.event_count += 1;
-                        if self.event_count > MAX_EVENTS {
+                        if self.event_count > self.event_limit {
                             return Err("event budget exceeded".into());
                         }
                         self.notify_change(net, old, newv)?;
@@ -3883,7 +3894,7 @@ impl<'d> Simulator<'d> {
                     }
                     for (net, old, newv) in changes {
                         self.event_count += 1;
-                        if self.event_count > MAX_EVENTS {
+                        if self.event_count > self.event_limit {
                             return Err("event budget exceeded".into());
                         }
                         self.notify_change(net, old, newv)?;
@@ -4133,7 +4144,7 @@ impl<'d> Simulator<'d> {
                     } else {
                         let line = self.format_display(parts, args);
                         if self.print_stdout {
-                            println!("{}", line);
+                            print!("{}", line);
                         }
                         self.displays.push(line);
                     }
@@ -5512,7 +5523,7 @@ impl<'d> Simulator<'d> {
         }
         for (net, old, newv) in changes {
             self.event_count += 1;
-            if self.event_count > MAX_EVENTS {
+            if self.event_count > self.event_limit {
                 return Err("event budget exceeded".into());
             }
             self.notify_change(net, old, newv)?;
@@ -6728,7 +6739,7 @@ impl<'d> Simulator<'d> {
         for strobe in strobes {
             let line = self.format_display(strobe.parts, strobe.args);
             if self.print_stdout {
-                println!("{}", line);
+                print!("{}", line);
             }
             self.displays.push(line);
         }
@@ -8332,7 +8343,11 @@ fn walk_stmt_memories(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr_memories(finish, out);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
         Stmt::NamedBlock { body, .. } => walk_stmt_memories(body, out),
         Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
         Stmt::DisableNamedBlock { .. } => {}
@@ -8566,7 +8581,11 @@ fn collect_stmt_access(s: &Stmt, reads: &mut HashSet<usize>, writes: &mut HashSe
                 reads.extend(expr_nets(finish));
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
         Stmt::NamedBlock { body, .. } => collect_stmt_access(body, reads, writes),
         Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
         Stmt::DisableNamedBlock { .. } => {}
@@ -8779,7 +8798,11 @@ fn walk_stmt(s: &Stmt, out: &mut Vec<usize>) {
                 walk_expr(finish, out);
             }
         }
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
         Stmt::NamedBlock { body, .. } => walk_stmt(body, out),
         Stmt::DisableFork | Stmt::WaitFork | Stmt::NamedBlockEnd => {}
         Stmt::DisableNamedBlock { .. } => {}

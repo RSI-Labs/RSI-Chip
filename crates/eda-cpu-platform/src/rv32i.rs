@@ -193,15 +193,23 @@ impl Rv32iMachine {
             0x03 => {
                 let immediate = immediate_i(instruction);
                 let address = a.wrapping_add(immediate);
-                let value = match funct3 {
-                    0 => sign_extend_u8(self.memory.read_u8(address)),
-                    1 => sign_extend_u16(self.memory.read_le_u16(address)),
-                    2 => self.memory.read_le_u32(address),
-                    4 => self.memory.read_u8(address) as u32,
-                    5 => self.memory.read_le_u16(address) as u32,
-                    _ => {
-                        self.take_trap(instruction);
-                        return self.finish_trap();
+                let value = if address == 0x1000_0008 {
+                    // Platform MMIO: UART status is always ready.
+                    1
+                } else if address == 0x1000_0000 || address == 0x1000_0004 {
+                    // Console TX and shutdown reads return zero.
+                    0
+                } else {
+                    match funct3 {
+                        0 => sign_extend_u8(self.memory.read_u8(address)),
+                        1 => sign_extend_u16(self.memory.read_le_u16(address)),
+                        2 => self.memory.read_le_u32(address),
+                        4 => self.memory.read_u8(address) as u32,
+                        5 => self.memory.read_le_u16(address) as u32,
+                        _ => {
+                            self.take_trap(instruction);
+                            return self.finish_trap();
+                        }
                     }
                 };
                 writeback = Some(value);
@@ -209,13 +217,19 @@ impl Rv32iMachine {
             0x23 => {
                 let immediate = store_immediate(instruction);
                 let address = a.wrapping_add(immediate);
-                match funct3 {
-                    0 => self.memory.write_u8(address, b as u8),
-                    1 => self.memory.write_le_u16(address, b as u16),
-                    2 => self.memory.write_le_u32(address, b),
-                    _ => {
-                        self.take_trap(instruction);
-                        return self.finish_trap();
+                if address == 0x1000_0000 {
+                    self.output.push(b as u8);
+                } else if address == 0x1000_0004 {
+                    self.stop = StopReason::Exit(b as i32);
+                } else {
+                    match funct3 {
+                        0 => self.memory.write_u8(address, b as u8),
+                        1 => self.memory.write_le_u16(address, b as u16),
+                        2 => self.memory.write_le_u32(address, b),
+                        _ => {
+                            self.take_trap(instruction);
+                            return self.finish_trap();
+                        }
                     }
                 }
             }

@@ -12,6 +12,52 @@ use serde_json::Value;
 use super::hierarchy::full_range;
 use super::{AstEventArrayCandidate, AstEventArraySelection, AstLoweredSymbol};
 
+/// Canonical packed part-select: use `Expr::Ref` with an explicit range when
+/// the base is a full-range reference, matching the eda-hdl lowering form.
+fn packed_select(base: eda_core::ir::Expr, msb: usize, lsb: usize) -> eda_core::ir::Expr {
+    use eda_core::ir::{Expr, Range};
+    if let Expr::Ref {
+        net,
+        decl_width,
+        range,
+        signed,
+    } = base
+    {
+        let full = match range {
+            Range::Span { msb: m, lsb: l } => m + 1 == decl_width && l == 0,
+            Range::Bit(b) => decl_width == 1 && b == 0,
+        };
+        if full && msb < decl_width && lsb <= msb {
+            let range = if msb == lsb {
+                Range::Bit(msb)
+            } else {
+                Range::Span { msb, lsb }
+            };
+            return Expr::Ref {
+                net,
+                decl_width,
+                range,
+                signed,
+            };
+        }
+        return Expr::Index {
+            e: Box::new(Expr::Ref {
+                net,
+                decl_width,
+                range,
+                signed,
+            }),
+            msb,
+            lsb,
+        };
+    }
+    Expr::Index {
+        e: Box::new(base),
+        msb,
+        lsb,
+    }
+}
+
 pub(super) fn binary_operator(operator: Option<&str>) -> Result<eda_core::ir::BinOp, String> {
     match operator {
         Some("Add") => Ok(eda_core::ir::BinOp::Add),
@@ -1035,19 +1081,11 @@ impl super::SlangAstLowerer {
                             ));
                         }
                         let index = index as usize;
-                        return Ok(Expr::Index {
-                            e: Box::new(base),
-                            msb: index,
-                            lsb: index,
-                        });
+                        return Ok(packed_select(base, index, index));
                     }
                 }
                 let (base, index) = self.lower_constant_select(value)?;
-                Ok(Expr::Index {
-                    e: Box::new(base),
-                    msb: index,
-                    lsb: index,
-                })
+                Ok(packed_select(base, index, index))
             }
             "RangeSelect" => {
                 if let Some((memory, indexes, start, width, ascending)) =
@@ -1065,11 +1103,7 @@ impl super::SlangAstLowerer {
                     return Ok(selected);
                 }
                 let (base, msb, lsb) = self.lower_constant_range(value)?;
-                Ok(Expr::Index {
-                    e: Box::new(base),
-                    msb,
-                    lsb,
-                })
+                Ok(packed_select(base, msb, lsb))
             }
             "MemberAccess" => {
                 if let Some(expression) = self.lower_class_property_access(value)? {
@@ -1101,11 +1135,7 @@ impl super::SlangAstLowerer {
                     }
                 }
                 let (base, msb, lsb) = self.lower_struct_member(value)?;
-                Ok(Expr::Index {
-                    e: Box::new(base),
-                    msb,
-                    lsb,
-                })
+                Ok(packed_select(base, msb, lsb))
             }
             _ => Err(format!(
                 "direct slang-AST lowering does not support expression kind '{kind}'"
@@ -1209,11 +1239,7 @@ impl super::SlangAstLowerer {
             let first = self.declared_bit_index(&symbol, low_logical)?;
             let second = self.declared_bit_index(&symbol, high_logical)?;
             let (msb, lsb) = (first.max(second), first.min(second));
-            let candidate = Expr::Index {
-                e: Box::new(self.lower_expression(selected)?),
-                msb,
-                lsb,
-            };
+            let candidate = packed_select(self.lower_expression(selected)?, msb, lsb);
             if constant_i64(start_value).is_ok() {
                 let constant_start = constant_i64(start_value)?;
                 if constant_start == logical_start {
@@ -1291,11 +1317,7 @@ impl super::SlangAstLowerer {
         let mut reversed_blocks = Vec::with_capacity(blocks);
         for block in 0..blocks {
             let lsb = block * slice_size;
-            reversed_blocks.push(Expr::Index {
-                e: Box::new(source.clone()),
-                msb: lsb + slice_size - 1,
-                lsb,
-            });
+            reversed_blocks.push(packed_select(source.clone(), lsb + slice_size - 1, lsb));
         }
         Ok(Expr::Concat(reversed_blocks))
     }
@@ -1614,19 +1636,11 @@ impl super::SlangAstLowerer {
         }
 
         let resized = if target_width < source_width {
-            Expr::Index {
-                e: Box::new(expression),
-                msb: target_width - 1,
-                lsb: 0,
-            }
+            packed_select(expression, target_width - 1, 0)
         } else if target_width > source_width {
             let extension = target_width - source_width;
             let padding = if source_signed {
-                let sign = Expr::Index {
-                    e: Box::new(expression.clone()),
-                    msb: source_width - 1,
-                    lsb: source_width - 1,
-                };
+                let sign = packed_select(expression.clone(), source_width - 1, source_width - 1);
                 Expr::Repeat {
                     times: extension,
                     e: Box::new(sign),
@@ -1862,11 +1876,7 @@ impl super::SlangAstLowerer {
             })?;
         let width = dimension.element_width;
         let start = coordinate * width;
-        let candidate = eda_core::ir::Expr::Index {
-            e: Box::new(base),
-            msb: start + width - 1,
-            lsb: start,
-        };
+        let candidate = packed_select(base, start + width - 1, start);
         if level + 1 == selectors.len() {
             Ok(candidate)
         } else {

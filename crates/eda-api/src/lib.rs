@@ -99,10 +99,14 @@ pub use eda_fault::{
     PatternOptions, StilPattern, StilPatternSet, StuckAt,
 };
 pub use eda_formal::{
+    check_equivalent_cross_checked as check_netlists_cross_checked, current_sat_backend,
     proof_report, solve as solve_cnf, solve_cancellable as solve_cnf_cancellable,
+    solve_cross_checked as solve_cnf_cross_checked,
     solve_with_assumptions as solve_cnf_with_assumptions,
-    solve_with_assumptions_cancellable as solve_cnf_with_assumptions_cancellable, BmcOptions,
-    BmcResult, Cnf, EquivResult, ProofInvariant, ProofResult, ProofStatus, SatResult,
+    solve_with_assumptions_cancellable as solve_cnf_with_assumptions_cancellable,
+    solve_with_backend as solve_cnf_with_backend, strict_lec, with_lec_strict, with_sat_backend,
+    BmcOptions, BmcResult, Cnf, EquivResult, ProofInvariant, ProofResult, ProofStatus, SatBackend,
+    SatCrossCheckResult, SatResult,
 };
 pub use eda_formal::{
     property_bmc_report, PropertyBmcResult, PropertyBmcStatus, PropertyReplayResult,

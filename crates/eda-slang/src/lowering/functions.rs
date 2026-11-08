@@ -1689,10 +1689,7 @@ impl SlangAstLowerer {
             monitor: false,
             strobe: false,
         };
-        let mut severity_statements = vec![
-            eda_core::ir::Stmt::Severity(severity_level),
-            display,
-        ];
+        let mut severity_statements = vec![eda_core::ir::Stmt::Severity(severity_level), display];
         if task_name == "$fatal" {
             severity_statements.push(eda_core::ir::Stmt::Finish);
         }
@@ -3443,6 +3440,130 @@ impl SlangAstLowerer {
                         Ok(None)
                     }
                 }
+            }
+            Some("Case") => {
+                if let Some(check) = string_field(value, "check").filter(|check| check != "None") {
+                    return Err(format!(
+                        "direct function inlining does not support {check} case semantics"
+                    ));
+                }
+                let expression = value
+                    .get("expr")
+                    .ok_or_else(|| "function case has no expression".to_string())?;
+                let case_expression = substitute_named_values(expression, environment);
+                let case_type = string_field(&case_expression, "type").unwrap_or_default();
+                let items = value
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "function case has no items".to_string())?;
+                let base = environment.clone();
+                let mut branches: Vec<(Vec<Value>, std::collections::BTreeMap<String, Value>)> =
+                    Vec::new();
+                for item in items {
+                    let statement = item
+                        .get("stmt")
+                        .ok_or_else(|| "function case item has no statement".to_string())?;
+                    let expressions = item
+                        .get("expressions")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| "function case item has no expressions".to_string())?;
+                    let mut branch = base.clone();
+                    if self
+                        .inline_function_statement(statement, &mut branch)?
+                        .is_some()
+                    {
+                        return Err(
+                            "direct function inlining does not support return inside case".into(),
+                        );
+                    }
+                    let conditions = expressions
+                        .iter()
+                        .map(|label| {
+                            json!({
+                                "kind": "BinaryOp",
+                                "op": "CaseEquality",
+                                "type": case_type,
+                                "left": case_expression,
+                                "right": substitute_named_values(label, &base),
+                            })
+                        })
+                        .collect();
+                    branches.push((conditions, branch));
+                }
+                let default = match value.get("defaultCase") {
+                    Some(statement) => {
+                        let mut branch = base.clone();
+                        if self
+                            .inline_function_statement(statement, &mut branch)?
+                            .is_some()
+                        {
+                            return Err(
+                                "direct function inlining does not support return inside case"
+                                    .into(),
+                            );
+                        }
+                        Some(branch)
+                    }
+                    None => None,
+                };
+                let mut names = std::collections::BTreeSet::new();
+                for (_, branch) in &branches {
+                    names.extend(branch.keys().cloned());
+                }
+                if let Some(branch) = &default {
+                    names.extend(branch.keys().cloned());
+                }
+                for name in names {
+                    let base_value = base.get(&name).cloned();
+                    let mut merged = match &default {
+                        Some(branch) => branch.get(&name).cloned().or_else(|| base_value.clone()),
+                        None => base_value.clone(),
+                    };
+                    for (conditions, branch) in branches.iter().rev() {
+                        let branch_value =
+                            match branch.get(&name).cloned().or_else(|| base_value.clone()) {
+                                Some(value) => value,
+                                None => continue,
+                            };
+                        let Some(current) = merged.clone() else {
+                            merged = Some(branch_value);
+                            continue;
+                        };
+                        if branch_value == current {
+                            merged = Some(current);
+                            continue;
+                        }
+                        let condition = conditions
+                            .iter()
+                            .cloned()
+                            .reduce(|left, right| {
+                                json!({
+                                    "kind": "BinaryOp",
+                                    "op": "LogicalOr",
+                                    "type": case_type,
+                                    "left": left,
+                                    "right": right,
+                                })
+                            })
+                            .ok_or_else(|| "function case item has no expressions".to_string())?;
+                        merged = Some(json!({
+                            "kind": "ConditionalOp",
+                            "type": string_field(&branch_value, "type").unwrap_or_default(),
+                            "conditions": [{"expr": condition}],
+                            "left": branch_value,
+                            "right": current,
+                        }));
+                    }
+                    match merged {
+                        Some(value) => {
+                            environment.insert(name, value);
+                        }
+                        None => {
+                            environment.remove(&name);
+                        }
+                    }
+                }
+                Ok(None)
             }
             Some("Return") => {
                 let expression = value

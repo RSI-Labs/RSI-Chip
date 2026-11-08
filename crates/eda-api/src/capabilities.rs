@@ -43,6 +43,13 @@ const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         domain: "simulation",
+        name: "cpu_platform_mmio_simulation",
+        status: CapabilityStatus::Implemented,
+        evidence: "event-driven eda_sim RTL platform for RV32I and i8086 with sparse memory, memory-mapped console/shutdown devices, configurable cycle/event budgets, VCD capture, MiniOS-RV32I boot plus user asm syscall program, and RTL-versus-golden console/exit/PC/register cross-checks",
+        limitation: "no UART RX/timer interrupt device; the RV32I core is machine-mode only",
+    },
+    Capability {
+        domain: "simulation",
         name: "spice_dc_ac_transient",
         status: CapabilityStatus::Implemented,
         evidence: "eda_ams MNA, phasor, BE/trapezoidal integration",
@@ -150,7 +157,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "formal",
         name: "equivalence_sat_bmc_induction",
         status: CapabilityStatus::Implemented,
-        evidence: "eda_formal SAT engine and proof reports; CDCL propagation/search, generic bad-state/expression BMC, equivalence encoding/miter solving, k-induction proof/unrolling, and temporal-property unrolling accept cooperative cancellation tokens",
+        evidence: "eda_formal SAT engine and proof reports; CDCL propagation/search, generic bad-state/expression BMC, equivalence encoding/miter solving, k-induction proof/unrolling, and temporal-property unrolling accept cooperative cancellation tokens; LEC entry points cover RTL-vs-mapped, two-source RTL-vs-RTL, RTL-vs-external-netlist, and in-memory Design-vs-Design with counterexample reporting and a lec CLI command; selectable SAT engines include the vendored Kissat backend, the in-tree CDCL solver, and external Z3/CVC5 cross-check backends with per-engine selection and fail-closed multi-engine agreement",
         limitation: "property language is a targeted subset",
     },
     Capability {

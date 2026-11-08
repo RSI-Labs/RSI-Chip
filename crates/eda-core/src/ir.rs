@@ -446,15 +446,7 @@ pub enum ImmediateAssertionKind {
 
 /// Severity level emitted by a SystemVerilog severity system task.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    Ord,
-    PartialOrd,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
+    Clone, Copy, Debug, Ord, PartialOrd, PartialEq, Eq, serde::Serialize, serde::Deserialize,
 )]
 pub enum SimulationSeverity {
     Info,

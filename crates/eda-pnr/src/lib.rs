@@ -12,8 +12,9 @@ pub mod layout_browser;
 pub mod physical;
 pub use layout_browser::{LayoutBrowserServer, LayoutBrowserService};
 pub use physical::{
-    parse_def, physical_from_def, write_def, write_lef, Def, DefComponent, DefNet,
-    DefPlacementBlockage, DefRoute, DefRouteBlockage, DefVia,
+    def_to_gds, def_to_oasis, parse_def, physical_from_def, write_def, write_gds, write_lef,
+    write_oasis, Def, DefComponent, DefNet, DefPlacementBlockage, DefRoute, DefRouteBlockage,
+    DefVia,
 };
 
 // Core PnR engine split by model, placement, routing, and physical checks.

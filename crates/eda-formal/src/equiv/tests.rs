@@ -786,3 +786,117 @@ fn flop_count_mismatch_detected() {
         r.notes
     );
 }
+
+#[test]
+fn lec_uses_each_available_sat_backend_and_preserves_counterexamples() {
+    let reference = "module m(input clk, rst, en, output reg [7:0] q);
+        always @(posedge clk) if (rst) q <= 8'd0; else if (en) q <= q + 8'd1;
+    endmodule";
+    let same_shape = "module m(input clk, rst, en, output reg [7:0] q);
+        always @(posedge clk) begin
+            if (rst) q <= 8'd0;
+            else if (en) q <= q + 1'b1;
+        end
+    endmodule";
+    let buggy = reference.replace("q + 8'd1", "q + 8'd2");
+    let options = SynthOptions {
+        optimize: false,
+        map_lib: false,
+    };
+    let gold = netlist_of(reference, options.clone());
+    let good = netlist_of(same_shape, options.clone());
+    let bad = netlist_of(&buggy, options);
+    for backend in [
+        crate::sat::SatBackend::Native,
+        crate::sat::SatBackend::Kissat,
+        crate::sat::SatBackend::Z3,
+        crate::sat::SatBackend::Cvc5,
+    ] {
+        if !backend.is_available() {
+            eprintln!("skipping {} (not installed)", backend.as_str());
+            continue;
+        }
+        let equivalent = check_equivalent_with_backend(&gold, &good, backend)
+            .unwrap_or_else(|error| panic!("{} equivalent query: {error}", backend.as_str()));
+        assert!(
+            equivalent.equivalent,
+            "{} reported a refactor as non-equivalent: {:?}",
+            backend.as_str(),
+            equivalent.notes
+        );
+        let distinguished = check_equivalent_with_backend(&gold, &bad, backend)
+            .unwrap_or_else(|error| panic!("{} bug query: {error}", backend.as_str()));
+        assert!(
+            !distinguished.equivalent,
+            "{} missed the increment-by-two bug",
+            backend.as_str()
+        );
+        assert!(
+            distinguished.counterexample.is_some(),
+            "{} did not return a counterexample",
+            backend.as_str()
+        );
+    }
+}
+
+#[test]
+fn lec_cross_checked_verdicts_agree() {
+    let reference = "module m(input a, b, output y); assign y = a ^ b; endmodule";
+    let same = "module m(input a, b, output y); wire n1 = ~a & b; wire n2 = a & ~b; assign y = n1 | n2; endmodule";
+    let different = "module m(input a, b, output y); assign y = a & b; endmodule";
+    let options = SynthOptions {
+        optimize: false,
+        map_lib: false,
+    };
+    let gold = netlist_of(reference, options.clone());
+    let good = netlist_of(same, options.clone());
+    let bad = netlist_of(different, options);
+    let backends = [
+        crate::sat::SatBackend::Kissat,
+        crate::sat::SatBackend::Native,
+        crate::sat::SatBackend::Z3,
+        crate::sat::SatBackend::Cvc5,
+    ];
+    let result = check_equivalent_cross_checked(&gold, &good, &backends).expect("cross-check");
+    assert!(result.equivalent, "cross-check failed: {:?}", result.notes);
+    eprintln!("equivalent cross-check notes: {:?}", result.notes);
+    let result = check_equivalent_cross_checked(&gold, &bad, &backends).expect("cross-check bug");
+    assert!(!result.equivalent);
+    assert!(result.counterexample.is_some());
+    eprintln!("bug cross-check notes: {:?}", result.notes);
+}
+
+#[test]
+fn strict_lec_proves_full_cones_without_internal_cuts() {
+    let reference = "module m(input clk, rst, en, output reg [7:0] q);
+        always @(posedge clk) if (rst) q <= 8'd0; else if (en) q <= q + 8'd1;
+    endmodule";
+    let same_shape = "module m(input clk, rst, en, output reg [7:0] q);
+        always @(posedge clk) begin
+            if (rst) q <= 8'd0;
+            else if (en) q <= q + 1'b1;
+        end
+    endmodule";
+    let gold = netlist_of(
+        reference,
+        SynthOptions {
+            optimize: false,
+            map_lib: false,
+        },
+    );
+    let mapped = netlist_of(
+        same_shape,
+        SynthOptions {
+            optimize: true,
+            map_lib: true,
+        },
+    );
+    let result = check_equivalent_strict(&gold, &mapped).expect("strict LEC");
+    assert!(result.equivalent, "{:?}", result.notes);
+    assert!(result
+        .notes
+        .iter()
+        .any(|note| note.contains("no internal cuts")));
+    assert!(result.notes.iter().any(|note| note.contains("proved all")));
+    eprintln!("strict notes: {:?}", result.notes);
+}

@@ -7,6 +7,7 @@ use eda_core::cancellation::FlowCancellation;
 use eda_core::library::LibFunc;
 use eda_core::logic::LogicWord;
 use eda_core::netlist::{CellKind, Dir, NetId, Netlist};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 
@@ -140,11 +141,261 @@ fn cone_intervals(nl: &Netlist, sink: NetId) -> HashMap<NetId, (u32, u32)> {
     out
 }
 
+/// Coverage summary for a netlist: flop count, number of combinational cells
+/// reachable from flop D pins or primary outputs, and the number of
+/// combinational cells that are not in any proof cone (dangling cells).
+fn proof_cone_coverage(nl: &Netlist) -> (usize, usize, usize) {
+    use std::collections::HashSet;
+    let mut visited_nets: HashSet<NetId> = HashSet::new();
+    let mut visited_cells: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<NetId> = Vec::new();
+    let mut flops = 0usize;
+    for cell in nl.cells() {
+        let sequential = matches!(cell.kind, CellKind::Dff { .. } | CellKind::DffR { .. })
+            || nl.library().is_some_and(
+                |lib| matches!(cell.kind, CellKind::Lib(id) if lib.get(id).seq.is_some()),
+            );
+        if sequential {
+            flops += 1;
+            // The next-state pin is the second input for both primitive and
+            // library flops in this toolchain.
+            if let Some(data) = cell.inputs.get(1) {
+                stack.push(*data);
+            }
+        }
+    }
+    for port in &nl.ports {
+        if port.dir == Dir::Out {
+            stack.extend(port.bits.iter().copied());
+        }
+    }
+    while let Some(net) = stack.pop() {
+        if !visited_nets.insert(net) {
+            continue;
+        }
+        for &driver in &nl.net(net).drivers {
+            let cell = nl.cell(driver);
+            let sequential = matches!(cell.kind, CellKind::Dff { .. } | CellKind::DffR { .. })
+                || nl.library().is_some_and(
+                    |lib| matches!(cell.kind, CellKind::Lib(id) if lib.get(id).seq.is_some()),
+                );
+            if sequential {
+                continue;
+            }
+            if visited_cells.insert(driver) {
+                stack.extend(cell.inputs.iter().copied());
+            }
+        }
+    }
+    let combinational: usize = nl
+        .cells()
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| {
+            !matches!(cell.kind, CellKind::Dff { .. } | CellKind::DffR { .. })
+                && !nl.library().is_some_and(
+                    |lib| matches!(cell.kind, CellKind::Lib(id) if lib.get(id).seq.is_some()),
+                )
+        })
+        .count();
+    (
+        flops,
+        visited_cells.len(),
+        combinational.saturating_sub(visited_cells.len()),
+    )
+}
+
 /// Check functional equivalence of two netlists (ports matched by name).
 /// Flip-flops are matched by their output net name; their next-state
 /// functions and all outputs are compared symbolically over all inputs.
 pub fn check_equivalent(gold: &Netlist, gate: &Netlist) -> Result<EquivResult, String> {
     check_equivalent_cancellable(gold, gate, &FlowCancellation::new())
+}
+
+thread_local! {
+    static STRICT_LEC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current proof runs without internal cut points.
+pub fn strict_lec() -> bool {
+    STRICT_LEC.with(Cell::get)
+}
+
+/// Run `f` with strict LEC enabled.
+///
+/// Strict mode disables internal correspondence-point cuts. Every flip-flop
+/// next-state function and every output bit is proven over its complete
+/// combinational fan-in cone (flop outputs remain free boundary variables, as
+/// required for sequential equivalence). No internal circuit is replaced by a
+/// cut-point obligation.
+pub fn with_lec_strict<T>(strict: bool, f: impl FnOnce() -> T) -> T {
+    let previous = STRICT_LEC.with(|cell| cell.replace(strict));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    STRICT_LEC.with(|cell| cell.set(previous));
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Full-circuit LEC with no internal cut points.
+pub fn check_equivalent_strict(gold: &Netlist, gate: &Netlist) -> Result<EquivResult, String> {
+    with_lec_strict(true, || check_equivalent(gold, gate))
+}
+
+/// Strict full-circuit LEC with an explicit SAT engine.
+pub fn check_equivalent_strict_with_backend(
+    gold: &Netlist,
+    gate: &Netlist,
+    backend: crate::sat::SatBackend,
+) -> Result<EquivResult, String> {
+    crate::sat::with_sat_backend(backend, || check_equivalent_strict(gold, gate))
+}
+
+/// Run equivalence checking with an explicitly selected SAT engine.
+///
+/// The engine is installed as a thread-local override for the duration of the
+/// proof, so every localized correspondence-point query and final miter uses
+/// it. `SatBackend::Auto` selects the vendored Kissat backend.
+pub fn check_equivalent_with_backend(
+    gold: &Netlist,
+    gate: &Netlist,
+    backend: crate::sat::SatBackend,
+) -> Result<EquivResult, String> {
+    crate::sat::with_sat_backend(backend, || check_equivalent(gold, gate))
+}
+
+/// Equivalence checking with an explicit engine and cooperative cancellation.
+pub fn check_equivalent_with_backend_cancellable(
+    gold: &Netlist,
+    gate: &Netlist,
+    backend: crate::sat::SatBackend,
+    cancellation: &FlowCancellation,
+) -> Result<EquivResult, String> {
+    crate::sat::with_sat_backend(backend, || {
+        check_equivalent_cancellable(gold, gate, cancellation)
+    })
+}
+
+/// Prove equivalence independently with several SAT engines and require that
+/// every available engine reaches the same verdict.
+///
+/// Unavailable engines are skipped. If two engines disagree the check fails
+/// closed instead of trusting either verdict. The returned result carries one
+/// note per engine so reports show which solvers participated.
+pub fn check_equivalent_cross_checked(
+    gold: &Netlist,
+    gate: &Netlist,
+    backends: &[crate::sat::SatBackend],
+) -> Result<EquivResult, String> {
+    let mut results: Vec<(crate::sat::SatBackend, EquivResult)> = Vec::new();
+    let mut notes = Vec::new();
+    for &backend in backends {
+        if !backend.is_available() {
+            notes.push(format!("{}: unavailable; skipped", backend.as_str()));
+            continue;
+        }
+        let result = check_equivalent_with_backend(gold, gate, backend)?;
+        notes.push(format!(
+            "{}: {}",
+            backend.as_str(),
+            if result.equivalent {
+                "equivalent"
+            } else {
+                "distinguished"
+            }
+        ));
+        results.push((backend, result));
+    }
+    let Some((first_backend, first)) = results.first().cloned() else {
+        return Err("no SAT backend is available for LEC cross-checking".into());
+    };
+    if let Some((other_backend, _)) = results
+        .iter()
+        .find(|(_, result)| result.equivalent != first.equivalent)
+    {
+        return Err(format!(
+            "LEC backend disagreement: {} and {} reached different verdicts",
+            first_backend.as_str(),
+            other_backend.as_str()
+        ));
+    }
+    let mut out = first;
+    out.notes.extend(notes);
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_obligation(
+    gold: &Netlist,
+    gate: &Netlist,
+    g_net: NetId,
+    t_net: NetId,
+    what: &str,
+    matched: &[(&FlopRec, &FlopRec)],
+    points: &[(NetId, NetId, bool)],
+    cancellation: &FlowCancellation,
+    use_internal_cuts: bool,
+) -> Result<Option<EquivResult>, String> {
+    let verdict = match prove_bit_equal(
+        gold,
+        gate,
+        g_net,
+        t_net,
+        matched,
+        points,
+        None,
+        cancellation,
+        use_internal_cuts,
+    ) {
+        Ok(verdict) => verdict,
+        // Capacity-limited local proof: fail closed with a structured
+        // note instead of aborting the whole flow.
+        Err(error) if error.contains("stuck") => {
+            return Ok(Some(EquivResult {
+                equivalent: false,
+                counterexample: None,
+                notes: vec![format!(
+                    "{what}: local miter exceeded solver capacity ({error}); {} correspondence points",
+                    points.len()
+                )],
+            }));
+        }
+        Err(error) => return Err(error),
+    };
+    let verdict = match verdict {
+        MiterVerdict::Distinguished { phases, .. } => match prove_bit_equal(
+            gold,
+            gate,
+            g_net,
+            t_net,
+            matched,
+            points,
+            Some(&phases),
+            cancellation,
+            false,
+        ) {
+            Ok(retry) => retry,
+            // A capacity-limited re-check must fail closed: the
+            // correspondence point stays unproven, so equivalence
+            // cannot be claimed for the design.
+            Err(error) => {
+                return Ok(Some(EquivResult {
+                    equivalent: false,
+                    counterexample: None,
+                    notes: vec![format!(
+                        "{what}: re-check without internal cuts exceeded solver capacity ({error}); {} correspondence points",
+                        points.len()
+                    )],
+                }));
+            }
+        },
+        other => other,
+    };
+    if let MiterVerdict::Distinguished { gold: model, .. } = verdict {
+        return Ok(Some(distinguished_result(what.to_string(), model, gold)));
+    }
+    Ok(None)
 }
 
 /// Cooperatively cancel netlist equivalence checking.
@@ -237,100 +488,34 @@ pub fn check_equivalent_cancellable(
             points.push((n, t, false));
         }
     }
-    let (gold_values, gate_values) = simulate_shared_values(gold, gate, &gf, &tf, cancellation)?;
-    let named: Vec<(NetId, NetId)> = points.iter().map(|(g, t, _)| (*g, *t)).collect();
-    let (verified_points, verified_named) = build_correspondence_points(
-        gold,
-        gate,
-        &gf,
-        &tf,
-        &gold_values,
-        &gate_values,
-        named,
-        cancellation,
-    )?;
-    notes.push(format!(
-        "verified {verified_named}/{} named correspondence points; accepted {} total",
-        points.len(),
-        verified_points.len()
-    ));
-    points = verified_points;
-    // Prove one localized correspondence-point miter per flop next-state
-    // function, per output bit, and per internal cut point. Each query
-    // encodes only the fan-in cones of that single bit, which keeps every
-    // SAT instance small even for designs with thousands of state bits.
-    let mut queries = 0usize;
-    let prove = |gold: &Netlist,
-                 gate: &Netlist,
-                 g_net: NetId,
-                 t_net: NetId,
-                 what: String,
-                 queries: &mut usize|
-     -> Result<Option<EquivResult>, String> {
-        let verdict = match prove_bit_equal(
+    let strict = strict_lec();
+    if strict {
+        notes.push(
+            "strict LEC: no internal cuts; every flop next-state function and output bit is proven over its full combinational cone"
+                .into(),
+        );
+        points.clear();
+    } else {
+        let (gold_values, gate_values) =
+            simulate_shared_values(gold, gate, &gf, &tf, cancellation)?;
+        let named: Vec<(NetId, NetId)> = points.iter().map(|(g, t, _)| (*g, *t)).collect();
+        let (verified_points, verified_named) = build_correspondence_points(
             gold,
             gate,
-            g_net,
-            t_net,
-            &matched,
-            &points,
-            None,
+            &gf,
+            &tf,
+            &gold_values,
+            &gate_values,
+            named,
             cancellation,
-            true,
-        ) {
-            Ok(verdict) => verdict,
-            // Capacity-limited local proof: fail closed with a structured
-            // note instead of aborting the whole flow.
-            Err(error) if error.contains("stuck") => {
-                return Ok(Some(EquivResult {
-                    equivalent: false,
-                    counterexample: None,
-                    notes: vec![format!(
-                        "{what}: local miter exceeded solver capacity ({error}); {} correspondence points",
-                        points.len()
-                    )],
-                }));
-            }
-            Err(error) => return Err(error),
-        };
-        let verdict = match verdict {
-            MiterVerdict::Distinguished { phases, .. } => {
-                match prove_bit_equal(
-                    gold,
-                    gate,
-                    g_net,
-                    t_net,
-                    &matched,
-                    &points,
-                    Some(&phases),
-                    cancellation,
-                    false,
-                ) {
-                    Ok(retry) => retry,
-                    // A capacity-limited re-check must fail closed: the
-                    // correspondence point stays unproven, so equivalence
-                    // cannot be claimed for the design.
-                    Err(error) => {
-                        return Ok(Some(EquivResult {
-                            equivalent: false,
-                            counterexample: None,
-                            notes: vec![format!(
-                                "{what}: re-check without internal cuts exceeded solver capacity ({error}); {} correspondence points",
-                                points.len()
-                            )],
-                        }));
-                    }
-                }
-            }
-            other => other,
-        };
-        *queries += 1;
-        if let MiterVerdict::Distinguished { gold: model, .. } = verdict {
-            return Ok(Some(distinguished_result(what, model, gold)));
-        }
-        Ok(None)
-    };
-
+        )?;
+        notes.push(format!(
+            "verified {verified_named}/{} named correspondence points; accepted {} total",
+            points.len(),
+            verified_points.len()
+        ));
+        points = verified_points;
+    }
     // Visit structurally deep next-state cones first. This is a fail-fast
     // scheduling policy, not a change to the proof itself: topological driver
     // depth is computed once per design and avoids re-walking every flop cone
@@ -373,17 +558,9 @@ pub fn check_equivalent_cancellable(
             .collect();
         eprintln!("LEC hardest flop obligations: {leading:?}");
     }
+    let mut obligations: Vec<(NetId, NetId, String)> = Vec::new();
     for (_, _, g, t) in proof_order {
-        if let Some(result) = prove(
-            gold,
-            gate,
-            g.d,
-            t.d,
-            format!("next-state function of '{}'", g.q_name),
-            &mut queries,
-        )? {
-            return Ok(result);
-        }
+        obligations.push((g.d, t.d, format!("next-state function of '{}'", g.q_name)));
     }
     for p in &gold.ports {
         if p.dir != Dir::Out {
@@ -391,25 +568,127 @@ pub fn check_equivalent_cancellable(
         }
         let gp = gate.port_by_name(&p.name).unwrap();
         for k in 0..p.bits.len() {
-            if let Some(result) = prove(
+            obligations.push((p.bits[k], gp.bits[k], format!("output '{}[{}]'", p.name, k)));
+        }
+    }
+    let mut queries = 0usize;
+    if strict {
+        let requested = std::env::var("EDA_LEC_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+            });
+        let workers = requested.clamp(1, 32).min(obligations.len().max(1));
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let failure: Mutex<Option<EquivResult>> = Mutex::new(None);
+        let worker = || -> Result<usize, String> {
+            let mut done = 0usize;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((g_net, t_net, what)) = obligations.get(index) else {
+                    break;
+                };
+                if cancellation.is_cancelled() {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err("equivalence checking cancelled".into());
+                }
+                match prove_obligation(
+                    gold,
+                    gate,
+                    *g_net,
+                    *t_net,
+                    what,
+                    &matched,
+                    &points,
+                    cancellation,
+                    false,
+                ) {
+                    Ok(None) => done += 1,
+                    Ok(Some(result)) => {
+                        *failure.lock().expect("failure lock") = Some(result);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(error) => {
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(done)
+        };
+        let results = std::thread::scope(|scope| {
+            // `&worker` is shared by every scoped spawn; the closure itself is
+            // not moved on the first iteration.
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            let handles: Vec<_> = (0..workers).map(|_| scope.spawn(&worker)).collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("strict LEC worker panicked"))
+                .collect::<Vec<Result<usize, String>>>()
+        });
+        let mut completed = 0usize;
+        for result in results {
+            completed += result?;
+        }
+        queries = completed;
+        if let Some(result) = failure.into_inner().expect("failure lock") {
+            return Ok(result);
+        }
+        notes.push(format!(
+            "strict LEC ran {workers} parallel workers; every obligation was proven independently"
+        ));
+    } else {
+        for (g_net, t_net, what) in &obligations {
+            if let Some(result) = prove_obligation(
                 gold,
                 gate,
-                p.bits[k],
-                gp.bits[k],
-                format!("output '{}[{}]'", p.name, k),
-                &mut queries,
+                *g_net,
+                *t_net,
+                what,
+                &matched,
+                &points,
+                cancellation,
+                true,
             )? {
                 return Ok(result);
             }
+            queries += 1;
         }
     }
     // Internal correspondence points were already discharged while the
     // inductive frontier was built. Replaying those proofs adds no new design
     // obligation: the final flop/output queries still consume the verified
     // points as sound cuts.
+    let output_bits: usize = gold
+        .ports
+        .iter()
+        .filter(|port| port.dir == Dir::Out)
+        .map(|port| port.bits.len())
+        .sum();
     notes.push(format!(
-        "proved with {queries} localized correspondence-point miter queries"
+        "proved all {} flop next-state functions and {} output bits with {queries} miter queries",
+        matched.len(),
+        output_bits
     ));
+    let (gold_flops, gold_comb, gold_dangling) = proof_cone_coverage(gold);
+    let (gate_flops, gate_comb, gate_dangling) = proof_cone_coverage(gate);
+    notes.push(format!(
+        "coverage: gold {gold_flops} flops + {gold_comb} combinational cells in proof cones ({gold_dangling} dangling); gate {gate_flops} flops + {gate_comb} combinational cells in proof cones ({gate_dangling} dangling)"
+    ));
+    if strict {
+        notes.push("strict full-circuit LEC: 0 internal cuts".into());
+    }
     Ok(EquivResult {
         equivalent: true,
         counterexample: None,

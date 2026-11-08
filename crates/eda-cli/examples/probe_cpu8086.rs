@@ -353,6 +353,7 @@ fn feedback(s: &Stmt) -> bool {
             Stmt::Display { .. }
             | Stmt::TimeFormat { .. }
             | Stmt::AssertControl(_)
+            | Stmt::Severity(_)
             | Stmt::Finish
             | Stmt::Stop => {}
         }

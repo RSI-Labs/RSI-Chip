@@ -672,6 +672,16 @@ cargo run -p eda-cli -- ams design.spice --stats vendor.stats
 cargo run -p eda-cli -- ams design.spice --def-locations layout.def
 cargo run -p eda-cli -- ams design.spice --rmodels layers.rmodels
 cargo run -p eda-cli -- flow design.v --top top
+# Full RTL platform simulator: MiniOS-RV32I + user asm program.
+cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin
+cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin --wave minios.vcd
+# RTL-vs-mapped equivalence with a detailed status/counterexample report.
+cargo run -p eda-cli -- lec design.v --top top
+# Two-source RTL-vs-RTL equivalence (golden revision vs implementation).
+cargo run -p eda-cli -- lec design.v --top top --reference golden.v --reference-top top
+# Pick a SAT engine (native | kissat | z3 | cvc5) or cross-check several.
+cargo run -p eda-cli -- lec design.v --top top --solver z3
+cargo run -p eda-cli -- lec design.v --top top --cross-check kissat,native,z3,cvc5
 ```
 
 ## Scope and current gaps

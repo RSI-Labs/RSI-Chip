@@ -620,6 +620,309 @@ fn macro_name(nl: &Netlist, ci: usize) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GDSII and OASIS export
+// ---------------------------------------------------------------------------
+
+/// Width of an emitted routed-wire rectangle in database units.
+const GDS_WIRE_DBU: usize = 20;
+/// Half-width of a via cut square in database units.
+const GDS_VIA_DBU: usize = 50;
+
+/// Rectangular physical shape: layer name and lower/upper coordinates.
+type PhysicalShape = (String, i64, i64, i64, i64);
+
+/// Rectangular physical shapes (layer, x1, y1, x2, y2) in database units.
+fn def_shapes(def: &Def) -> Vec<PhysicalShape> {
+    let mut out = Vec::new();
+    for component in &def.components {
+        let x = component.x as i64;
+        let y = component.y as i64;
+        out.push((
+            "cell".to_string(),
+            x,
+            y,
+            x + (SITE_DBU * 4) as i64,
+            y + ROW_DBU as i64,
+        ));
+    }
+    let half = (GDS_WIRE_DBU / 2) as i64;
+    for net in &def.nets {
+        for route in &net.routes {
+            let (x1, y1) = (route.x1 as i64, route.y1 as i64);
+            let (x2, y2) = (route.x2 as i64, route.y2 as i64);
+            let shape = if y1 == y2 {
+                (
+                    x1.min(x2),
+                    y1.saturating_sub(half),
+                    x1.max(x2),
+                    y1.saturating_add(half),
+                )
+            } else if x1 == x2 {
+                (
+                    x1.saturating_sub(half),
+                    y1.min(y2),
+                    x1.saturating_add(half),
+                    y1.max(y2),
+                )
+            } else {
+                (x1, y1, x2, y2)
+            };
+            out.push((route.layer.clone(), shape.0, shape.1, shape.2, shape.3));
+        }
+        for via in &net.vias {
+            let x = via.x as i64;
+            let y = via.y as i64;
+            out.push((
+                "via".to_string(),
+                x - GDS_VIA_DBU as i64,
+                y - GDS_VIA_DBU as i64,
+                x + GDS_VIA_DBU as i64,
+                y + GDS_VIA_DBU as i64,
+            ));
+        }
+    }
+    out.retain(|(_, x1, y1, x2, y2)| x1 != x2 && y1 != y2);
+    out
+}
+
+/// Number GDS/OASIS layers deterministically from the layer names in the DEF.
+fn layer_numbers(def: &Def) -> std::collections::BTreeMap<String, i16> {
+    let mut names = std::collections::BTreeSet::new();
+    names.insert("cell".to_string());
+    names.insert("via".to_string());
+    for net in &def.nets {
+        for route in &net.routes {
+            names.insert(route.layer.clone());
+        }
+    }
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name, (index + 1) as i16))
+        .collect()
+}
+
+fn gds_record(out: &mut Vec<u8>, kind: u8, dtype: u8, data: &[u8]) {
+    let mut payload = data.to_vec();
+    if !(4 + payload.len()).is_multiple_of(2) {
+        payload.push(0);
+    }
+    let length = (4 + payload.len()) as u16;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.push(kind);
+    out.push(dtype);
+    out.extend_from_slice(&payload);
+}
+
+fn gds_int16(out: &mut Vec<u8>, kind: u8, data: &[u8]) {
+    gds_record(out, kind, 0x02, data);
+}
+
+fn gds_real8(out: &mut Vec<u8>, kind: u8, values: &[f64]) {
+    let mut data = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        data.extend_from_slice(&gds_real8_value(*value));
+    }
+    gds_record(out, kind, 0x05, &data);
+}
+
+/// GDSII 8-byte real: sign bit, 7-bit base-16 excess-64 exponent, 56-bit
+/// fraction.
+fn gds_real8_value(value: f64) -> [u8; 8] {
+    let mut out = [0_u8; 8];
+    if value == 0.0 || !value.is_finite() {
+        return out;
+    }
+    let sign = if value < 0.0 { 0x80 } else { 0 };
+    let mut mantissa_value = value.abs();
+    let mut exponent = 64_i32;
+    while mantissa_value >= 1.0 {
+        mantissa_value /= 16.0;
+        exponent += 1;
+    }
+    while mantissa_value < 1.0 / 16.0 {
+        mantissa_value *= 16.0;
+        exponent -= 1;
+    }
+    let fraction = (mantissa_value * (1_u64 << 56) as f64).round() as u64;
+    out[0] = sign | (exponent.clamp(0, 127) as u8 & 0x7f);
+    out[1..].copy_from_slice(&fraction.to_be_bytes()[1..]);
+    out
+}
+
+fn gds_xy(out: &mut Vec<u8>, points: &[(i64, i64)]) {
+    let mut data = Vec::with_capacity(points.len() * 8);
+    for (x, y) in points {
+        data.extend_from_slice(&(*x as i32).to_be_bytes());
+        data.extend_from_slice(&(*y as i32).to_be_bytes());
+    }
+    gds_record(out, 0x10, 0x03, &data);
+}
+
+fn gds_boundary(out: &mut Vec<u8>, layer: i16, points: &[(i64, i64)]) {
+    if points.len() < 4 {
+        return;
+    }
+    gds_record(out, 0x08, 0x00, &[]);
+    gds_int16(out, 0x0d, &layer.to_be_bytes());
+    gds_int16(out, 0x0e, &0_i16.to_be_bytes());
+    gds_xy(out, points);
+    gds_record(out, 0x11, 0x00, &[]);
+}
+
+fn rect_points(x1: i64, y1: i64, x2: i64, y2: i64) -> Vec<(i64, i64)> {
+    let (x1, x2) = (x1.min(x2), x1.max(x2));
+    let (y1, y2) = (y1.min(y2), y1.max(y2));
+    vec![(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+}
+
+/// Convert a DEF physical database to a GDSII stream.
+pub fn def_to_gds(def: &Def) -> Result<Vec<u8>, String> {
+    let layers = layer_numbers(def);
+    let layer = |name: &str| layers.get(name).copied().unwrap_or(1);
+    let mut out = Vec::new();
+
+    gds_int16(&mut out, 0x00, &600_i16.to_be_bytes());
+    let stamp = [2024_i16, 1, 1, 0, 0, 0, 2024, 1, 1, 0, 0, 0];
+    let mut stamp_bytes = Vec::new();
+    for value in stamp {
+        stamp_bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    gds_int16(&mut out, 0x01, &stamp_bytes);
+    gds_record(&mut out, 0x02, 0x06, b"EDA_LAYOUT");
+    gds_real8(&mut out, 0x03, &[0.001, 1.0e-9]);
+    gds_int16(&mut out, 0x05, &stamp_bytes);
+    gds_record(&mut out, 0x06, 0x06, def.design.as_bytes());
+
+    for (layer_name, x1, y1, x2, y2) in def_shapes(def) {
+        gds_boundary(&mut out, layer(&layer_name), &rect_points(x1, y1, x2, y2));
+    }
+
+    gds_record(&mut out, 0x07, 0x00, &[]);
+    gds_record(&mut out, 0x04, 0x00, &[]);
+    Ok(out)
+}
+
+/// Export the placed/routed design as a GDSII stream.
+pub fn write_gds(
+    nl: &Netlist,
+    placement: &Placement,
+    routing: &Routing,
+) -> Result<Vec<u8>, String> {
+    let def = parse_def(&write_def(nl, placement, routing)?)?;
+    def_to_gds(&def)
+}
+
+// --- OASIS (SEMI P39) -------------------------------------------------------
+
+fn oasis_uint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// OASIS signed integer with the sign in the lowest bit (per SEMI P39).
+fn oasis_int(out: &mut Vec<u8>, value: i64) {
+    let (mut magnitude, sign) = if value < 0 {
+        ((-(value as i128)) as u64, 1_u8)
+    } else {
+        (value as u64, 0_u8)
+    };
+    let mut byte = sign | (((magnitude & 0x3f) as u8) << 1);
+    magnitude >>= 6;
+    loop {
+        if magnitude == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+        byte = (magnitude & 0x7f) as u8;
+        magnitude >>= 7;
+    }
+}
+
+fn oasis_string(out: &mut Vec<u8>, value: &str) {
+    oasis_uint(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// OASIS real encoded as a positive integer (type 0).
+fn oasis_real_uint(out: &mut Vec<u8>, value: u64) {
+    out.push(0);
+    oasis_uint(out, value);
+}
+
+fn oasis_rectangle(out: &mut Vec<u8>, layer: u64, datatype: u64, x: i64, y: i64, w: u64, h: u64) {
+    out.push(20); // RECTANGLE
+                  // layer, datatype, width, height, x, y
+    out.push(0x01 | 0x02 | 0x40 | 0x20 | 0x10 | 0x08);
+    oasis_uint(out, layer);
+    oasis_uint(out, datatype);
+    oasis_uint(out, w);
+    oasis_uint(out, h);
+    oasis_int(out, x);
+    oasis_int(out, y);
+}
+
+/// Convert a DEF physical database to a SEMI P39 OASIS stream.
+pub fn def_to_oasis(def: &Def) -> Result<Vec<u8>, String> {
+    let layers = layer_numbers(def);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%SEMI-OASIS\r\n");
+    out.push(1); // START
+    oasis_string(&mut out, "1.0");
+    // unit / precision = 1e-6 / 1e-9 = 1000
+    oasis_real_uint(&mut out, 1000);
+    out.push(1); // offset table stored in END
+    out.push(14); // CELL
+    oasis_string(&mut out, &def.design);
+    for (layer_name, x1, y1, x2, y2) in def_shapes(def) {
+        let layer = layers.get(&layer_name).copied().unwrap_or(1) as u64;
+        let (x1, x2) = (x1.min(x2), x1.max(x2));
+        let (y1, y2) = (y1.min(y2), y1.max(y2));
+        oasis_rectangle(
+            &mut out,
+            layer,
+            0,
+            x1,
+            y1,
+            (x2 - x1) as u64,
+            (y2 - y1) as u64,
+        );
+    }
+    out.push(2); // END
+                 // Offset table: cellname, textstring, propname, propstring, layername,
+                 // xname. There are no name tables in this stream, so all offsets are 0.
+    for _ in 0..5 {
+        out.push(1);
+        oasis_uint(&mut out, 0);
+    }
+    out.push(1);
+    out.push(0);
+    oasis_uint(&mut out, 0); // padding length
+    out.push(0); // no validation
+    Ok(out)
+}
+
+/// Export the placed/routed design as a SEMI P39 OASIS stream.
+pub fn write_oasis(
+    nl: &Netlist,
+    placement: &Placement,
+    routing: &Routing,
+) -> Result<Vec<u8>, String> {
+    let def = parse_def(&write_def(nl, placement, routing)?)?;
+    def_to_oasis(&def)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,5 +1003,235 @@ mod tests {
         let (imported_placement, imported_routing) = physical_from_def(&nl, &parsed).unwrap();
         assert_eq!(imported_placement, placement);
         assert_eq!(imported_routing, routing);
+    }
+    #[test]
+    fn gds_export_contains_valid_gdsii_records() {
+        let lib = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("gds_physical");
+        nl.set_library(lib.clone());
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u1".into(),
+            kind: CellKind::Lib(lib.find("AND2").unwrap()),
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, vec![a]);
+        nl.add_port("b", Dir::In, vec![b]);
+        nl.add_port("y", Dir::Out, vec![y]);
+        let placement = eda_pnr::place(&nl).unwrap();
+        let routing = eda_pnr::route(&nl, &placement).unwrap();
+        let gds = write_gds(&nl, &placement, &routing).unwrap();
+        assert!(gds.len() > 64);
+
+        let mut offset = 0usize;
+        let mut kinds = Vec::new();
+        while offset + 4 <= gds.len() {
+            let length = u16::from_be_bytes([gds[offset], gds[offset + 1]]) as usize;
+            assert!(length >= 4, "GDS record length {{length}} at {{offset}}");
+            assert!(offset + length <= gds.len(), "truncated GDS record");
+            kinds.push(gds[offset + 2]);
+            offset += length;
+        }
+        assert_eq!(offset, gds.len(), "GDS stream has trailing bytes");
+        for kind in [
+            0x00_u8, 0x01, 0x02, 0x03, 0x05, 0x06, 0x08, 0x11, 0x07, 0x04,
+        ] {
+            assert!(
+                kinds.contains(&kind),
+                "GDS stream missing record type {{kind:#04x}}"
+            );
+        }
+        assert!(
+            kinds.iter().filter(|kind| **kind == 0x08).count() >= 2,
+            "expected component + route boundaries"
+        );
+    }
+    fn oasis_read_uint(data: &[u8], pos: &mut usize) -> Result<u64, String> {
+        let mut value = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = *data.get(*pos).ok_or("truncated OASIS integer")?;
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn oasis_read_int(data: &[u8], pos: &mut usize) -> Result<i64, String> {
+        let first = *data.get(*pos).ok_or("truncated OASIS signed integer")?;
+        *pos += 1;
+        let negative = first & 1 == 1;
+        let mut magnitude = u64::from((first >> 1) & 0x3f);
+        let mut shift = 6_u32;
+        let mut byte = first;
+        while byte & 0x80 != 0 {
+            byte = *data.get(*pos).ok_or("truncated OASIS signed integer")?;
+            *pos += 1;
+            magnitude |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+        }
+        Ok(if negative {
+            -(magnitude as i64)
+        } else {
+            magnitude as i64
+        })
+    }
+
+    fn oasis_read_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
+        let len = oasis_read_uint(data, pos)? as usize;
+        let end = pos.checked_add(len).ok_or("OASIS string length overflow")?;
+        let bytes = data.get(*pos..end).ok_or("truncated OASIS string")?;
+        *pos = end;
+        String::from_utf8(bytes.to_vec()).map_err(|error| error.to_string())
+    }
+
+    type OasisRect = (u64, u64, i64, i64, u64, u64);
+
+    fn parse_oasis(data: &[u8]) -> Result<(String, Vec<OasisRect>), String> {
+        if !data.starts_with(b"%SEMI-OASIS\r\n") {
+            return Err("missing OASIS magic".into());
+        }
+        let mut pos = 13;
+        if data.get(pos) != Some(&1) {
+            return Err("missing START record".into());
+        }
+        pos += 1;
+        if oasis_read_string(data, &mut pos)? != "1.0" {
+            return Err("unexpected OASIS version".into());
+        }
+        if data.get(pos) != Some(&0) {
+            return Err("expected real-positive-integer unit".into());
+        }
+        pos += 1;
+        if oasis_read_uint(data, &mut pos)? != 1000 {
+            return Err("unexpected OASIS unit".into());
+        }
+        if oasis_read_uint(data, &mut pos)? != 1 {
+            return Err("expected END offset table".into());
+        }
+        let mut name = String::new();
+        let mut rects = Vec::new();
+        loop {
+            let record = *data.get(pos).ok_or("truncated OASIS record")?;
+            pos += 1;
+            match record {
+                14 => {
+                    name = oasis_read_string(data, &mut pos)?;
+                }
+                20 => {
+                    let info = *data.get(pos).ok_or("truncated RECTANGLE")?;
+                    pos += 1;
+                    if info & 0x04 != 0 {
+                        return Err("unexpected repetition".into());
+                    }
+                    let layer = if info & 0x01 != 0 {
+                        oasis_read_uint(data, &mut pos)?
+                    } else {
+                        return Err("rectangle layer missing".into());
+                    };
+                    let datatype = if info & 0x02 != 0 {
+                        oasis_read_uint(data, &mut pos)?
+                    } else {
+                        0
+                    };
+                    let width = oasis_read_uint(data, &mut pos)?;
+                    let height = oasis_read_uint(data, &mut pos)?;
+                    let x = oasis_read_int(data, &mut pos)?;
+                    let y = oasis_read_int(data, &mut pos)?;
+                    rects.push((layer, datatype, x, y, width, height));
+                }
+                2 => break,
+                other => return Err(format!("unexpected OASIS record {other}")),
+            }
+        }
+        Ok((name, rects))
+    }
+
+    fn small_physical_fixture() -> (Netlist, crate::Placement, crate::Routing) {
+        let lib = Arc::new(CellLibrary::std());
+        let mut nl = Netlist::new("oasis_physical");
+        nl.set_library(lib.clone());
+        let a = nl.add_net("a");
+        let b = nl.add_net("b");
+        let y = nl.add_net("y");
+        nl.add_cell(Cell {
+            name: "u1".into(),
+            kind: CellKind::Lib(lib.find("AND2").unwrap()),
+            inputs: vec![a, b],
+            output: y,
+        });
+        nl.add_port("a", Dir::In, vec![a]);
+        nl.add_port("b", Dir::In, vec![b]);
+        nl.add_port("y", Dir::Out, vec![y]);
+        let placement = eda_pnr::place(&nl).unwrap();
+        let routing = eda_pnr::route(&nl, &placement).unwrap();
+        (nl, placement, routing)
+    }
+
+    #[test]
+    fn oasis_round_trip_contains_cell_and_rectangles() {
+        let (nl, placement, routing) = small_physical_fixture();
+        let oasis = write_oasis(&nl, &placement, &routing).unwrap();
+        let (name, rects) = parse_oasis(&oasis).expect("parse OASIS");
+        assert_eq!(name, "oasis_physical");
+        assert!(!rects.is_empty(), "OASIS has no rectangles");
+        // Component box plus routed wires.
+        assert!(rects.len() >= 2, "expected component + routes");
+        assert!(rects.iter().all(|(_, _, _, _, w, h)| *w > 0 && *h > 0));
+    }
+
+    #[test]
+    fn oasis_and_gds_are_readable_by_gdstk() {
+        let (nl, placement, routing) = small_physical_fixture();
+        let oasis = write_oasis(&nl, &placement, &routing).unwrap();
+        let gds = write_gds(&nl, &placement, &routing).unwrap();
+        let dir = std::env::temp_dir();
+        let base = format!("eda_pnr_{}", std::process::id());
+        let oasis_path = dir.join(format!("{base}.oas"));
+        let gds_path = dir.join(format!("{base}.gds"));
+        std::fs::write(&oasis_path, &oasis).unwrap();
+        std::fs::write(&gds_path, &gds).unwrap();
+
+        let probe = std::process::Command::new("python3")
+            .args(["-c", "import gdstk"])
+            .output();
+        match probe {
+            Ok(output) if output.status.success() => {}
+            _ => {
+                eprintln!("skipping: python3/gdstk unavailable");
+                return;
+            }
+        }
+        let script = format!(
+            "import gdstk,sys\n\
+             o=gdstk.read_oas(r'{}')\n\
+             g=gdstk.read_gds(r'{}')\n\
+             op=[p for c in o.cells for p in c.polygons]\n\
+             gp=[p for c in g.cells for p in c.polygons]\n\
+             print(f'oas_cells={{len(o.cells)}} oas_polys={{len(op)}} gds_cells={{len(g.cells)}} gds_polys={{len(gp)}}')\n",
+            oasis_path.display(),
+            gds_path.display()
+        );
+        let output = std::process::Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .expect("run gdstk oracle");
+        assert!(
+            output.status.success(),
+            "gdstk failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("gdstk oracle: {}", stdout.trim());
+        assert!(stdout.contains("oas_cells=1"), "{stdout}");
+        assert!(stdout.contains("gds_cells=1"), "{stdout}");
+        assert!(!stdout.contains("oas_polys=0"), "{stdout}");
+        assert!(!stdout.contains("gds_polys=0"), "{stdout}");
     }
 }

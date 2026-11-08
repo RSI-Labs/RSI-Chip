@@ -51,6 +51,8 @@ module rv32i_core (
   reg [7:0] byte_sel;
   reg [31:0] store_word;
   reg [31:0] store_dword;
+  wire [4:0] rs1    = instr[19:15];
+  wire [4:0] rs2    = instr[24:20];
   always @* begin
     instr = i0; // 默认值，避免不完整 case 推断出锁存器
     case (pc[5:2])
@@ -150,8 +152,6 @@ module rv32i_core (
   wire [6:0] opcode = instr[6:0];
   wire [4:0] rd     = instr[11:7];
   wire [2:0] funct3 = instr[14:12];
-  wire [4:0] rs1    = instr[19:15];
-  wire [4:0] rs2    = instr[24:20];
   wire [6:0] funct7 = instr[31:25];
 
   wire [31:0] imm_i = {{20{instr[31]}}, instr[31:20]};

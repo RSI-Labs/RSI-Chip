@@ -7,7 +7,7 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
                              console_write, console_char,
                              mem_addr, mem_wdata, mem_we, mem_width,
                              source_addr, io_addr, io_we, io_width, io_wdata,
-                             ax, cx, dx, bx, sp, bp, si, di, ip, flags);
+                             ax, cx, dx, bx, sp, bp, si, di, es, cs, ss, ds, ip, flags);
   input [15:0] mem_rdata;
   input [15:0] source_rdata;
   input [15:0] io_rdata;
@@ -44,6 +44,10 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
   output [15:0] bp;
   output [15:0] si;
   output [15:0] di;
+  output [15:0] es;
+  output [15:0] cs;
+  output [15:0] ss;
+  output [15:0] ds;
   output [15:0] ip;
   output [15:0] flags;
   reg clk;
@@ -78,7 +82,7 @@ module i8086_full_runtime_tb(mem_rdata, source_rdata, io_rdata,
     .interrupt_ack(interrupt_ack),
     .halted(halted), .trap(trap), .instructions_retired(retired),
     .dbg_ax(ax), .dbg_cx(cx), .dbg_dx(dx), .dbg_bx(bx), .dbg_sp(sp),
-    .dbg_bp(bp), .dbg_si(si), .dbg_di(di), .dbg_es(), .dbg_cs(),
-    .dbg_ss(), .dbg_ds(), .dbg_ip(ip), .dbg_flags(flags)
+    .dbg_bp(bp), .dbg_si(si), .dbg_di(di), .dbg_es(es), .dbg_cs(cs),
+    .dbg_ss(ss), .dbg_ds(ds), .dbg_ip(ip), .dbg_flags(flags)
   );
 endmodule

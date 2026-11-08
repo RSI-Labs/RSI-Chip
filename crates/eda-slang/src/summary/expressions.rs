@@ -2501,6 +2501,27 @@ pub(crate) fn slang_expression_fingerprint_with_parameters(
     parameters: &[SlangParameterSummary],
     mode: ExpressionFingerprintMode,
 ) -> Option<String> {
+    if matches!(expression.kind.as_str(), "Concat" | "Concatenation") {
+        let width = expression.type_width.or_else(|| {
+            expression
+                .operands
+                .iter()
+                .map(|operand| operand.type_width)
+                .collect::<Option<Vec<_>>>()
+                .map(|widths| widths.into_iter().sum())
+        })?;
+        let signed = expression.type_signed.unwrap_or(false);
+        let parts = expression
+            .operands
+            .iter()
+            .map(|operand| slang_expression_fingerprint_with_parameters(operand, parameters, mode))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(format!(
+            "Concat:{width}:{}[{}]",
+            if signed { "s" } else { "u" },
+            parts.join(",")
+        ));
+    }
     if expression.kind == "StringToRadix" {
         if let Some(name) = expression.plusarg_name.as_deref() {
             return Some(format!(
@@ -4873,6 +4894,7 @@ fn design_stmt_assignments_guarded(
         | Stmt::TimeFormat { .. }
         | Stmt::WriteMem { .. }
         | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
         | Stmt::FileClose { .. }
         | Stmt::FileFlush { .. }
         | Stmt::FileDisplay { .. }

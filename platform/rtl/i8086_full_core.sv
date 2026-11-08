@@ -179,47 +179,40 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
   );
 
   function [19:0] physical_address(input [1:0] segment, input [15:0] offset);
-    case (segment)
-      2'b00: physical_address = {es, 4'b0000} + {4'b0000, offset};
-      2'b01: physical_address = {cs, 4'b0000} + {4'b0000, offset};
-      2'b10: physical_address = {ss, 4'b0000} + {4'b0000, offset};
-      default: physical_address = {ds, 4'b0000} + {4'b0000, offset};
-    endcase
+    physical_address =
+      (segment == 2'b00) ? {es, 4'b0000} + {4'b0000, offset} :
+      (segment == 2'b01) ? {cs, 4'b0000} + {4'b0000, offset} :
+      (segment == 2'b10) ? {ss, 4'b0000} + {4'b0000, offset} :
+                           {ds, 4'b0000} + {4'b0000, offset};
   endfunction
 
   function [15:0] segment_result_value(input [1:0] segment);
-    case (segment)
-      2'b00: segment_result_value = es;
-      2'b01: segment_result_value = cs;
-      2'b10: segment_result_value = ss;
-      default: segment_result_value = ds;
-    endcase
+    segment_result_value =
+      (segment == 2'b00) ? es :
+      (segment == 2'b01) ? cs :
+      (segment == 2'b10) ? ss : ds;
   endfunction
 
   function [15:0] register_word(input [2:0] index);
-    case (index)
-      3'd0: register_word = ax;
-      3'd1: register_word = cx;
-      3'd2: register_word = dx;
-      3'd3: register_word = bx;
-      3'd4: register_word = sp;
-      3'd5: register_word = bp;
-      3'd6: register_word = si;
-      default: register_word = di;
-    endcase
+    register_word =
+      (index == 3'd0) ? ax :
+      (index == 3'd1) ? cx :
+      (index == 3'd2) ? dx :
+      (index == 3'd3) ? bx :
+      (index == 3'd4) ? sp :
+      (index == 3'd5) ? bp :
+      (index == 3'd6) ? si : di;
   endfunction
 
   function [7:0] register_byte(input [2:0] index);
-    case (index)
-      3'd0: register_byte = ax[7:0];
-      3'd1: register_byte = cx[7:0];
-      3'd2: register_byte = dx[7:0];
-      3'd3: register_byte = bx[7:0];
-      3'd4: register_byte = ax[15:8];
-      3'd5: register_byte = cx[15:8];
-      3'd6: register_byte = dx[15:8];
-      default: register_byte = bx[15:8];
-    endcase
+    register_byte =
+      (index == 3'd0) ? ax[7:0] :
+      (index == 3'd1) ? cx[7:0] :
+      (index == 3'd2) ? dx[7:0] :
+      (index == 3'd3) ? bx[7:0] :
+      (index == 3'd4) ? ax[15:8] :
+      (index == 3'd5) ? cx[15:8] :
+      (index == 3'd6) ? dx[15:8] : bx[15:8];
   endfunction
 
   function logic parity_even(input [7:0] result_value);
@@ -381,7 +374,7 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
                     (ax[15] ? {rm_result_value, 16'b0} : 32'b0) -
                     (rm_result_value[15] ? {ax, 16'b0} : 32'b0);
     else if (modrm_register == 3'd5)
-      mul_product = {{16{al[7]}}, al} * {{16{rm_result_value[7]}}, rm_result_value[7:0]};
+      mul_product = {{24{al[7]}}, al} * {{24{rm_result_value[7]}}, rm_result_value[7:0]};
     else if (execute_width8)
       mul_product = {24'b0, al} * {24'b0, rm_result_value[7:0]};
     else
@@ -1071,9 +1064,21 @@ module i8086_full_core(clk, rst, init_ip, init_sp, init_cs, init_ds, init_es, in
               default: execute_mem_wdata = ds;
             endcase
           end
-          8'h07: begin next_es = mem_rdata; next_sp = sp + 16'd2; end
-          8'h17: begin next_ss = mem_rdata; next_sp = sp + 16'd2; end
-          8'h1f: begin next_ds = mem_rdata; next_sp = sp + 16'd2; end
+          8'h07: begin
+            execute_mem_addr = physical_address(2'b10, sp);
+            next_es = mem_rdata;
+            next_sp = sp + 16'd2;
+          end
+          8'h17: begin
+            execute_mem_addr = physical_address(2'b10, sp);
+            next_ss = mem_rdata;
+            next_sp = sp + 16'd2;
+          end
+          8'h1f: begin
+            execute_mem_addr = physical_address(2'b10, sp);
+            next_ds = mem_rdata;
+            next_sp = sp + 16'd2;
+          end
           8'h27, 8'h2f, 8'h37, 8'h3f: begin
             next_ax = bcd_result;
             next_flags = bcd_flags;

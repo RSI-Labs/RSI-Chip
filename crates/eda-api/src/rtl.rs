@@ -46,7 +46,7 @@ pub fn run_flow_with_library_options_cancellable(
 }
 
 /// Staged implementation flow: `include_lec` false skips the (expensive)
-/// generic-vs-mapped equivalence proof, for physical-only signoff stages
+/// RTL-reference-vs-mapped equivalence proof, for physical-only signoff stages
 /// where LEC is tracked as its own separately gated deliverable.
 pub fn run_flow_staged_cancellable(
     src: &str,
@@ -56,23 +56,50 @@ pub fn run_flow_staged_cancellable(
     include_lec: bool,
     cancellation: &FlowCancellation,
 ) -> Result<Flow, String> {
+    let design = compile(src, top)?;
+    run_flow_from_design_cancellable(design, lib, route, include_lec, None, cancellation)
+}
+
+/// Full flow whose LEC golden side is the explicit, unoptimized, unmapped
+/// netlist lowered from the RTL design.
+///
+/// This is the RTL-vs-netlist signoff entry point: the reference netlist keeps
+/// RTL-derived names and is proved equivalent to the optimized, library-mapped
+/// implementation.  The reference is still produced by the in-tree RTL
+/// lowering, so a future independent RTL formal encoder can replace it without
+/// changing this API.
+pub fn run_flow_with_rtl_reference_lec(
+    src: &str,
+    top: Option<&str>,
+    lib: &CellLibrary,
+    route: &RouteOptions,
+    cancellation: &FlowCancellation,
+) -> Result<Flow, String> {
+    let design = compile(src, top)?;
+    let reference = eda_synth::synthesize_rtl_reference(&design)?;
+    run_flow_from_design_cancellable(design, lib, route, true, Some(reference), cancellation)
+}
+
+fn run_flow_from_design_cancellable(
+    design: Design,
+    lib: &CellLibrary,
+    route: &RouteOptions,
+    include_lec: bool,
+    reference: Option<Netlist>,
+    cancellation: &FlowCancellation,
+) -> Result<Flow, String> {
     let cancelled = || {
         cancellation
             .is_cancelled()
             .then(|| "RTL flow cancelled".to_string())
     };
-    let design = compile(src, top)?;
     if let Some(error) = cancelled() {
         return Err(error);
     }
-    let gold = synthesize(
-        &design,
-        &SynthOptions {
-            optimize: false,
-            map_lib: false,
-        },
-    )?
-    .netlist;
+    let gold = match reference {
+        Some(reference) => reference,
+        None => eda_synth::synthesize_rtl_reference(&design)?,
+    };
     if let Some(error) = cancelled() {
         return Err(error);
     }
@@ -191,6 +218,385 @@ pub fn check_rtl_equivalence_cancellable(
         notes: result.notes,
         gold_stats: gold.stats(),
         mapped_stats: netlist.stats(),
+    })
+}
+
+/// Result of comparing two RTL descriptions, or an RTL description against an
+/// externally supplied gate-level netlist.
+#[derive(Clone, Debug)]
+pub struct RtlDualEquivalenceResult {
+    pub equivalent: bool,
+    /// MSB-first binary input assignment that distinguishes the two sides.
+    pub counterexample: BTreeMap<String, String>,
+    pub notes: Vec<String>,
+    pub reference_stats: NetlistStats,
+    pub implementation_stats: NetlistStats,
+}
+
+/// Formal LEC between two RTL sources.
+///
+/// Both sides are lowered by the same frontend, then synthesized with the
+/// generic (unoptimized, cell-library-free) reference path so that the check
+/// compares the RTL semantics rather than a mapping artifact. This is the
+/// two-design entry point used for revision-vs-revision and refactor-vs-golden
+/// equivalence.
+pub fn check_rtl_equivalence_between(
+    reference_src: &str,
+    reference_top: Option<&str>,
+    implementation_src: &str,
+    implementation_top: Option<&str>,
+) -> Result<RtlDualEquivalenceResult, String> {
+    check_rtl_equivalence_between_cancellable(
+        reference_src,
+        reference_top,
+        implementation_src,
+        implementation_top,
+        &FlowCancellation::new(),
+    )
+}
+
+/// Two-source RTL LEC with cooperative cancellation between stages.
+pub fn check_rtl_equivalence_between_cancellable(
+    reference_src: &str,
+    reference_top: Option<&str>,
+    implementation_src: &str,
+    implementation_top: Option<&str>,
+    cancellation: &FlowCancellation,
+) -> Result<RtlDualEquivalenceResult, String> {
+    let reference_design = compile(reference_src, reference_top)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let implementation_design = compile(implementation_src, implementation_top)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let reference = eda_synth::synthesize_rtl_reference(&reference_design)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let implementation = eda_synth::synthesize_rtl_reference(&implementation_design)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    dual_equivalence(&reference, &implementation, cancellation)
+}
+
+/// Formal LEC between an RTL source and an externally supplied gate-level
+/// netlist (for example a mapped or placed-and-routed netlist).
+///
+/// The RTL side is lowered and synthesized with the generic reference path,
+/// while the implementation netlist is consumed as-is. Library-mapped cells, if
+/// present, are handled by the formal engine.
+pub fn check_rtl_vs_netlist_equivalence(
+    src: &str,
+    top: Option<&str>,
+    implementation: &Netlist,
+) -> Result<RtlDualEquivalenceResult, String> {
+    check_rtl_vs_netlist_equivalence_cancellable(src, top, implementation, &FlowCancellation::new())
+}
+
+/// RTL-vs-netlist LEC with cooperative cancellation between stages.
+pub fn check_rtl_vs_netlist_equivalence_cancellable(
+    src: &str,
+    top: Option<&str>,
+    implementation: &Netlist,
+    cancellation: &FlowCancellation,
+) -> Result<RtlDualEquivalenceResult, String> {
+    let design = compile(src, top)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let reference = eda_synth::synthesize_rtl_reference(&design)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    dual_equivalence(&reference, implementation, cancellation)
+}
+
+/// Formal LEC that consumes two lowered [`Design`] values directly.
+///
+/// This is the in-memory entry point: callers can run their own frontend (for
+/// example an independent SystemVerilog parser) and prove the resulting design
+/// against a design produced by this toolchain without round-tripping through
+/// Verilog text.
+pub fn check_design_equivalence(
+    reference: &Design,
+    implementation: &Design,
+) -> Result<RtlDualEquivalenceResult, String> {
+    check_design_equivalence_cancellable(reference, implementation, &FlowCancellation::new())
+}
+
+/// Direct [`Design`]-to-[`Design`] LEC with cooperative cancellation.
+pub fn check_design_equivalence_cancellable(
+    reference: &Design,
+    implementation: &Design,
+    cancellation: &FlowCancellation,
+) -> Result<RtlDualEquivalenceResult, String> {
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let reference_netlist = eda_synth::synthesize_rtl_reference(reference)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let implementation_netlist = eda_synth::synthesize_rtl_reference(implementation)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    dual_equivalence(&reference_netlist, &implementation_netlist, cancellation)
+}
+
+fn dual_equivalence(
+    reference: &Netlist,
+    implementation: &Netlist,
+    cancellation: &FlowCancellation,
+) -> Result<RtlDualEquivalenceResult, String> {
+    let result = eda_formal::check_equivalent_cancellable(reference, implementation, cancellation)?;
+    if cancellation.is_cancelled() {
+        return Err("RTL equivalence cancelled".into());
+    }
+    let counterexample = result
+        .counterexample
+        .unwrap_or_default()
+        .iter()
+        .map(|(input, value)| (input.clone(), value.to_bin_str()))
+        .collect();
+    Ok(RtlDualEquivalenceResult {
+        equivalent: result.equivalent,
+        counterexample,
+        notes: result.notes,
+        reference_stats: reference.stats(),
+        implementation_stats: implementation.stats(),
+    })
+}
+
+/// Human-readable report for an RTL-vs-mapped equivalence result.
+pub fn report_rtl_equivalence(result: &RtlEquivalenceResult) -> String {
+    let mut out = format!(
+        "reference: {} cells, {} nets\nmapped: {} cells, {} nets\n",
+        result.gold_stats.cells,
+        result.gold_stats.nets,
+        result.mapped_stats.cells,
+        result.mapped_stats.nets
+    );
+    out.push_str(&report_lec_verdict(
+        result.equivalent,
+        &result.counterexample,
+        &result.notes,
+    ));
+    out
+}
+
+/// Human-readable report for a two-source or RTL-vs-netlist LEC result.
+pub fn report_rtl_dual_equivalence(result: &RtlDualEquivalenceResult) -> String {
+    let mut out = format!(
+        "reference: {} cells, {} nets\nimplementation: {} cells, {} nets\n",
+        result.reference_stats.cells,
+        result.reference_stats.nets,
+        result.implementation_stats.cells,
+        result.implementation_stats.nets
+    );
+    out.push_str(&report_lec_verdict(
+        result.equivalent,
+        &result.counterexample,
+        &result.notes,
+    ));
+    out
+}
+
+fn report_lec_verdict(
+    equivalent: bool,
+    counterexample: &BTreeMap<String, String>,
+    notes: &[String],
+) -> String {
+    let mut out = if equivalent {
+        "EQUIVALENT\n".to_string()
+    } else {
+        "NOT EQUIVALENT\n".to_string()
+    };
+    for note in notes {
+        out.push_str(&format!("note: {note}\n"));
+    }
+    if !counterexample.is_empty() {
+        out.push_str("counterexample:\n");
+        for (name, value) in counterexample {
+            out.push_str(&format!("  {name} = {value}\n"));
+        }
+    }
+    out
+}
+
+/// RTL-vs-mapped LEC with an explicitly selected SAT engine.
+pub fn check_rtl_equivalence_with_solver(
+    src: &str,
+    top: Option<&str>,
+    solver: eda_formal::SatBackend,
+) -> Result<RtlEquivalenceResult, String> {
+    let mut result = eda_formal::with_sat_backend(solver, || check_rtl_equivalence(src, top))?;
+    result
+        .notes
+        .push(format!("sat-backend: {}", solver.as_str()));
+    Ok(result)
+}
+
+/// Two-source RTL LEC with an explicitly selected SAT engine.
+pub fn check_rtl_equivalence_between_with_solver(
+    reference_src: &str,
+    reference_top: Option<&str>,
+    implementation_src: &str,
+    implementation_top: Option<&str>,
+    solver: eda_formal::SatBackend,
+) -> Result<RtlDualEquivalenceResult, String> {
+    eda_formal::with_sat_backend(solver, || {
+        check_rtl_equivalence_between(
+            reference_src,
+            reference_top,
+            implementation_src,
+            implementation_top,
+        )
+    })
+}
+
+/// RTL-vs-external-netlist LEC with an explicitly selected SAT engine.
+pub fn check_rtl_vs_netlist_equivalence_with_solver(
+    src: &str,
+    top: Option<&str>,
+    implementation: &Netlist,
+    solver: eda_formal::SatBackend,
+) -> Result<RtlDualEquivalenceResult, String> {
+    let mut result = eda_formal::with_sat_backend(solver, || {
+        check_rtl_vs_netlist_equivalence(src, top, implementation)
+    })?;
+    result
+        .notes
+        .push(format!("sat-backend: {}", solver.as_str()));
+    Ok(result)
+}
+
+/// Direct Design-to-Design LEC with an explicitly selected SAT engine.
+pub fn check_design_equivalence_with_solver(
+    reference: &Design,
+    implementation: &Design,
+    solver: eda_formal::SatBackend,
+) -> Result<RtlDualEquivalenceResult, String> {
+    let mut result = eda_formal::with_sat_backend(solver, || {
+        check_design_equivalence(reference, implementation)
+    })?;
+    result
+        .notes
+        .push(format!("sat-backend: {}", solver.as_str()));
+    Ok(result)
+}
+
+/// Cross-check RTL-vs-mapped LEC across several independent SAT engines.
+///
+/// Unavailable engines are skipped. A disagreement between available engines
+/// fails closed. The result notes identify every participating engine.
+pub fn check_rtl_equivalence_cross_checked(
+    src: &str,
+    top: Option<&str>,
+    solvers: &[eda_formal::SatBackend],
+) -> Result<RtlEquivalenceResult, String> {
+    let design = compile(src, top)?;
+    let gold = eda_synth::synthesize_rtl_reference(&design)?;
+    let netlist =
+        eda_synth::synthesize_with_library(&design, &SynthOptions::default(), &CellLibrary::std())?
+            .netlist;
+    let result = eda_formal::check_equivalent_cross_checked(&gold, &netlist, solvers)?;
+    let counterexample = result
+        .counterexample
+        .unwrap_or_default()
+        .iter()
+        .map(|(input, value)| (input.clone(), value.to_bin_str()))
+        .collect();
+    Ok(RtlEquivalenceResult {
+        equivalent: result.equivalent,
+        counterexample,
+        notes: result.notes,
+        gold_stats: gold.stats(),
+        mapped_stats: netlist.stats(),
+    })
+}
+
+/// Cross-check two-source RTL LEC across several independent SAT engines.
+pub fn check_rtl_equivalence_between_cross_checked(
+    reference_src: &str,
+    reference_top: Option<&str>,
+    implementation_src: &str,
+    implementation_top: Option<&str>,
+    solvers: &[eda_formal::SatBackend],
+) -> Result<RtlDualEquivalenceResult, String> {
+    let reference_design = compile(reference_src, reference_top)?;
+    let implementation_design = compile(implementation_src, implementation_top)?;
+    let reference = eda_synth::synthesize_rtl_reference(&reference_design)?;
+    let implementation = eda_synth::synthesize_rtl_reference(&implementation_design)?;
+    let result = eda_formal::check_equivalent_cross_checked(&reference, &implementation, solvers)?;
+    let counterexample = result
+        .counterexample
+        .unwrap_or_default()
+        .iter()
+        .map(|(input, value)| (input.clone(), value.to_bin_str()))
+        .collect();
+    Ok(RtlDualEquivalenceResult {
+        equivalent: result.equivalent,
+        counterexample,
+        notes: result.notes,
+        reference_stats: reference.stats(),
+        implementation_stats: implementation.stats(),
+    })
+}
+
+/// Cross-check RTL-vs-external-netlist LEC across several SAT engines.
+pub fn check_rtl_vs_netlist_equivalence_cross_checked(
+    src: &str,
+    top: Option<&str>,
+    implementation: &Netlist,
+    solvers: &[eda_formal::SatBackend],
+) -> Result<RtlDualEquivalenceResult, String> {
+    let design = compile(src, top)?;
+    let reference = eda_synth::synthesize_rtl_reference(&design)?;
+    let result = eda_formal::check_equivalent_cross_checked(&reference, implementation, solvers)?;
+    let counterexample = result
+        .counterexample
+        .unwrap_or_default()
+        .iter()
+        .map(|(input, value)| (input.clone(), value.to_bin_str()))
+        .collect();
+    Ok(RtlDualEquivalenceResult {
+        equivalent: result.equivalent,
+        counterexample,
+        notes: result.notes,
+        reference_stats: reference.stats(),
+        implementation_stats: implementation.stats(),
+    })
+}
+
+/// Cross-check in-memory Design-to-Design LEC across several SAT engines.
+pub fn check_design_equivalence_cross_checked(
+    reference: &Design,
+    implementation: &Design,
+    solvers: &[eda_formal::SatBackend],
+) -> Result<RtlDualEquivalenceResult, String> {
+    let reference_netlist = eda_synth::synthesize_rtl_reference(reference)?;
+    let implementation_netlist = eda_synth::synthesize_rtl_reference(implementation)?;
+    let result = eda_formal::check_equivalent_cross_checked(
+        &reference_netlist,
+        &implementation_netlist,
+        solvers,
+    )?;
+    let counterexample = result
+        .counterexample
+        .unwrap_or_default()
+        .iter()
+        .map(|(input, value)| (input.clone(), value.to_bin_str()))
+        .collect();
+    Ok(RtlDualEquivalenceResult {
+        equivalent: result.equivalent,
+        counterexample,
+        notes: result.notes,
+        reference_stats: reference_netlist.stats(),
+        implementation_stats: implementation_netlist.stats(),
     })
 }
 

@@ -1,3 +1,5 @@
+pub mod gate;
+
 use eda_cpu_platform::SparseMemory;
 
 const ES: usize = 0;

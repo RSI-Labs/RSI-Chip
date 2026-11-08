@@ -6,8 +6,14 @@
 //! `2*(v-1) + (neg ? 1 : 0)`.
 
 use eda_core::cancellation::FlowCancellation;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default)]
 pub struct Cnf {
@@ -92,17 +98,515 @@ fn solve_kissat_cancellable(
     result
 }
 
-fn solve_with_kissat_backend(
-    cnf: &Cnf,
-    cancellation: &FlowCancellation,
-    builtin: impl FnOnce() -> Result<SatResult, String>,
-) -> Result<SatResult, String> {
-    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
-        return Ok(result);
+/// SAT engine selection for LEC and for direct CNF queries.
+///
+/// `Kissat` is the vendored production backend. `Z3` and `Cvc5` are external
+/// cross-check engines driven over DIMACS so their verdicts and models can be
+/// compared against Kissat/the in-tree solver without sharing code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SatBackend {
+    Auto,
+    Native,
+    Kissat,
+    Z3,
+    Cvc5,
+}
+
+impl SatBackend {
+    pub const ALL: [SatBackend; 5] = [
+        SatBackend::Auto,
+        SatBackend::Native,
+        SatBackend::Kissat,
+        SatBackend::Z3,
+        SatBackend::Cvc5,
+    ];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(SatBackend::Auto),
+            "native" | "builtin" => Some(SatBackend::Native),
+            "kissat" => Some(SatBackend::Kissat),
+            "z3" => Some(SatBackend::Z3),
+            "cvc5" => Some(SatBackend::Cvc5),
+            _ => None,
+        }
     }
-    // Kissat initialization or an unexpected backend failure falls back to the
-    // in-tree solver. Cancellation is preserved by both paths.
-    builtin()
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SatBackend::Auto => "auto",
+            SatBackend::Native => "native",
+            SatBackend::Kissat => "kissat",
+            SatBackend::Z3 => "z3",
+            SatBackend::Cvc5 => "cvc5",
+        }
+    }
+
+    pub fn is_available(self) -> bool {
+        match self {
+            SatBackend::Auto | SatBackend::Native | SatBackend::Kissat => true,
+            SatBackend::Z3 => z3_binary().is_some(),
+            SatBackend::Cvc5 => cvc5_driver().is_some(),
+        }
+    }
+
+    fn resolve(self) -> SatBackend {
+        match self {
+            SatBackend::Auto => SatBackend::Kissat,
+            other => other,
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_SAT_BACKEND: Cell<SatBackend> = const { Cell::new(SatBackend::Kissat) };
+}
+
+/// Read the SAT engine currently selected for this thread.
+pub fn current_sat_backend() -> SatBackend {
+    ACTIVE_SAT_BACKEND.with(Cell::get)
+}
+
+/// Run `f` with a thread-local SAT engine selection (LEC entry points use this).
+pub fn with_sat_backend<T>(backend: SatBackend, f: impl FnOnce() -> T) -> T {
+    let previous = ACTIVE_SAT_BACKEND.with(|cell| cell.replace(backend));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    ACTIVE_SAT_BACKEND.with(|cell| cell.set(previous));
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn command_available(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn z3_binary() -> Option<PathBuf> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("EDA_Z3") {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            if command_available("z3") {
+                return Some(PathBuf::from("z3"));
+            }
+            for candidate in ["/opt/homebrew/bin/z3", "/usr/local/bin/z3", "/usr/bin/z3"] {
+                if Path::new(candidate).is_file() {
+                    return Some(PathBuf::from(candidate));
+                }
+            }
+            // `pip install --user z3-solver` ships the CLI in the per-version
+            // Python user bin directory, which is not on PATH by default.
+            if let Some(home) = std::env::var_os("HOME") {
+                let base = Path::new(&home).join("Library").join("Python");
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        let candidate = entry.path().join("bin").join("z3");
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+                let base = Path::new(&home).join(".local").join("bin");
+                let candidate = base.join("z3");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn python_binary() -> Option<PathBuf> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("EDA_PYTHON") {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            for name in [
+                "python3",
+                "python",
+                "python3.13",
+                "python3.12",
+                "python3.11",
+                "python3.10",
+            ] {
+                if command_available(name) {
+                    return Some(PathBuf::from(name));
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn cvc5_python_available() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let Some(python) = python_binary() else {
+            return false;
+        };
+        Command::new(python)
+            .args(["-c", "import cvc5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+fn cvc5_driver() -> Option<PathBuf> {
+    // cvc5 is driven through its official Python bindings: the pip wheel
+    // ships libcvc5/parser but no standalone CLI, and the bindings expose the
+    // same CDCL(T) core.
+    if cvc5_python_available() {
+        python_binary()
+    } else {
+        None
+    }
+}
+
+fn solver_timeout() -> Duration {
+    let seconds = std::env::var("EDA_SAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600);
+    Duration::from_secs(seconds)
+}
+
+fn dimacs(cnf: &Cnf) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(cnf.clauses.iter().map(Vec::len).sum::<usize>() * 8 + 64);
+    let _ = writeln!(out, "p cnf {} {}", cnf.n_vars, cnf.clauses.len());
+    for clause in &cnf.clauses {
+        for literal in clause {
+            let _ = write!(out, "{literal} ");
+        }
+        out.push_str("0\n");
+    }
+    out
+}
+
+fn parse_dimacs_output(stdout: &str, n_vars: usize) -> Result<SatResult, String> {
+    let mut verdict: Option<bool> = None;
+    let mut model = vec![false; n_vars];
+    let mut assigned = vec![false; n_vars];
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("s ") {
+            let rest = rest.trim();
+            if rest.starts_with("SATISFIABLE") {
+                verdict = Some(true);
+            } else if rest.starts_with("UNSATISFIABLE") {
+                verdict = Some(false);
+            } else {
+                return Err(format!("external SAT solver returned '{rest}'"));
+            }
+        } else if let Some(rest) = line.strip_prefix("v ") {
+            for token in rest.split_whitespace() {
+                let literal: i64 = token
+                    .parse()
+                    .map_err(|_| format!("external SAT model has invalid literal '{token}'"))?;
+                if literal == 0 {
+                    continue;
+                }
+                let variable = literal.unsigned_abs() as usize;
+                if variable == 0 || variable > n_vars {
+                    return Err(format!(
+                        "external SAT model literal {literal} is outside 1..={n_vars}"
+                    ));
+                }
+                model[variable - 1] = literal > 0;
+                assigned[variable - 1] = true;
+            }
+        }
+    }
+    match verdict {
+        Some(true) => Ok(SatResult::Sat(model)),
+        Some(false) => Ok(SatResult::Unsat),
+        None => Err(format!(
+            "external SAT solver produced no verdict: {}",
+            stdout.chars().take(240).collect::<String>()
+        )),
+    }
+}
+
+fn run_solver_process(
+    mut command: Command,
+    input: String,
+    cancellation: &FlowCancellation,
+    label: &str,
+) -> Result<String, String> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start {label}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{label} stdin unavailable"))?;
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label} stdout unavailable"))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label} stderr unavailable"))?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let timeout = solver_timeout();
+    let started = Instant::now();
+    let status = loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            return Err("SAT solving cancelled".into());
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            return Err(format!(
+                "{label} exceeded the {}s SAT timeout (EDA_SAT_TIMEOUT_SECS)",
+                timeout.as_secs()
+            ));
+        }
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let _ = writer.join();
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "{label} exited with status {}: {}",
+            status,
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
+}
+
+fn model_satisfies_cnf(cnf: &Cnf, model: &[bool]) -> bool {
+    cnf.clauses.iter().all(|clause| {
+        clause.iter().any(|literal| {
+            let variable = literal.unsigned_abs() as usize - 1;
+            model.get(variable).copied().unwrap_or(false) == (*literal > 0)
+        })
+    })
+}
+
+fn solve_z3(cnf: &Cnf, cancellation: &FlowCancellation) -> Result<SatResult, String> {
+    let binary = z3_binary().ok_or_else(|| {
+        "z3 backend is unavailable: install z3 or set EDA_Z3 to the binary path".to_string()
+    })?;
+    let mut command = Command::new(binary);
+    command.arg("-dimacs").arg("-in");
+    let stdout = run_solver_process(command, dimacs(cnf), cancellation, "z3")?;
+    let result = parse_dimacs_output(&stdout, cnf.n_vars)?;
+    if let SatResult::Sat(model) = &result {
+        if !model_satisfies_cnf(cnf, model) {
+            return Err("z3 returned a model that does not satisfy the CNF".into());
+        }
+    }
+    Ok(result)
+}
+
+const CVC5_BRIDGE: &str = r#"
+import sys
+from cvc5.pythonic import Bool, Not, Or, Solver, sat, unsat
+lines = sys.stdin.read().splitlines()
+n_vars = 0
+clauses = []
+current = []
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith('c'):
+        continue
+    if line.startswith('p'):
+        n_vars = int(line.split()[2])
+        continue
+    for token in line.split():
+        literal = int(token)
+        if literal == 0:
+            clauses.append(current)
+            current = []
+        else:
+            current.append(literal)
+if current:
+    clauses.append(current)
+variables = [Bool(f'v{i}') for i in range(1, n_vars + 1)]
+solver = Solver()
+for clause in clauses:
+    terms = [variables[abs(literal) - 1] if literal > 0 else Not(variables[abs(literal) - 1]) for literal in clause]
+    if not terms:
+        solver.add(False)
+    elif len(terms) == 1:
+        solver.add(terms[0])
+    else:
+        solver.add(Or(terms))
+result = solver.check()
+if result == sat:
+    model = solver.model()
+    values = [str(i) if bool(model.eval(v, model_completion=True)) else str(-i) for i, v in enumerate(variables, 1)]
+    print('s SATISFIABLE')
+    print('v ' + ' '.join(values) + ' 0')
+elif result == unsat:
+    print('s UNSATISFIABLE')
+else:
+    print('s UNKNOWN')
+"#;
+
+fn solve_cvc5(cnf: &Cnf, cancellation: &FlowCancellation) -> Result<SatResult, String> {
+    let python = cvc5_driver().ok_or_else(|| {
+        "cvc5 backend is unavailable: install the cvc5 Python bindings or set EDA_PYTHON"
+            .to_string()
+    })?;
+    let mut command = Command::new(python);
+    command.arg("-c").arg(CVC5_BRIDGE);
+    let stdout = run_solver_process(command, dimacs(cnf), cancellation, "cvc5")?;
+    let result = parse_dimacs_output(&stdout, cnf.n_vars)?;
+    if let SatResult::Sat(model) = &result {
+        if !model_satisfies_cnf(cnf, model) {
+            return Err("cvc5 returned a model that does not satisfy the CNF".into());
+        }
+    }
+    Ok(result)
+}
+
+fn solve_dispatch(
+    cnf: &Cnf,
+    backend: SatBackend,
+    cancellation: &FlowCancellation,
+    local_limit: Option<u64>,
+) -> Result<SatResult, String> {
+    match backend.resolve() {
+        SatBackend::Native => {
+            let mut solver = Solver::new(cnf);
+            if cancellation.is_cancelled() {
+                return Err("SAT solving cancelled".into());
+            }
+            match local_limit {
+                Some(limit) => solver.solve_cancellable_with_limit(cancellation, limit),
+                None => solver.solve_cancellable(cancellation),
+            }
+        }
+        SatBackend::Kissat => solve_kissat_cancellable(cnf, cancellation),
+        SatBackend::Z3 => solve_z3(cnf, cancellation),
+        SatBackend::Cvc5 => solve_cvc5(cnf, cancellation),
+        SatBackend::Auto => unreachable!("Auto is resolved before dispatch"),
+    }
+}
+
+/// Solve a CNF with an explicitly selected backend.
+pub fn solve_with_backend(
+    cnf: &Cnf,
+    backend: SatBackend,
+    cancellation: &FlowCancellation,
+) -> Result<SatResult, String> {
+    solve_dispatch(cnf, backend, cancellation, None)
+}
+
+/// Result of solving the same CNF with multiple independent engines.
+#[derive(Clone, Debug)]
+pub struct SatCrossCheckResult {
+    pub result: SatResult,
+    pub engines: Vec<(SatBackend, SatResult)>,
+    pub skipped: Vec<SatBackend>,
+}
+
+/// Solve one CNF with several engines and require identical verdicts.
+///
+/// A model is only returned if every engine that ran agreed. Engines that are
+/// not installed are reported in `skipped`, so a cross-check on a machine with
+/// only Kissat still validates the CNF against the in-tree solver.
+pub fn solve_cross_checked(
+    cnf: &Cnf,
+    backends: &[SatBackend],
+    cancellation: &FlowCancellation,
+) -> Result<SatCrossCheckResult, String> {
+    let mut engines: Vec<(SatBackend, SatResult)> = Vec::new();
+    let mut skipped: Vec<SatBackend> = Vec::new();
+    for backend in backends {
+        if !backend.is_available() {
+            skipped.push(*backend);
+            continue;
+        }
+        let result = solve_with_backend(cnf, *backend, cancellation)
+            .map_err(|error| format!("{} backend: {error}", backend.as_str()))?;
+        if let Some((first_backend, first_result)) = engines.first() {
+            let same = matches!(
+                (first_result, &result),
+                (SatResult::Unsat, SatResult::Unsat)
+            ) || matches!(
+                (first_result, &result),
+                (SatResult::Sat(_), SatResult::Sat(_))
+            );
+            if !same {
+                return Err(format!(
+                    "SAT backend disagreement: {} returned {} but {} returned {}",
+                    first_backend.as_str(),
+                    sat_result_name(first_result),
+                    backend.as_str(),
+                    sat_result_name(&result)
+                ));
+            }
+        }
+        engines.push((*backend, result));
+    }
+    let Some((_, result)) = engines.first() else {
+        return Err("no SAT backend is available for cross-checking".into());
+    };
+    Ok(SatCrossCheckResult {
+        result: result.clone(),
+        engines,
+        skipped,
+    })
+}
+
+fn sat_result_name(result: &SatResult) -> &'static str {
+    match result {
+        SatResult::Sat(_) => "SAT",
+        SatResult::Unsat => "UNSAT",
+    }
 }
 
 impl Cnf {
@@ -765,16 +1269,17 @@ impl IncrementalSolver {
         &mut self,
         cancellation: &FlowCancellation,
     ) -> Result<SatResult, String> {
-        solve_with_kissat_backend(&self.cnf, cancellation, || {
-            if self.solver.is_none() {
-                let solver = Solver::new(&self.cnf);
-                self.solver = Some(solver);
-            }
-            self.solver
-                .as_mut()
-                .expect("builtin solver was just initialized")
-                .solve_cancellable(cancellation)
-        })
+        let backend = current_sat_backend();
+        if backend.resolve() != SatBackend::Native {
+            return solve_dispatch(&self.cnf, backend, cancellation, None);
+        }
+        if self.solver.is_none() {
+            self.solver = Some(Solver::new(&self.cnf));
+        }
+        self.solver
+            .as_mut()
+            .expect("builtin solver was just initialized")
+            .solve_cancellable(cancellation)
     }
 
     pub fn solve_with_limit_cancellable(
@@ -782,16 +1287,17 @@ impl IncrementalSolver {
         cancellation: &FlowCancellation,
         max_iterations: u64,
     ) -> Result<SatResult, String> {
-        solve_with_kissat_backend(&self.cnf, cancellation, || {
-            if self.solver.is_none() {
-                let solver = Solver::new(&self.cnf);
-                self.solver = Some(solver);
-            }
-            self.solver
-                .as_mut()
-                .expect("builtin solver was just initialized")
-                .solve_cancellable_with_limit(cancellation, max_iterations)
-        })
+        let backend = current_sat_backend();
+        if backend.resolve() != SatBackend::Native {
+            return solve_dispatch(&self.cnf, backend, cancellation, Some(max_iterations));
+        }
+        if self.solver.is_none() {
+            self.solver = Some(Solver::new(&self.cnf));
+        }
+        self.solver
+            .as_mut()
+            .expect("builtin solver was just initialized")
+            .solve_cancellable_with_limit(cancellation, max_iterations)
     }
 
     pub fn learnt_clause_count(&self) -> usize {
@@ -829,14 +1335,7 @@ pub fn solve(cnf: &Cnf) -> SatResult {
 /// Cooperatively solve a CNF and return an error instead of a misleading
 /// UNSAT result if the caller cancels the search.
 pub fn solve_cancellable(cnf: &Cnf, cancellation: &FlowCancellation) -> Result<SatResult, String> {
-    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
-        return Ok(result);
-    }
-    let mut s = Solver::new(cnf);
-    if cancellation.is_cancelled() {
-        return Err("SAT solving cancelled".into());
-    }
-    s.solve_cancellable(cancellation)
+    solve_dispatch(cnf, current_sat_backend(), cancellation, None)
 }
 
 /// Solve with deterministic phase hints. Phases are search hints only; they
@@ -846,8 +1345,12 @@ pub fn solve_with_phase_hints_cancellable(
     phases: &HashMap<usize, bool>,
     cancellation: &FlowCancellation,
 ) -> Result<SatResult, String> {
-    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
-        return Ok(result);
+    let backend = current_sat_backend();
+    if backend.resolve() != SatBackend::Native {
+        // Kissat and the external engines do not accept the in-tree phase
+        // hints; hints are search guidance only, so dropping them preserves
+        // the formula and the verdict.
+        return solve_dispatch(cnf, backend, cancellation, None);
     }
     let mut solver = Solver::new(cnf);
     if cancellation.is_cancelled() {
@@ -868,14 +1371,12 @@ pub fn solve_local_cancellable(
     cancellation: &FlowCancellation,
     max_iterations: u64,
 ) -> Result<SatResult, String> {
-    if let Ok(result) = solve_kissat_cancellable(cnf, cancellation) {
-        return Ok(result);
-    }
-    let mut s = Solver::new(cnf);
-    if cancellation.is_cancelled() {
-        return Err("SAT solving cancelled".into());
-    }
-    s.solve_cancellable_with_limit(cancellation, max_iterations)
+    solve_dispatch(
+        cnf,
+        current_sat_backend(),
+        cancellation,
+        Some(max_iterations),
+    )
 }
 
 /// Solve under assumptions (all must hold).
@@ -1221,5 +1722,159 @@ mod tests {
                 }
             }
         }
+    }
+    fn model_satisfies(cnf: &Cnf, model: &[bool]) -> bool {
+        cnf.clauses.iter().all(|clause| {
+            clause.iter().any(|literal| {
+                let variable = literal.unsigned_abs() as usize - 1;
+                model.get(variable).copied().unwrap_or(false) == (*literal > 0)
+            })
+        })
+    }
+
+    fn small_backend_cnf() -> Cnf {
+        // (x1) & (!x1 | x2) & (!x2 | x3): SAT, x3 must be true.
+        let mut cnf = Cnf::new();
+        let x1 = cnf.add_var() as i32;
+        let x2 = cnf.add_var() as i32;
+        let x3 = cnf.add_var() as i32;
+        cnf.add_clause(vec![x1]);
+        cnf.add_clause(vec![-x1, x2]);
+        cnf.add_clause(vec![-x2, x3]);
+        cnf
+    }
+
+    fn unsat_backend_cnf() -> Cnf {
+        let mut cnf = Cnf::new();
+        let x = cnf.add_var() as i32;
+        cnf.add_clause(vec![x]);
+        cnf.add_clause(vec![-x]);
+        cnf
+    }
+
+    #[test]
+    fn sat_backend_names_round_trip() {
+        for backend in SatBackend::ALL {
+            assert_eq!(SatBackend::parse(backend.as_str()), Some(backend));
+        }
+        assert_eq!(SatBackend::parse("builtin"), Some(SatBackend::Native));
+        assert_eq!(SatBackend::parse("nope"), None);
+        assert!(SatBackend::Native.is_available());
+        assert!(SatBackend::Kissat.is_available());
+    }
+
+    #[test]
+    fn explicit_backends_solve_small_cnfs() {
+        let sat_cnf = small_backend_cnf();
+        let unsat_cnf = unsat_backend_cnf();
+        for backend in [
+            SatBackend::Native,
+            SatBackend::Kissat,
+            SatBackend::Z3,
+            SatBackend::Cvc5,
+        ] {
+            if !backend.is_available() {
+                eprintln!("skipping {} (not installed)", backend.as_str());
+                continue;
+            }
+            let cancellation = FlowCancellation::new();
+            let sat = solve_with_backend(&sat_cnf, backend, &cancellation)
+                .unwrap_or_else(|error| panic!("{} SAT query: {error}", backend.as_str()));
+            match sat {
+                SatResult::Sat(model) => assert!(
+                    model_satisfies(&sat_cnf, &model),
+                    "{} returned an invalid model",
+                    backend.as_str()
+                ),
+                SatResult::Unsat => panic!("{} returned UNSAT for a SAT CNF", backend.as_str()),
+            }
+            let unsat = solve_with_backend(&unsat_cnf, backend, &cancellation)
+                .unwrap_or_else(|error| panic!("{} UNSAT query: {error}", backend.as_str()));
+            assert_eq!(
+                unsat,
+                SatResult::Unsat,
+                "{} failed to prove a trivial UNSAT CNF",
+                backend.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn cross_checked_backends_agree_and_report_participants() {
+        let cnf = small_backend_cnf();
+        let cancellation = FlowCancellation::new();
+        let checked = solve_cross_checked(
+            &cnf,
+            &[
+                SatBackend::Kissat,
+                SatBackend::Native,
+                SatBackend::Z3,
+                SatBackend::Cvc5,
+            ],
+            &cancellation,
+        )
+        .expect("cross-checked SAT");
+        let model = match checked.result {
+            SatResult::Sat(model) => model,
+            SatResult::Unsat => panic!("cross-check returned UNSAT for a SAT CNF"),
+        };
+        assert!(model_satisfies(&cnf, &model));
+        assert!(
+            checked.engines.len() >= 2,
+            "at least Kissat+Native must run"
+        );
+        assert!(checked
+            .engines
+            .iter()
+            .any(|(backend, _)| *backend == SatBackend::Kissat));
+        assert!(checked
+            .engines
+            .iter()
+            .any(|(backend, _)| *backend == SatBackend::Native));
+        eprintln!(
+            "cross-check engines: {:?}; skipped: {:?}",
+            checked
+                .engines
+                .iter()
+                .map(|(backend, _)| backend.as_str())
+                .collect::<Vec<_>>(),
+            checked
+                .skipped
+                .iter()
+                .map(|backend| backend.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn external_backends_honor_pre_cancelled_tokens() {
+        let cnf = small_backend_cnf();
+        for backend in [SatBackend::Z3, SatBackend::Cvc5] {
+            if !backend.is_available() {
+                eprintln!("skipping {} (not installed)", backend.as_str());
+                continue;
+            }
+            let cancellation = FlowCancellation::new();
+            cancellation.cancel();
+            let error = solve_with_backend(&cnf, backend, &cancellation)
+                .expect_err("cancelled external solve must not return a verdict");
+            assert!(
+                error.contains("cancel"),
+                "{}: unexpected error {error}",
+                backend.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn thread_local_backend_selection_is_scoped() {
+        assert_eq!(current_sat_backend(), SatBackend::Kissat);
+        with_sat_backend(SatBackend::Native, || {
+            assert_eq!(current_sat_backend(), SatBackend::Native);
+            let cnf = small_backend_cnf();
+            let result = solve_cancellable(&cnf, &FlowCancellation::new()).unwrap();
+            assert!(matches!(result, SatResult::Sat(_)));
+        });
+        assert_eq!(current_sat_backend(), SatBackend::Kissat);
     }
 }

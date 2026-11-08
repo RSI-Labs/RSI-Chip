@@ -19,7 +19,11 @@ pub mod sat;
 pub use bmc::{
     bmc, bmc_cancellable, bmc_expression, bmc_expression_cancellable, BmcOptions, BmcResult,
 };
-pub use equiv::{check_equivalent, check_equivalent_cancellable, EquivResult};
+pub use equiv::{
+    check_equivalent, check_equivalent_cancellable, check_equivalent_cross_checked,
+    check_equivalent_strict, check_equivalent_strict_with_backend, check_equivalent_with_backend,
+    check_equivalent_with_backend_cancellable, strict_lec, with_lec_strict, EquivResult,
+};
 pub use induction::{
     prove, prove_cancellable, prove_expression, prove_expression_cancellable,
     prove_expression_with_expression_invariants,
@@ -37,6 +41,7 @@ pub use property::{
     verify_property_trace, PropertyBmcResult, PropertyBmcStatus, PropertyReplayResult,
 };
 pub use sat::{
-    solve, solve_cancellable, solve_with_assumptions, solve_with_assumptions_cancellable, Cnf,
-    IncrementalSolver, SatResult,
+    current_sat_backend, solve, solve_cancellable, solve_cross_checked, solve_with_assumptions,
+    solve_with_assumptions_cancellable, solve_with_backend, with_sat_backend, Cnf,
+    IncrementalSolver, SatBackend, SatCrossCheckResult, SatResult,
 };

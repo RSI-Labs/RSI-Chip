@@ -585,6 +585,93 @@ impl SlangAstLowerer {
         Ok(())
     }
 
+    /// Lower a built-in gate primitive instance (`and`, `or`, `xor`, `not`,
+    /// `buf`, `nand`, `nor`, `xnor`) to a continuous assignment. Slang exposes
+    /// the gate type as `primitiveType` and the terminals as `ports`; the
+    /// first terminal is the output, represented as an Assignment whose left
+    /// side is the output lvalue.
+    pub(super) fn lower_primitive_instance(
+        &mut self,
+        member: &serde_json::Value,
+    ) -> Result<(), String> {
+        use eda_core::ir::{BinOp, Expr, UnOp};
+        let primitive = string_field(member, "primitiveType")
+            .unwrap_or_default()
+            .split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let ports = member
+            .get("ports")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "primitive instance has no ports".to_string())?;
+        let first = ports
+            .first()
+            .ok_or_else(|| "primitive instance has no output terminal".to_string())?;
+        let output = if string_field(first, "kind").as_deref() == Some("Assignment") {
+            first
+                .get("left")
+                .ok_or_else(|| "primitive output assignment has no left side".to_string())?
+        } else {
+            first
+        };
+        let inputs = ports
+            .iter()
+            .skip(1)
+            .map(|port| {
+                if string_field(port, "kind").as_deref() == Some("EmptyArgument") {
+                    return Err("primitive instance has an empty input terminal".to_string());
+                }
+                self.lower_expression(port)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let fold = |op: BinOp| {
+            inputs
+                .iter()
+                .cloned()
+                .reduce(|a, b| Expr::Bin {
+                    op,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                })
+                .ok_or_else(|| format!("primitive '{primitive}' has no input terminals"))
+        };
+        let expression = match primitive.as_str() {
+            "buf" if inputs.len() == 1 => inputs[0].clone(),
+            "not" if inputs.len() == 1 => Expr::Un {
+                op: UnOp::Not,
+                a: Box::new(inputs[0].clone()),
+            },
+            "and" => fold(BinOp::And)?,
+            "or" => fold(BinOp::Or)?,
+            "xor" => fold(BinOp::Xor)?,
+            "nand" => Expr::Un {
+                op: UnOp::Not,
+                a: Box::new(fold(BinOp::And)?),
+            },
+            "nor" => Expr::Un {
+                op: UnOp::Not,
+                a: Box::new(fold(BinOp::Or)?),
+            },
+            "xnor" => Expr::Un {
+                op: UnOp::Not,
+                a: Box::new(fold(BinOp::Xor)?),
+            },
+            other => {
+                return Err(format!(
+                    "direct slang-AST lowering does not support primitive '{other}'"
+                ))
+            }
+        };
+        let lv = self.lower_lvalue(output)?;
+        self.design.assigns.push(eda_core::ir::Assign {
+            lv,
+            e: expression,
+            delay: 0,
+        });
+        Ok(())
+    }
+
     pub(super) fn record_implicit_type_mismatch(
         &mut self,
         lvalue: &eda_core::ir::LValue,

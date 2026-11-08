@@ -5,6 +5,9 @@ use raven_riscv_engine::falcon::{exec, memory::Bus, memory::Ram, Cpu};
 use raven_riscv_engine::host::Console;
 use std::collections::BTreeMap;
 
+mod design_timing;
+mod rv32i_support;
+
 fn i_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, immediate: i32) -> u32 {
     ((immediate as u32 & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
 }
@@ -66,7 +69,9 @@ fn csr(funct3: u32, rd: u32, rs1: u32, address: u32) -> u32 {
 }
 
 fn load_upper(rd: u32, value: u32) -> Vec<u32> {
-    let lower = (value & 0xfff) as u16 as i16 as i32;
+    // Sign-extend the 12-bit ADDI immediate. Casting through u16/i16 keeps
+    // 0xff0 positive and produces the wrong base value; 0xff0 means -16.
+    let lower = ((value & 0xfff) as i32) - if value & 0x800 != 0 { 0x1000 } else { 0 };
     let upper = value.wrapping_sub(lower as u32);
     vec![u_type(0x37, rd, upper), addi(rd, rd, lower)]
 }
@@ -413,7 +418,12 @@ fn assert_rtl_matches_independent_privileged(
     }
 }
 
-fn assert_matches_golden(golden: &Rv32iMachine, rtl: &Rv32iSvResult) {
+fn assert_matches_golden(
+    golden: &Rv32iMachine,
+    rtl: &Rv32iSvResult,
+    memory: &SparseMemory,
+    entry: u32,
+) {
     assert_eq!(golden.stop, StopReason::Ebreak);
     assert!(rtl.halted);
     assert!(!rtl.trap || rtl.trap_cause == 3);
@@ -431,6 +441,70 @@ fn assert_matches_golden(golden: &Rv32iMachine, rtl: &Rv32iSvResult) {
             "memory differs at {address:#010x}"
         );
     }
+    let gate = rv32i_support::gate::run_rv32i_design_timed(memory.clone(), entry, 200_000)
+        .expect("execute gate-level RV32I program");
+    assert!(gate.halted, "gate-level RV32I core did not halt");
+    assert_eq!(gate.regs, golden.regs, "gate-level registers differ");
+    assert_eq!(gate.pc, expected_pc, "gate-level PC differs");
+    assert_eq!(gate.trap, rtl.trap, "gate-level trap flag differs");
+    assert_eq!(
+        gate.trap_cause, rtl.trap_cause,
+        "gate-level trap cause differs"
+    );
+    // GL+SDF timing gate: the same program must meet setup/hold at the
+    // signoff clock period on the SDF-annotated mapped netlist.
+    assert!(
+        gate.worst_setup_slack_ns >= 0.0,
+        "SDF setup violation: worst slack {:.3} ns (arrival {:.3} ns, period {:.1} ns)",
+        gate.worst_setup_slack_ns,
+        gate.max_arrival_ns,
+        rv32i_support::gate::CLOCK_PERIOD_NS
+    );
+    assert!(
+        gate.worst_hold_slack_ns >= 0.0,
+        "SDF hold violation: worst slack {:.3} ns",
+        gate.worst_hold_slack_ns
+    );
+    for address in [0x1000_u32, 0x1004, 0x1008, 0x100c] {
+        assert_eq!(
+            gate.memory.read_le_u32(address),
+            golden.memory.read_le_u32(address),
+            "gate-level memory differs at {address:#010x}"
+        );
+    }
+}
+
+#[test]
+fn rv32i_signed_and_unsigned_branch_predicates_affect_control_flow() {
+    // BGE x5(-1), x6(-2) must skip the next instruction; BGEU x9(2), x10(1)
+    // must skip as well. A previously inverted branch implementation left
+    // x7/x11 set and x8/x12 clear.
+    let program = vec![
+        addi(5, 0, -1),
+        addi(6, 0, -2),
+        b_type(5, 5, 6, 8),
+        addi(7, 0, 1),
+        addi(8, 0, 1),
+        addi(9, 0, 2),
+        addi(10, 0, 1),
+        b_type(7, 9, 10, 8),
+        addi(11, 0, 1),
+        addi(12, 0, 1),
+        ebreak(),
+    ];
+    let mut memory = SparseMemory::new();
+    write_program(&mut memory, &program, 0);
+    let mut golden = Rv32iMachine::baremetal(0, memory.clone());
+    assert_eq!(golden.run(100), StopReason::Ebreak);
+    let rtl = Rv32iSvRunner::new()
+        .expect("RV32I runner")
+        .run_memory(0, memory.clone())
+        .expect("RV32I RTL run");
+    assert_matches_golden(&golden, &rtl, &memory, 0);
+    assert_eq!(rtl.regs[7], 0, "BGE did not take the skip path");
+    assert_eq!(rtl.regs[8], 1, "BGE skip path target missing");
+    assert_eq!(rtl.regs[11], 0, "BGEU did not take the skip path");
+    assert_eq!(rtl.regs[12], 1, "BGEU skip path target missing");
 }
 
 #[test]
@@ -445,7 +519,7 @@ fn rv32i_base_instruction_matrix_matches_internal_and_independent_golden_models(
     let rtl = runner
         .run_memory(0, memory.clone())
         .expect("execute RV32I base instruction matrix");
-    assert_matches_golden(&golden, &rtl);
+    assert_matches_golden(&golden, &rtl, &memory, 0);
 
     let halt_pc = (program.len() as u32 - 1) * 4;
     let oracle = run_independent_rv32i(&memory, 0x2000, 0, halt_pc);
@@ -471,9 +545,9 @@ fn rv32i_csr_read_write_modify_matrix_matches_golden_model() {
 
     let runner = Rv32iSvRunner::new().expect("compile RV32I runtime");
     let rtl = runner
-        .run_memory(0, memory)
+        .run_memory(0, memory.clone())
         .expect("execute RV32I CSR matrix");
-    assert_matches_golden(&golden, &rtl);
+    assert_matches_golden(&golden, &rtl, &memory, 0);
 }
 
 #[test]
@@ -497,7 +571,7 @@ fn rv32i_machine_csr_matrix_matches_independent_golden_model() {
     let rtl = runner
         .run_memory(0, memory.clone())
         .expect("execute RV32I machine-CSR matrix");
-    assert_matches_golden(&golden, &rtl);
+    assert_matches_golden(&golden, &rtl, &memory, 0);
 
     let halt_pc = (program.len() as u32 - 1) * 4;
     let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);
@@ -549,7 +623,7 @@ fn rv32i_extended_machine_csr_matrix_matches_independent_golden_model() {
     let rtl = runner
         .run_memory(0, memory.clone())
         .expect("execute RV32I extended CSR matrix");
-    assert_matches_golden(&golden, &rtl);
+    assert_matches_golden(&golden, &rtl, &memory, 0);
 
     let halt_pc = (program.len() as u32 - 1) * 4;
     let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);
@@ -611,7 +685,7 @@ fn rv32i_trap_csr_and_mret_matrix_matches_golden_model() {
     let rtl = runner
         .run_memory(0, memory.clone())
         .expect("execute RV32I trap/mret matrix");
-    assert_matches_golden(&golden, &rtl);
+    assert_matches_golden(&golden, &rtl, &memory, 0);
 
     let halt_pc = (main.len() as u32 - 1) * 4;
     let oracle = run_independent_rv32i_privileged(&memory, 0x2000, halt_pc);

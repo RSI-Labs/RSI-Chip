@@ -2064,7 +2064,22 @@ impl SlangFrontend {
     }
 
     fn version_matches(&self, version: &str) -> bool {
-        version.trim() == PINNED_SLANG_VERSION
+        let version = version.trim();
+        if version == PINNED_SLANG_VERSION {
+            return true;
+        }
+        // `git rev-parse --short` may use more than the pinned eight hex
+        // characters when that prefix is ambiguous in a local clone. Accept a
+        // longer hash suffix as long as the version and commit prefix match.
+        match (
+            version.split_once('+'),
+            PINNED_SLANG_VERSION.split_once('+'),
+        ) {
+            (Some((found, hash)), Some((expected, expected_hash))) => {
+                found == expected && hash.starts_with(expected_hash)
+            }
+            _ => false,
+        }
     }
 
     fn command(&self) -> Command {

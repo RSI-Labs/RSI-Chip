@@ -67,7 +67,7 @@ module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_
   reg csr_write;
   reg [31:0] csr_wdata;
   reg [31:0] stored_word;
-  reg [31:0] loaded_word;
+  wire [31:0] loaded_word = dmem_rdata;
 
   function [31:0] sra32(input [31:0] value, input [4:0] shift);
     begin
@@ -196,7 +196,6 @@ module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_
   wire [31:0] jalr_target = (va + imm_i) & 32'hfffffffe;
 
   always @* begin
-    loaded_word = dmem_rdata;
     stored_word = vb;
     case (funct3)
       3'b000: stored_word = {24'b0, vb[7:0]};
@@ -236,9 +235,9 @@ module rv32i_full_core(clk, rst, init_pc, init_sp, imem_rdata, dmem_rdata, imem_
           3'b100: next_pc = (va[31] != vb[31]) ? (va[31] ? branch_target : pc + 4)
                                                  : ((va < vb) ? branch_target : pc + 4);
           3'b101: next_pc = (va[31] != vb[31]) ? (va[31] ? pc + 4 : branch_target)
-                                                 : ((va >= vb) ? pc + 4 : branch_target);
+                                                 : ((va >= vb) ? branch_target : pc + 4);
           3'b110: next_pc = (va < vb) ? branch_target : pc + 4;
-          3'b111: next_pc = (va >= vb) ? pc + 4 : branch_target;
+          3'b111: next_pc = (va >= vb) ? branch_target : pc + 4;
           default: exception = 1'b1;
         endcase
         if (branch_target[1:0] != 2'b00) begin

@@ -68,6 +68,8 @@ def gen():
     a("  reg [7:0] byte_sel;")
     a("  reg [31:0] store_word;")
     a("  reg [31:0] store_dword;")
+    a("  wire [4:0] rs1    = instr[19:15];")
+    a("  wire [4:0] rs2    = instr[24:20];")
     a("  always @* begin")
     a("    instr = i0; // 默认值，避免不完整 case 推断出锁存器")
     a("    case (pc[5:2])")
@@ -90,8 +92,6 @@ def gen():
   wire [6:0] opcode = instr[6:0];
   wire [4:0] rd     = instr[11:7];
   wire [2:0] funct3 = instr[14:12];
-  wire [4:0] rs1    = instr[19:15];
-  wire [4:0] rs2    = instr[24:20];
   wire [6:0] funct7 = instr[31:25];
 
   wire [31:0] imm_i = {{20{instr[31]}}, instr[31:20]};

@@ -60,6 +60,25 @@ pub fn synthesize(design: &Design, opts: &SynthOptions) -> Result<SynthResult, S
     synthesize_with_library(design, opts, &CellLibrary::std())
 }
 
+/// Lower RTL to the unoptimized, unmapped reference netlist used as the
+/// golden side of RTL-vs-netlist LEC.
+///
+/// This path deliberately keeps every RTL-derived name and does not run the
+/// optimizer or technology mapper, so it is the structural reference that the
+/// mapped implementation is proved against. It is still produced by the same
+/// RTL lowering as the implementation; a fully independent RTL formal encoder
+/// remains future work.
+pub fn synthesize_rtl_reference(design: &Design) -> Result<Netlist, String> {
+    synthesize(
+        design,
+        &SynthOptions {
+            optimize: false,
+            map_lib: false,
+        },
+    )
+    .map(|result| result.netlist)
+}
+
 /// Synthesize using an imported/custom standard-cell library.
 pub fn synthesize_with_library(
     design: &Design,
@@ -164,6 +183,15 @@ impl<'a> Synth<'a> {
             self.reset_sym();
             let w = a.lv.range.width();
             let v = self.blast(&a.e, w)?;
+            if std::env::var("SYNTH_DEBUG_WIDTH").is_ok() && v.len() != w {
+                eprintln!(
+                    "assign width mismatch lv={} w={w} v={} range={:?} expr={:?}",
+                    self.design.net_name(a.lv.net),
+                    v.len(),
+                    a.lv.range,
+                    a.e
+                );
+            }
             self.hook_assign(&a.lv, &v)?;
         }
         for (process_index, p) in self.design.processes.iter().enumerate() {
@@ -235,25 +263,23 @@ impl<'a> Synth<'a> {
         // single-use internal cell output, retarget that cell instead of
         // inserting a buffer.
         let drivers: Vec<(NetId, NetId)> = self.drivers_list();
-        let mut src_uses: HashMap<NetId, usize> = HashMap::new();
         let port_nets: HashSet<NetId> = self
             .nl
             .ports
             .iter()
             .flat_map(|p| p.bits.iter().copied())
             .collect();
-        for (dst, src) in &drivers {
-            if dst != src && !port_nets.contains(src) {
-                *src_uses.entry(*src).or_insert(0) += 1;
-            }
-        }
         for (dst, src) in drivers {
             if dst == src {
                 continue;
             }
+            // Retargeting removes the source net from the driver chain. It is
+            // only safe when that net has no remaining consumers; otherwise
+            // the retargeted cell output disappears while other cells still
+            // read the old net (observed on the RV32I immediate fan-out).
             let single = self.nl.net(src).drivers.len() == 1
-                && src_uses.get(&src).copied().unwrap_or(0) == 1
-                && !port_nets.contains(&src);
+                && !port_nets.contains(&src)
+                && self.nl.net(src).sinks.is_empty();
             if single {
                 let ci = self.nl.net(src).drivers[0];
                 self.nl.retarget_cell_output(ci, dst);

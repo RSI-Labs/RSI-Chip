@@ -1,7 +1,7 @@
 //! # eda — command-line interface
 //!
 //! Usage: `eda <command> <file.v> [--top <module>]`; `slang-info` also accepts `--lint-policy <file>`
-//! Commands: info | slang-info | synth | equiv | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
+//! Commands: info | slang-info | synth | equiv | lec | sim | sta | pnr | power | drc | pdk | assert | coverage | cdc | spef | dft | fault | eco | upf | cts | ir | prove | ams | flow | daemon [--artifact-store <dir>]
 //! Library: `--lib <file.lib>` imports a Liberty subset.
 //! Activity: `--vcd <file.vcd>` drives `eda power` and `eda assert`.
 //! Properties: `--sva <file.sva>` drives `eda assert`.
@@ -71,6 +71,7 @@
 //! Physical output: `--lef <out.lef>` and `--def <out.def>`.
 
 use eda_core::library::CellLibrary;
+use std::io::Write;
 use std::process::ExitCode;
 
 mod cli;
@@ -79,6 +80,163 @@ use cli::dispatch::{dispatch, RunContext};
 
 pub(crate) use cli::formal::*;
 pub(crate) use cli::timing::*;
+
+fn sim_rtl_source(
+    bytes: &[u8],
+    top: Option<&str>,
+    max_time: u64,
+    wave_path: Option<&str>,
+) -> Result<ExitCode, String> {
+    let source = String::from_utf8(bytes.to_vec())
+        .map_err(|_| "RTL simulation source is not UTF-8".to_string())?;
+    let design = eda_api::compile(&source, top)?;
+    let mut simulator = eda_sim::Simulator::new(&design)
+        .map_err(|error| format!("simulator construction: {error}"))?;
+    if wave_path.is_some() {
+        simulator.enable_vcd();
+    }
+    simulator
+        .run_until(max_time)
+        .map_err(|error| format!("simulation: {error}"))?;
+    for line in simulator.take_displays() {
+        println!("{line}");
+    }
+    if let Some(path) = wave_path {
+        let vcd = simulator
+            .vcd()
+            .ok_or_else(|| "simulator produced no VCD".to_string())?;
+        std::fs::write(path, vcd).map_err(|error| format!("cannot write '{path}': {error}"))?;
+    }
+    eprintln!(
+        "sim rtl: top={} finished={} time={}ns",
+        design.name,
+        simulator.finished(),
+        simulator.now()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_sim(args: &[String]) -> ExitCode {
+    match run_sim_inner(args) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_sim_inner(args: &[String]) -> Result<ExitCode, String> {
+    let path = args
+        .first()
+        .ok_or_else(|| "sim requires an image path".to_string())?;
+    let mut cpu: Option<String> = None;
+    let mut top: Option<String> = None;
+    let mut max_cycles = 500_000u64;
+    let mut wave_path: Option<String> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cpu" => {
+                cpu = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--cpu requires a core name".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--top" => {
+                top = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--top requires a module name".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--cycles" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--cycles requires a count".to_string())?;
+                max_cycles = value
+                    .parse()
+                    .map_err(|_| format!("invalid cycle count '{value}'"))?;
+                index += 2;
+            }
+            "--wave" => {
+                wave_path = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--wave requires an output path".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => return Err(format!("unknown sim option '{other}'")),
+        }
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("cannot read '{path}': {error}"))?;
+    let looks_like_rtl =
+        path.ends_with(".sv") || path.ends_with(".v") || path.ends_with(".svh") || top.is_some();
+    if looks_like_rtl && cpu.is_none() {
+        return sim_rtl_source(&bytes, top.as_deref(), max_cycles, wave_path.as_deref());
+    }
+    let cpu = cpu.unwrap_or_else(|| "rv32i".to_string());
+    match cpu.as_str() {
+        "rv32i" => {
+            let mut memory = eda_cpu_platform::SparseMemory::new();
+            memory.write_slice(0, &bytes);
+            let result = eda_cpu_platform::systemverilog::Rv32iPlatformRunner::new()
+                .map_err(|error| format!("RV32I platform: {error}"))?
+                .run_binary(0, memory, max_cycles, wave_path.is_some())
+                .map_err(|error| format!("RV32I simulation: {error}"))?;
+            if !result.console.is_empty() {
+                let _ = std::io::stdout().write_all(&result.console);
+                let _ = std::io::stdout().flush();
+            }
+            if let Some(path) = wave_path {
+                let vcd = result
+                    .vcd
+                    .ok_or_else(|| "simulator produced no VCD".to_string())?;
+                std::fs::write(&path, vcd)
+                    .map_err(|error| format!("cannot write '{path}': {error}"))?;
+            }
+            eprintln!(
+                "sim rv32i: exit={:?} halted={} trap={} trap_cause={} pc={:#010x} instructions={} cycles={}",
+                result.exit_code,
+                result.halted,
+                result.trap,
+                result.trap_cause,
+                result.pc,
+                result.instructions,
+                result.cycles
+            );
+            Ok(if result.exit_code == Some(0) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        "i8086" => {
+            let result = eda_cpu_platform::systemverilog::run_i8086_com(&bytes)
+                .map_err(|error| format!("i8086 simulation: {error}"))?;
+            if !result.output.is_empty() {
+                let _ = std::io::stdout().write_all(&result.output);
+                let _ = std::io::stdout().flush();
+            }
+            eprintln!(
+                "sim i8086: halted={} trap={} instructions={} ip={:#06x} ax={:#06x}",
+                result.halted, result.trap, result.instructions, result.ip, result.ax
+            );
+            Ok(if result.trap {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        other => Err(format!(
+            "unsupported sim cpu '{other}'; expected rv32i or i8086"
+        )),
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -132,11 +290,14 @@ fn main() -> ExitCode {
     }
     if args.len() < 3 {
         eprintln!(
-            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|slang-info|synth|equiv|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>]"
+            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|slang-info|synth|equiv|lec|sim|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>] [--solver auto|native|kissat|z3|cvc5] [--cross-check kissat,z3,cvc5]\n       eda sim <image.bin|design.sv> [--cpu rv32i|i8086] [--top <module>] [--cycles N] [--wave file.vcd]"
         );
         return ExitCode::from(2);
     }
     let cmd = args[1].clone();
+    if cmd == "sim" {
+        return run_sim(&args[2..]);
+    }
     let file = args[2].clone();
     if cmd == "slang-info" {
         let top = args
@@ -357,6 +518,11 @@ fn main() -> ExitCode {
     let mut lef_out: Option<String> = None;
     let mut def_out: Option<String> = None;
     let mut def_input_path: Option<String> = None;
+    let mut reference_path: Option<String> = None;
+    let mut reference_top: Option<String> = None;
+    let mut solver = eda_api::SatBackend::Auto;
+    let mut cross_check: Vec<eda_api::SatBackend> = Vec::new();
+    let mut strict_lec = false;
     let mut stil_out: Option<String> = None;
     let mut eco_path: Option<String> = None;
     let mut repair_hold = false;
@@ -702,6 +868,63 @@ fn main() -> ExitCode {
                 def_out = Some(path.clone());
             }
         }
+        if args.get(i).map(|s| s == "--strict").unwrap_or(false) {
+            strict_lec = true;
+        }
+        if args.get(i).map(|s| s == "--solver").unwrap_or(false) {
+            let Some(name) = args.get(i + 1) else {
+                eprintln!("error: --solver requires auto|native|kissat|z3|cvc5");
+                return ExitCode::from(2);
+            };
+            let Some(backend) = eda_api::SatBackend::parse(name) else {
+                eprintln!(
+                    "error: unknown SAT solver '{name}' (expected auto|native|kissat|z3|cvc5)"
+                );
+                return ExitCode::from(2);
+            };
+            solver = backend;
+        }
+        if args.get(i).map(|s| s == "--cross-check").unwrap_or(false) {
+            let Some(list) = args.get(i + 1) else {
+                eprintln!("error: --cross-check requires a comma-separated solver list");
+                return ExitCode::from(2);
+            };
+            for name in list.split(',') {
+                let Some(backend) = eda_api::SatBackend::parse(name) else {
+                    eprintln!("error: unknown SAT solver '{name}' in --cross-check");
+                    return ExitCode::from(2);
+                };
+                if backend == eda_api::SatBackend::Auto {
+                    eprintln!("error: --cross-check does not accept 'auto'");
+                    return ExitCode::from(2);
+                }
+                if !cross_check.contains(&backend) {
+                    cross_check.push(backend);
+                }
+            }
+            if cross_check.is_empty() {
+                eprintln!("error: --cross-check requires at least one engine");
+                return ExitCode::from(2);
+            }
+        }
+        if args.get(i).map(|s| s == "--reference").unwrap_or(false) {
+            match args.get(i + 1) {
+                Some(path) => reference_path = Some(path.clone()),
+                None => {
+                    eprintln!("error: --reference requires an RTL file");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        if args.get(i).map(|s| s == "--reference-top").unwrap_or(false) {
+            match args.get(i + 1) {
+                Some(name) => reference_top = Some(name.clone()),
+                None => {
+                    eprintln!("error: --reference-top requires a module name");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         if args.get(i).map(|s| s == "--import-def").unwrap_or(false) {
             match args.get(i + 1) {
                 Some(path) => def_input_path = Some(path.clone()),
@@ -829,6 +1052,18 @@ fn main() -> ExitCode {
             eprintln!("error: cannot read {}: {}", file, e);
             return ExitCode::FAILURE;
         }
+    };
+    let reference_src = match reference_path.as_deref().map(std::fs::read_to_string) {
+        Some(Ok(text)) => Some(text),
+        Some(Err(error)) => {
+            eprintln!(
+                "error: cannot read {}: {}",
+                reference_path.unwrap_or_default(),
+                error
+            );
+            return ExitCode::FAILURE;
+        }
+        None => None,
     };
     let pdk = match pdk_path.as_deref().map(std::fs::read_to_string) {
         Some(Ok(text)) => match eda_api::parse_pdk(&text) {
@@ -1131,6 +1366,30 @@ fn main() -> ExitCode {
         }
         None => None,
     };
+    if reference_path.is_some() && cmd != "lec" {
+        eprintln!("error: --reference requires the lec command");
+        return ExitCode::FAILURE;
+    }
+    if reference_top.is_some() && reference_path.is_none() {
+        eprintln!("error: --reference-top requires --reference");
+        return ExitCode::FAILURE;
+    }
+    if solver != eda_api::SatBackend::Auto && !matches!(cmd.as_str(), "lec" | "equiv") {
+        eprintln!("error: --solver requires the lec or equiv command");
+        return ExitCode::FAILURE;
+    }
+    if strict_lec && !matches!(cmd.as_str(), "lec" | "equiv") {
+        eprintln!("error: --strict requires the lec or equiv command");
+        return ExitCode::FAILURE;
+    }
+    if !cross_check.is_empty() && cmd != "lec" {
+        eprintln!("error: --cross-check requires the lec command");
+        return ExitCode::FAILURE;
+    }
+    if solver != eda_api::SatBackend::Auto && !cross_check.is_empty() {
+        eprintln!("error: choose either --solver or --cross-check, not both");
+        return ExitCode::FAILURE;
+    }
     if def_input.is_some() && !matches!(cmd.as_str(), "pnr" | "drc" | "flow") {
         eprintln!("error: --import-def requires pnr, drc, or flow");
         return ExitCode::FAILURE;
@@ -1281,6 +1540,11 @@ fn main() -> ExitCode {
         hold_buffer_limit_set,
         timing_driven_cts,
         cts_target_skew,
+        reference_src: reference_src.as_deref(),
+        reference_top: reference_top.as_deref(),
+        solver,
+        cross_check: &cross_check,
+        strict_lec,
         bad_net: &bad_net,
         cex_path: &cex_path,
         proof_expr: &proof_expr,

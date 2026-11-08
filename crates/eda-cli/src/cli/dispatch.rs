@@ -46,6 +46,11 @@ pub(crate) struct RunContext<'a> {
     pub(crate) hold_buffer_limit_set: bool,
     pub(crate) timing_driven_cts: bool,
     pub(crate) cts_target_skew: f64,
+    pub(crate) reference_src: Option<&'a str>,
+    pub(crate) reference_top: Option<&'a str>,
+    pub(crate) solver: eda_api::SatBackend,
+    pub(crate) cross_check: &'a [eda_api::SatBackend],
+    pub(crate) strict_lec: bool,
     pub(crate) bad_net: &'a Option<String>,
     pub(crate) cex_path: &'a Option<String>,
     pub(crate) proof_expr: &'a Option<eda_api::BoolExpr>,
@@ -131,12 +136,56 @@ pub(crate) fn dispatch(ctx: &RunContext) -> Result<String, String> {
             let f = eda_api::run_flow_with_library(ctx.src, ctx.top.as_deref(), ctx.active_lib)?;
             Ok(f.verilog)
         }
+        "lec" => {
+            let report = eda_api::with_lec_strict(ctx.strict_lec, || -> Result<String, String> {
+                if !ctx.cross_check.is_empty() {
+                    if let Some(reference) = ctx.reference_src {
+                        let r = eda_api::check_rtl_equivalence_between_cross_checked(
+                            reference,
+                            ctx.reference_top,
+                            ctx.src,
+                            ctx.top.as_deref(),
+                            ctx.cross_check,
+                        )?;
+                        Ok(eda_api::report_rtl_dual_equivalence(&r))
+                    } else {
+                        let r = eda_api::check_rtl_equivalence_cross_checked(
+                            ctx.src,
+                            ctx.top.as_deref(),
+                            ctx.cross_check,
+                        )?;
+                        Ok(eda_api::report_rtl_equivalence(&r))
+                    }
+                } else if let Some(reference) = ctx.reference_src {
+                    let r = eda_api::check_rtl_equivalence_between_with_solver(
+                        reference,
+                        ctx.reference_top,
+                        ctx.src,
+                        ctx.top.as_deref(),
+                        ctx.solver,
+                    )?;
+                    Ok(eda_api::report_rtl_dual_equivalence(&r))
+                } else {
+                    let r = eda_api::check_rtl_equivalence_with_solver(
+                        ctx.src,
+                        ctx.top.as_deref(),
+                        ctx.solver,
+                    )?;
+                    Ok(eda_api::report_rtl_equivalence(&r))
+                }
+            })?;
+            Ok(report)
+        }
         "equiv" => {
-            let f = eda_api::run_flow_with_library(ctx.src, ctx.top.as_deref(), ctx.active_lib)?;
+            let f = eda_api::with_lec_strict(ctx.strict_lec, || {
+                eda_api::with_sat_backend(ctx.solver, || {
+                    eda_api::run_flow_with_library(ctx.src, ctx.top.as_deref(), ctx.active_lib)
+                })
+            })?;
             Ok(if f.equivalent {
-                "EQUIVALENT\n".into()
+                format!("EQUIVALENT (sat-backend: {})\n", ctx.solver.as_str())
             } else {
-                "NOT EQUIVALENT\n".into()
+                format!("NOT EQUIVALENT (sat-backend: {})\n", ctx.solver.as_str())
             })
         }
         "sta" => {

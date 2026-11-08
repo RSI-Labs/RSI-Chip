@@ -450,16 +450,61 @@ pub fn annotate_sdf(nl: &Netlist, sdf: &Sdf) -> Result<Netlist, String> {
         None => return Err("SDF annotation requires a library-backed netlist".into()),
     };
     let mut patches: HashMap<usize, CellTimingPatch> = HashMap::new();
+    // Instance names are unique. Index them once so annotation is
+    // O(paths + cells) rather than O(paths * cells); the latter is
+    // pathological for a full CPU netlist (tens of thousands of cells).
+    let cell_by_name: HashMap<&str, usize> = nl
+        .cells()
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.name.as_str(), index))
+        .collect();
+    let lookup_cells =
+        |instance: Option<&str>, cell_type: Option<&str>| -> Result<Vec<usize>, String> {
+            let Some(name) = instance else {
+                return matching_cells(nl, None, cell_type);
+            };
+            let Some(&ci) = cell_by_name.get(name) else {
+                return Err(format!("SDF instance '{name}' not found"));
+            };
+            if let Some(kind) = cell_type {
+                let cell = nl.cell(ci);
+                let actual = if let CellKind::Lib(id) = cell.kind {
+                    nl.library()
+                        .expect("library-backed netlist")
+                        .get(id)
+                        .name
+                        .clone()
+                } else {
+                    format!("{:?}", cell.kind)
+                };
+                if !kind.eq_ignore_ascii_case(&actual) {
+                    return Ok(Vec::new());
+                }
+            }
+            Ok(vec![ci])
+        };
 
     for path in &sdf.iopaths {
-        for ci in matching_cells(nl, path.instance.as_deref(), path.cell_type.as_deref())? {
+        for ci in lookup_cells(path.instance.as_deref(), path.cell_type.as_deref())? {
             let patch = patches.entry(ci).or_default();
             let cell = nl.cell(ci);
             let CellKind::Lib(lib_id) = cell.kind else {
                 return Err(format!("cell '{}' is not a library cell", cell.name));
             };
             let def = original_lib.get(lib_id);
-            if def
+            let clock_pin = def
+                .seq
+                .as_ref()
+                .and_then(|seq| def.inputs.get(seq.clk_pin))
+                .map(String::as_str);
+            if clock_pin.is_some_and(|pin| pin.eq_ignore_ascii_case(&path.from_pin))
+                && path.to_pin.eq_ignore_ascii_case(&def.output)
+            {
+                // A sequential cell's clock input is also listed in `inputs`;
+                // classify clk -> Q before the generic input-arc branch.
+                patch.clk_to_q = Some(path.delay.conservative());
+            } else if def
                 .inputs
                 .iter()
                 .any(|pin| pin.eq_ignore_ascii_case(&path.from_pin))
@@ -468,16 +513,6 @@ pub fn annotate_sdf(nl: &Netlist, sdf: &Sdf) -> Result<Netlist, String> {
                     path.from_pin.to_ascii_uppercase(),
                     path.delay.conservative(),
                 );
-            } else if def.seq.is_some()
-                && path.from_pin.eq_ignore_ascii_case(
-                    def.inputs
-                        .get(def.seq.as_ref().unwrap().clk_pin)
-                        .map(String::as_str)
-                        .unwrap_or("clk"),
-                )
-                && path.to_pin.eq_ignore_ascii_case(&def.output)
-            {
-                patch.clk_to_q = Some(path.delay.conservative());
             } else {
                 return Err(format!(
                     "SDF IOPATH pins {} -> {} do not match cell '{}'",
@@ -488,7 +523,7 @@ pub fn annotate_sdf(nl: &Netlist, sdf: &Sdf) -> Result<Netlist, String> {
     }
 
     for check in &sdf.timing_checks {
-        for ci in matching_cells(nl, check.instance.as_deref(), check.cell_type.as_deref())? {
+        for ci in lookup_cells(check.instance.as_deref(), check.cell_type.as_deref())? {
             let patch = patches.entry(ci).or_default();
             match check.kind {
                 TimingCheckKind::Setup => {

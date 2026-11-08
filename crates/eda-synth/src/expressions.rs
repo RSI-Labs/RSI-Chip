@@ -508,14 +508,20 @@ impl<'a> Synth<'a> {
                 }
             }
             BinOp::LogAnd | BinOp::LogOr => {
-                let av = self.blast(a, 1)?;
-                let bv = self.blast(b, 1)?;
+                // Logical operators test truthiness: a multi-bit operand is
+                // true when any bit is set, not just its low bit. Using
+                // `blast(_, 1)` would truncate multi-bit operands and produce
+                // wrong logic for `a && b` / `a || b`.
+                let av = self.blast_nat(a)?;
+                let bv = self.blast_nat(b)?;
+                let at = self.reduce(&av, CellKind::Or, LogicValue::Zero);
+                let bt = self.reduce(&bv, CellKind::Or, LogicValue::Zero);
                 let kind = if op == BinOp::LogAnd {
                     CellKind::And
                 } else {
                     CellKind::Or
                 };
-                Ok(vec![self.combine(kind, av[0], bv[0])])
+                Ok(vec![self.combine(kind, at, bt)])
             }
         }
     }

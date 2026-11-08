@@ -300,9 +300,9 @@ pub fn register(c: &mut CaseList) {
             "{I8086_PREFIX_DECODER}\n{I8086_OPCODE_DECODER}\n{}{I8086_FULL_CORE}",
             include_str!("../../../platform/rtl/i8086_modrm_decoder.sv")
         );
-        let route = eda_api::RouteOptions::new(512)?;
+        let route = eda_api::RouteOptions::new(4096)?;
         let library = eda_api::CellLibrary::std();
-        let flow = eda_api::run_flow_with_library_options_cancellable(
+        let flow = eda_api::run_flow_with_rtl_reference_lec(
             &source,
             Some("i8086_full_core"),
             &library,
@@ -315,6 +315,55 @@ pub fn register(c: &mut CaseList) {
         }
         if flow.drc.has_errors() {
             return Err("i8086 full-core layout has DRC errors".into());
+        }
+        Ok(())
+    });
+
+    c.add("platform_i8086_full_core_pdk_signoff_mmmc_pass", || {
+        let source = format!(
+            "{I8086_PREFIX_DECODER}\n{I8086_OPCODE_DECODER}\n{}{I8086_FULL_CORE}",
+            include_str!("../../../platform/rtl/i8086_modrm_decoder.sv")
+        );
+        let manifest = r#"pdk i8086-signoff-pdk
+version 1.0
+layer met1 routing pitch_um 0.34 min_width_um 0.14 min_spacing_um 0.14 tracks 4096
+corner fast process FF voltage_v 1.9 temperature_c -40 delay_scale 0.8
+corner slow process SS voltage_v 1.6 temperature_c 125 delay_scale 1.25
+correlate nmos VTO nominal 0.45 golden 0.452 tolerance 0.01
+signoff model-correlation
+signoff equivalence
+signoff timing
+signoff drc
+signoff physical-database
+.end
+"#;
+        let pdk = eda_api::parse_pdk(manifest).map_err(|e| e.to_string())?;
+        let result = eda_api::run_pdk_signoff(&source, Some("i8086_full_core"), &pdk)
+            .map_err(|e| e.to_string())?;
+        if !result.passed {
+            return Err(format!(
+                "i8086 full-core signoff failed: {:?}",
+                result.checks
+            ));
+        }
+        if result.corner_results.len() != 2 {
+            return Err(format!(
+                "expected 2 i8086 signoff corners, got {}",
+                result.corner_results.len()
+            ));
+        }
+        if !result.equivalent || result.drc_errors != 0 {
+            return Err("i8086 signoff equivalence or DRC failed".into());
+        }
+        if result.critical_path_delay_ns <= 0.0 {
+            return Err("missing i8086 critical path delay".into());
+        }
+        let report = eda_api::report_pdk_signoff(&result);
+        if !report.contains("PDK corner result fast")
+            || !report.contains("PDK corner result slow")
+            || !report.contains("Overall signoff: PASS")
+        {
+            return Err("i8086 signoff report missing verdicts".into());
         }
         Ok(())
     });

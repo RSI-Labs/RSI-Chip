@@ -21,8 +21,16 @@ impl<'a> Synth<'a> {
     }
 
     fn sym_set(&mut self, lv: &LValue, val: &[NetId]) {
-        let base = lv.net;
-        let w = self.decl_width(base);
+        // `lv.net` may point inside a vector declaration (slang part-select
+        // lvalues use the bit offset as the net id). Resolve the declaration
+        // base so the symbolic vector has the full declaration width.
+        let (base, w, offset) = self
+            .design
+            .net_decls
+            .iter()
+            .find(|decl| lv.net >= decl.base && lv.net < decl.base + decl.width)
+            .map(|decl| (decl.base, decl.width, lv.net - decl.base))
+            .unwrap_or((lv.net, 1, 0));
         if !self.sym.contains_key(&base) {
             let nets: Vec<NetId> = (0..w).map(|i| self.flat2net[base + i]).collect();
             self.sym.insert(base, nets);
@@ -32,8 +40,17 @@ impl<'a> Synth<'a> {
             Range::Bit(b) => (*b, 1),
             Range::Span { msb, lsb } => (*lsb, msb - lsb + 1),
         };
-        cur[lo..lo + n].copy_from_slice(&val[..n]);
+        let lo = lo + offset;
+        if lo + n > cur.len() {
+            return;
+        }
+        for (index, slot) in cur[lo..lo + n].iter_mut().enumerate() {
+            if let Some(value) = val.get(index) {
+                *slot = *value;
+            }
+        }
         self.sym.insert(base, cur);
+        self.written.insert(base);
     }
 
     fn base_nets(&mut self, base: usize) -> Vec<NetId> {
@@ -85,7 +102,6 @@ impl<'a> Synth<'a> {
                 let w = lv.range.width();
                 let v = self.blast(e, w)?;
                 self.sym_set(lv, &v);
-                self.written.insert(lv.net);
                 Ok(())
             }
             Stmt::NBlIndexed {
@@ -261,10 +277,15 @@ impl<'a> Synth<'a> {
                     state
                 };
 
-                for ((eq, arm_state), arm_written) in
+                for ((eq, arm_state), _arm_written) in
                     arm_states.into_iter().zip(arm_written_sets).rev()
                 {
-                    for k in sorted_set(&arm_written) {
+                    // Merge every variable written by any arm or the default.
+                    // An arm that leaves a variable unassigned retains the
+                    // value from before the case, which is exactly the value
+                    // captured in `arm_state`.
+                    let targets: Vec<usize> = ordered_all_written.clone();
+                    for k in targets {
                         let cur = result.get(&k).cloned().unwrap_or_else(|| self.base_nets(k));
                         let arm_v = arm_state
                             .get(&k)
@@ -272,7 +293,11 @@ impl<'a> Synth<'a> {
                             .unwrap_or_else(|| self.base_nets(k));
                         let mut merged = Vec::with_capacity(cur.len());
                         for i in 0..cur.len() {
-                            merged.push(self.mux(eq, arm_v[i], cur[i]));
+                            merged.push(if arm_v[i] == cur[i] {
+                                cur[i]
+                            } else {
+                                self.mux(eq, arm_v[i], cur[i])
+                            });
                         }
                         result.insert(k, merged);
                     }
@@ -311,7 +336,8 @@ impl<'a> Synth<'a> {
             | Stmt::Assert { .. }
             | Stmt::Assume { .. }
             | Stmt::Cover { .. }
-            | Stmt::AssertControl(_) => Ok(()),
+            | Stmt::AssertControl(_)
+            | Stmt::Severity(_) => Ok(()),
             Stmt::FileClose { .. }
             | Stmt::FileFlush { .. }
             | Stmt::FileGets { .. }

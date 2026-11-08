@@ -237,6 +237,213 @@ fn structural_gate_netlist_sim() {
 }
 
 #[test]
+fn sdf_annotated_gate_netlist_delays_output() {
+    use eda_core::library::CellLibrary;
+    use eda_core::netlist::{Cell, CellKind, Dir, Netlist};
+    use eda_core::to_design::netlist_to_design_with_timing;
+    use std::sync::Arc;
+
+    let lib = Arc::new(CellLibrary::std());
+    let and_id = lib.find("AND2").expect("AND2 cell");
+    let mut nl = Netlist::new("sdf_gate");
+    nl.set_library(lib.clone());
+    let a = nl.add_net("a");
+    let b = nl.add_net("b");
+    let y = nl.add_net("y");
+    nl.add_cell(Cell {
+        name: "u1".into(),
+        kind: CellKind::Lib(and_id),
+        inputs: vec![a, b],
+        output: y,
+    });
+    nl.add_port("a", Dir::In, vec![a]);
+    nl.add_port("b", Dir::In, vec![b]);
+    nl.add_port("y", Dir::Out, vec![y]);
+
+    let sdf = eda_sdf::Sdf {
+        version: "3.0".into(),
+        design: "sdf_gate".into(),
+        timescale_ns: 1.0,
+        iopaths: vec![eda_sdf::Iopath {
+            instance: Some("u1".into()),
+            cell_type: None,
+            from_pin: "a".into(),
+            to_pin: "y".into(),
+            delay: eda_sdf::SdfDelay {
+                rise: 3.0,
+                fall: 3.0,
+                transition: 0.0,
+            },
+        }],
+        interconnects: Vec::new(),
+        timing_checks: Vec::new(),
+    };
+    let annotated = eda_sdf::annotate_sdf(&nl, &sdf).expect("annotate SDF");
+    let d: &'static Design = Box::leak(Box::new(netlist_to_design_with_timing(&annotated)));
+    let mut sim = Simulator::new(d).unwrap();
+    sim.set_input("a", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("b", &LogicWord::from_u64(1, 1)).unwrap();
+    sim.run_until(3).unwrap();
+    assert_eq!(sim.read_port("y").unwrap().to_u64(), Some(0));
+    sim.set_input("a", &LogicWord::from_u64(1, 1)).unwrap();
+    sim.run_until(5).unwrap();
+    assert_eq!(
+        sim.read_port("y").unwrap().to_u64(),
+        Some(0),
+        "output must not change before the SDF delay"
+    );
+    sim.run_until(6).unwrap();
+    assert_eq!(
+        sim.read_port("y").unwrap().to_u64(),
+        Some(1),
+        "output must change after the SDF delay"
+    );
+}
+
+#[test]
+fn sdf_annotated_flop_delays_q_update() {
+    use eda_core::library::CellLibrary;
+    use eda_core::netlist::{Cell, CellKind, Dir, Netlist};
+    use eda_core::to_design::netlist_to_design_with_timing;
+    use std::sync::Arc;
+
+    let lib = Arc::new(CellLibrary::std());
+    let dff_id = lib.find("DFF").expect("DFF cell");
+    let mut nl = Netlist::new("sdf_flop");
+    nl.set_library(lib.clone());
+    let clk = nl.add_net("clk");
+    let d = nl.add_net("d");
+    let q = nl.add_net("q");
+    nl.add_cell(Cell {
+        name: "u1".into(),
+        kind: CellKind::Lib(dff_id),
+        inputs: vec![clk, d],
+        output: q,
+    });
+    nl.add_port("clk", Dir::In, vec![clk]);
+    nl.add_port("d", Dir::In, vec![d]);
+    nl.add_port("q", Dir::Out, vec![q]);
+
+    let sdf = eda_sdf::Sdf {
+        version: "3.0".into(),
+        design: "sdf_flop".into(),
+        timescale_ns: 1.0,
+        iopaths: vec![eda_sdf::Iopath {
+            instance: Some("u1".into()),
+            cell_type: None,
+            from_pin: "clk".into(),
+            to_pin: "q".into(),
+            delay: eda_sdf::SdfDelay {
+                rise: 4.0,
+                fall: 4.0,
+                transition: 0.0,
+            },
+        }],
+        interconnects: Vec::new(),
+        timing_checks: Vec::new(),
+    };
+    let annotated = eda_sdf::annotate_sdf(&nl, &sdf).expect("annotate SDF");
+    let design: &'static Design = Box::leak(Box::new(netlist_to_design_with_timing(&annotated)));
+    let mut sim = Simulator::new(design).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.set_input("d", &LogicWord::from_u64(1, 1)).unwrap();
+    sim.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    sim.run_until(3).unwrap();
+    assert_ne!(
+        sim.read_port("q").and_then(|word| word.to_u64()),
+        Some(1),
+        "Q must not update before the clk-to-Q delay"
+    );
+    sim.run_until(4).unwrap();
+    assert_eq!(
+        sim.read_port("q").and_then(|word| word.to_u64()),
+        Some(1),
+        "Q must update after the clk-to-Q delay"
+    );
+}
+
+#[test]
+fn sdf_setup_and_hold_checks_report_violations() {
+    use eda_core::ir::SimulationSeverity;
+    use eda_core::library::CellLibrary;
+    use eda_core::netlist::{Cell, CellKind, Dir, Netlist};
+    use eda_core::to_design::netlist_to_design_with_timing;
+    use std::sync::Arc;
+
+    fn flop_netlist() -> Netlist {
+        let lib = Arc::new(CellLibrary::std());
+        let dff_id = lib.find("DFF").expect("DFF cell");
+        let mut nl = Netlist::new("sdf_timing");
+        nl.set_library(lib);
+        let clk = nl.add_net("clk");
+        let d = nl.add_net("d");
+        let q = nl.add_net("q");
+        nl.add_cell(Cell {
+            name: "u1".into(),
+            kind: CellKind::Lib(dff_id),
+            inputs: vec![clk, d],
+            output: q,
+        });
+        nl.add_port("clk", Dir::In, vec![clk]);
+        nl.add_port("d", Dir::In, vec![d]);
+        nl.add_port("q", Dir::Out, vec![q]);
+        nl
+    }
+
+    fn check(kind: eda_sdf::TimingCheckKind, delay: f64) -> Simulator<'static> {
+        let nl = flop_netlist();
+        let sdf = eda_sdf::Sdf {
+            version: "3.0".into(),
+            design: "sdf_timing".into(),
+            timescale_ns: 1.0,
+            iopaths: Vec::new(),
+            interconnects: Vec::new(),
+            timing_checks: vec![eda_sdf::SdfTimingCheck {
+                instance: Some("u1".into()),
+                cell_type: None,
+                kind,
+                data_pin: "d".into(),
+                clock_pin: "clk".into(),
+                delay: eda_sdf::SdfDelay {
+                    rise: delay,
+                    fall: delay,
+                    transition: 0.0,
+                },
+            }],
+        };
+        let annotated = eda_sdf::annotate_sdf(&nl, &sdf).expect("annotate SDF");
+        let design: &'static Design =
+            Box::leak(Box::new(netlist_to_design_with_timing(&annotated)));
+        Simulator::new(design).unwrap()
+    }
+
+    let mut setup = check(eda_sdf::TimingCheckKind::Setup, 2.0);
+    setup.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    setup.set_input("d", &LogicWord::from_u64(1, 0)).unwrap();
+    setup.run_until(10).unwrap();
+    setup.set_input("d", &LogicWord::from_u64(1, 1)).unwrap();
+    setup.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    setup.run_until(10).unwrap();
+    assert!(
+        setup.severity_hits(SimulationSeverity::Error) > 0,
+        "data change inside the setup window must report an error"
+    );
+
+    let mut hold = check(eda_sdf::TimingCheckKind::Hold, 1.0);
+    hold.set_input("clk", &LogicWord::from_u64(1, 0)).unwrap();
+    hold.set_input("d", &LogicWord::from_u64(1, 0)).unwrap();
+    hold.run_until(10).unwrap();
+    hold.set_input("clk", &LogicWord::from_u64(1, 1)).unwrap();
+    hold.run_until(10).unwrap();
+    hold.set_input("d", &LogicWord::from_u64(1, 1)).unwrap();
+    hold.run_until(11).unwrap();
+    assert!(
+        hold.severity_hits(SimulationSeverity::Error) > 0,
+        "data change inside the hold window must report an error"
+    );
+}
+
+#[test]
 fn fsm_state_sequence() {
     let src = "module fsm(input clk, rst, in, output reg [1:0] state, output reg out);
         always @(posedge clk or posedge rst) begin
@@ -414,4 +621,39 @@ fn signed_declarations_literals_arithmetic_and_shift() {
     sim.run_until(1).unwrap();
     assert_eq!(sim.read("y").unwrap().to_u64(), Some(1));
     assert_eq!(sim.read("less").unwrap().to_u64(), Some(1));
+}
+
+#[test]
+fn delayed_assign_keeps_newest_scheduled_value() {
+    // Two input changes in the same delta wave used to schedule two delayed
+    // updates for the same net at the same future time. The stale (X) update
+    // could be applied last and clobber the correct value. The newest
+    // evaluation for a (net, driver) pair must win.
+    let mut design = eda_hdl::compile(
+        "module m(input c, input a, input b, output y);
+            assign y = c ? a : b;
+         endmodule",
+        Some("m"),
+    )
+    .expect("compile");
+    for assign in &mut design.assigns {
+        assign.delay = 2;
+    }
+    let mut sim = Simulator::new(&design).unwrap();
+    sim.set_input("b", &LogicWord::from_u64(1, 1)).unwrap();
+    // Both changes happen at the same simulation time.
+    sim.set_input("c", &LogicWord::from_u64(1, 1)).unwrap();
+    sim.set_input("a", &LogicWord::from_u64(1, 0)).unwrap();
+    sim.run_until(1).unwrap();
+    assert_eq!(
+        sim.read_port("y").unwrap().to_u64(),
+        None,
+        "delayed assign must not update before its delay"
+    );
+    sim.run_until(2).unwrap();
+    assert_eq!(
+        sim.read_port("y").unwrap().to_u64(),
+        Some(0),
+        "stale scheduled value overwrote the newest assign evaluation"
+    );
 }

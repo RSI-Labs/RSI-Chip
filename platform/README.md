@@ -29,6 +29,17 @@ platform.
   string output, write, interrupt-vector installation, version query, and exit.
 * Directed validation for registers, arithmetic carry, REP MOVSB, and MZ load.
 
+The RV32I RTL platform now boots MiniOS-RV32I, a small unikernel with trap
+handling, syscalls, a memory-mapped console, and a user asm program
+(`platform/os/rv32i`). It runs on `eda-sim` through `Rv32iPlatformRunner`, and
+the same image is cross-checked against the fast golden model (console, exit
+code, PC, all registers). Run it with:
+
+```sh
+cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin
+cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin --wave minios.vcd
+```
+
 The 8086 golden model is still being expanded and correlated against the complete
 commercial 8086 opcode map. It is not yet the final full SystemVerilog core.
 

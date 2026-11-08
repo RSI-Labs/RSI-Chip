@@ -27,7 +27,104 @@ struct ReconstructedBlockRamReadPort {
     address_width: usize,
 }
 
+fn add_sdf_timing_checks(
+    d: &mut ir::Design,
+    label: &str,
+    data_net: usize,
+    clock_net: usize,
+    setup: u64,
+    hold: u64,
+) {
+    let bit = |net: usize| ir::Expr::Ref {
+        net,
+        decl_width: 1,
+        range: ir::Range::Bit(0),
+        signed: false,
+    };
+    if setup > 0 {
+        let base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("{label}__setup_shadow"),
+            width: 1,
+            is_reg: false,
+            is_signed: false,
+            base,
+        });
+        d.n_nets += 1;
+        d.assigns.push(ir::Assign {
+            lv: ir::LValue {
+                net: base,
+                decl_width: 1,
+                range: ir::Range::Bit(0),
+            },
+            e: bit(data_net),
+            delay: setup,
+        });
+        d.processes.push(ir::Process {
+            sens: ir::Sens::Posedge(clock_net),
+            body: ir::Stmt::If {
+                c: ir::Expr::Bin {
+                    op: ir::BinOp::Ne,
+                    a: Box::new(bit(base)),
+                    b: Box::new(bit(data_net)),
+                },
+                t: Box::new(ir::Stmt::Severity(ir::SimulationSeverity::Error)),
+                f: None,
+            },
+        });
+    }
+    if hold > 0 {
+        let base = d.n_nets;
+        d.net_decls.push(ir::NetDecl {
+            name: format!("{label}__hold_sample"),
+            width: 1,
+            is_reg: true,
+            is_signed: false,
+            base,
+        });
+        d.n_nets += 1;
+        d.processes.push(ir::Process {
+            sens: ir::Sens::Posedge(clock_net),
+            body: ir::Stmt::Block(vec![
+                ir::Stmt::NBl {
+                    lv: ir::LValue {
+                        net: base,
+                        decl_width: 1,
+                        range: ir::Range::Bit(0),
+                    },
+                    e: bit(data_net),
+                },
+                ir::Stmt::Delay {
+                    ns: hold,
+                    body: Box::new(ir::Stmt::If {
+                        c: ir::Expr::Bin {
+                            op: ir::BinOp::Ne,
+                            a: Box::new(bit(data_net)),
+                            b: Box::new(bit(base)),
+                        },
+                        t: Box::new(ir::Stmt::Severity(ir::SimulationSeverity::Error)),
+                        f: None,
+                    }),
+                },
+            ]),
+        });
+    }
+}
+
 pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
+    netlist_to_design_impl(nl, false)
+}
+
+/// Convert a gate-level netlist to the simulator IR while honoring the
+/// library timing arcs carried by the netlist (for example after SDF
+/// back-annotation). Delays are rounded to canonical simulation ticks (1 ns
+/// by default), so this is a gate-level functional-timing model rather than a
+/// signoff timer.
+pub fn netlist_to_design_with_timing(nl: &Netlist) -> ir::Design {
+    netlist_to_design_impl(nl, true)
+}
+
+fn netlist_to_design_impl(nl: &Netlist, honor_timing: bool) -> ir::Design {
     let mut d = ir::Design {
         name: nl.name.clone(),
         ..Default::default()
@@ -741,6 +838,61 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
                                 e: in_ref(1),
                             }
                         };
+                        let body = if honor_timing && seq.clk_to_q > 0.0 {
+                            // Sample the next value at the clock edge and delay
+                            // only the Q update. Delaying the whole body would
+                            // sample D after clk-to-Q, before combinational
+                            // next-state logic has settled.
+                            let sample_base = d.n_nets;
+                            d.net_decls.push(ir::NetDecl {
+                                name: format!("{}__next_q", c.name),
+                                width: 1,
+                                is_reg: true,
+                                is_signed: false,
+                                base: sample_base,
+                            });
+                            d.n_nets += 1;
+                            let sample_lv = ir::LValue {
+                                net: sample_base,
+                                decl_width: 1,
+                                range: ir::Range::Bit(0),
+                            };
+                            let sample_body = if let Some(rp) = rst_pin {
+                                ir::Stmt::If {
+                                    c: in_ref(rp),
+                                    t: Box::new(ir::Stmt::NBl {
+                                        lv: sample_lv.clone(),
+                                        e: ir::Expr::Const(LogicWord::zero(1)),
+                                    }),
+                                    f: Some(Box::new(ir::Stmt::NBl {
+                                        lv: sample_lv,
+                                        e: in_ref(1),
+                                    })),
+                                }
+                            } else {
+                                ir::Stmt::NBl {
+                                    lv: sample_lv,
+                                    e: in_ref(1),
+                                }
+                            };
+                            ir::Stmt::Block(vec![
+                                sample_body,
+                                ir::Stmt::Delay {
+                                    ns: seq.clk_to_q.round().max(0.0) as u64,
+                                    body: Box::new(ir::Stmt::NBl {
+                                        lv: lv_out.clone(),
+                                        e: ir::Expr::Ref {
+                                            net: sample_base,
+                                            decl_width: 1,
+                                            range: ir::Range::Bit(0),
+                                            signed: false,
+                                        },
+                                    }),
+                                },
+                            ])
+                        } else {
+                            body
+                        };
                         let mut sens = vec![edge_sens(true, net_base[c.inputs[seq.clk_pin]])];
                         if let Some(rp) = rst_pin {
                             sens.push(edge_sens(true, net_base[c.inputs[rp]]));
@@ -749,12 +901,36 @@ pub fn netlist_to_design(nl: &Netlist) -> ir::Design {
                             sens: ir::Sens::List(sens),
                             body,
                         });
+                        if honor_timing {
+                            let setup = seq.setup.round().max(0.0) as u64;
+                            let hold = seq.hold.round().max(0.0) as u64;
+                            if setup > 0 || hold > 0 {
+                                add_sdf_timing_checks(
+                                    &mut d,
+                                    &c.name,
+                                    net_base[c.inputs[1]],
+                                    net_base[c.inputs[seq.clk_pin]],
+                                    setup,
+                                    hold,
+                                );
+                            }
+                        }
                     } else {
                         let e = libfunc_expr(&def.func, &in_ref);
+                        let delay = if honor_timing {
+                            def.arcs
+                                .iter()
+                                .map(|(_, delay)| *delay)
+                                .fold(0.0_f64, f64::max)
+                                .round()
+                                .max(0.0) as u64
+                        } else {
+                            0
+                        };
                         d.assigns.push(ir::Assign {
                             lv: lv_out,
                             e,
-                            delay: 0,
+                            delay,
                         });
                     }
                 }

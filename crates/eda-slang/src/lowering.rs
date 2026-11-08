@@ -1328,6 +1328,9 @@ impl SlangAstLowerer {
                 "Instance" => self
                     .lower_instance(member)
                     .map_err(|error| with_source_span(member, error))?,
+                "PrimitiveInstance" => self
+                    .lower_primitive_instance(member)
+                    .map_err(|error| with_source_span(member, error))?,
                 "InstanceArray" => self
                     .lower_instance_array(member)
                     .map_err(|error| with_source_span(member, error))?,

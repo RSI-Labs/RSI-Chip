@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 mod i8086_support;
 
 use i8086_support::ReferenceI8086;
+mod design_timing;
 
 fn shared_i8086_runner() -> &'static I8086SvRunner {
     static RUNNER: OnceLock<I8086SvRunner> = OnceLock::new();
@@ -123,7 +124,7 @@ fn assert_matches_golden_with_options(
     }
 
     let rtl = shared_i8086_runner()
-        .run_memory_with_budget(initial_memory, event_budget)
+        .run_memory_with_budget(initial_memory.clone(), event_budget)
         .unwrap_or_else(|error| panic!("execute {context} in RTL: {error}"));
     assert!(!rtl.trap, "{context}: RTL trapped");
     assert_eq!(rtl.ip, golden.ip, "{context}: IP differs");
@@ -136,6 +137,11 @@ fn assert_matches_golden_with_options(
     assert_eq!(
         actual_registers, golden.regs,
         "{context}: architectural registers differ"
+    );
+    assert_eq!(
+        [rtl.es, rtl.cs, rtl.ss, rtl.ds],
+        golden.segments,
+        "{context}: segment registers differ"
     );
     for address in [0x1000_u32, 0x1001, 0x1010, 0x1011, 0x1020, 0x1021, 0xfffe] {
         assert_eq!(
@@ -152,6 +158,49 @@ fn assert_matches_golden_with_options(
                 "{context}: unary log differs at {address:#06x}"
             );
         }
+    }
+
+    let gate = i8086_support::gate::run_i8086_design_timed(initial_memory.clone(), event_budget)
+        .unwrap_or_else(|error| panic!("{context}: gate-level run failed: {error}"));
+    assert!(gate.halted, "{context}: gate-level core did not halt");
+    assert!(!gate.trap, "{context}: gate-level core trapped");
+    assert_eq!(
+        [gate.ax, gate.cx, gate.dx, gate.bx, gate.sp, gate.bp, gate.si, gate.di],
+        golden.regs,
+        "{context}: gate-level registers differ"
+    );
+    assert_eq!(
+        [gate.es, gate.cs, gate.ss, gate.ds],
+        golden.segments,
+        "{context}: gate-level segments differ"
+    );
+    assert_eq!(gate.ip, golden.ip, "{context}: gate-level IP differs");
+    // GL+SDF timing gate: the same program must meet setup/hold at the
+    // signoff clock period while running on the SDF-annotated mapped netlist.
+    assert!(
+        gate.worst_setup_slack_ns >= 0.0,
+        "{context}: SDF setup violation: worst slack {:.3} ns (arrival {:.3} ns, period {:.1} ns)",
+        gate.worst_setup_slack_ns,
+        gate.max_arrival_ns,
+        i8086_support::gate::CLOCK_PERIOD_NS
+    );
+    assert!(
+        gate.worst_hold_slack_ns >= 0.0,
+        "{context}: SDF hold violation: worst slack {:.3} ns",
+        gate.worst_hold_slack_ns
+    );
+    if compare_flags {
+        assert_eq!(
+            gate.flags, golden.flags,
+            "{context}: gate-level FLAGS differ"
+        );
+    }
+    for address in [0x1000_u32, 0x1001, 0x1010, 0x1011, 0x1020, 0x1021, 0xfffe] {
+        assert_eq!(
+            gate.memory.read_le_u16(address),
+            golden.memory.read_le_u16(address),
+            "{context}: gate-level memory {address:#06x} differs"
+        );
     }
     rtl
 }

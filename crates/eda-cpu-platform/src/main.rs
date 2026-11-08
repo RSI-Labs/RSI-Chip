@@ -162,9 +162,12 @@ fn run_rv32i(args: &[String]) -> Result<ExitCode, CommandError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| CommandError("missing rv32i action".into()))?;
+    if action == "os" {
+        return run_rv32i_os(args);
+    }
     if action != "run" {
         return Err(CommandError(format!(
-            "unsupported rv32i action '{action}'; expected 'run'"
+            "unsupported rv32i action '{action}'; expected 'run' or 'os'"
         )));
     }
     let path = args
@@ -248,6 +251,70 @@ fn run_rv32i(args: &[String]) -> Result<ExitCode, CommandError> {
         }
         StopReason::Running => Ok(ExitCode::SUCCESS),
     }
+}
+
+fn run_rv32i_os(args: &[String]) -> Result<ExitCode, CommandError> {
+    let path = args
+        .get(1)
+        .ok_or_else(|| CommandError("rv32i os requires a flat binary image".into()))?;
+    let mut max_cycles = 500_000_u64;
+    let mut vcd_path: Option<String> = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--steps" | "--cycles" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| CommandError("--cycles requires a count".into()))?;
+                max_cycles = value
+                    .parse()
+                    .map_err(|_| CommandError(format!("invalid cycle limit '{value}'")))?;
+                index += 2;
+            }
+            "--vcd" | "--wave" => {
+                vcd_path = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| CommandError("--vcd requires an output path".into()))?
+                        .clone(),
+                );
+                index += 2;
+            }
+            other => return Err(CommandError(format!("unknown rv32i os option '{other}'"))),
+        }
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| CommandError(format!("cannot read '{path}': {error}")))?;
+    let mut memory = eda_cpu_platform::SparseMemory::new();
+    memory.write_slice(0, &bytes);
+    let result = eda_cpu_platform::systemverilog::Rv32iPlatformRunner::new()
+        .map_err(|error| CommandError(format!("RV32I platform: {error}")))?
+        .run_binary(0, memory, max_cycles, vcd_path.is_some())
+        .map_err(|error| CommandError(format!("RV32I platform execution: {error}")))?;
+    if !result.console.is_empty() {
+        let _ = std::io::stdout().write_all(&result.console);
+    }
+    if let Some(path) = vcd_path {
+        let vcd = result
+            .vcd
+            .ok_or_else(|| CommandError("simulator produced no VCD".into()))?;
+        std::fs::write(&path, vcd)
+            .map_err(|error| CommandError(format!("cannot write '{path}': {error}")))?;
+    }
+    eprintln!(
+        "rv32i-os exit={:?} halted={} trap={} trap_cause={} pc={:#010x} instructions={} cycles={}",
+        result.exit_code,
+        result.halted,
+        result.trap,
+        result.trap_cause,
+        result.pc,
+        result.instructions,
+        result.cycles
+    );
+    Ok(if result.exit_code == Some(0) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn usage() -> &'static str {

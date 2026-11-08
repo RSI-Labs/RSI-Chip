@@ -523,8 +523,9 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
         }
         Stmt::Case { e, arms, dflt } => {
             remap_expression(e, offset);
-            for (expression, _) in arms {
+            for (expression, statement) in arms {
                 remap_expression(expression, offset);
+                remap_statement(statement, offset);
             }
             if let Some(statement) = dflt {
                 remap_statement(statement, offset);
@@ -680,7 +681,11 @@ pub(super) fn remap_statement(statement: &mut eda_core::ir::Stmt, offset: usize)
             seed.net += offset;
             destination.net += offset;
         }
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
     }
 }
 
@@ -919,8 +924,9 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
         }
         Stmt::Case { e, arms, dflt } => {
             rewrite_expression_nets(e, rewrites);
-            for (expression, _) in arms {
+            for (expression, statement) in arms {
                 rewrite_expression_nets(expression, rewrites);
+                rewrite_statement_nets(statement, rewrites);
             }
             if let Some(statement) = dflt {
                 rewrite_statement_nets(statement, rewrites);
@@ -1079,7 +1085,11 @@ fn rewrite_statement_nets(statement: &mut eda_core::ir::Stmt, rewrites: &[NetRew
             rewrite_lvalue_nets(seed, rewrites);
             rewrite_lvalue_nets(destination, rewrites);
         }
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
     }
 }
 
@@ -1349,8 +1359,9 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
         }
         Stmt::Case { e, arms, dflt } => {
             remap_expression_memory_ids(e, offset);
-            for (expression, _) in arms {
+            for (expression, statement) in arms {
                 remap_expression_memory_ids(expression, offset);
+                remap_statement_memory_ids(statement, offset);
             }
             if let Some(statement) = dflt {
                 remap_statement_memory_ids(statement, offset);
@@ -1460,7 +1471,11 @@ pub(super) fn remap_statement_memory_ids(statement: &mut eda_core::ir::Stmt, off
             }
         }
         Stmt::RandomSeeded { .. } => {}
-        Stmt::TimeFormat { .. } | Stmt::AssertControl(_) | Stmt::Finish | Stmt::Stop => {}
+        Stmt::TimeFormat { .. }
+        | Stmt::AssertControl(_)
+        | Stmt::Severity(_)
+        | Stmt::Finish
+        | Stmt::Stop => {}
     }
 }
 

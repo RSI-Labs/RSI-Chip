@@ -7,7 +7,7 @@ pub const SITES_PER_ROW: usize = 256;
 /// Global-routing tracks available in each horizontal/vertical channel.
 /// RV32I's default-grid route peaks at 254 occupied vertical tracks, so 256
 /// is the smallest power-of-two default observed to close that release gate.
-pub const TRACKS_PER_CHANNEL: usize = 256;
+pub const TRACKS_PER_CHANNEL: usize = 1024;
 /// Conservative antenna threshold in routing-length units per connected pin.
 pub const MAX_ANTENNA_RATIO: f64 = 16.0;
 

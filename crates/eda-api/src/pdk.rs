@@ -671,6 +671,10 @@ pub struct PdkCornerResult {
     pub drc_errors: usize,
     pub drc_warnings: usize,
     pub physical_database_complete: bool,
+    /// Size of the exported GDSII stream for this corner.
+    pub gds_bytes: usize,
+    /// Size of the exported OASIS stream for this corner.
+    pub oasis_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -854,6 +858,9 @@ pub fn run_pdk_signoff_cancellable(
             .iter()
             .filter(|violation| violation.severity == eda_pnr::DrcSeverity::Warning)
             .count();
+        let layout = eda_pnr::parse_def(&flow.def)?;
+        let gds = eda_pnr::def_to_gds(&layout)?;
+        let oasis = eda_pnr::def_to_oasis(&layout)?;
         corner_results.push(PdkCornerResult {
             name: corner.name.clone(),
             process: corner.process.clone(),
@@ -869,7 +876,11 @@ pub fn run_pdk_signoff_cancellable(
             drc_warnings,
             physical_database_complete: !flow.lef.trim().is_empty()
                 && !flow.def.trim().is_empty()
-                && !flow.sdf.trim().is_empty(),
+                && !flow.sdf.trim().is_empty()
+                && !gds.is_empty()
+                && !oasis.is_empty(),
+            gds_bytes: gds.len(),
+            oasis_bytes: oasis.len(),
         });
         corner_flows.push(flow);
     }
@@ -998,7 +1009,8 @@ pub fn run_pdk_signoff_cancellable(
                 };
                 (
                     passed,
-                    "LEF, DEF, and SDF databases generated in every corner".to_string(),
+                    "LEF, DEF, GDSII, OASIS, and SDF databases generated in every corner"
+                        .to_string(),
                 )
             }
         };
@@ -1064,7 +1076,7 @@ pub fn report_pdk_signoff(result: &PdkSignoffResult) -> String {
     }
     for corner in &result.corner_results {
         out.push_str(&format!(
-            "PDK corner result {}: process={} V={:.3} T={:.1} C scale={:.6} library={} imported-liberty={} liberty-checksum={} timing={:.6} ns equivalent={} DRC={} errors/{} warnings {}\n",
+            "PDK corner result {}: process={} V={:.3} T={:.1} C scale={:.6} library={} imported-liberty={} liberty-checksum={} timing={:.6} ns equivalent={} DRC={} errors/{} warnings {} gds={} oas={}\n",
             corner.name,
             corner.process,
             corner.voltage_v,
@@ -1081,7 +1093,9 @@ pub fn report_pdk_signoff(result: &PdkSignoffResult) -> String {
                 "physical-db=PASS"
             } else {
                 "physical-db=FAIL"
-            }
+            },
+            corner.gds_bytes,
+            corner.oasis_bytes
         ));
     }
     for check in &result.checks {

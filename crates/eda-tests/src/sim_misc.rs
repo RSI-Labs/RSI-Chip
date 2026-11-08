@@ -145,7 +145,7 @@ fn displays(c: &mut CaseList) {
         let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         sim.run_until(10).map_err(|e| e.to_string())?;
         let ds = sim.take_displays();
-        if !ds.iter().any(|l| l == "n=42") {
+        if !ds.iter().any(|l| l == "n=42\n") {
             Err(format!("displays: {:?}", ds))
         } else {
             Ok(())
@@ -158,7 +158,7 @@ fn displays(c: &mut CaseList) {
         let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         sim.run_until(10).map_err(|e| e.to_string())?;
         let ds = sim.take_displays();
-        if !ds.iter().any(|l| l == "v=1010") {
+        if !ds.iter().any(|l| l == "v=1010\n") {
             Err(format!("displays: {:?}", ds))
         } else {
             Ok(())
@@ -171,7 +171,7 @@ fn displays(c: &mut CaseList) {
         let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         sim.run_until(10).map_err(|e| e.to_string())?;
         let ds = sim.take_displays();
-        if !ds.iter().any(|l| l == "v=a5") {
+        if !ds.iter().any(|l| l == "v=a5\n") {
             Err(format!("displays: {:?}", ds))
         } else {
             Ok(())
@@ -184,7 +184,7 @@ fn displays(c: &mut CaseList) {
         let mut sim = Simulator::new(d).map_err(|e| e.to_string())?;
         sim.run_until(20).map_err(|e| e.to_string())?;
         let ds = sim.take_displays();
-        if !ds.iter().any(|l| l == "t=12") {
+        if !ds.iter().any(|l| l == "t=12\n") {
             Err(format!("displays: {:?}", ds))
         } else {
             Ok(())

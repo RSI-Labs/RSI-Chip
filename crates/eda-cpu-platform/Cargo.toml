@@ -12,6 +12,10 @@ eda-sim = { path = "../eda-sim" }
 [dev-dependencies]
 # Independent RV32I instruction-set oracle used by the RTL differential tests.
 raven-riscv-engine = "=0.1.1"
+# Gate-level regression uses the in-tree synthesizer.
+eda-synth = { path = "../eda-synth" }
+# SDF back-annotation for the GL+SDF regression matrices.
+eda-sdf = { path = "../eda-sdf" }
 
 [[bin]]
 name = "cpu-platform"
