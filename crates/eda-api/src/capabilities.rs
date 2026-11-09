@@ -45,7 +45,7 @@ const CAPABILITIES: &[Capability] = &[
         domain: "simulation",
         name: "cpu_platform_mmio_simulation",
         status: CapabilityStatus::Implemented,
-        evidence: "event-driven eda_sim RTL platform for RV32I and i8086 with sparse memory, memory-mapped console/shutdown devices, configurable cycle/event budgets, VCD capture, MiniOS-RV32I boot plus user asm syscall program, and RTL-versus-golden console/exit/PC/register cross-checks",
+        evidence: "event-driven eda_sim RTL platform for RV32I, RV64I, and i8086 with sparse memory, memory-mapped console/shutdown devices, configurable cycle/event budgets, VCD capture, MiniOS-RV32I boot plus user asm syscall program, RV64G ISS conformance images running register-for-register identically on the RV64I RTL core, and RTL-versus-golden console/exit/register cross-checks",
         limitation: "no UART RX/timer interrupt device; the RV32I core is machine-mode only",
     },
     Capability {

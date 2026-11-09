@@ -1,4 +1,4 @@
-//! Full-circuit LEC for every synthesizable 8086 and RV32I circuit.
+//! Full-circuit LEC for every synthesizable 8086, RV32I, and RV64I circuit.
 //!
 //! For each circuit this runs:
 //! 1. RTL-derived reference vs standard-cell-mapped netlist LEC.
@@ -16,6 +16,7 @@ const RV_ISA_DECODER: &str = include_str!("../../../platform/rtl/rv32i_isa_decod
 const RV_FULL_CORE: &str = include_str!("../../../platform/rtl/rv32i_full_core.sv");
 const RV_SOC: &str = include_str!("../../../platform/rtl/rv32i_full_soc_16.sv");
 const RV_SIGNOFF_CORE: &str = include_str!("../../../rv32i/rtl/rv32i_core.v");
+const RV64I_CORE: &str = include_str!("../../../platform/rtl/rv64i_full_core.sv");
 const I8086_PREFIX: &str = include_str!("../../../platform/rtl/i8086_prefix_decoder.sv");
 const I8086_OPCODE: &str = include_str!("../../../platform/rtl/i8086_opcode_decoder.sv");
 const I8086_MODRM: &str = include_str!("../../../platform/rtl/i8086_modrm_decoder.sv");
@@ -82,7 +83,7 @@ fn check(label: &str, source: &str, top: &str) {
 }
 
 #[test]
-fn all_synthesizable_8086_and_rv32i_circuits_lec() {
+fn all_synthesizable_8086_rv32i_and_rv64i_circuits_lec() {
     if cfg!(debug_assertions) {
         eprintln!("skipping full-circuit LEC in debug builds");
         return;
@@ -95,6 +96,7 @@ fn all_synthesizable_8086_and_rv32i_circuits_lec() {
         &format!("{RV_FULL_CORE}\n{RV_SOC}"),
         "rv32i_full_soc_16",
     );
+    check("rv64i_full_core", RV64I_CORE, "rv64i_full_core");
 
     check("i8086_prefix_decoder", I8086_PREFIX, "i8086_prefix_decoder");
     check("i8086_opcode_decoder", I8086_OPCODE, "i8086_opcode_decoder");

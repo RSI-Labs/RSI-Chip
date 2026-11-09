@@ -163,7 +163,7 @@ complete commercial ISA (see the i8086 flow audit for ISA/foundry limits).
 
 ## All-circuit LEC matrix (2026-11-07)
 
-Every synthesizable 8086 and RV32I circuit is checked as a complete netlist.
+Every synthesizable 8086, RV32I, and RV64I circuit is checked as a complete netlist.
 `crates/eda-tests/tests/full_circuit_lec.rs` runs RTL-vs-mapped LEC and an
 independent slang-vs-eda-hdl LEC for each row:
 
@@ -173,6 +173,7 @@ independent slang-vs-eda-hdl LEC for each row:
 | `rv32i_full_core` | 52,552 / 37,119 | 1,572 | 327 | yes (52,012 / 37,119) |
 | `rv32i_core` (signoff) | 42,196 / 31,320 | 2,243 | 163 | yes (42,196 / 31,320) |
 | `rv32i_full_soc_16` | 60,348 / 44,175 | 2,084 | 226 | yes (59,808 / 44,175) |
+| `rv64ima_full_core` | 218,552 / 168,463 | 3,709 | 647 | yes (217,711 / 168,463) |
 | `i8086_prefix_decoder` | 500 / 76 | 0 | 8 | yes (500 / 76) |
 | `i8086_opcode_decoder` | 6,316 / 941 | 0 | 17 | yes (5,588 / 941) |
 | `i8086_modrm_decoder` | 795 / 584 | 0 | 25 | yes (795 / 584) |
@@ -182,7 +183,9 @@ independent slang-vs-eda-hdl LEC for each row:
 | `sys8086` | 46,336 / 39,600 | 1,216 | 35 | yes (44,509 / 39,600) |
 
 `cargo test --release -p eda-tests --test full_circuit_lec -- --test-threads=1`
-passes all rows in 4342.65 s.
+runs every row. The 8086/RV32I rows completed in 4,342.65 s; the RV64I row is
+also independently covered by `crates/eda-tests/tests/rv64i_rtl_lec.rs`
+(independent frontend: 849.08 s) and by the strict no-cut probe (996.3 s).
 
 Testbenches (`*_tb*`, `*_runtime_tb*`) are excluded because they contain
 clocks/initial blocks and are not synthesizable circuits.
@@ -237,6 +240,7 @@ controls proof parallelization (results below use 10 workers):
 | `rv32i_full_soc_16` | 44,175 | 2,084 + 226 | 326.5 s |
 | `sys8086` | 39,600 | 1,216 + 35 | 5.6 s |
 | `rv32i_isa_decoder` | 210 | 0 + 193 | < 1 s |
+| `rv64ima_full_core` | 168,463 | 3,709 + 647 | 996.3 s |
 
 All results: `equivalent=true`, `strict full-circuit LEC: 0 internal cuts`,
 and `gate ... (0 dangling)` coverage. The mapped DUT side has no combinational

@@ -675,6 +675,10 @@ cargo run -p eda-cli -- flow design.v --top top
 # Full RTL platform simulator: MiniOS-RV32I + user asm program.
 cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin
 cargo run -p eda-cli -- sim platform/os/rv32i/minios.bin --wave minios.vcd
+# RV64G user-level ISS conformance images, and the RV64I RTL core.
+cargo test --release -p eda-cpu-platform --test rv64g_iss
+cargo test --release -p eda-cpu-platform --test rv64i_rtl
+cargo run -p eda-cli -- sim platform/programs/rv64g/rv64i.bin --cpu rv64i
 # RTL-vs-mapped equivalence with a detailed status/counterexample report.
 cargo run -p eda-cli -- lec design.v --top top
 # Two-source RTL-vs-RTL equivalence (golden revision vs implementation).

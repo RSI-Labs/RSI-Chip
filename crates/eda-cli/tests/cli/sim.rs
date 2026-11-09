@@ -62,3 +62,15 @@ fn sim_runs_a_generic_systemverilog_testbench() {
     assert!(output.contains("time-ten"), "{output}");
     assert!(output.contains("sim rtl: top=tb finished=true"), "{output}");
 }
+
+#[test]
+fn sim_runs_the_rv64i_conformance_image() {
+    let image = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../platform/programs/rv64g/rv64i.bin"
+    );
+    let (ok, output) = run_edu(&["sim", image, "--cpu", "rv64i"]);
+    assert!(ok, "{output}");
+    assert!(output.contains("sim rv64i: exit=Some(0)"), "{output}");
+    assert!(output.contains("trap=false"), "{output}");
+}

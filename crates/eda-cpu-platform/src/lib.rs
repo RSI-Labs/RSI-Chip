@@ -9,6 +9,7 @@ pub mod elf;
 pub mod i8086;
 pub mod memory;
 pub mod rv32i;
+pub mod rv64g;
 pub mod systemverilog;
 pub mod validation;
 

@@ -8,6 +8,7 @@ use eda_core::library::CellLibrary;
 
 const RV_SIGNOFF: &str = include_str!("../../../rv32i/rtl/rv32i_core.v");
 const RV_FULL: &str = include_str!("../../../platform/rtl/rv32i_full_core.sv");
+const RV64I_FULL: &str = include_str!("../../../platform/rtl/rv64i_full_core.sv");
 const RV_SOC: &str = include_str!("../../../platform/rtl/rv32i_full_soc_16.sv");
 const I8086_DECODERS: &str = concat!(
     include_str!("../../../platform/rtl/i8086_prefix_decoder.sv"),
@@ -42,6 +43,7 @@ fn main() {
     let (source, top) = match which.as_str() {
         "rv32i_core" => (RV_SIGNOFF.to_string(), "rv32i_core"),
         "rv32i_full_core" => (RV_FULL.to_string(), "rv32i_full_core"),
+        "rv64i_full_core" => (RV64I_FULL.to_string(), "rv64i_full_core"),
         "rv32i_soc" => (format!("{RV_FULL}\n{RV_SOC}"), "rv32i_full_soc_16"),
         "i8086_full_core" => (format!("{I8086_DECODERS}{I8086_FULL}"), "i8086_full_core"),
         "i8086_soc" => (

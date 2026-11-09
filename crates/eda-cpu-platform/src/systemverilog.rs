@@ -638,3 +638,173 @@ fn execute_rv32i_platform(
         vcd,
     })
 }
+
+/// Result of running an RV64I bare-metal program on the RTL platform.
+#[derive(Clone, Debug)]
+pub struct Rv64iPlatformResult {
+    pub console: Vec<u8>,
+    pub exit_code: Option<u64>,
+    pub halted: bool,
+    pub trap: bool,
+    pub trap_cause: u64,
+    pub pc: u64,
+    pub regs: [u64; 32],
+    pub instructions: u64,
+    pub cycles: u64,
+    pub vcd: Option<String>,
+}
+
+const RV64_CORE: &str = include_str!("../../../platform/rtl/rv64i_full_core.sv");
+const RV64_TB: &str = include_str!("../../../platform/rtl/rv64i_full_runtime_tb.sv");
+
+const RV64_PLATFORM_UART_TX: u64 = 0x1000_0000;
+const RV64_PLATFORM_SHUTDOWN: u64 = 0x1000_0004;
+const RV64_PLATFORM_UART_STATUS: u64 = 0x1000_0008;
+
+/// RV64I RTL platform with the same sparse memory map and console/shutdown
+/// devices as the RV32I platform.
+pub struct Rv64iPlatformRunner {
+    design: Design,
+}
+
+impl Rv64iPlatformRunner {
+    pub fn new() -> Result<Self, String> {
+        let source = format!("{RV64_CORE}\n{RV64_TB}");
+        let design =
+            eda_hdl::compile(&source, Some("rv64i_full_runtime_tb")).map_err(|e| e.to_string())?;
+        Ok(Self { design })
+    }
+
+    pub fn from_design(design: Design) -> Self {
+        Self { design }
+    }
+
+    pub fn run_binary(
+        &self,
+        entry: u64,
+        initial_memory: crate::rv64g::Rv64Memory,
+        max_cycles: u64,
+        capture_vcd: bool,
+    ) -> Result<Rv64iPlatformResult, String> {
+        execute_rv64i_platform(&self.design, entry, initial_memory, max_cycles, capture_vcd)
+    }
+}
+
+/// Load a flat binary at address 0 and run it on the RV64I RTL platform.
+pub fn run_rv64i_platform(bytes: &[u8], max_cycles: u64) -> Result<Rv64iPlatformResult, String> {
+    let mut memory = crate::rv64g::Rv64Memory::new();
+    memory.write_slice(0, bytes);
+    Rv64iPlatformRunner::new()?.run_binary(0, memory, max_cycles, false)
+}
+
+fn execute_rv64i_platform(
+    design: &Design,
+    entry: u64,
+    mut memory: crate::rv64g::Rv64Memory,
+    max_cycles: u64,
+    capture_vcd: bool,
+) -> Result<Rv64iPlatformResult, String> {
+    let mut simulator = Simulator::new(design).map_err(|e| e.to_string())?;
+    simulator.set_event_limit(max_cycles.saturating_mul(4096).max(100_000_000));
+    if capture_vcd {
+        simulator.enable_vcd();
+    }
+    simulator.set_input("init_pc", &LogicWord::from_u64(64, entry))?;
+
+    let mut console = Vec::new();
+    let mut exit_code = None;
+    let mut cycles = 0u64;
+
+    for time in 0..max_cycles {
+        let clock = output_bool(&simulator, "clock")?;
+        let instruction_address = bus_u64(&simulator, "imem_addr")?;
+        let data_address = bus_u64(&simulator, "dmem_addr")?;
+        let dmem_req = bus_u64(&simulator, "dmem_req")? == 1;
+        let dmem_we = bus_u64(&simulator, "dmem_we")? == 1;
+        let dmem_width = bus_u64(&simulator, "dmem_width")?;
+        let dmem_wdata = bus_u64(&simulator, "dmem_wdata")?;
+        let dmem_rdata = if data_address == RV64_PLATFORM_UART_STATUS {
+            1u64
+        } else if data_address == RV64_PLATFORM_UART_TX || data_address == RV64_PLATFORM_SHUTDOWN {
+            0
+        } else {
+            memory.read_le_u64(data_address & !7)
+        };
+        simulator.set_input(
+            "imem_rdata",
+            &LogicWord::from_u64(64, u64::from(memory.read_le_u32(instruction_address))),
+        )?;
+        simulator.set_input("dmem_rdata", &LogicWord::from_u64(64, dmem_rdata))?;
+
+        let write_address = data_address;
+        let write_value = dmem_wdata;
+        let write_width = dmem_width;
+        let pending_write = dmem_req && dmem_we;
+
+        simulator.run_until(time + 1)?;
+        let clock_now = output_bool(&simulator, "clock")?;
+        if clock_now && !clock {
+            cycles += 1;
+            if pending_write {
+                match write_address {
+                    RV64_PLATFORM_UART_TX => console.push(write_value as u8),
+                    RV64_PLATFORM_SHUTDOWN => {
+                        exit_code = Some(write_value & 0xffff_ffff);
+                    }
+                    address => {
+                        let size = 1u64 << write_width.min(3);
+                        for offset in 0..size {
+                            memory.write_u8(
+                                address.wrapping_add(offset),
+                                (write_value >> (8 * offset)) as u8,
+                            );
+                        }
+                    }
+                }
+            }
+            if exit_code.is_some() {
+                break;
+            }
+            if output_bool(&simulator, "halted")? {
+                if output_u64(&simulator, "trap_cause")? == 11 {
+                    // ECALL with mtvec == 0: use a0 as the process exit code.
+                    exit_code = Some(
+                        simulator
+                            .read("core.x10")
+                            .and_then(|word| word.to_u64())
+                            .unwrap_or(0)
+                            & 0xffff_ffff,
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    let mut regs = [0u64; 32];
+    for (index, register) in regs.iter_mut().enumerate().skip(1) {
+        *register = simulator
+            .read(&format!("core.x{index}"))
+            .and_then(|word| word.to_u64())
+            .ok_or_else(|| format!("missing RTL register x{index}"))?;
+    }
+    let instructions = simulator
+        .read("core.instret_count")
+        .and_then(|word| word.to_u64())
+        .unwrap_or(0);
+    let vcd = if capture_vcd { simulator.vcd() } else { None };
+    let halted = output_bool(&simulator, "halted")?;
+    let trapped = output_bool(&simulator, "trap")?;
+    Ok(Rv64iPlatformResult {
+        console,
+        exit_code,
+        halted,
+        trap: trapped && exit_code.is_none(),
+        trap_cause: output_u64(&simulator, "trap_cause")?,
+        pc: output_u64(&simulator, "dbg_pc")?,
+        regs,
+        instructions,
+        cycles,
+        vcd,
+    })
+}

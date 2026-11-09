@@ -215,6 +215,40 @@ fn run_sim_inner(args: &[String]) -> Result<ExitCode, String> {
                 ExitCode::FAILURE
             })
         }
+        "rv64i" => {
+            let mut memory = eda_cpu_platform::rv64g::Rv64Memory::new();
+            memory.write_slice(0, &bytes);
+            let result = eda_cpu_platform::systemverilog::Rv64iPlatformRunner::new()
+                .map_err(|error| format!("RV64I platform: {error}"))?
+                .run_binary(0, memory, max_cycles, wave_path.is_some())
+                .map_err(|error| format!("RV64I simulation: {error}"))?;
+            if !result.console.is_empty() {
+                let _ = std::io::stdout().write_all(&result.console);
+                let _ = std::io::stdout().flush();
+            }
+            if let Some(path) = wave_path {
+                let vcd = result
+                    .vcd
+                    .ok_or_else(|| "simulator produced no VCD".to_string())?;
+                std::fs::write(&path, vcd)
+                    .map_err(|error| format!("cannot write '{path}': {error}"))?;
+            }
+            eprintln!(
+                "sim rv64i: exit={:?} halted={} trap={} trap_cause={} pc={:#x} instructions={} cycles={}",
+                result.exit_code,
+                result.halted,
+                result.trap,
+                result.trap_cause,
+                result.pc,
+                result.instructions,
+                result.cycles
+            );
+            Ok(if result.exit_code == Some(0) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         "i8086" => {
             let result = eda_cpu_platform::systemverilog::run_i8086_com(&bytes)
                 .map_err(|error| format!("i8086 simulation: {error}"))?;
@@ -233,7 +267,7 @@ fn run_sim_inner(args: &[String]) -> Result<ExitCode, String> {
             })
         }
         other => Err(format!(
-            "unsupported sim cpu '{other}'; expected rv32i or i8086"
+            "unsupported sim cpu '{other}'; expected rv32i, rv64i, or i8086"
         )),
     }
 }
@@ -290,7 +324,7 @@ fn main() -> ExitCode {
     }
     if args.len() < 3 {
         eprintln!(
-            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|slang-info|synth|equiv|lec|sim|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>] [--solver auto|native|kissat|z3|cvc5] [--cross-check kissat,z3,cvc5]\n       eda sim <image.bin|design.sv> [--cpu rv32i|i8086] [--top <module>] [--cycles N] [--wave file.vcd]"
+            "usage: eda capabilities | eda daemon [--listen <ip>:<port>] [--artifact-store <dir>] | eda <info|slang-info|synth|equiv|lec|sim|sta|pnr|power|drc|pdk|assert|coverage|cdc|spef|dft|fault|eco|upf|cts|ir|prove|ams|flow> <file.v> [--top <module>] [--solver auto|native|kissat|z3|cvc5] [--cross-check kissat,z3,cvc5]\n       eda sim <image.bin|design.sv> [--cpu rv32i|rv64i|i8086] [--top <module>] [--cycles N] [--wave file.vcd]"
         );
         return ExitCode::from(2);
     }
