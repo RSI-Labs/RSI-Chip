@@ -12,6 +12,7 @@ const RV64I: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64i.bin"
 const RV64CSR: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64csr.bin");
 const RV64M: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64m.bin");
 const RV64A: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64a.bin");
+const RV64F_OPS: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64f_ops.bin");
 const RV64EXIT: &[u8] = include_bytes!("../../../platform/programs/rv64g/rv64exit.bin");
 
 fn run_iss(image: &[u8]) -> Rv64gMachine {
@@ -84,6 +85,21 @@ fn rv64a_atomic_image_matches_iss() {
     let mut iss = Rv64gMachine::load_flat(0, RV64A);
     assert_eq!(iss.run(200_000), Rv64Stop::Exit(0));
     assert_eq!(rtl.regs, iss.regs, "RV64A RTL/ISS register mismatch");
+}
+
+#[test]
+fn rv64f_non_arithmetic_image_matches_iss() {
+    if cfg!(debug_assertions) {
+        eprintln!("skipping RV64F subset RTL run in debug builds");
+        return;
+    }
+    let rtl = eda_cpu_platform::systemverilog::run_rv64i_platform(RV64F_OPS, 200_000)
+        .expect("RV64F subset RTL run");
+    assert_eq!(rtl.exit_code, Some(0), "RTL exit code");
+    assert!(!rtl.trap, "RTL reported a fatal trap");
+    let mut iss = Rv64gMachine::load_flat(0, RV64F_OPS);
+    assert_eq!(iss.run(200_000), Rv64Stop::Exit(0));
+    assert_eq!(rtl.regs, iss.regs, "RV64F subset RTL/ISS register mismatch");
 }
 
 #[test]

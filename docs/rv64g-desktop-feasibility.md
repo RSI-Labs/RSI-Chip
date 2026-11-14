@@ -1,7 +1,7 @@
 # RV64G 桌面级 CPU：可行性、差距与分阶段计划
 
 日期：2026-11-08
-状态：**P0 用户级 RV64G ISS、P1 RV64I RTL、P2 的 RTL M/A 扩展已完成；P3-P6 未完成。完整商用桌面 RV64G 目标仍无法在当前环境完成。**
+状态：**P0 用户级 RV64G ISS、P1 RV64I RTL、P2 的 RTL M/A 扩展已完成；P3 的 FP 寄存器堆与非算术 F 子集已进入 RTL，浮点算术/P4-P6 未完成。完整商用桌面 RV64G 目标仍无法在当前环境完成。**
 
 ## 1. 结论
 
@@ -136,7 +136,12 @@ DFT/ATPG、形式验证、门级/SDF 回归、物理实现、signoff、流片与
   及 W 形式）用 64 位迭代乘/除法器实现；RV64A 的 LR/SC、全部 AMO
   （AMOADD/SWAP/XOR/AND/OR/MIN/MAX/MINU/MAXU，.W/.D）已进入 RTL。
   `rv64m.bin` 和 `rv64a.bin` 在 RTL 与 ISS 上寄存器逐一相同。
-- **未完成**：RTL 的 F/D、S/U 特权级、MMU、缓存、桌面 SoC、商用签核。
+- **P3 部分完成**：RV64F 的 32×64 位浮点寄存器堆、FMV.W.X/FMV.X.W、
+  FSGNJ/N/X、FMIN/FMAX、FEQ/FLT/FLE、FCLASS 已进入 RTL，`rv64f_ops.bin`
+  在 RTL 与 ISS 上寄存器一致。FADD/FSUB/FMUL/FDIV/FSQRT/FMA、浮点
+  加载/存储、转换与异常标志仍未进入 RTL。
+- **未完成**：RTL 的浮点算术、D、S/U 特权级、MMU、缓存、桌面 SoC、
+  商用签核。
 - **仍不能声称“商用级别 RV64G 桌面级 CPU”已完成。**
 - 下一步：P2（M/A RTL）→ P3（F/D RTL）→ P4（特权级/MMU）→ P5（桌面 SoC）
   → P6（商用签核）。这些阶段需要认证 PDK、商业 EDA、验证 IP 和流片资源。

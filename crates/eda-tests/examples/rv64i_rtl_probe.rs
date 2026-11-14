@@ -21,6 +21,10 @@ fn main() {
             "rv64a",
             &include_bytes!("../../../platform/programs/rv64g/rv64a.bin")[..],
         ),
+        (
+            "rv64f_ops",
+            &include_bytes!("../../../platform/programs/rv64g/rv64f_ops.bin")[..],
+        ),
     ] {
         let rtl = run_rv64i_platform(image, 2_000_000).expect("RTL run");
         let mut iss = Rv64gMachine::load_flat(0, image);

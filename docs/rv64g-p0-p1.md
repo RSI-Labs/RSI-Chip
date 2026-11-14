@@ -1,7 +1,7 @@
 # RV64G P0/P1: user-level ISS, RV64I RTL, LEC and simulation
 
 Date: 2026-11-08
-Status: **P0 user-level RV64G ISS complete; P1 RV64I RTL complete; P2 RTL M/A extensions complete; P3-P6 pending.**
+Status: **P0 user-level RV64G ISS complete; P1 RV64I RTL complete; P2 RTL M/A complete; P3 partial (FP register file and non-arithmetic F subset in RTL); P4-P6 pending.**
 The full commercial desktop RV64G CPU (P2-P6) is **not** complete and cannot be
 claimed from the current environment; see the scope table at the end.
 
@@ -47,7 +47,7 @@ cargo test --release -p eda-cpu-platform --test rv64g_iss
 # 7 passed (six ISA images + sparse-memory widths)
 ```
 
-## 2. P1/P2: RV64IMA RTL
+## 2. P1/P2/P3(partial): RV64IMA + F-subset RTL
 
 Files:
 
@@ -56,26 +56,27 @@ Files:
 - `platform/rtl/rv64i_full_runtime_tb.sv` - simulation harness
 - `crates/eda-cpu-platform/src/systemverilog.rs` - `Rv64iPlatformRunner`
 
-The core is a multicycle RV64IMA machine: 64-bit GPRs/PC, external 64-bit
+The core is a multicycle RV64IMA machine with an FP register file: 64-bit GPRs/PC, external 64-bit
 instruction/data buses, byte/half/word/dword loads and stores, W-form ALU
 operations, 6-bit shifts, RV64M multiply/divide (sequential 64-bit shift-add /
 shift-subtract units), LR/SC and all AMO operations (atomic read-modify-write
-state), machine-mode CSRs, ecall/ebreak traps, and the same
+state), a 32x64-bit FP register file, FP moves/sign-injection/min-max/compares/FCLASS,
+machine-mode CSRs, ecall/ebreak traps, and the same
 MMIO platform devices as the RV32I core.
 
 ### LEC evidence
 
-Netlist scale after adding RV64M and RV64A: reference 218,552 cells, mapped
-168,463 cells, 3,709 flops, 647 output bits.
+Netlist scale after adding RV64M, RV64A, and the FP register file / F subset:
+reference 283,488 cells, mapped 225,046 cells, 5,757 flops, 647 output bits.
 
 Independent frontend (slang-vs-eda-hdl) on the final RV64IM netlist:
 
 ```text
 rv64i_full_core: independent slang-vs-hdl equivalent=true
-slang_cells=217711 hdl_cells=168463
-proved all 3709 flop next-state functions and 647 output bits
-coverage: gate 3709 flops + 164754 combinational cells in proof cones (0 dangling)
-elapsed=849.1s
+slang_cells=282647 hdl_cells=225046
+proved all 5757 flop next-state functions and 647 output bits
+coverage: gate 5757 flops + 219289 combinational cells in proof cones (0 dangling)
+elapsed=1193.6s
 ```
 
 RTL-vs-mapped equivalence is executed with the strict no-cut parallel engine
@@ -86,12 +87,12 @@ Strict no-internal-cut LEC (every flop next-state function and output bit
 proven over its complete combinational fan-in cone):
 
 ```text
-rv64i_full_core: strict equivalent=true reference_cells=218552 mapped_cells=168463
+rv64i_full_core: strict equivalent=true reference_cells=283488 mapped_cells=225046
 strict LEC ran 10 parallel workers
-proved all 3709 flop next-state functions and 647 output bits
-coverage: gate 3709 flops + 164754 combinational cells in proof cones (0 dangling)
+proved all 5757 flop next-state functions and 647 output bits
+coverage: gate 5757 flops + 219289 combinational cells in proof cones (0 dangling)
 strict full-circuit LEC: 0 internal cuts
-elapsed=996.3s
+elapsed=1491.3s
 ```
 
 Reproduce:
@@ -116,6 +117,8 @@ rv64csr: rtl exit=Some(0) halted=false trap=false inst=88 cycles=177
 rv64m:  rtl exit=Some(0) halted=false trap=false inst=137 cycles=2131
         rtl regs == ISS regs (all 31 registers)
 rv64a:  rtl exit=Some(0) halted=false trap=false inst=145 cycles=306
+        rtl regs == ISS regs (all 31 registers)
+rv64f_ops: rtl exit=Some(0) halted=false trap=false inst=82 cycles=165
         rtl regs == ISS regs (all 31 registers)
 ```
 
@@ -164,8 +167,8 @@ It is **not** a commercial desktop CPU:
 
 | Capability | Current | Commercial desktop RV64G |
 |---|---|---|
-| RTL ISA | RV64IMA + Zicsr | RV64G + privilege + MMU |
-| RTL M/A/F/D | M/A done; F/D ISS only | required in RTL |
+| RTL ISA | RV64IMA + F subset + Zicsr | RV64G + privilege + MMU |
+| RTL M/A/F/D | M/A + non-arithmetic F; arithmetic F/D ISS only | required in RTL |
 | Privilege | M-mode subset | M/S/U, delegation, interrupts |
 | MMU | none | Sv39+ |
 | Pipeline/caches | multicycle, no cache | pipelined, L1/L2, coherence |

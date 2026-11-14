@@ -173,7 +173,7 @@ independent slang-vs-eda-hdl LEC for each row:
 | `rv32i_full_core` | 52,552 / 37,119 | 1,572 | 327 | yes (52,012 / 37,119) |
 | `rv32i_core` (signoff) | 42,196 / 31,320 | 2,243 | 163 | yes (42,196 / 31,320) |
 | `rv32i_full_soc_16` | 60,348 / 44,175 | 2,084 | 226 | yes (59,808 / 44,175) |
-| `rv64ima_full_core` | 218,552 / 168,463 | 3,709 | 647 | yes (217,711 / 168,463) |
+| `rv64ima_fsub_full_core` | 283,488 / 225,046 | 5,757 | 647 | yes (282,647 / 225,046) |
 | `i8086_prefix_decoder` | 500 / 76 | 0 | 8 | yes (500 / 76) |
 | `i8086_opcode_decoder` | 6,316 / 941 | 0 | 17 | yes (5,588 / 941) |
 | `i8086_modrm_decoder` | 795 / 584 | 0 | 25 | yes (795 / 584) |
@@ -240,7 +240,7 @@ controls proof parallelization (results below use 10 workers):
 | `rv32i_full_soc_16` | 44,175 | 2,084 + 226 | 326.5 s |
 | `sys8086` | 39,600 | 1,216 + 35 | 5.6 s |
 | `rv32i_isa_decoder` | 210 | 0 + 193 | < 1 s |
-| `rv64ima_full_core` | 168,463 | 3,709 + 647 | 996.3 s |
+| `rv64ima_fsub_full_core` | 225,046 | 5,757 + 647 | 1491.3 s |
 
 All results: `equivalent=true`, `strict full-circuit LEC: 0 internal cuts`,
 and `gate ... (0 dangling)` coverage. The mapped DUT side has no combinational

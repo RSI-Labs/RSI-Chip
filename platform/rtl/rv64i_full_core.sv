@@ -117,6 +117,7 @@ module rv64i_full_core(
   reg [63:0] fp_wdata_c;
   reg fp_max_c;
   reg [63:0] fp_minmax_value;
+  reg [63:0] fp_fclass_value;
 
   reg rf_we_c;
   reg [63:0] next_pc_c;
@@ -199,31 +200,6 @@ module rv64i_full_core(
     end
   endfunction
 
-  function [63:0] fclass32(input [31:0] v);
-    reg sign;
-    reg [7:0] exp;
-    reg [22:0] frac;
-    reg quiet;
-    begin
-      sign = v[31];
-      exp = v[30:23];
-      frac = v[22:0];
-      quiet = v[22];
-      if (exp == 8'hff) begin
-        if (frac == 23'b0)
-          fclass32 = sign ? 64'd1 : 64'd128;
-        else
-          fclass32 = quiet ? 64'd512 : 64'd256;
-      end else if (exp == 8'b0) begin
-        if (frac == 23'b0)
-          fclass32 = sign ? 64'd8 : 64'd16;
-        else
-          fclass32 = sign ? 64'd4 : 64'd32;
-      end else begin
-        fclass32 = sign ? 64'd2 : 64'd64;
-      end
-    end
-  endfunction
 
   function [63:0] csr_read_value(input [11:0] address);
     begin
@@ -562,6 +538,22 @@ module rv64i_full_core(
   end
 
   always @* begin
+    if (fva[30:23] == 8'hff) begin
+      if (fva[22:0] == 23'b0)
+        fp_fclass_value = fva[31] ? 64'd1 : 64'd128;
+      else
+        fp_fclass_value = fva[22] ? 64'd512 : 64'd256;
+    end else if (fva[30:23] == 8'b0) begin
+      if (fva[22:0] == 23'b0)
+        fp_fclass_value = fva[31] ? 64'd8 : 64'd16;
+      else
+        fp_fclass_value = fva[31] ? 64'd4 : 64'd32;
+    end else begin
+      fp_fclass_value = fva[31] ? 64'd2 : 64'd64;
+    end
+  end
+
+  always @* begin
     rf_we_c = 1'b0;
     next_pc_c = pc + 64'd4;
     mem_req_c = 1'b0;
@@ -848,7 +840,7 @@ module rv64i_full_core(
       end
       7'b1010011: begin // RV64F non-arithmetic subset
         case (funct7)
-          7'b0001000: begin // FSGNJ / FSGNJN / FSGNJX
+          7'b0010000: begin // FSGNJ / FSGNJN / FSGNJX
             fp_we_c = 1'b1;
             if (funct3 == 3'b000)
               fp_wdata_c = {32'hffffffff, fvb[31], fva[30:0]};
@@ -893,7 +885,7 @@ module rv64i_full_core(
               result_c = {{32{fva[31]}}, fva[31:0]};
             end else if (funct3 == 3'b001) begin
               rf_we_c = 1'b1;
-              result_c = fclass32(fva[31:0]);
+              result_c = fp_fclass_value;
             end else begin
               exception_c = 1'b1;
               exception_cause_c = 64'd2;

@@ -29,7 +29,8 @@ and links with `platform/programs/rv64g/link.ld`, producing a flat `.bin`.
 | `rv64i.bin` | RV64I integer, 64-bit loads/stores, W-forms, branches, jumps | yes |
 | `rv64m.bin` | M multiply/divide including corner cases | yes |
 | `rv64a.bin` | A LR/SC and AMOs | yes |
-| `rv64f.bin` | F single precision, conversions, flags, FMA | ISS only (P3) |
+| `rv64f.bin` | F single precision, conversions, flags, FMA | ISS only (P3 arithmetic) |
+| `rv64f_ops.bin` | FP moves, sign injection, min/max, compares, FCLASS | yes |
 | `rv64d.bin` | D double precision, conversions, flags, FMA | ISS only (P3) |
 | `rv64csr.bin` | Zicsr/fflags/frm/fcsr/trap CSRs | yes |
 | `rv64exit.bin` | ECALL with `mtvec == 0` exit-code path | yes |
